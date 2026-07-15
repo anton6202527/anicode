@@ -9,7 +9,6 @@ coverage/
 .DS_Store
 .env
 .env.*
-.agentx-dev/
 .anicode-dev/
 .anicode/
 *.vsix
