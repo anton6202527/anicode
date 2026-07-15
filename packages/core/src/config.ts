@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { McpServerConfig } from "./mcp.js";
 import type { SubagentDefinition } from "./subagent.js";
+import type { LspServerConfig } from "./lsp.js";
 
 /** 配置里的单个 agent 定义（比 SubagentDefinition 更贴近用户书写习惯）。 */
 export interface ConfigAgent {
@@ -33,6 +34,8 @@ export interface AnicodeConfig {
   mcp?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
   /** 自定义子 agent：name → 定义。 */
   agents?: Record<string, ConfigAgent>;
+  /** 语言服务器：name → 配置（命令 + 负责扩展名）。 */
+  lsp?: Record<string, LspServerConfig>;
   /** 额外注入 system 的规则文件路径（相对 cwd 或绝对）。 */
   instructions?: string[];
 }
@@ -45,7 +48,7 @@ export interface LoadedConfig {
   warnings: string[];
 }
 
-const KNOWN_KEYS = new Set(["model", "smallModel", "mcp", "agents", "instructions"]);
+const KNOWN_KEYS = new Set(["model", "smallModel", "mcp", "agents", "lsp", "instructions"]);
 
 function candidatePaths(cwd: string, home: string): string[] {
   return [
@@ -85,6 +88,7 @@ function merge(base: AnicodeConfig, over: AnicodeConfig): AnicodeConfig {
     ...over,
     ...(base.mcp || over.mcp ? { mcp: { ...base.mcp, ...over.mcp } } : {}),
     ...(base.agents || over.agents ? { agents: { ...base.agents, ...over.agents } } : {}),
+    ...(base.lsp || over.lsp ? { lsp: { ...base.lsp, ...over.lsp } } : {}),
     ...(base.instructions || over.instructions
       ? { instructions: [...new Set([...(base.instructions ?? []), ...(over.instructions ?? [])])] }
       : {}),
@@ -118,6 +122,12 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
     ...(c.args ? { args: c.args } : {}),
     ...(c.env ? { env: c.env } : {}),
   }));
+}
+
+/** 把配置里的 lsp 映射转成 LspServerConfig[]（name 只是标识，运行期按扩展名路由）。 */
+export function toLspServers(config: AnicodeConfig): LspServerConfig[] {
+  if (!config.lsp) return [];
+  return Object.values(config.lsp);
 }
 
 /** 把配置里的 agents 映射转成 SubagentDefinition[]（prompt→system）。 */

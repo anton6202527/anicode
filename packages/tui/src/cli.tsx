@@ -27,9 +27,12 @@ import {
   loadConfig,
   toMcpServerConfigs,
   toSubagentDefinitions,
+  toLspServers,
   connectMcpServers,
   loadCommands,
   defaultTools,
+  createDiagnosticsTool,
+  LspPool,
   GENERAL_SUBAGENT,
   type SessionHost,
   type AnicodeConfig,
@@ -326,7 +329,7 @@ export function resolveConfiguredProvider(model: string) {
 
 export async function buildHost(
   args: CliArgs,
-  extras: { config?: AnicodeConfig; mcpTools?: Tool[] } = {},
+  extras: { config?: AnicodeConfig; extraTools?: Tool[] } = {},
 ): Promise<SessionHost> {
   if (args.daemon) {
     return DaemonClient.connect(args.socket);
@@ -335,7 +338,7 @@ export async function buildHost(
   // 配置里的自定义 agents 追加到内置 general 之后（general 兜底通用委派）。
   const configAgents = toSubagentDefinitions(config);
   const subagents = configAgents.length > 0 ? [GENERAL_SUBAGENT, ...configAgents] : true;
-  const mcpTools = extras.mcpTools ?? [];
+  const extraTools = extras.extraTools ?? [];
   const manager = new SessionManager({
     store: new SessionStore(args.sessionsDir),
     resolveProvider: resolveConfiguredProvider,
@@ -343,12 +346,12 @@ export async function buildHost(
     permission: { mode: args.permissionMode },
     skills: true,
     subagents,
-    // MCP 工具与内置工具合流；无 MCP 时不传 tools，沿用 Agent 默认工具集。
-    ...(mcpTools.length > 0
+    // MCP / diagnostics 等附加工具与内置工具合流；无附加工具时沿用默认工具集。
+    ...(extraTools.length > 0
       ? {
           tools: () => {
             const reg = defaultTools();
-            for (const t of mcpTools) reg.register(t);
+            for (const t of extraTools) reg.register(t);
             return reg;
           },
         }
@@ -448,12 +451,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
     }
   }
+  // 配置了 LSP 服务器则建池，并暴露 diagnostics 工具（惰性按扩展名启动服务器）。
+  const lspServers = args.daemon ? [] : toLspServers(config);
+  const lspPool = lspServers.length > 0 ? new LspPool(args.cwd, lspServers) : undefined;
+  const extraTools: Tool[] = [...mcpTools, ...(lspPool ? [createDiagnosticsTool(lspPool)] : [])];
+
   // 自定义斜杠命令（.anicode/command/*.md，全局+项目）。
   const commands: CustomCommand[] = args.daemon ? [] : await loadCommands({ cwd: args.cwd });
 
   let host: SessionHost | undefined;
   try {
-    const baseHost = await buildHost(args, { config, mcpTools }).catch((err) => {
+    const baseHost = await buildHost(args, { config, extraTools }).catch((err) => {
       throw new Error(`无法建立会话宿主: ${(err as Error).message}`);
     });
     host = baseHost;
@@ -486,6 +494,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     await instance.waitUntilExit();
   } finally {
     host?.dispose();
+    lspPool?.closeAll();
     for (const c of mcpClients) {
       try {
         c.close();

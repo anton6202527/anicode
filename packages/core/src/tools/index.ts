@@ -2,11 +2,13 @@ import { ToolRegistry } from "./tool.js";
 import { readTool, writeTool, editTool, globTool, grepTool } from "./fs.js";
 import { bashTool } from "./bash.js";
 import { createTodoTool } from "./todo.js";
+import { webFetchTool } from "./webfetch.js";
 
 export * from "./tool.js";
 export { readTool, writeTool, editTool, globTool, grepTool } from "./fs.js";
 export { bashTool, splitShellCommand, analyzeShellCommand, type ShellCommandAnalysis } from "./bash.js";
 export { createTodoTool, type TodoItem } from "./todo.js";
+export { webFetchTool, htmlToText } from "./webfetch.js";
 export {
   type SandboxPolicy,
   type SandboxSpec,
@@ -24,5 +26,6 @@ export function defaultTools(): ToolRegistry {
     .register(globTool)
     .register(grepTool)
     .register(bashTool)
+    .register(webFetchTool)
     .register(createTodoTool());
 }

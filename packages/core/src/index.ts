@@ -95,10 +95,19 @@ export {
   loadConfig,
   toMcpServerConfigs,
   toSubagentDefinitions,
+  toLspServers,
   type AnicodeConfig,
   type ConfigAgent,
   type LoadedConfig,
 } from "./config.js";
+export {
+  LspClient,
+  LspPool,
+  pickLspServer,
+  type LspServerConfig,
+  type Diagnostic,
+} from "./lsp.js";
+export { createDiagnosticsTool } from "./tools/diagnostics.js";
 export {
   loadCommands,
   expandCommand,
@@ -138,6 +147,8 @@ export {
   globTool,
   grepTool,
   bashTool,
+  webFetchTool,
+  htmlToText,
   splitShellCommand,
   analyzeShellCommand,
   type ShellCommandAnalysis,
