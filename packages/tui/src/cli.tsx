@@ -24,7 +24,18 @@ import {
   SessionStore,
   LocalSessionHost,
   DaemonClient,
+  loadConfig,
+  toMcpServerConfigs,
+  toSubagentDefinitions,
+  connectMcpServers,
+  loadCommands,
+  defaultTools,
+  GENERAL_SUBAGENT,
   type SessionHost,
+  type AnicodeConfig,
+  type CustomCommand,
+  type Tool,
+  type McpClient,
 } from "@anicode/core";
 import { App } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
@@ -313,18 +324,36 @@ export function resolveConfiguredProvider(model: string) {
   return createProvider(model);
 }
 
-export async function buildHost(args: CliArgs): Promise<SessionHost> {
+export async function buildHost(
+  args: CliArgs,
+  extras: { config?: AnicodeConfig; mcpTools?: Tool[] } = {},
+): Promise<SessionHost> {
   if (args.daemon) {
     return DaemonClient.connect(args.socket);
   }
+  const config = extras.config ?? {};
+  // 配置里的自定义 agents 追加到内置 general 之后（general 兜底通用委派）。
+  const configAgents = toSubagentDefinitions(config);
+  const subagents = configAgents.length > 0 ? [GENERAL_SUBAGENT, ...configAgents] : true;
+  const mcpTools = extras.mcpTools ?? [];
   const manager = new SessionManager({
     store: new SessionStore(args.sessionsDir),
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: { mode: args.permissionMode },
     skills: true,
-    subagents: true,
-    smallModel: true, // 摘要等杂活自动走便宜模型
+    subagents,
+    // MCP 工具与内置工具合流；无 MCP 时不传 tools，沿用 Agent 默认工具集。
+    ...(mcpTools.length > 0
+      ? {
+          tools: () => {
+            const reg = defaultTools();
+            for (const t of mcpTools) reg.register(t);
+            return reg;
+          },
+        }
+      : {}),
+    smallModel: config.smallModel ?? true, // 摘要等杂活自动走便宜模型
   });
   return new LocalSessionHost(manager);
 }
@@ -383,10 +412,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
-  // 未显式指定模型时挑默认：本地 Ollama（优先 DeepSeek，真正零 Key 免费开源）→
+  // 读取 anicode.json（全局+项目合并）；非法配置只提示不致命。
+  const { config, warnings: configWarnings } = await loadConfig({ cwd: args.cwd });
+  for (const w of configWarnings) console.error(`anicode 配置告警: ${w}`);
+
+  // 未显式指定模型时挑默认：配置 model → 本地 Ollama（优先 DeepSeek）→
   // 已配置凭证的云端（DeepSeek 优先）→ 零网络 debug/demo。绝不因缺 ANTHROPIC_API_KEY 报错退出。
   if (!args.modelExplicit && !args.demo) {
-    args.model = (await detectLocalModel()) ?? resolveDefaultModel();
+    args.model = config.model ?? (await detectLocalModel()) ?? resolveDefaultModel();
   }
 
   // 校验 provider（本地模式下尽早报错）。仅当用户显式选了缺 key 的模型才会抛错。
@@ -399,9 +432,28 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   }
 
+  // 连接配置里的 MCP 服务器（本地进程内模式才需要；daemon 由其自身进程负责）。
+  let mcpClients: McpClient[] = [];
+  let mcpTools: Tool[] = [];
+  if (!args.daemon) {
+    const mcpConfigs = toMcpServerConfigs(config);
+    if (mcpConfigs.length > 0) {
+      try {
+        const connected = await connectMcpServers(mcpConfigs);
+        mcpTools = connected.tools;
+        mcpClients = connected.clients;
+        console.error(`anicode: 已连接 ${mcpClients.length} 个 MCP 服务器，${mcpTools.length} 个工具`);
+      } catch (err) {
+        console.error(`anicode: MCP 连接失败（已跳过）: ${(err as Error).message}`);
+      }
+    }
+  }
+  // 自定义斜杠命令（.anicode/command/*.md，全局+项目）。
+  const commands: CustomCommand[] = args.daemon ? [] : await loadCommands({ cwd: args.cwd });
+
   let host: SessionHost | undefined;
   try {
-    const baseHost = await buildHost(args).catch((err) => {
+    const baseHost = await buildHost(args, { config, mcpTools }).catch((err) => {
       throw new Error(`无法建立会话宿主: ${(err as Error).message}`);
     });
     host = baseHost;
@@ -426,6 +478,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         sessionId={sessionId}
         providers={listProviderDetails()}
         catalog={listModelCatalog()}
+        commands={commands}
         inspectProviderCredentials={!args.daemon}
         version={CLI_VERSION}
       />,
@@ -433,6 +486,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     await instance.waitUntilExit();
   } finally {
     host?.dispose();
+    for (const c of mcpClients) {
+      try {
+        c.close();
+      } catch {
+        // 关闭 MCP 子进程失败不影响退出
+      }
+    }
   }
 }
 

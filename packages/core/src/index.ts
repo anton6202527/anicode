@@ -92,6 +92,19 @@ export {
 export * from "./daemon/index.js";
 export { McpClient, connectMcpServers, type McpServerConfig } from "./mcp.js";
 export {
+  loadConfig,
+  toMcpServerConfigs,
+  toSubagentDefinitions,
+  type AnicodeConfig,
+  type ConfigAgent,
+  type LoadedConfig,
+} from "./config.js";
+export {
+  loadCommands,
+  expandCommand,
+  type CustomCommand,
+} from "./commands.js";
+export {
   loadProjectMemory,
   composeSystem,
   estimateTokens,

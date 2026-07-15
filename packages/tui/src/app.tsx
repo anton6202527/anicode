@@ -9,9 +9,10 @@
 
 import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
-import { probeLocalProviders } from "@anicode/core";
+import { probeLocalProviders, expandCommand } from "@anicode/core";
 import type {
   ChatMessage,
+  CustomCommand,
   ModelCatalogEntry,
   ProviderDescriptor,
   SessionEvent,
@@ -21,6 +22,7 @@ import type {
   TodoItem,
   Usage,
 } from "@anicode/core";
+import { expandFileMentions } from "./mentions.js";
 import { messagesToItems, todosFromMessages, firstLine, truncate, type Item } from "./transcript.js";
 import { ensureOllama } from "./ollama.js";
 
@@ -174,6 +176,8 @@ export interface AppProps {
   catalog?: readonly ModelCatalogEntry[];
   /** 仅本地 host 可安全读取当前进程 env；daemon 的凭证属于服务端进程。 */
   inspectProviderCredentials?: boolean;
+  /** 自定义斜杠命令（.anicode/command/*.md）。 */
+  commands?: readonly CustomCommand[];
   /** CLI 版本号，显示在底部状态栏。 */
   version?: string;
 }
@@ -186,6 +190,7 @@ export function App({
   providers = [],
   catalog = [],
   inspectProviderCredentials = false,
+  commands = [],
   version = "0.0.1",
 }: AppProps) {
   const { exit } = useApp();
@@ -452,10 +457,32 @@ export function App({
         setSessionId(meta.id);
         return true;
       }
+      // 自定义命令（.anicode/command/*.md）：展开模板后作为提示发送。
+      const custom = commands.find((c) => c.name === cmd);
+      if (custom) {
+        const prompt = expandCommand(custom, rest.join(" "));
+        dispatch({ t: "running", v: true });
+        void host.send(sessionId, prompt).catch((err) => {
+          dispatch({ t: "running", v: false });
+          dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+        });
+        return true;
+      }
       dispatch({ t: "push", item: { kind: "error", text: `未知命令: /${cmd}` } });
       return true;
     },
-    [host, providers, catalog, inspectProviderCredentials, selectModel, state.meta, state.running, exit],
+    [
+      host,
+      providers,
+      catalog,
+      inspectProviderCredentials,
+      selectModel,
+      state.meta,
+      state.running,
+      exit,
+      commands,
+      sessionId,
+    ],
   );
 
   // 输入缓冲区与光标一起改写：ref 供同 tick 内连续编辑，state 供渲染。
@@ -485,13 +512,21 @@ export function App({
         return;
       }
       // 运行中发送 = steering（core 在 turn 边界注入）；user 条目由事件渲染。
+      // 先展开 @文件引用（把文件内容拼进消息），再发送。
       dispatch({ t: "running", v: true });
-      void host.send(sessionId, text).catch((err) => {
-        dispatch({ t: "running", v: false });
-        dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
-      });
+      void expandFileMentions(text, state.meta.cwd)
+        .then(({ text: expanded, missing }) => {
+          for (const m of missing) {
+            dispatch({ t: "push", item: { kind: "info", text: `@${m}: 未找到该文件，已按原文保留` } });
+          }
+          return host.send(sessionId, expanded);
+        })
+        .catch((err) => {
+          dispatch({ t: "running", v: false });
+          dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+        });
     },
-    [host, runSlash, sessionId],
+    [host, runSlash, sessionId, state.meta.cwd],
   );
 
   useInput((ch, key) => {
