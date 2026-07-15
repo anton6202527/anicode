@@ -190,11 +190,16 @@ export function App({
   const { exit } = useApp();
   const { rows: termRows } = useTerminalSize();
   // 进入 alt-screen 占满终端，退出时还原原有回滚缓冲（仅真实 TTY；测试跳过）。
+  // 同时用 OSC 17/19 把鼠标选区配色设成 VS Code 同款（选中背景 #264f78 / 前景 #dcdcdc），
+  // 退出时 OSC 117/119 复位；iTerm2 等 xterm 兼容终端支持。选中即复制由终端负责
+  // （iTerm2 默认开启「Copy to pasteboard on selection」）。
   useEffect(() => {
     const out = process.stdout;
     if (!out.isTTY) return;
     out.write("\x1b[?1049h\x1b[H");
+    out.write("\x1b]17;#264f78\x07\x1b]19;#dcdcdc\x07");
     return () => {
+      out.write("\x1b]117\x07\x1b]119\x07");
       out.write("\x1b[?1049l");
     };
   }, []);
