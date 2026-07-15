@@ -22,6 +22,7 @@ import type {
   Usage,
 } from "@anicode/core";
 import { messagesToItems, todosFromMessages, firstLine, truncate, type Item } from "./transcript.js";
+import { ensureOllama } from "./ollama.js";
 
 /** transcript 行：既有条目 + 欢迎 logo（logo 放进 Static 只画一次，避免动态区重绘鬼影）。 */
 type Row = Item | { kind: "logo" };
@@ -188,7 +189,7 @@ export function App({
   version = "0.0.1",
 }: AppProps) {
   const { exit } = useApp();
-  const { rows: termRows } = useTerminalSize();
+  const { rows: termRows, cols: termCols } = useTerminalSize();
   // 进入 alt-screen 占满终端，退出时还原原有回滚缓冲（仅真实 TTY；测试跳过）。
   // 同时用 OSC 17/19 把鼠标选区配色设成 VS Code 同款（选中背景 #264f78 / 前景 #dcdcdc），
   // 退出时 OSC 117/119 复位；iTerm2 等 xterm 兼容终端支持。选中即复制由终端负责
@@ -197,8 +198,11 @@ export function App({
     const out = process.stdout;
     if (!out.isTTY) return;
     out.write("\x1b[?1049h\x1b[H");
+    // 整屏背景对齐 opencode（主 #393939）；选区配色对齐 VS Code（#264f78/#dcdcdc）。
+    out.write("\x1b]11;#393939\x07");
     out.write("\x1b]17;#264f78\x07\x1b]19;#dcdcdc\x07");
     return () => {
+      out.write("\x1b]111\x07"); // 复位背景
       out.write("\x1b]117\x07\x1b]119\x07");
       out.write("\x1b[?1049l");
     };
@@ -249,6 +253,30 @@ export function App({
 
   const selectModel = useCallback(
     async (spec: string): Promise<void> => {
+      // 本地 Ollama 模型：选中即尝试自启动服务，省去手动 `ollama serve`。
+      if (spec.startsWith("ollama/")) {
+        setPicker(null);
+        dispatch({ t: "push", item: { kind: "info", text: "正在确保本地 Ollama 已启动…" } });
+        const r = await ensureOllama();
+        if (r === "missing") {
+          dispatch({
+            t: "push",
+            item: { kind: "error", text: "未检测到 ollama 命令，请先安装 Ollama（https://ollama.com）。" },
+          });
+          return;
+        }
+        if (r === "timeout") {
+          dispatch({
+            t: "push",
+            item: { kind: "error", text: "Ollama 启动超时，请手动运行 `ollama serve` 后重试。" },
+          });
+          return;
+        }
+        dispatch({
+          t: "push",
+          item: { kind: "info", text: r === "started" ? "Ollama 已自动启动。" : "Ollama 已在运行。" },
+        });
+      }
       // 模型是会话持久化元数据；始终新建会话，不在原会话上热改。
       // provider/model 的最终校验由 host（本地或 daemon）作为唯一事实源。
       const meta = await host.createSession({ cwd: state.meta.cwd, model: spec });
@@ -665,33 +693,35 @@ export function App({
   const elapsedS =
     state.running && runStartRef.current ? Math.floor((Date.now() - runStartRef.current) / 1000) : 0;
 
+  // /model 选择器：以居中弹框接管整屏（对齐 opencode）。
+  if (picker) {
+    return (
+      <Box height={termRows} flexDirection="column" justifyContent="center" alignItems="center">
+        <ModelPicker
+          rows={picker.rows}
+          index={picker.index}
+          filter={picker.filter}
+          width={Math.min(Math.max(48, termCols - 8), 80)}
+          maxRows={termRows}
+        />
+      </Box>
+    );
+  }
+
   // 输入框簇（含底部提示）；被授权弹窗/选择器接管时不渲染。
   const inputCluster =
     !pendings[0] && !picker ? (
       <Box flexDirection="column" marginTop={1} marginBottom={1}>
-        <Box
-          borderStyle="single"
-          borderColor={state.running ? "gray" : "cyan"}
-          borderTop={false}
-          borderRight={false}
-          borderBottom={false}
-          paddingLeft={1}
-          paddingTop={1}
-          paddingBottom={1}
-          flexDirection="column"
-        >
-          <Box>
-            <InputLine text={input} cursor={cursor} placeholder="输入需求开始… 例如「修复一个失败的测试」" />
-          </Box>
-          <Box marginTop={1}>
-            <Text>
-              <Text color={state.running ? "yellow" : "cyan"}>{spinner} </Text>
-              <Text color="white">{state.meta.model}</Text>
-              <Text dimColor> · {basename(state.meta.cwd)}</Text>
-              {state.meta.title ? <Text dimColor> · {truncate(state.meta.title, 20)}</Text> : null}
-            </Text>
-          </Box>
-        </Box>
+        <InputPanel
+          text={input}
+          cursor={cursor}
+          model={state.meta.model}
+          cwd={state.meta.cwd}
+          {...(state.meta.title ? { title: state.meta.title } : {})}
+          running={state.running}
+          spinner={spinner}
+          width={termCols}
+        />
         <Box justifyContent="flex-end">
           <Text dimColor>
             {state.running
@@ -706,7 +736,6 @@ export function App({
   const controls = (
     <>
       {sessions ? <SessionList sessions={sessions} /> : null}
-      {picker ? <ModelPicker rows={picker.rows} index={picker.index} filter={picker.filter} /> : null}
       {pendings[0] ? (
         <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
           <Text color="yellow">
@@ -1011,74 +1040,172 @@ async function probeLive(
   return { probed, live };
 }
 
-function ModelPicker({ rows, index, filter }: { rows: PickerRow[]; index: number; filter: string }) {
-  const visible = filterPickerRows(rows, filter);
-  const selectedSpec = visible[index]?.spec;
-  // 按 provider 分组并保留出现顺序；只显示当前高亮项附近的一段，避免超长列表撑爆终端。
-  const groups: { provider: string; items: PickerRow[] }[] = [];
-  for (const row of visible) {
-    const last = groups[groups.length - 1];
-    if (last && last.provider === row.providerName) last.items.push(row);
-    else groups.push({ provider: row.providerName, items: [row] });
+// opencode 同款选择器高亮色（暖橙）。
+const PICKER_HL = "#f6b17a";
+
+/** 终端显示宽度：CJK/全角/emoji 记 2，其余记 1（用于高亮行的整行铺底对齐）。 */
+function dispWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0) ?? 0;
+    const wide =
+      c >= 0x1100 &&
+      (c <= 0x115f ||
+        c === 0x2329 ||
+        c === 0x232a ||
+        (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) ||
+        (c >= 0xac00 && c <= 0xd7a3) ||
+        (c >= 0xf900 && c <= 0xfaff) ||
+        (c >= 0xfe30 && c <= 0xfe4f) ||
+        (c >= 0xff00 && c <= 0xff60) ||
+        (c >= 0xffe0 && c <= 0xffe6) ||
+        (c >= 0x1f300 && c <= 0x1faff) ||
+        (c >= 0x20000 && c <= 0x3fffd));
+    w += wide ? 2 : 1;
   }
+  return w;
+}
+
+/** 按显示宽度截断（保证高亮行不因超宽而折行）。 */
+function truncWidth(s: string, max: number): string {
+  if (dispWidth(s) <= max) return s;
+  let out = "";
+  let w = 0;
+  for (const ch of s) {
+    const cw = dispWidth(ch);
+    if (w + cw > max - 1) break;
+    out += ch;
+    w += cw;
+  }
+  return out + "…";
+}
+
+function ModelPicker({
+  rows,
+  index,
+  filter,
+  width = 72,
+  maxRows = 24,
+}: {
+  rows: PickerRow[];
+  index: number;
+  filter: string;
+  width?: number;
+  maxRows?: number;
+}) {
+  const visible = filterPickerRows(rows, filter);
+  const inner = Math.max(24, width - 6); // 扣掉边框(2) + 左右内边距(4)
+  // 列表开窗：让高亮项始终可见，超长目录只画一段。
+  const maxItems = Math.max(6, maxRows - 10);
+  let start = 0;
+  if (visible.length > maxItems) {
+    start = Math.min(Math.max(0, index - Math.floor(maxItems / 2)), visible.length - maxItems);
+  }
+  const windowRows = visible.slice(start, start + maxItems);
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={2} paddingY={0}>
+    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={2} paddingY={1} width={width}>
       <Box justifyContent="space-between">
         <Text bold>选择模型</Text>
-        <Text dimColor>Esc</Text>
+        <Text dimColor>esc</Text>
       </Box>
-      <Box>
-        <Text color="yellow">🔍 </Text>
-        {filter ? <Text>{filter}<Text inverse> </Text></Text> : <Text dimColor>输入以搜索…<Text inverse> </Text></Text>}
-      </Box>
-      {visible.length === 0 ? <Text dimColor>（无匹配模型）</Text> : null}
-      {groups.map((g) => (
-        <Box key={g.provider} flexDirection="column" marginTop={1}>
-          <Text color="magenta" bold>{g.provider}</Text>
-          {g.items.map((row) => {
-            const selected = row.spec === selectedSpec;
-            const mark = row.ready === false ? "✖" : row.ready === true ? "✔" : "·";
-            const markColor = row.ready === false ? "red" : row.ready === true ? "green" : "gray";
-            return (
-              <Box key={row.spec} justifyContent="space-between">
-                <Text {...(selected ? { color: "cyan" as const, bold: true } : {})}>
-                  {selected ? "❯ " : "  "}
-                  <Text color={markColor as never}>{mark}</Text> {row.label}
-                </Text>
-                <Text dimColor>
-                  {row.free ? "Free " : ""}
-                  {row.ready === false ? row.readyHint : ""}
-                </Text>
-              </Box>
-            );
-          })}
-        </Box>
-      ))}
       <Box marginTop={1}>
-        <Text dimColor>↑/↓ 选择 · Enter 确认 · Esc 取消</Text>
+        {filter ? (
+          <Text>
+            {filter}
+            <Text backgroundColor={PICKER_HL}> </Text>
+          </Text>
+        ) : (
+          <Text dimColor>
+            <Text backgroundColor={PICKER_HL} color="black">
+              搜
+            </Text>
+            索…
+          </Text>
+        )}
       </Box>
+
+      {visible.length === 0 ? (
+        <Box marginTop={1}>
+          <Text dimColor>（无匹配模型）</Text>
+        </Box>
+      ) : null}
+
+      <Box flexDirection="column" marginTop={1}>
+        {windowRows.map((row, i) => {
+          const globalIdx = start + i;
+          const selected = globalIdx === index;
+          const prev = windowRows[i - 1];
+          const showHeader = i === 0 || prev?.providerName !== row.providerName;
+          const rightTag = row.free ? "Free" : row.ready === false ? row.readyHint : "";
+          // 选中行画成整行暖橙底、深色字（对齐 opencode）。
+          if (selected) {
+            const rightW = dispWidth(rightTag);
+            const left = truncWidth(`● ${row.label}`, inner - rightW - 1);
+            const pad = Math.max(1, inner - dispWidth(left) - rightW);
+            return (
+              <React.Fragment key={row.spec}>
+                {showHeader ? <ProviderHeader name={row.providerName} /> : null}
+                <Text backgroundColor={PICKER_HL} color="black">
+                  {left}
+                  {" ".repeat(pad)}
+                  {rightTag}
+                </Text>
+              </React.Fragment>
+            );
+          }
+          return (
+            <React.Fragment key={row.spec}>
+              {showHeader ? <ProviderHeader name={row.providerName} /> : null}
+              <Box justifyContent="space-between">
+                <Text>
+                  {"  "}
+                  {row.label}
+                </Text>
+                <Text dimColor>{rightTag}</Text>
+              </Box>
+            </React.Fragment>
+          );
+        })}
+      </Box>
+
+      <Box marginTop={1} justifyContent="space-between">
+        <Text dimColor>↑/↓ 选择 · Enter 确认</Text>
+        <Text dimColor>esc 取消</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function ProviderHeader({ name }: { name: string }) {
+  return (
+    <Box marginTop={1}>
+      <Text color="magenta" bold>
+        {name}
+      </Text>
     </Box>
   );
 }
 
 // ---------- 欢迎页 logo ----------
 
+// 7 行厚描边块字，字高与 opencode wordmark 接近。
+const GLYPH_H = 7;
 const LOGO_GLYPHS: Record<string, string[]> = {
-  a: [" ██ ", "█  █", "████", "█  █", "█  █"],
-  n: ["█  █", "██ █", "█ ██", "█  █", "█  █"],
-  i: ["███", " █ ", " █ ", " █ ", "███"],
-  c: [" ███", "█   ", "█   ", "█   ", " ███"],
-  o: [" ██ ", "█  █", "█  █", "█  █", " ██ "],
-  d: ["██  ", "█ █ ", "█  █", "█ █ ", "██  "],
-  e: ["████", "█   ", "███ ", "█   ", "████"],
+  a: [" ████ ", "██  ██", "██  ██", "██████", "██  ██", "██  ██", "██  ██"],
+  n: ["██  ██", "██  ██", "███ ██", "██████", "██ ███", "██  ██", "██  ██"],
+  i: ["██████", "  ██  ", "  ██  ", "  ██  ", "  ██  ", "  ██  ", "██████"],
+  c: [" █████", "██   █", "██    ", "██    ", "██    ", "██   █", " █████"],
+  o: [" ████ ", "██  ██", "██  ██", "██  ██", "██  ██", "██  ██", " ████ "],
+  d: ["█████ ", "██  ██", "██  ██", "██  ██", "██  ██", "██  ██", "█████ "],
+  e: ["██████", "██    ", "██    ", "█████ ", "██    ", "██    ", "██████"],
 };
 
 function wordmarkRows(word: string): string[] {
-  const rows = ["", "", "", "", ""];
+  const rows = Array.from({ length: GLYPH_H }, () => "");
   for (const ch of word) {
-    const g = LOGO_GLYPHS[ch] ?? ["", "", "", "", ""];
-    for (let r = 0; r < 5; r++) rows[r] += g[r] + " ";
+    const g = LOGO_GLYPHS[ch] ?? Array<string>(GLYPH_H).fill("");
+    for (let r = 0; r < GLYPH_H; r++) rows[r] += (g[r] ?? "") + " ";
   }
   return rows;
 }
@@ -1179,6 +1306,104 @@ function InputLine({ text, cursor, placeholder }: { text: string; cursor: number
       <Text inverse>{at}</Text>
       {after}
     </Text>
+  );
+}
+
+// opencode 同款输入面板：整块 #454545 底色、左侧青色竖条，撑满整行宽度。
+const PANEL_BG = "#454545";
+const PANEL_BAR = "#22d3ee";
+const PANEL_PLACEHOLDER = "输入需求开始… 例如「修复一个失败的测试」";
+
+function pad(width: number, used: number): string {
+  return " ".repeat(Math.max(0, width - used));
+}
+
+function InputPanel({
+  text,
+  cursor,
+  model,
+  cwd,
+  title,
+  running,
+  spinner,
+  width,
+}: {
+  text: string;
+  cursor: number;
+  model: string;
+  cwd: string;
+  title?: string;
+  running: boolean;
+  spinner: string;
+  width: number;
+}) {
+  const barColor = running ? "gray" : PANEL_BAR;
+  const cursorCell = (ch: string) => (
+    <Text color="black" backgroundColor="#dcdcdc">
+      {ch}
+    </Text>
+  );
+
+  // 输入行
+  let inputNode: React.ReactNode;
+  let inputW: number;
+  if (text) {
+    const c = Math.max(0, Math.min(cursor, text.length));
+    const before = text.slice(0, c);
+    const at = text.slice(c, c + 1);
+    if (at) {
+      inputNode = (
+        <>
+          {before}
+          {cursorCell(at)}
+          {text.slice(c + 1)}
+        </>
+      );
+      inputW = dispWidth(text);
+    } else {
+      inputNode = (
+        <>
+          {before}
+          {cursorCell(" ")}
+        </>
+      );
+      inputW = dispWidth(text) + 1;
+    }
+  } else {
+    inputNode = (
+      <>
+        {cursorCell(" ")}
+        <Text color="#9a9a9a">{PANEL_PLACEHOLDER}</Text>
+      </>
+    );
+    inputW = 1 + dispWidth(PANEL_PLACEHOLDER);
+  }
+  const inputUsed = 2 + inputW; // "▌ "
+
+  // 模型行
+  const metaPlain = ` ${spinner} ${model} · ${basename(cwd)}${title ? ` · ${truncate(title, 20)}` : ""}`;
+  const metaUsed = dispWidth(metaPlain);
+
+  return (
+    <Box flexDirection="column" width={width}>
+      <Text backgroundColor={PANEL_BG}>{pad(width, 0)}</Text>
+      <Text backgroundColor={PANEL_BG}>
+        <Text color={barColor}>▌</Text>
+        {" "}
+        {inputNode}
+        {pad(width, inputUsed)}
+      </Text>
+      <Text backgroundColor={PANEL_BG}>{pad(width, 0)}</Text>
+      <Text backgroundColor={PANEL_BG}>
+        {" "}
+        <Text color={running ? "yellow" : PANEL_BAR}>{spinner}</Text>{" "}
+        <Text color="white">{model}</Text>
+        <Text color="#9a9a9a"> · {basename(cwd)}</Text>
+        {title ? <Text color="#9a9a9a"> · {truncate(title, 20)}</Text> : null}
+        {pad(width, metaUsed)}
+      </Text>
+      <Text backgroundColor={PANEL_BG}>{pad(width, 0)}</Text>
+    </Box>
   );
 }
 
