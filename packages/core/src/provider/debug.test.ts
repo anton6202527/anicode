@@ -64,7 +64,7 @@ test("DebugProvider: 工具结果后收尾，不重复发起同一指令", async
           type: "tool_result",
           toolCallId: "debug_bash_1",
           toolName: "bash",
-          content: "agentx debug provider",
+          content: "anicode debug provider",
         },
       ],
     },

@@ -51,7 +51,7 @@ const composer = div("composer");
 const textarea = document.createElement("textarea");
 textarea.className = "input";
 textarea.rows = 1;
-textarea.placeholder = "给 agentx 发消息…（Enter 发送，Shift+Enter 换行）";
+textarea.placeholder = "给 anicode 发消息…（Enter 发送，Shift+Enter 换行）";
 const sendBtn = button("send", submit);
 sendBtn.textContent = "↑";
 composer.append(textarea, sendBtn);

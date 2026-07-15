@@ -76,15 +76,15 @@ test("CLI: demo 与隔离会话目录适合零配置本地调试", () => {
     "--cwd",
     "/work",
     "--sessions",
-    "/tmp/agentx-test-sessions",
+    "/tmp/anicode-test-sessions",
     "--debug-log",
-    "/tmp/agentx-test.jsonl",
+    "/tmp/anicode-test.jsonl",
   ]);
 
   assert.equal(args.model, "debug/demo");
   assert.equal(args.cwd, "/work");
-  assert.equal(args.sessionsDir, "/tmp/agentx-test-sessions");
-  assert.equal(args.debugLog, "/tmp/agentx-test.jsonl");
+  assert.equal(args.sessionsDir, "/tmp/anicode-test-sessions");
+  assert.equal(args.debugLog, "/tmp/anicode-test.jsonl");
   assert.doesNotThrow(() => validateArgs(args));
 });
 

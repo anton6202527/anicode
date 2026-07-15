@@ -26,7 +26,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anton6202527/agentx.git",
+    "url": "git+https://github.com/anton6202527/anicode.git",
     "directory": "packages/cli"
   },
   "scripts": {

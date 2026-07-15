@@ -39,7 +39,7 @@ const tsResolvePlugin = {
   },
 };
 
-/** 外部化所有非 @agentx 的裸依赖（node: 内建由 platform:node 自动外部化） */
+/** 外部化所有非 @anicode 的裸依赖（node: 内建由 platform:node 自动外部化） */
 const externalizePlugin = {
   name: "externalize-npm",
   setup(b) {

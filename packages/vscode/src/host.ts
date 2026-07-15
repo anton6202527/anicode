@@ -27,7 +27,7 @@ export function resolveConfiguredProvider(model: string) {
 }
 
 export function buildManager(sessionsDir?: string): SessionManager {
-  const dir = sessionsDir ?? path.join(os.homedir(), ".agentx", "sessions");
+  const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
   return new SessionManager({
     store: new SessionStore(dir),
     resolveProvider: resolveConfiguredProvider,

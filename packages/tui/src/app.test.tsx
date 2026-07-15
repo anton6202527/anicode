@@ -125,7 +125,7 @@ function offlineHost(options: {
 }
 
 test("TUI: 键入 → 授权 → 文件落盘 → 渲染（走 SessionHost）", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-tui-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-tui-"));
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({
@@ -170,7 +170,7 @@ test("TUI: 键入 → 授权 → 文件落盘 → 渲染（走 SessionHost）", 
 });
 
 test("TUI: 工具被拒绝后以最终状态追加，不被错误结果覆盖", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-tui-deny-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-tui-deny-"));
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({
@@ -212,7 +212,7 @@ test("TUI: 工具被拒绝后以最终状态追加，不被错误结果覆盖", 
 });
 
 test("TUI: /resume 回显已有会话的历史", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-tui-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-tui-"));
   const store = new SessionStore(path.join(dir, "sessions"));
   const targetCwd = path.join(dir, "target-project");
   await fs.mkdir(targetCwd);
@@ -259,7 +259,7 @@ test("TUI: /resume 回显已有会话的历史", async () => {
 });
 
 test("TUI: /sessions 列出会话", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-tui-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-tui-"));
   const store = new SessionStore(path.join(dir, "sessions"));
   await store.create({ id: "s_a", cwd: dir, model: "scripted", title: "会话A" });
 
@@ -450,7 +450,7 @@ test("TUI: /model 无参打开选择器，↓ 选中并 Enter 以该模型新建
   const providers: ProviderDescriptor[] = [
     {
       id: "debug",
-      name: "AgentX Debug",
+      name: "anicode Debug",
       kind: "debug",
       protocol: "debug",
       aliases: ["demo"],
@@ -471,7 +471,7 @@ test("TUI: /model 无参打开选择器，↓ 选中并 Enter 以该模型新建
       openWeight: false,
       recommended: true,
       providerId: "debug",
-      providerName: "AgentX Debug",
+      providerName: "anicode Debug",
       spec: "debug/demo",
       local: true,
       requiresApiKey: false,

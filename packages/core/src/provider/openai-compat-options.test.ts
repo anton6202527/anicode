@@ -20,7 +20,7 @@ test("OpenAI compatibility profile: 可省略不兼容字段并设置 header", a
   let body: Record<string, unknown> | undefined;
   let header = "";
   const server = http.createServer((req, res) => {
-    header = String(req.headers["x-agentx-fixture"] ?? "");
+    header = String(req.headers["x-anicode-fixture"] ?? "");
     let text = "";
     req.on("data", (chunk) => (text += chunk));
     req.on("end", () => {
@@ -45,7 +45,7 @@ test("OpenAI compatibility profile: 可省略不兼容字段并设置 header", a
       streamUsage: false,
       maxTokensField: "max_tokens",
       reasoningEffort: false,
-      defaultHeaders: { "x-agentx-fixture": "present" },
+      defaultHeaders: { "x-anicode-fixture": "present" },
     });
     for await (const _event of provider.stream({
       model: "fixture",

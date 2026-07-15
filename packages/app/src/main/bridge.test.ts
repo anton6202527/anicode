@@ -42,7 +42,7 @@ function fakeIpc(): { ipcMain: IpcMain; invoke: (channel: string, sender: FakeSe
 }
 
 async function tempBridge(): Promise<{ bridge: Bridge; dir: string }> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-app-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-"));
   const bridge = new Bridge({
     cwd: dir,
     sessionsDir: path.join(dir, "sessions"),

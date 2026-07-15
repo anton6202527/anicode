@@ -67,7 +67,7 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
 }
 
 test("MCP: 工具挂进 Agent，端到端调用", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-mcp-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-"));
   const client = await McpClient.start(serverCfg);
   const mcpTools = await client.listTools();
 

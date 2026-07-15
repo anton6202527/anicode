@@ -16,7 +16,7 @@ import { readTool, writeTool, editTool, applyEdit } from "./fs.js";
 const ctx = (cwd: string) => ({ cwd, signal: new AbortController().signal });
 
 async function setup() {
-  const base = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-sbx-"));
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sbx-"));
   const root = path.join(base, "root"); // 沙箱 cwd
   const outside = path.join(base, "outside"); // 沙箱外
   await fs.mkdir(root);

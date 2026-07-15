@@ -31,8 +31,8 @@ export interface DaemonArgs {
 }
 
 export function daemonHelpText(): string {
-  return `agentx-daemon ${DAEMON_VERSION}\n\n` +
-    `用法: agentx-daemon [选项]\n\n` +
+  return `anicode-daemon ${DAEMON_VERSION}\n\n` +
+    `用法: anicode-daemon [选项]\n\n` +
     `  --socket <path>       Unix socket 路径（默认 ${defaultSocketPath()}）\n` +
     `  --sessions <dir>      会话目录（默认 ~/.anicode/sessions）\n` +
     `  --auto                自动允许工具操作\n` +
@@ -130,7 +130,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const server = new DaemonServer({ manager });
   await server.listen(args.socketPath);
   console.log(
-    `agentx daemon 监听于 ${args.socketPath}` +
+    `anicode daemon 监听于 ${args.socketPath}` +
       `（会话目录 ${args.sessionsDir}，权限 ${args.permissionMode}）`,
   );
 

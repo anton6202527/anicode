@@ -40,7 +40,7 @@ async function collect(agent: Agent, text: string) {
 }
 
 test("Agent: 工具调用 → 执行 → 结果回传 → 收尾", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   const provider = scriptedProvider([
     // 第一轮：写文件
     [{ role: "assistant", content: [
@@ -80,7 +80,7 @@ test("Agent: 工具调用 → 执行 → 结果回传 → 收尾", async () => {
 });
 
 test("Agent: 权限拒绝 → 错误结果回传给模型", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   const provider = scriptedProvider([
     [{ role: "assistant", content: [
       { type: "tool_call", id: "c1", name: "bash", args: { command: "rm -rf /" } },
@@ -108,7 +108,7 @@ test("Agent: 权限拒绝 → 错误结果回传给模型", async () => {
 });
 
 test("Agent: 并发护栏 —— send 重入抛错，不破坏历史", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   // 用一个可控延迟的 provider，让第一次 send 卡在流式中
   let release: () => void = () => {};
   const gate = new Promise<void>((r) => (release = r));
@@ -145,7 +145,7 @@ test("Agent: 并发护栏 —— send 重入抛错，不破坏历史", async () 
 
 test("Agent: resume 悬空 tool_call 自愈 + 补写落盘", async () => {
   const { SessionStore } = await import("./session.js");
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   const store = new SessionStore(path.join(dir, "sessions"));
   const meta = await store.create({ id: "s_crash", cwd: dir, model: "x" });
   // 模拟崩溃现场：文件以含 tool_call 的 assistant 消息结尾，没有结果
@@ -193,7 +193,7 @@ test("Agent: resume 悬空 tool_call 自愈 + 补写落盘", async () => {
 });
 
 test("Agent: 只读工具在 default 模式下自动放行（不触发 confirm）", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   await fs.writeFile(path.join(dir, "a.txt"), "content");
   let confirmCalled = false;
   const provider = scriptedProvider([

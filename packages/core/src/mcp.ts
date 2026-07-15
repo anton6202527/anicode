@@ -61,7 +61,7 @@ export class McpClient {
     await client.rpc("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "agentx", version: "0.0.1" },
+      clientInfo: { name: "anicode", version: "0.0.1" },
     });
     client.notify("notifications/initialized", {});
     return client;

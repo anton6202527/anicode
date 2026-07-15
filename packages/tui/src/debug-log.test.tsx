@@ -7,7 +7,7 @@ import type { SessionHost } from "@anicode/core";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
 
 test("debug log: 默认只记内容长度并保持 SessionHost 行为", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-debug-log-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
   const file = path.join(dir, "trace.jsonl");
   let disposed = false;
   const host: SessionHost = {

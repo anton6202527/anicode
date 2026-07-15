@@ -713,7 +713,7 @@ function runtimeConfig(d: ProviderDescriptor, directApiKey?: string): { baseURL?
   return {
     ...(envBase ?? d.baseURL ? { baseURL: envBase ?? d.baseURL } : {}),
     // 本地匿名服务仍给 SDK 一个无敏感性的占位 key；云端缺 key 用空串尽早失败。
-    apiKey: credential ?? (d.requiresApiKey ? "" : "agentx-local"),
+    apiKey: credential ?? (d.requiresApiKey ? "" : "anicode-local"),
   };
 }
 

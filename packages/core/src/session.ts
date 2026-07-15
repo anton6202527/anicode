@@ -7,7 +7,7 @@
  * 选 JSONL 而非单个 JSON，是为了能「追加写」——每轮结束 append 新消息，
  * 不必重写整个文件，长会话也不卡。
  *
- * 默认目录：~/.agentx/sessions/（可覆盖）。core 不碰凭证，只存对话。
+ * 默认目录：~/.anicode/sessions/（可覆盖）。core 不碰凭证，只存对话。
  */
 
 import { promises as fs, createReadStream } from "node:fs";
@@ -31,7 +31,7 @@ export interface SessionData extends SessionMeta {
 }
 
 function defaultDir(): string {
-  return path.join(os.homedir(), ".agentx", "sessions");
+  return path.join(os.homedir(), ".anicode", "sessions");
 }
 
 /** 生成一个可排序（时间前缀）的会话 id，无外部依赖 */

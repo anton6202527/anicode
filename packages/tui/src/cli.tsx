@@ -1,12 +1,12 @@
 #!/usr/bin/env tsx
 /**
- * agentx TUI 入口。
+ * anicode TUI 入口。
  *
  * 前端只认 SessionHost；这里决定用哪种实现：
  *   默认         → LocalSessionHost（进程内 SessionManager，零 IPC）
  *   --daemon [P] → 连 daemon 的 DaemonClient（跨进程共享会话，可与 App/其他 CLI 接管）
  *
- *   agentx [--model provider/model] [--cwd DIR] [--auto|--accept-edits] [--daemon [SOCKET]] [--resume ID]
+ *   anicode [--model provider/model] [--cwd DIR] [--auto|--accept-edits] [--daemon [SOCKET]] [--resume ID]
  */
 
 import * as os from "node:os";
@@ -231,14 +231,14 @@ export function validateArgs(args: CliArgs): void {
     const flag = args.permissionMode === "auto" ? "--auto" : "--accept-edits";
     throw new Error(
       `${flag} 不能用于 --daemon 客户端：权限策略由 daemon 进程统一决定。` +
-        `请在启动 agentx-daemon 时传入 ${flag}；已运行 daemon 的策略不会被当前连接修改。`,
+        `请在启动 anicode-daemon 时传入 ${flag}；已运行 daemon 的策略不会被当前连接修改。`,
     );
   }
 }
 
 /**
  * 未显式指定模型时的默认：优先挑一个「已配置凭证」的云端 provider，
- * 都没有就回退零网络的 debug/demo —— 于是 `animecode`（无 key、无参数）能像 opencode
+ * 都没有就回退零网络的 debug/demo —— 于是 `anicode`（无 key、无参数）能像 opencode
  * 一样直接进 TUI，再用 /model 选免费/本地模型或配置密钥。绝不因缺 ANTHROPIC_API_KEY 而退出。
  */
 // 偏好开源 DeepSeek 优先，再退到其它已配置的云端；本地 Ollama 由 detectLocalModel 单独探测。
@@ -269,7 +269,7 @@ export function resolveDefaultModel(): string {
 
 /**
  * 探测本地 Ollama：在跑就返回一个可用模型 spec（优先 deepseek），否则 null。
- * 这样 `animecode`（无 Key）在装了 Ollama 且拉过 deepseek-r1 时，默认就是真正免费开源的 DeepSeek。
+ * 这样 `anicode`（无 Key）在装了 Ollama 且拉过 deepseek-r1 时，默认就是真正免费开源的 DeepSeek。
  * 失败/超时/未运行一律静默返回 null（回退云端偏好或 debug/demo）。
  */
 export async function detectLocalModel(
@@ -414,7 +414,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         permissionMode: args.permissionMode,
       });
       host = withDebugLogging(baseHost, logger);
-      console.error(`agentx 调试日志: ${logger.file}`);
+      console.error(`anicode 调试日志: ${logger.file}`);
     }
     // 选定会话：--resume 用已有 ID，否则新建。订阅只由 App 负责。
     const sessionId = await selectSessionId(host, args);

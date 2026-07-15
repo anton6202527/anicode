@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "description": "anicode 桌面应用（Electron）—— ChatGPT 风格界面 + 插件市场，复用 @anicode/core",
-  "author": "agentx",
+  "author": "anicode",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",

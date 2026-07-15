@@ -33,7 +33,7 @@ function createWindow(): void {
     minWidth: 720,
     minHeight: 480,
     show: false,
-    title: "agentx",
+    title: "anicode",
     backgroundColor: "#1a1a1a",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {

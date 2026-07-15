@@ -14,7 +14,7 @@ import { ChatBridge } from "./bridge.js";
 import type { HostToWebview } from "./protocol.js";
 
 async function setup() {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-vsc-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-vsc-"));
   const manager = buildManager(path.join(dir, "sessions"));
   const posted: HostToWebview[] = [];
   const bridge = new ChatBridge(manager, dir, "debug/demo", (m) => posted.push(m));
@@ -81,7 +81,7 @@ test("ChatBridge: switchModel 换到新会话，resume 可回到旧会话", asyn
 });
 
 test("ChatBridge: write 工具成功后回发 fileChange 预览", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-vsc-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-vsc-"));
   // auto 权限：!write 无需人工确认即可执行，便于验证 fileChange。
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
@@ -98,7 +98,7 @@ test("ChatBridge: write 工具成功后回发 fileChange 预览", async () => {
     const fc = posted.find((m) => m.type === "fileChange");
     assert.ok(fc && fc.type === "fileChange", "应回发 fileChange");
     assert.equal(fc.change.kind, "write");
-    assert.equal(fc.change.path, ".agentx-debug.txt");
+    assert.equal(fc.change.path, ".anicode-debug.txt");
     assert.ok(fc.change.added > 0);
   } finally {
     bridge.dispose();

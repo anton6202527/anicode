@@ -1,7 +1,7 @@
 /**
  * 插件市场的数据模型与内置目录。
  *
- * agentx 的「插件」统一抽象为可挂到 agent 上的能力来源：MCP server、skill、内建工具组。
+ * anicode 的「插件」统一抽象为可挂到 agent 上的能力来源：MCP server、skill、内建工具组。
  * 本文件只描述目录与状态；实际把启用的插件接进 SessionManager 的工具链是后续工作
  * （见 main/bridge.ts 里的 TODO）。市场 UI 现在负责浏览、启用/停用并持久化选择。
  */

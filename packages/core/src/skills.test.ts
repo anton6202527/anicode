@@ -14,7 +14,7 @@ async function writeSkill(root: string, dir: string, text: string): Promise<stri
 }
 
 test("skills: 项目级同名 skill 覆盖用户级，并发现额外目录", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-skills-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-skills-"));
   const home = path.join(root, "home");
   const project = path.join(root, "project");
   const extra = path.join(root, "extra");
@@ -56,7 +56,7 @@ test("skills: 项目级同名 skill 覆盖用户级，并发现额外目录", as
 });
 
 test("skills: skill 工具加载正文时剥离 YAML frontmatter", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-skill-tool-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-skill-tool-"));
   try {
     const file = await writeSkill(
       root,

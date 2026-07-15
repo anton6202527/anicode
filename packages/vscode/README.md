@@ -1,7 +1,7 @@
-# agentx for VSCode
+# anicode for VSCode
 
-在 VSCode 侧边栏里与 agentx 自研 coding agent 对话。扩展主机进程内
-运行 `@agentx/core` 的 `SessionManager`，webview 只负责渲染——与 daemon / Electron app
+在 VSCode 侧边栏里与 anicode 自研 coding agent 对话。扩展主机进程内
+运行 `@anicode/core` 的 `SessionManager`，webview 只负责渲染——与 daemon / Electron app
 是同一套 `SessionHost` 契约的不同传输实现。
 
 ## 功能
@@ -15,14 +15,14 @@
 ## 开发
 
 ```bash
-npm run build --workspace @agentx/vscode    # 用 esbuild 打包 out/extension.js 与 out/webview.js
-npm run watch --workspace @agentx/vscode    # 监听重建
+npm run build --workspace @anicode/vscode    # 用 esbuild 打包 out/extension.js 与 out/webview.js
+npm run watch --workspace @anicode/vscode    # 监听重建
 ```
 
 在 VSCode 里按 F5（以本目录为扩展开发宿主）即可调试。打包为 `.vsix`：
 
 ```bash
-npm run package --workspace @agentx/vscode
+npm run package --workspace @anicode/vscode
 ```
 
 默认使用零网络的 `debug/demo` 模型，开箱即用；云端模型需配置相应环境变量。

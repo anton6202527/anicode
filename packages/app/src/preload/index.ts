@@ -38,4 +38,4 @@ const api: AgentxApi = {
   setPluginEnabled: (id, enabled) => ipcRenderer.invoke("plugins:setEnabled", id, enabled),
 };
 
-contextBridge.exposeInMainWorld("agentx", api);
+contextBridge.exposeInMainWorld("anicode", api);

@@ -29,7 +29,7 @@ async function drain(agent: Agent, text: string) {
 }
 
 test("SessionStore: create/append/load/list 往返", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-sess-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-"));
   const store = new SessionStore(dir);
   const id = newSessionId(Date.now(), Math.random);
   const meta = await store.create({ id, cwd: "/x", model: "m", title: "测试会话" });
@@ -51,7 +51,7 @@ test("SessionStore: create/append/load/list 往返", async () => {
 });
 
 test("SessionStore: JSONL mtime 驱动最近活跃排序与 load.updatedAt", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-sess-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-"));
   const store = new SessionStore(dir);
   await store.create({ id: "s_old", cwd: "/x", model: "m" });
   await store.create({ id: "s_new", cwd: "/x", model: "m" });
@@ -69,7 +69,7 @@ test("SessionStore: JSONL mtime 驱动最近活跃排序与 load.updatedAt", asy
 });
 
 test("SessionStore: 会话目录/文件为私有权限，并自动收紧旧文件", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-sess-mode-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-mode-"));
   const dir = path.join(root, "sessions");
   const store = new SessionStore(dir);
   const meta = await store.create({ id: "s_private", cwd: "/x", model: "m" });
@@ -98,7 +98,7 @@ test("SessionStore: 会话目录/文件为私有权限，并自动收紧旧文�
 });
 
 test("SessionStore: 会话 id 不能路径穿越，meta id 必须与文件名一致", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-sess-boundary-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-boundary-"));
   const sessions = path.join(root, "sessions");
   await fs.mkdir(sessions);
   const outside = {
@@ -126,7 +126,7 @@ test("SessionStore: 会话 id 不能路径穿越，meta id 必须与文件名一
 });
 
 test("Agent: 对话自动持久化，可 resume 续接", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-sess-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-"));
   const store = new SessionStore(dir);
   const id = newSessionId(Date.now(), Math.random);
   const meta = await store.create({ id, cwd: dir, model: "m" });

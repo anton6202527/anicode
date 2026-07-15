@@ -7,7 +7,7 @@ import { loadProjectMemory, composeSystem, estimateTokens, maybeCompact, microco
 import { textMessage, type ChatMessage } from "./types.js";
 
 test("项目记忆: 逐级向上收集 AGENTS.md，止于 .git", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-mem-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mem-"));
   await fs.mkdir(path.join(root, ".git"));
   await fs.writeFile(path.join(root, "AGENTS.md"), "根约定：用 pnpm");
   const sub = path.join(root, "packages", "app");
@@ -28,7 +28,7 @@ test("项目记忆: 逐级向上收集 AGENTS.md，止于 .git", async () => {
 });
 
 test("项目记忆: 无记忆文件返回空，composeSystem 原样", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agentx-mem-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mem-"));
   const mem = await loadProjectMemory(dir);
   assert.equal(mem, "");
   assert.equal(composeSystem("base", ""), "base");
