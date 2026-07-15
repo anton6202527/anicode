@@ -221,6 +221,7 @@ export function App({
   // /model 选择器：非空即打开，index 为高亮项，filter 为搜索词。
   const [picker, setPicker] = useState<{ rows: PickerRow[]; index: number; filter: string } | null>(null);
   const closeRef = useRef<(() => void) | null>(null);
+  const flushRef = useRef<(() => void) | null>(null);
 
   const selectModel = useCallback(
     async (spec: string): Promise<void> => {
@@ -250,13 +251,26 @@ export function App({
     closeRef.current = null;
     setPendings([]);
     dispatch({ t: "opening", v: true });
+    // 事件合流：流式 token 高频到达时，把一帧内的事件攒成一批，
+    // 用 ~16ms 定时器统一 flush（React18 会自动 batch 这些 dispatch），
+    // 把「每 token 一次全屏重渲染」降到 ~60fps 上限。
+    const queue: SessionEvent[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      flushTimer = null;
+      if (queue.length === 0) return;
+      const batch = queue.splice(0, queue.length);
+      for (const ev of batch) handleEvent(ev, dispatch, setPendings);
+    };
+    flushRef.current = flush;
     const onEvent = (ev: SessionEvent) => {
       if (closed) return;
       if (!ready) {
         buffered.push(ev);
         return;
       }
-      handleEvent(ev, dispatch, setPendings);
+      queue.push(ev);
+      if (!flushTimer) flushTimer = setTimeout(flush, 16);
     };
     void host
       .open(sessionId, onEvent)
@@ -300,6 +314,9 @@ export function App({
       });
     return () => {
       closed = true;
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = null;
+      flushRef.current = null;
       closeRef.current?.();
       closeRef.current = null;
     };
@@ -545,6 +562,13 @@ export function App({
     !state.liveText &&
     state.activeTools.size === 0;
 
+  // 只渲染贴底可见的尾部条目：屏幕至多容纳 termRows 行，取 2×termRows 个条目
+  // 足以覆盖可见区（历史条目不进 yoga 布局），把整棵树的布局代价与会话长度解耦。
+  const visibleItems = conversationEmpty
+    ? state.items
+    : state.items.slice(-(termRows * 2 + 16));
+  const baseKey = state.items.length - visibleItems.length;
+
   return (
     <Box flexDirection="column" height={termRows}>
       {/* 内容区弹性铺满：有对话时贴底（最新可见）；空会话时贴顶（logo 在上）。 */}
@@ -554,8 +578,12 @@ export function App({
         overflow="hidden"
         justifyContent={conversationEmpty ? "flex-start" : "flex-end"}
       >
-        {state.items.map((item, i) =>
-          item.kind === "logo" ? <Welcome key={i} /> : <ItemView key={i} item={item} />,
+        {visibleItems.map((item, i) =>
+          item.kind === "logo" ? (
+            <Welcome key={baseKey + i} />
+          ) : (
+            <ItemView key={baseKey + i} item={item} />
+          ),
         )}
 
         {state.liveText ? (
@@ -1001,7 +1029,10 @@ function SessionList({ sessions }: { sessions: SessionSummary[] }) {
   );
 }
 
-function ItemView({ item }: { item: Item }) {
+// memo：历史条目引用不变时跳过重渲染，流式期间只有尾部活动条目会更新。
+const ItemView = React.memo(ItemViewImpl);
+
+function ItemViewImpl({ item }: { item: Item }) {
   switch (item.kind) {
     case "info":
       return <Text dimColor>{item.text}</Text>;
