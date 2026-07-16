@@ -36,27 +36,79 @@ before(async () => {
       if (requestCount === 1) {
         // 第一轮：返回一个参数分两片传输的工具调用
         sse(res, [
-          { ...chunkBase, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
           {
             ...chunkBase,
-            choices: [{
-              index: 0,
-              // 某些兼容端点会把 id/name 也拆片；adapter 必须和 arguments 一样聚合。
-              delta: { tool_calls: [{ index: 0, id: "call_", type: "function", function: { name: "a", arguments: '{"a":' } }] },
-              finish_reason: null,
-            }],
+            choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
           },
-          { ...chunkBase, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "abc", function: { name: "dd", arguments: "12345," } }] }, finish_reason: null }] },
-          { ...chunkBase, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"b":67890}' } }] }, finish_reason: null }] },
+          {
+            ...chunkBase,
+            choices: [
+              {
+                index: 0,
+                // 某些兼容端点会把 id/name 也拆片；adapter 必须和 arguments 一样聚合。
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_",
+                      type: "function",
+                      function: { name: "a", arguments: '{"a":' },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            ...chunkBase,
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: "abc", function: { name: "dd", arguments: "12345," } },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          },
+          {
+            ...chunkBase,
+            choices: [
+              {
+                index: 0,
+                delta: { tool_calls: [{ index: 0, function: { arguments: '"b":67890}' } }] },
+                finish_reason: null,
+              },
+            ],
+          },
           { ...chunkBase, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
-          { ...chunkBase, choices: [], usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 40 } } },
+          {
+            ...chunkBase,
+            choices: [],
+            usage: {
+              prompt_tokens: 100,
+              completion_tokens: 20,
+              prompt_tokens_details: { cached_tokens: 40 },
+            },
+          },
         ]);
       } else {
         // 第二轮：记录请求体（验证 tool_result 映射），返回纯文本
         secondRequestBody = JSON.parse(body);
         sse(res, [
-          { ...chunkBase, choices: [{ index: 0, delta: { role: "assistant", content: "结果是 " }, finish_reason: null }] },
-          { ...chunkBase, choices: [{ index: 0, delta: { content: "80235。" }, finish_reason: null }] },
+          {
+            ...chunkBase,
+            choices: [
+              { index: 0, delta: { role: "assistant", content: "结果是 " }, finish_reason: null },
+            ],
+          },
+          {
+            ...chunkBase,
+            choices: [{ index: 0, delta: { content: "80235。" }, finish_reason: null }],
+          },
           { ...chunkBase, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
           { ...chunkBase, choices: [], usage: { prompt_tokens: 130, completion_tokens: 8 } },
         ]);
@@ -124,7 +176,10 @@ test("OpenAI 兼容层: 完整工具调用回路", async () => {
   assert.equal(assistantMsg.tool_calls[0].function.name, "add");
 
   // 第二轮输出纯文本并正常收尾
-  const text = events2.filter((e) => e.type === "text_delta").map((e: any) => e.text).join("");
+  const text = events2
+    .filter((e) => e.type === "text_delta")
+    .map((e: any) => e.text)
+    .join("");
   assert.equal(text, "结果是 80235。");
   const done2 = events2.find((e) => e.type === "done");
   assert.ok(done2 && done2.type === "done");

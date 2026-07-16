@@ -45,10 +45,7 @@ test("HookRunner: matcher 命中，updatedInput 链式传递并拼接 context", 
     toolInput: { command: "npm test" },
   });
 
-  assert.deepEqual(seen, [
-    { command: "npm test" },
-    { command: "git status", stage: 1 },
-  ]);
+  assert.deepEqual(seen, [{ command: "npm test" }, { command: "git status", stage: 1 }]);
   assert.equal(unmatchedCalled, false);
   assert.deepEqual(outcome, {
     blocked: false,

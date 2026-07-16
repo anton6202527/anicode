@@ -38,7 +38,9 @@ export class DebugProvider implements Provider {
     const results = latestToolResults(req.messages);
     if (results.length > 0) {
       const summary = results
-        .map((result) => `${result.toolName}: ${result.isError ? "失败" : "完成"} — ${result.content}`)
+        .map(
+          (result) => `${result.toolName}: ${result.isError ? "失败" : "完成"} — ${result.content}`,
+        )
         .join("\n");
       yield* this.textResponse(`Debug 工具回合结束：\n${summary}`, req);
       return;
@@ -68,7 +70,10 @@ export class DebugProvider implements Provider {
     yield { type: "done", stopReason: "end_turn", message, usage: debugUsage(req, text.length) };
   }
 
-  private async *toolResponse(calls: ToolCallPart[], req: StreamRequest): AsyncIterable<StreamEvent> {
+  private async *toolResponse(
+    calls: ToolCallPart[],
+    req: StreamRequest,
+  ): AsyncIterable<StreamEvent> {
     for (const call of calls) {
       throwIfAborted(req.signal);
       yield { type: "tool_call_start", id: call.id, name: call.name };
@@ -98,7 +103,11 @@ function directiveCalls(input: string): ToolCallPart[] | null {
       return [
         call("debug_todo_1", "todo_write", {
           todos: [
-            { content: "验证 DebugProvider 工具调用", status: "in_progress", activeForm: "正在验证调试 provider" },
+            {
+              content: "验证 DebugProvider 工具调用",
+              status: "in_progress",
+              activeForm: "正在验证调试 provider",
+            },
             { content: "检查 TUI 流式与进度显示", status: "pending" },
           ],
         }),
@@ -151,7 +160,8 @@ function debugUsage(req: StreamRequest, outputChars: number): Usage {
   for (const message of req.messages) {
     for (const part of message.content) {
       if (part.type === "text" || part.type === "thinking") inputChars += part.text.length;
-      else if (part.type === "tool_call") inputChars += part.name.length + JSON.stringify(part.args).length;
+      else if (part.type === "tool_call")
+        inputChars += part.name.length + JSON.stringify(part.args).length;
       else if (part.type === "tool_result") inputChars += part.content.length;
       else inputChars += 1000;
     }

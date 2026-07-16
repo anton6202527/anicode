@@ -42,7 +42,7 @@ test("markdown: 标题按层级降级渲染", () => {
 });
 
 test("markdown: 绝不注入原始 HTML（防 XSS）", () => {
-  const out = html('正常 <script>alert(1)</script> 与 <img src=x onerror=alert(2)>');
+  const out = html("正常 <script>alert(1)</script> 与 <img src=x onerror=alert(2)>");
   assert.doesNotMatch(out, /<script>/);
   assert.doesNotMatch(out, /<img/);
   // 危险字符被转义为实体。

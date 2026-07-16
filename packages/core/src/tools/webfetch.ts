@@ -3,6 +3,7 @@
  * 让 agent 能查在线文档/网页。默认只读、可被权限引擎按域名裁决。
  */
 import { type Tool, type ToolContext, ToolError } from "./tool.js";
+import { t } from "../i18n.js";
 
 const ENTITIES: Record<string, string> = {
   "&amp;": "&",
@@ -34,13 +35,21 @@ export const webFetchTool: Tool = {
   readOnly: true,
   def: {
     name: "webfetch",
-    description:
+    description: t(
+      "Fetch an http(s) URL and return its text content (HTML is converted to readable plain text). Use for looking up online docs and reading web pages.",
       "抓取一个 http(s) URL 并返回其文本内容（HTML 会转成可读纯文本）。用于查在线文档、读网页。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        url: { type: "string", description: "http 或 https URL" },
-        maxChars: { type: "number", description: "返回文本上限字符数（默认 20000）" },
+        url: { type: "string", description: t("http or https URL", "http 或 https URL") },
+        maxChars: {
+          type: "number",
+          description: t(
+            "Maximum number of characters of text to return (default 20000)",
+            "返回文本上限字符数（默认 20000）",
+          ),
+        },
       },
       required: ["url"],
       additionalProperties: false,

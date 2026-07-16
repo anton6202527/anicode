@@ -4,6 +4,7 @@
  */
 
 import React, { useState } from "react";
+import { t } from "@anicode/core";
 import { parseMarkdown, type MdBlock, type Span } from "@anicode/shared";
 
 export function Markdown({ text }: { text: string }) {
@@ -16,18 +17,34 @@ function renderBlock(block: MdBlock, key: number): React.ReactNode {
       return <CodeBlock key={key} lang={block.lang} code={block.code} />;
     case "heading": {
       const Tag = `h${Math.min(block.level + 2, 6)}` as keyof React.JSX.IntrinsicElements;
-      return <Tag key={key} className="md-h">{renderSpans(block.spans)}</Tag>;
+      return (
+        <Tag key={key} className="md-h">
+          {renderSpans(block.spans)}
+        </Tag>
+      );
     }
     case "paragraph":
-      return <p key={key} className="md-p">{renderSpans(block.spans)}</p>;
+      return (
+        <p key={key} className="md-p">
+          {renderSpans(block.spans)}
+        </p>
+      );
     case "quote":
-      return <blockquote key={key} className="md-quote">{renderSpans(block.spans)}</blockquote>;
+      return (
+        <blockquote key={key} className="md-quote">
+          {renderSpans(block.spans)}
+        </blockquote>
+      );
     case "list": {
       const items = block.items.map((spans, i) => <li key={i}>{renderSpans(spans)}</li>);
       return block.ordered ? (
-        <ol key={key} className="md-ol">{items}</ol>
+        <ol key={key} className="md-ol">
+          {items}
+        </ol>
       ) : (
-        <ul key={key} className="md-ul">{items}</ul>
+        <ul key={key} className="md-ul">
+          {items}
+        </ul>
       );
     }
   }
@@ -42,7 +59,11 @@ function renderSpan(span: Span, key: number): React.ReactNode {
     case "text":
       return <React.Fragment key={key}>{span.value}</React.Fragment>;
     case "code":
-      return <code key={key} className="md-code">{span.value}</code>;
+      return (
+        <code key={key} className="md-code">
+          {span.value}
+        </code>
+      );
     case "strong":
       return <strong key={key}>{renderSpans(span.children)}</strong>;
     case "em":
@@ -69,7 +90,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
       <div className="md-codebar">
         <span className="md-lang">{lang || "code"}</span>
         <button className="md-copy" onClick={copy}>
-          {copied ? "已复制" : "复制"}
+          {copied ? t("Copied", "已复制") : t("Copy", "复制")}
         </button>
       </div>
       <pre>

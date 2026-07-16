@@ -13,6 +13,7 @@ import {
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
+  t,
 } from "@anicode/core";
 
 export const DEFAULT_MODEL = "debug/demo";
@@ -21,7 +22,12 @@ export const DEFAULT_MODEL = "debug/demo";
 export function resolveConfiguredProvider(model: string) {
   const d = diagnoseProvider(model);
   if (d.requiresApiKey && !d.hasCredentials) {
-    throw new Error(`${d.warnings.join("；")}。可改用 debug/demo 等免 key 模型，或配置对应环境变量。`);
+    throw new Error(
+      t(
+        `${d.warnings.join("；")}. You can switch to a no-key model like debug/demo, or configure the corresponding environment variable.`,
+        `${d.warnings.join("；")}。可改用 debug/demo 等免 key 模型，或配置对应环境变量。`,
+      ),
+    );
   }
   return createProvider(model);
 }
@@ -49,7 +55,9 @@ export interface ModelChoice {
 /** 目录 + 就绪状态；主机能读 env 并探测本地服务存活，据此排序与标注。 */
 export async function modelChoices(): Promise<ModelChoice[]> {
   const details = listProviderDetails();
-  const probed = new Set(details.filter((d) => d.local && (d.baseURL || d.baseURLEnv)).map((d) => d.id));
+  const probed = new Set(
+    details.filter((d) => d.local && (d.baseURL || d.baseURLEnv)).map((d) => d.id),
+  );
   const live = await probeLocalProviders(details);
   return listModelCatalog()
     .map((entry) => {
@@ -59,15 +67,29 @@ export async function modelChoices(): Promise<ModelChoice[]> {
       if (probed.has(entry.providerId)) {
         // 本地端点：以存活探测为准（未启动 → 不可用），别被「免 key」误导。
         ready = live.has(entry.providerId);
-        cred = ready ? `${entry.providerName} 已就绪` : `需先启动 ${entry.providerName}`;
+        cred = ready
+          ? t(`${entry.providerName} ready`, `${entry.providerName} 已就绪`)
+          : t(`Start ${entry.providerName} first`, `需先启动 ${entry.providerName}`);
       } else if (!d.requiresApiKey) {
         ready = true;
-        cred = "免 key";
+        cred = t("No key", "免 key");
       } else {
         ready = d.hasCredentials;
-        cred = ready ? `${d.credentialEnv ?? "凭证"} 已配置` : `缺 ${d.apiKeyEnv.join(" / ") || "API key"}`;
+        cred = ready
+          ? t(
+              `${d.credentialEnv ?? t("credential", "凭证")} configured`,
+              `${d.credentialEnv ?? "凭证"} 已配置`,
+            )
+          : t(
+              `Missing ${d.apiKeyEnv.join(" / ") || "API key"}`,
+              `缺 ${d.apiKeyEnv.join(" / ") || "API key"}`,
+            );
       }
-      const tags = [entry.free ? "免费" : "", entry.openWeight ? "开源" : "", entry.local ? "本地" : ""]
+      const tags = [
+        entry.free ? t("Free", "免费") : "",
+        entry.openWeight ? t("open-weight", "开源") : "",
+        entry.local ? t("local", "本地") : "",
+      ]
         .filter(Boolean)
         .join(" · ");
       return {

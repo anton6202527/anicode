@@ -1,5 +1,14 @@
 export * from "./types.js";
 export {
+  t,
+  getLang,
+  setLang,
+  detectLang,
+  clearLangOverride,
+  onLangChange,
+  type Lang,
+} from "./i18n.js";
+export {
   AnthropicProvider,
   buildAnthropicRequest,
   type AnthropicProviderOptions,
@@ -59,16 +68,12 @@ export {
 export {
   createTaskTool,
   GENERAL_SUBAGENT,
+  EXPLORE_SUBAGENT,
   type SubagentDefinition,
   type TaskToolOptions,
 } from "./subagent.js";
 export { Chan } from "./chan.js";
-export {
-  discoverSkills,
-  skillListPrompt,
-  createSkillTool,
-  type SkillMeta,
-} from "./skills.js";
+export { discoverSkills, skillListPrompt, createSkillTool, type SkillMeta } from "./skills.js";
 export {
   SessionManager,
   type SessionManagerOptions,
@@ -76,19 +81,31 @@ export {
   type SessionSnapshot,
   type SessionSummary,
   type SessionListener,
+  type Checkpoint,
 } from "./session-manager.js";
+export { SnapshotStore, type Snapshot, type RestoreResult } from "./snapshot.js";
+export {
+  buildAuthUrl,
+  exchangeCode,
+  refreshTokens,
+  parseCallbackCode,
+  parseTokenResponse,
+  createVerifier,
+  challengeFromVerifier,
+  type OAuthTokens,
+  type AuthorizationRequest,
+  ANTHROPIC_CLIENT_ID,
+  ANTHROPIC_OAUTH_BETA,
+} from "./auth/oauth.js";
+export { AuthStore, type Credential, type OAuthCredential } from "./auth/store.js";
+export { AnthropicOAuthTokenSource, type TokenSource } from "./auth/token-source.js";
 export {
   type SessionHost,
   type OpenHandle,
   type PermissionDecisionKind,
   LocalSessionHost,
 } from "./host.js";
-export {
-  SessionStore,
-  newSessionId,
-  type SessionMeta,
-  type SessionData,
-} from "./session.js";
+export { SessionStore, newSessionId, type SessionMeta, type SessionData } from "./session.js";
 export * from "./daemon/index.js";
 export { McpClient, connectMcpServers, type McpServerConfig } from "./mcp.js";
 export {
@@ -100,19 +117,9 @@ export {
   type ConfigAgent,
   type LoadedConfig,
 } from "./config.js";
-export {
-  LspClient,
-  LspPool,
-  pickLspServer,
-  type LspServerConfig,
-  type Diagnostic,
-} from "./lsp.js";
+export { LspClient, LspPool, pickLspServer, type LspServerConfig, type Diagnostic } from "./lsp.js";
 export { createDiagnosticsTool } from "./tools/diagnostics.js";
-export {
-  loadCommands,
-  expandCommand,
-  type CustomCommand,
-} from "./commands.js";
+export { loadCommands, expandCommand, type CustomCommand } from "./commands.js";
 export {
   loadProjectMemory,
   composeSystem,
@@ -134,11 +141,13 @@ export {
   type ConfirmFn,
 } from "./permission.js";
 export {
-  ToolRegistry,
-  ToolError,
-  type Tool,
-  type ToolContext,
-} from "./tools/tool.js";
+  buildRepoMap,
+  gatherRepoMap,
+  extractSymbols,
+  type RepoMapOptions,
+  type SourceFile,
+} from "./repomap.js";
+export { ToolRegistry, ToolError, type Tool, type ToolContext } from "./tools/tool.js";
 export {
   defaultTools,
   readTool,

@@ -15,7 +15,7 @@ async function tmp(): Promise<{ home: string; cwd: string; cleanup: () => Promis
 }
 
 test("commands: 加载 frontmatter 描述与正文，项目同名覆盖全局", async () => {
-  const { home, cwd, cleanup } = await tmp();
+  const { home, cwd } = await tmp();
   await fs.writeFile(
     path.join(home, ".config", "anicode", "command", "review.md"),
     "---\ndescription: 全局评审\n---\n全局模板",

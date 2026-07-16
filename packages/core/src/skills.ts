@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Tool } from "./tools/tool.js";
 import { ToolError } from "./tools/tool.js";
+import { t } from "./i18n.js";
 
 export interface SkillMeta {
   name: string;
@@ -60,8 +61,13 @@ export async function discoverSkills(cwd: string, extraDirs: string[] = []): Pro
 /** L1：注入 system 提示的技能清单 */
 export function skillListPrompt(skills: SkillMeta[]): string {
   if (skills.length === 0) return "";
-  const lines = skills.map((s) => `- ${s.name}: ${s.description || "（无描述）"}`);
-  return `# 可用技能\n以下技能可用 skill 工具按名加载完整指引。当任务与某技能匹配时，先加载再动手：\n${lines.join("\n")}`;
+  const lines = skills.map(
+    (s) => `- ${s.name}: ${s.description || t("(no description)", "（无描述）")}`,
+  );
+  return `${t(
+    "# Available skills\nThe skills below can be loaded by name with the skill tool for full guidance. When a task matches a skill, load it before acting:",
+    "# 可用技能\n以下技能可用 skill 工具按名加载完整指引。当任务与某技能匹配时，先加载再动手：",
+  )}\n${lines.join("\n")}`;
 }
 
 /** L2：skill 工具 —— 按名加载 SKILL.md 正文（剥离 frontmatter） */
@@ -71,12 +77,20 @@ export function createSkillTool(skills: SkillMeta[]): Tool {
     readOnly: true,
     def: {
       name: "skill",
-      description:
+      description: t(
+        "Load a skill's full guidance (the SKILL.md body). When a task matches a skill, load it first and follow its guidance.",
         "加载一个技能的完整指引（SKILL.md 正文）。任务与某技能匹配时先加载它，按其中的指引执行。",
+      ),
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: `技能名。可用: ${skills.map((s) => s.name).join(", ") || "（无）"}` },
+          name: {
+            type: "string",
+            description: t(
+              `Skill name. Available: ${skills.map((s) => s.name).join(", ") || "(none)"}`,
+              `技能名。可用: ${skills.map((s) => s.name).join(", ") || "（无）"}`,
+            ),
+          },
         },
         required: ["name"],
         additionalProperties: false,
@@ -92,7 +106,10 @@ export function createSkillTool(skills: SkillMeta[]): Tool {
       const text = await fs.readFile(meta.file, "utf8");
       const body = stripFrontmatter(text).trim();
       const dir = path.dirname(meta.file);
-      return `以下是技能「${name}」的指引（附属资源相对目录 ${dir}）：\n\n${body}`;
+      return `${t(
+        `Below is the guidance for skill “${name}” (companion resources are relative to ${dir}):`,
+        `以下是技能「${name}」的指引（附属资源相对目录 ${dir}）：`,
+      )}\n\n${body}`;
     },
   };
 }

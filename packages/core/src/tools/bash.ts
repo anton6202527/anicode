@@ -1,18 +1,27 @@
 /**
  * Bash 工具 —— 执行 shell 命令。副作用最大的工具，权限门的主要看护对象。
  *
- * 安全说明（原型级，正式版需上真沙箱）：
- * - 命令在 cwd 下执行
+ * 安全说明：
+ * - 命令在 cwd 下执行，默认经 OS 级沙箱（macOS Seatbelt / Linux bubblewrap，见 sandbox.ts）：
+ *   写入限工作区+临时目录，.git/.anicode 保持只读；网络默认放行，可用
+ *   AGENTX_SANDBOX_NETWORK=off 收紧。缺沙箱二进制时回退裸跑并告警一次。
  * - 有超时；abort signal 会 kill 子进程
  * - ruleKey 直接返回命令原文，便于 "Bash(git *)" 这类规则匹配
- * 正式版 TODO：seatbelt(macOS)/landlock(Linux) 收敛可写路径与网络。
  */
 
 import { spawn } from "node:child_process";
-import { resolveSandboxPolicy, wrapWithSandbox } from "./sandbox.js";
+import { realpathSync } from "node:fs";
+import {
+  resolveSandboxPolicy,
+  resolveSandboxNetwork,
+  wrapWithSandbox,
+  sandboxBinaryAvailable,
+  type SandboxSpec,
+} from "./sandbox.js";
 import * as path from "node:path";
 import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
+import { t } from "../i18n.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT = 30_000; // 截断超长输出，保护上下文
@@ -110,12 +119,39 @@ export function splitShellCommand(command: string): string[] {
 }
 
 const SHELL_CONTROL_WORDS = new Set([
-  "!", "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
-  "case", "esac", "select", "function", "coproc", "time",
+  "!",
+  "if",
+  "then",
+  "else",
+  "elif",
+  "fi",
+  "for",
+  "while",
+  "until",
+  "do",
+  "done",
+  "case",
+  "esac",
+  "select",
+  "function",
+  "coproc",
+  "time",
 ]);
 const COMMAND_WRAPPERS = new Set([
-  "env", "command", "builtin", "exec", "eval", "source", ".", "sudo", "doas", "nohup",
-  "xargs", "parallel", "nice", "timeout",
+  "env",
+  "command",
+  "builtin",
+  "exec",
+  "eval",
+  "source",
+  ".",
+  "sudo",
+  "doas",
+  "nohup",
+  "xargs",
+  "parallel",
+  "nice",
+  "timeout",
 ]);
 const SHELL_INTERPRETERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish"]);
 
@@ -202,7 +238,10 @@ function normalizeSimpleCommand(raw: string): { command: string; complete: boole
   if (SHELL_INTERPRETERS.has(executable) && words.some((w) => w === "-c" || w === "--command")) {
     complete = false;
   }
-  if (executable === "find" && words.some((w) => /^-(?:exec|execdir|ok|okdir|delete|fprint|fls)/.test(w))) {
+  if (
+    executable === "find" &&
+    words.some((w) => /^-(?:exec|execdir|ok|okdir|delete|fprint|fls)/.test(w))
+  ) {
     complete = false;
   }
   // `git -c alias.x=!command x` 是一个任意命令入口，不能命中 Bash(git *) 自动放行。
@@ -210,9 +249,9 @@ function normalizeSimpleCommand(raw: string): { command: string; complete: boole
     complete = false;
   }
 
-  const command = words.map((w) =>
-    w === "" || /[\s;&|<>]/.test(w) ? JSON.stringify(w) : w,
-  ).join(" ");
+  const command = words
+    .map((w) => (w === "" || /[\s;&|<>]/.test(w) ? JSON.stringify(w) : w))
+    .join(" ");
   return { command, complete };
 }
 
@@ -220,13 +259,24 @@ export const bashTool: Tool = {
   readOnly: false,
   def: {
     name: "bash",
-    description:
+    description: t(
+      "Run a shell command in the working directory, returning combined stdout+stderr and the exit code. Use for running builds, tests, git, etc.",
       "在工作目录下执行一条 shell 命令，返回合并的 stdout+stderr 与退出码。用于运行构建、测试、git 等。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        command: { type: "string", description: "要执行的 shell 命令" },
-        timeout_ms: { type: "number", description: `超时毫秒数（默认 ${DEFAULT_TIMEOUT_MS}）` },
+        command: {
+          type: "string",
+          description: t("The shell command to run", "要执行的 shell 命令"),
+        },
+        timeout_ms: {
+          type: "number",
+          description: t(
+            `Timeout in milliseconds (default ${DEFAULT_TIMEOUT_MS})`,
+            `超时毫秒数（默认 ${DEFAULT_TIMEOUT_MS}）`,
+          ),
+        },
       },
       required: ["command"],
       additionalProperties: false,
@@ -247,11 +297,36 @@ export const bashTool: Tool = {
       ? Math.max(1000, requestedTimeout)
       : DEFAULT_TIMEOUT_MS;
 
-    // OS 级沙箱（macOS 第一阶段）：可写限工作区 + 临时目录，默认断网。裸跑为 fallback。
+    // OS 级沙箱：macOS Seatbelt / Linux bubblewrap。写入限工作区+临时目录，.git/.anicode 只读，
+    // 网络按 resolveSandboxNetwork 决定。缺沙箱二进制（如未装 bwrap）时回退裸跑并告警一次。
     const policy = resolveSandboxPolicy(ctx.sandbox);
-    const wrapped = wrapWithSandbox(command, { policy, cwd: ctx.cwd });
-    const spawnFile = wrapped ? wrapped.file : "/bin/bash";
-    const spawnArgs = wrapped ? wrapped.args : ["-c", command];
+    // 用真实路径（解 symlink）构 profile：macOS 的 /tmp→/private/tmp、/var→/private/var 等
+    // 前缀会让「字面 subpath」匹配不到内核已规范化的实际访问路径，导致 .git deny 形同虚设。
+    const canonicalCwd = realpathOr(ctx.cwd);
+    const spec: SandboxSpec = {
+      policy,
+      cwd: canonicalCwd,
+      network: resolveSandboxNetwork(),
+      ...(policy === "workspace-write"
+        ? {
+            readOnlySubpaths: [
+              path.join(canonicalCwd, ".git"),
+              path.join(canonicalCwd, ".anicode"),
+            ],
+          }
+        : {}),
+    };
+    const wrapped = wrapWithSandbox(command, spec);
+    let spawnFile = "/bin/bash";
+    let spawnArgs = ["-c", command];
+    if (wrapped) {
+      if (sandboxBinaryAvailable(wrapped.file)) {
+        spawnFile = wrapped.file;
+        spawnArgs = wrapped.args;
+      } else {
+        warnSandboxUnavailable(wrapped.file, policy);
+      }
+    }
 
     return new Promise((resolve, reject) => {
       const child = spawn(spawnFile, spawnArgs, {
@@ -293,6 +368,27 @@ export const bashTool: Tool = {
     });
   },
 };
+
+/** 解析真实路径；路径不存在等异常时回退原值（沙箱仍能用字面路径工作）。 */
+function realpathOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/** 缺沙箱二进制时的一次性告警（按二进制去重），避免每条命令刷屏。 */
+const sandboxWarned = new Set<string>();
+function warnSandboxUnavailable(bin: string, policy: string): void {
+  if (sandboxWarned.has(bin)) return;
+  sandboxWarned.add(bin);
+  const hint =
+    bin === "bwrap"
+      ? "未检测到 bubblewrap（bwrap），命令将不受沙箱约束。安装后可启用文件系统隔离：apt install bubblewrap / dnf install bubblewrap。"
+      : `未检测到沙箱程序 ${bin}，命令将不受沙箱约束。`;
+  process.stderr.write(`[anicode] 沙箱策略=${policy} 但${hint}\n`);
+}
 
 /** 避免 BASH_ENV / 导出的 shell function 在命令正文前隐式执行。 */
 function sanitizedShellEnv(): NodeJS.ProcessEnv {

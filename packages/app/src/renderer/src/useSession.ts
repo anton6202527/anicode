@@ -4,12 +4,8 @@
  */
 
 import { useEffect, useReducer, useRef } from "react";
-import type {
-  SessionEvent,
-  SessionMeta,
-  TodoItem,
-  Usage,
-} from "@anicode/core";
+import { t } from "@anicode/core";
+import type { SessionEvent, SessionMeta, TodoItem, Usage } from "@anicode/core";
 import { messagesToItems, todosFromMessages, type Item } from "./transcript.js";
 
 export interface PendingPerm {
@@ -32,7 +28,12 @@ export interface ChatState {
   opening: boolean;
 }
 
-const emptyUsage: Usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+const emptyUsage: Usage = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+};
 
 const initialState: ChatState = {
   items: [],
@@ -132,11 +133,27 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
     return;
   }
   if (se.type === "permission_request") {
-    dispatch({ t: "permAdd", perm: { permId: se.permId, toolName: se.toolName, ruleKey: se.ruleKey } });
+    dispatch({
+      t: "permAdd",
+      perm: { permId: se.permId, toolName: se.toolName, ruleKey: se.ruleKey },
+    });
     return;
   }
   if (se.type === "permission_resolved") {
     dispatch({ t: "permRemove", permId: se.permId });
+    return;
+  }
+  if (se.type === "reverted") {
+    dispatch({
+      t: "push",
+      item: {
+        kind: "info",
+        text: t(
+          `↩ Workspace rolled back: restored ${se.restored} files, deleted ${se.deleted} new files`,
+          `↩ 工作区已回滚：恢复 ${se.restored} 个文件，删除 ${se.deleted} 个新增文件`,
+        ),
+      },
+    });
     return;
   }
   const ev = se.event;
@@ -155,7 +172,16 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
       dispatch({ t: "resetLive" });
       break;
     case "retry":
-      dispatch({ t: "push", item: { kind: "info", text: `⟳ 瞬时错误，${ev.delayMs}ms 后第 ${ev.attempt} 次重试` } });
+      dispatch({
+        t: "push",
+        item: {
+          kind: "info",
+          text: t(
+            `⟳ Transient error, retry #${ev.attempt} after ${ev.delayMs}ms`,
+            `⟳ 瞬时错误，${ev.delayMs}ms 后第 ${ev.attempt} 次重试`,
+          ),
+        },
+      });
       break;
     case "tool_start":
       dispatch({ t: "flushLive" });
@@ -165,13 +191,27 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
       if (ev.decision === "deny") dispatch({ t: "toolDeny", id: ev.id });
       break;
     case "tool_result":
-      dispatch({ t: "toolFinish", id: ev.id, status: ev.isError ? "err" : "ok", detail: firstLineOf(ev.content) });
+      dispatch({
+        t: "toolFinish",
+        id: ev.id,
+        status: ev.isError ? "err" : "ok",
+        detail: firstLineOf(ev.content),
+      });
       break;
     case "turn_end":
       dispatch({ t: "usage", u: ev.usage });
       break;
     case "compacted":
-      dispatch({ t: "push", item: { kind: "info", text: `上下文已压缩 ${ev.beforeTokens}→${ev.afterTokens} tokens` } });
+      dispatch({
+        t: "push",
+        item: {
+          kind: "info",
+          text: t(
+            `Context compacted ${ev.beforeTokens}→${ev.afterTokens} tokens`,
+            `上下文已压缩 ${ev.beforeTokens}→${ev.afterTokens} tokens`,
+          ),
+        },
+      });
       break;
     case "done":
       dispatch({ t: "flushLive" });
@@ -260,7 +300,16 @@ export function useSession(sessionId: string | null): SessionController {
     if (!id) return;
     dispatch({ t: "permRemove", permId });
     void window.anicode.answerPermission(id, permId, decision).catch((err: unknown) => {
-      dispatch({ t: "push", item: { kind: "error", text: `授权答复失败: ${errorMessage(err)}` } });
+      dispatch({
+        t: "push",
+        item: {
+          kind: "error",
+          text: t(
+            `Failed to reply to permission: ${errorMessage(err)}`,
+            `授权答复失败: ${errorMessage(err)}`,
+          ),
+        },
+      });
     });
   };
 

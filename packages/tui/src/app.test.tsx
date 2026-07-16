@@ -22,6 +22,7 @@ import {
   type SessionEvent,
   type SessionHost,
 } from "@anicode/core";
+import { clearLangOverride } from "@anicode/core";
 import { App, dispWidth, inputView, InputPanel, Welcome } from "./app.js";
 import { messagesToItems, todosFromMessages } from "./transcript.js";
 
@@ -32,7 +33,8 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
     async *stream(): AsyncIterable<StreamEvent> {
       const content = scripts[turn++]?.[0]?.content ?? [];
       const hasTool = content.some((p) => p.type === "tool_call");
-      for (const part of content) if (part.type === "text") yield { type: "text_delta", text: part.text };
+      for (const part of content)
+        if (part.type === "text") yield { type: "text_delta", text: part.text };
       yield {
         type: "done",
         stopReason: hasTool ? "tool_use" : "end_turn",
@@ -52,27 +54,31 @@ const zeroUsage = {
   cacheWriteTokens: 0,
 };
 
-function offlineHost(options: {
-  id?: string;
-  cwd?: string;
-  model?: string;
-  eventsBeforeSnapshot?: SessionEvent[];
-  pendingPermissions?: { permId: string; toolName: string; ruleKey: string }[];
-  onInterrupt?: () => void;
-  onSend?: (text: string) => void;
-  onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
-} = {}): SessionHost {
+function offlineHost(
+  options: {
+    id?: string;
+    cwd?: string;
+    model?: string;
+    eventsBeforeSnapshot?: SessionEvent[];
+    pendingPermissions?: { permId: string; toolName: string; ruleKey: string }[];
+    onInterrupt?: () => void;
+    onSend?: (text: string) => void;
+    onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
+  } = {},
+): SessionHost {
   const id = options.id ?? "s_offline";
   const cwd = options.cwd ?? "/offline/project";
   const model = options.model ?? "offline/model";
-  let created: {
-    id: string;
-    cwd: string;
-    model: string;
-    title?: string;
-    createdAt: string;
-    updatedAt: string;
-  } | undefined;
+  let created:
+    | {
+        id: string;
+        cwd: string;
+        model: string;
+        title?: string;
+        createdAt: string;
+        updatedAt: string;
+      }
+    | undefined;
   return {
     async listSessions() {
       return [];
@@ -91,15 +97,16 @@ function offlineHost(options: {
     },
     async open(sessionId, listener) {
       for (const event of options.eventsBeforeSnapshot ?? []) listener(event);
-      const opened = created?.id === sessionId
-        ? created
-        : {
-            id,
-            cwd,
-            model,
-            createdAt: "2026-07-14T00:00:00.000Z",
-            updatedAt: "2026-07-14T00:00:00.000Z",
-          };
+      const opened =
+        created?.id === sessionId
+          ? created
+          : {
+              id,
+              cwd,
+              model,
+              createdAt: "2026-07-14T00:00:00.000Z",
+              updatedAt: "2026-07-14T00:00:00.000Z",
+            };
       return {
         snapshot: {
           meta: opened,
@@ -117,6 +124,9 @@ function offlineHost(options: {
     async interrupt() {
       options.onInterrupt?.();
     },
+    async undo() {
+      return { restored: 0, deleted: 0 };
+    },
     async answerPermission() {
       return true;
     },
@@ -130,10 +140,20 @@ test("TUI: 键入 → 授权 → 文件落盘 → 渲染（走 SessionHost）", 
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({
       provider: scriptedProvider([
-        [{ role: "assistant", content: [
-          { type: "text", text: "创建文件中。" },
-          { type: "tool_call", id: "c1", name: "write", args: { path: "note.txt", content: "hello" } },
-        ] }],
+        [
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "创建文件中。" },
+              {
+                type: "tool_call",
+                id: "c1",
+                name: "write",
+                args: { path: "note.txt", content: "hello" },
+              },
+            ],
+          },
+        ],
         [{ role: "assistant", content: [{ type: "text", text: "完成，已写入 note.txt。" }] }],
       ]),
       model: "scripted",
@@ -175,15 +195,19 @@ test("TUI: 工具被拒绝后以最终状态追加，不被错误结果覆盖", 
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({
       provider: scriptedProvider([
-        [{
-          role: "assistant",
-          content: [{
-            type: "tool_call",
-            id: "deny-write",
-            name: "write",
-            args: { path: "blocked.txt", content: "no" },
-          }],
-        }],
+        [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_call",
+                id: "deny-write",
+                name: "write",
+                args: { path: "blocked.txt", content: "no" },
+              },
+            ],
+          },
+        ],
         [{ role: "assistant", content: [{ type: "text", text: "已停止。" }] }],
       ]),
       model: "scripted",
@@ -226,7 +250,10 @@ test("TUI: /resume 回显已有会话的历史", async () => {
   }
   await store.create({ id: "s_old", cwd: targetCwd, model: "target-model", title: "旧会话" });
   await store.append("s_old", { role: "user", content: [{ type: "text", text: "先前的问题" }] });
-  await store.append("s_old", { role: "assistant", content: [{ type: "text", text: "先前的回答" }] });
+  await store.append("s_old", {
+    role: "assistant",
+    content: [{ type: "text", text: "先前的回答" }],
+  });
 
   const manager = new SessionManager({
     store,
@@ -263,11 +290,16 @@ test("TUI: /sessions 列出会话", async () => {
   const store = new SessionStore(path.join(dir, "sessions"));
   await store.create({ id: "s_a", cwd: dir, model: "scripted", title: "会话A" });
 
-  const manager = new SessionManager({ store, resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }) });
+  const manager = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
   const host = new LocalSessionHost(manager);
   const start = await host.createSession({ cwd: dir, model: "scripted", title: "起点" });
 
-  const { stdin, lastFrame } = render(<App host={host} cwd={dir} model="scripted" sessionId={start.id} />);
+  const { stdin, lastFrame } = render(
+    <App host={host} cwd={dir} model="scripted" sessionId={start.id} />,
+  );
   await tick();
   for (const ch of "/sessions") stdin.write(ch);
   await tick();
@@ -283,14 +315,83 @@ test("TUI: /sessions 列出会话", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("TUI: 键入 / 弹出命令补全菜单，Enter 直接运行高亮命令", async () => {
+  const host = offlineHost();
+  const { stdin, lastFrame } = render(<App host={host} cwd="/x" model="m" sessionId="s_offline" />);
+  await tick();
+  // 敲命令名前缀即弹出菜单：命令名 + 描述都可见。
+  for (const ch of "/hel") stdin.write(ch);
+  await tick();
+  const menu = lastFrame() ?? "";
+  assert.match(menu, /\/help/);
+  assert.match(menu, /显示命令帮助/);
+  // Enter 运行高亮命令（此刻输入只有 /hel，无需补全完整）。
+  stdin.write("\r");
+  await tick(80);
+  assert.match(lastFrame() ?? "", /git 快照回滚/); // 仅 /help 运行后才出现的帮助正文
+
+  host.dispose();
+});
+
+test("TUI: /lang 即时切换界面语言（英文），并可切回", async () => {
+  const host = offlineHost();
+  const { stdin, lastFrame } = render(<App host={host} cwd="/x" model="m" sessionId="s_offline" />);
+  await tick();
+  try {
+    // 初始中文（脚本 env=zh）：命令菜单描述为中文。
+    for (const ch of "/hel") stdin.write(ch);
+    await tick();
+    assert.match(lastFrame() ?? "", /显示命令帮助/);
+    // 切英文后，同一菜单描述随之变英文（onLangChange 触发整屏重渲染）。
+    for (const ch of "".repeat(4)) stdin.write(ch); // 退格清空 /hel
+    for (const ch of "/lang en") stdin.write(ch);
+    stdin.write("\r");
+    await tick(60);
+    assert.match(lastFrame() ?? "", /Language switched to English/);
+    for (const ch of "/hel") stdin.write(ch);
+    await tick();
+    const en = lastFrame() ?? "";
+    assert.match(en, /Show command help/);
+    assert.doesNotMatch(en, /显示命令帮助/);
+  } finally {
+    clearLangOverride(); // 复位，避免污染其余以中文断言的用例
+    host.dispose();
+  }
+});
+
+test("TUI: 命令菜单 Tab 补全命令名并留空格待输参数", async () => {
+  const host = offlineHost();
+  const { stdin, lastFrame } = render(<App host={host} cwd="/x" model="m" sessionId="s_offline" />);
+  await tick();
+  for (const ch of "/res") stdin.write(ch);
+  await tick();
+  assert.match(lastFrame() ?? "", /\/resume/);
+  stdin.write("\t"); // Tab 补全
+  await tick();
+  const after = lastFrame() ?? "";
+  // 补全后输入为 "/resume "（含空格）→ 菜单收起（描述行不再出现）。
+  assert.doesNotMatch(after, /载入已有会话/);
+
+  host.dispose();
+});
+
 test("TUI: open 响应前的所有事件在 snapshot 后按序回放", async () => {
   const events: SessionEvent[] = [
     { type: "agent", event: { type: "user_message", text: "缓冲用户消息", queued: false } },
     { type: "agent", event: { type: "text", text: "缓冲回答" } },
-    { type: "agent", event: { type: "tool_start", id: "buffer-tool", name: "read", ruleKey: "a.ts" } },
     {
       type: "agent",
-      event: { type: "tool_result", id: "buffer-tool", name: "read", content: "ok", isError: false },
+      event: { type: "tool_start", id: "buffer-tool", name: "read", ruleKey: "a.ts" },
+    },
+    {
+      type: "agent",
+      event: {
+        type: "tool_result",
+        id: "buffer-tool",
+        name: "read",
+        content: "ok",
+        isError: false,
+      },
     },
     { type: "permission_request", permId: "already-done", toolName: "bash", ruleKey: "pwd" },
     { type: "permission_resolved", permId: "already-done", decision: "allow" },
@@ -607,12 +708,14 @@ test("TUI transcript: 隐藏内部 context，并从最近 todo_write 恢复清�
     },
     {
       role: "assistant",
-      content: [{
-        type: "tool_call",
-        id: "todo-1",
-        name: "todo_write",
-        args: { todos: [{ content: "跑测试", status: "in_progress", activeForm: "正在跑测试" }] },
-      }],
+      content: [
+        {
+          type: "tool_call",
+          id: "todo-1",
+          name: "todo_write",
+          args: { todos: [{ content: "跑测试", status: "in_progress", activeForm: "正在跑测试" }] },
+        },
+      ],
     },
   ];
   const items = messagesToItems(messages);
@@ -651,7 +754,9 @@ test("TUI transcript: 并行工具结果按 toolCallId 关联", () => {
       ],
     },
   ]);
-  const tools = items.filter((item): item is Extract<typeof item, { kind: "tool" }> => item.kind === "tool");
+  const tools = items.filter(
+    (item): item is Extract<typeof item, { kind: "tool" }> => item.kind === "tool",
+  );
   assert.deepEqual(
     tools.map(({ id, status, detail }) => ({ id, status, detail })),
     [
@@ -718,29 +823,31 @@ test("TUI: ↑/↓ 回溯已提交的输入历史", async () => {
 /** ink-testing-library 的帧带 ANSI 颜色，比对宽度前先剥掉 SGR。 */
 const SGR = new RegExp("\\u001b\\[[0-9;]*m", "g");
 
-test("TUI: 窄屏 logo 只裁两侧，不压缩也不折行", () => {
+test("TUI: 始终画 3 行大 logo，窄屏只裁两侧不折行", () => {
   const rowsAt = (width: number) =>
     (render(<Welcome width={width} />).lastFrame() ?? "")
       .replace(SGR, "")
       .split("\n")
-      .map((l) => l.trimEnd());
+      .map((l) => l.trimEnd())
+      .filter((l) => l.length > 0);
+  const contentWidth = (line: string) => line.trim().length;
 
-  // 渲染宽度（ink-testing-library 固定 100 列）里 logo 被居中，故行首留白不算内容宽度。
-  const contentWidth = (line: string) => line.length - (line.length - line.trimStart().length);
+  // 宽屏：3 行半块大字，每行都含块字符且不超宽。
+  const wide = rowsAt(120);
+  assert.equal(wide.length, 3, "宽屏应为 3 行块字 logo");
+  for (const row of wide) {
+    assert.match(row, /[█▀▄]/, "块字行应含半块字符");
+    assert.ok(contentWidth(row) <= 120);
+  }
 
-  const wide = rowsAt(120).map((l) => l.trim()); // 宽屏：完整 wordmark
-  assert.equal(wide.length, 5); // 行数即字高，折行会把它撑高
-
-  for (const width of [40, 24, 12]) {
+  // 极窄屏：仍是 3 行大 logo，只裁两侧、不折行、不超宽。
+  for (const width of [24, 12, 4]) {
     const rows = rowsAt(width);
-    assert.equal(rows.length, 5, `width=${width} 折行了`);
-    for (const l of rows) {
-      assert.ok(contentWidth(l) <= width, `width=${width} 行超宽（${contentWidth(l)}）`);
+    assert.equal(rows.length, 3, `width=${width} 仍应为 3 行块字 logo`);
+    for (const row of rows) {
+      assert.match(row, /[█▀▄]/, `width=${width} 块字行应含半块字符`);
+      assert.ok(contentWidth(row) <= width, `width=${width} 超宽`);
     }
-    // 可见部分必须是完整 wordmark 的连续片段：字形没被压缩，只是两侧裁掉了
-    rows.forEach((l, i) => {
-      assert.ok(wide[i]!.includes(l.trim()), `width=${width} 第 ${i} 行不是原 wordmark 的子串`);
-    });
   }
 });
 

@@ -3,6 +3,8 @@
  * 解析逻辑共享，渲染各前端各自实现。
  */
 
+// 走零依赖子路径，避免把 core 的 Node-only 依赖（Anthropic/OpenAI SDK）打进浏览器 bundle。
+import { t } from "@anicode/core/i18n";
 import { parseMarkdown, type MdBlock, type Span } from "@anicode/shared";
 
 export function renderMarkdown(container: HTMLElement, text: string): void {
@@ -88,11 +90,11 @@ function codeBlock(lang: string, code: string): HTMLElement {
   label.textContent = lang || "code";
   const copy = document.createElement("button");
   copy.className = "md-copy";
-  copy.textContent = "复制";
+  copy.textContent = t("Copy", "复制");
   copy.addEventListener("click", () => {
     void navigator.clipboard?.writeText(code).then(() => {
-      copy.textContent = "已复制";
-      setTimeout(() => (copy.textContent = "复制"), 1200);
+      copy.textContent = t("Copied", "已复制");
+      setTimeout(() => (copy.textContent = t("Copy", "复制")), 1200);
     });
   });
   bar.append(label, copy);

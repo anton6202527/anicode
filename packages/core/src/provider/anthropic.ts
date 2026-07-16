@@ -26,6 +26,8 @@ import type {
   Usage,
 } from "../types.js";
 import { emptyUsage } from "../types.js";
+import { ANTHROPIC_OAUTH_BETA } from "../auth/oauth.js";
+import type { TokenSource } from "../auth/token-source.js";
 
 export interface AnthropicProviderOptions {
   apiKey?: string;
@@ -34,30 +36,65 @@ export interface AnthropicProviderOptions {
   adaptiveThinking?: boolean | ((model: string) => boolean);
   /** SDK 内层重试默认关闭，由 Agent 统一处理。 */
   maxRetries?: number;
+  /**
+   * OAuth 订阅令牌源（Claude Pro/Max）。传入即走 Bearer + oauth beta 头、注入 Claude Code
+   * 身份 system 块，并在每次请求前取新 token（临期自动续期）。与 apiKey 互斥优先。
+   */
+  tokenSource?: TokenSource;
 }
 
 export class AnthropicProvider implements Provider {
   readonly name = "anthropic";
   private client: Anthropic;
   private readonly adaptiveThinking: AnthropicProviderOptions["adaptiveThinking"];
+  private readonly tokenSource: TokenSource | undefined;
+  private readonly baseURL: string | undefined;
+  private readonly maxRetries: number;
+  private builtToken: string | undefined;
 
   constructor(opts: AnthropicProviderOptions = {}) {
+    this.tokenSource = opts.tokenSource;
+    this.baseURL = opts.baseURL;
+    this.maxRetries = opts.maxRetries ?? 0;
     this.client = new Anthropic({
-      ...(opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
+      // OAuth 模式先给占位 authToken，真正 token 在每次请求前按需构建/刷新。
+      ...(this.tokenSource ? { authToken: "pending" } : {}),
+      ...(!this.tokenSource && opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
       ...(opts.baseURL !== undefined ? { baseURL: opts.baseURL } : {}),
-      maxRetries: opts.maxRetries ?? 0,
+      ...(this.tokenSource ? { defaultHeaders: { "anthropic-beta": ANTHROPIC_OAUTH_BETA } } : {}),
+      maxRetries: this.maxRetries,
     });
     this.adaptiveThinking = opts.adaptiveThinking;
   }
 
+  /** OAuth 模式：确保 client 持有当前有效 token（变化时重建），返回是否为 OAuth。 */
+  private async ensureAuth(): Promise<boolean> {
+    if (!this.tokenSource) return false;
+    const token = await this.tokenSource.getAccessToken();
+    if (token !== this.builtToken) {
+      this.client = new Anthropic({
+        authToken: token,
+        ...(this.baseURL !== undefined ? { baseURL: this.baseURL } : {}),
+        defaultHeaders: { "anthropic-beta": ANTHROPIC_OAUTH_BETA },
+        maxRetries: this.maxRetries,
+      });
+      this.builtToken = token;
+    }
+    return true;
+  }
+
   async *stream(req: StreamRequest): AsyncIterable<StreamEvent> {
+    const oauth = await this.ensureAuth();
     const adaptiveThinking =
       typeof this.adaptiveThinking === "function"
         ? this.adaptiveThinking(req.model)
         : (this.adaptiveThinking ?? false);
-    const stream = this.client.messages.stream(buildAnthropicRequest(req, { adaptiveThinking }), {
-      ...(req.signal ? { signal: req.signal } : {}),
-    });
+    const stream = this.client.messages.stream(
+      buildAnthropicRequest(req, { adaptiveThinking, oauth }),
+      {
+        ...(req.signal ? { signal: req.signal } : {}),
+      },
+    );
 
     // 按块索引跟踪进行中的 tool_use，便于在 block stop 时按序发出 tool_call_end
     const pendingTools = new Map<number, { id: string; name: string; json: string }>();
@@ -110,31 +147,34 @@ export class AnthropicProvider implements Provider {
 
 // ---------- 请求构造（纯函数，可离线测试） ----------
 
+/**
+ * OAuth 订阅令牌要求首个 system 块是 Claude Code 身份声明，否则 API 拒绝。
+ * 与 Claude Code / opencode 的做法一致。
+ */
+export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 export function buildAnthropicRequest(
   req: StreamRequest,
-  options: { adaptiveThinking?: boolean } = {},
+  options: { adaptiveThinking?: boolean; oauth?: boolean } = {},
 ): Anthropic.MessageStreamParams {
   const messages = req.messages.map(toAnthropicMessage);
   markLastMessageCache(messages);
+
+  // OAuth 模式：身份块置顶（不缓存，块小）；真正 system 跟在其后并打缓存断点。
+  const identityBlock = options.oauth
+    ? [{ type: "text" as const, text: CLAUDE_CODE_IDENTITY }]
+    : [];
+  const userSystem = req.system
+    ? [{ type: "text" as const, text: req.system, cache_control: { type: "ephemeral" as const } }]
+    : [];
+  const system = [...identityBlock, ...userSystem];
 
   return {
     model: req.model,
     max_tokens: req.maxTokens ?? 32000,
     ...(options.adaptiveThinking ? { thinking: { type: "adaptive" as const } } : {}),
-    ...(options.adaptiveThinking && req.effort
-      ? { output_config: { effort: req.effort } }
-      : {}),
-    ...(req.system
-      ? {
-          system: [
-            {
-              type: "text" as const,
-              text: req.system,
-              cache_control: { type: "ephemeral" as const },
-            },
-          ],
-        }
-      : {}),
+    ...(options.adaptiveThinking && req.effort ? { output_config: { effort: req.effort } } : {}),
+    ...(system.length ? { system } : {}),
     ...(req.tools?.length ? { tools: req.tools.map(toAnthropicTool) } : {}),
     messages,
   };

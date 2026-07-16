@@ -11,6 +11,7 @@
 
 import type { Tool } from "./tool.js";
 import { ToolError } from "./tool.js";
+import { t } from "../i18n.js";
 
 export interface TodoItem {
   content: string;
@@ -29,20 +30,31 @@ export function createTodoTool(): Tool & { readonly todos: readonly TodoItem[] }
     readOnly: true, // 只改内存清单，无外部副作用；可并发、免授权
     def: {
       name: "todo_write",
-      description:
+      description: t(
+        "Maintain the current todo list (whole-list replacement). List the plan when starting a multi-step task, mark an item in_progress before starting it, and mark it completed immediately after finishing.",
         "维护当前任务清单（整表替换）。多步任务开始时列出计划，动手前把该项标 in_progress，完成后立即标 completed。",
+      ),
       parameters: {
         type: "object",
         properties: {
           todos: {
             type: "array",
-            description: "完整的新任务列表（覆盖旧表）",
+            description: t(
+              "The full new todo list (replaces the old one)",
+              "完整的新任务列表（覆盖旧表）",
+            ),
             items: {
               type: "object",
               properties: {
-                content: { type: "string", description: "任务内容（祈使句）" },
+                content: {
+                  type: "string",
+                  description: t("Task content (imperative)", "任务内容（祈使句）"),
+                },
                 status: { type: "string", enum: ["pending", "in_progress", "completed"] },
-                activeForm: { type: "string", description: "进行时文案（可选）" },
+                activeForm: {
+                  type: "string",
+                  description: t("Present-continuous wording (optional)", "进行时文案（可选）"),
+                },
               },
               required: ["content", "status"],
               additionalProperties: false,

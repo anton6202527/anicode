@@ -9,6 +9,7 @@
  */
 
 import { createProvider, textMessage, toolCallsOf } from "./index.js";
+import { t } from "./i18n.js";
 import type { ChatMessage, ToolDefinition } from "./index.js";
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
@@ -52,7 +53,10 @@ async function main() {
   console.log(dim(`provider=${provider.name} model=${model}\n`));
 
   const messages: ChatMessage[] = [
-    textMessage("user", "现在几点了？另外帮我算一下 12345 + 67890。用工具，最后用一句中文总结两个结果。"),
+    textMessage(
+      "user",
+      "现在几点了？另外帮我算一下 12345 + 67890。用工具，最后用一句中文总结两个结果。",
+    ),
   ];
 
   // agent loop：直到模型不再调用工具
@@ -60,7 +64,13 @@ async function main() {
     let stopReason = "";
     let finalMessage: ChatMessage | null = null;
 
-    for await (const ev of provider.stream({ model, messages, tools, effort: "low", maxTokens: 4096 })) {
+    for await (const ev of provider.stream({
+      model,
+      messages,
+      tools,
+      effort: "low",
+      maxTokens: 4096,
+    })) {
       switch (ev.type) {
         case "text_delta":
           process.stdout.write(ev.text);
@@ -85,7 +95,8 @@ async function main() {
       }
     }
 
-    if (!finalMessage) throw new Error("provider 没有产出 done 事件");
+    if (!finalMessage)
+      throw new Error(t("provider did not emit a done event", "provider 没有产出 done 事件"));
     messages.push(finalMessage);
 
     const calls = toolCallsOf(finalMessage);

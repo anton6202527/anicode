@@ -16,7 +16,9 @@
  * 前端返回 allow / deny / allow-and-remember。
  */
 
-export type PermissionMode = "default" | "acceptEdits" | "auto" | "bypass";
+import { t } from "./i18n.js";
+
+export type PermissionMode = "default" | "acceptEdits" | "auto" | "bypass" | "plan";
 
 export interface PermissionDecision {
   behavior: "allow" | "deny";
@@ -96,11 +98,31 @@ export class PermissionEngine {
     for (const name of names) this.editTools.add(name.toLowerCase());
   }
 
+  /** 运行时切换权限模式（如 /plan 进入/退出计划模式）。 */
+  setMode(mode: PermissionMode): void {
+    this.mode = mode;
+  }
+
+  getMode(): PermissionMode {
+    return this.mode;
+  }
+
   async check(req: PermissionRequest): Promise<PermissionDecision> {
     // 无法完整分析复杂命令时，只要该工具配置了 deny 规则就保守拒绝，避免
     // `git status $(rm ...)` 之类把被禁动作藏进细粒度规则看不到的位置。
     if (this.matchesDeny(req)) {
       return { behavior: "deny", message: `操作被 deny 规则禁止: ${req.toolName}(${req.ruleKey})` };
+    }
+    // 计划模式：只读工具放行，任何有副作用的操作一律拒绝——让模型先给出方案，
+    // 用户确认（退出计划模式）后再执行。拒绝理由是反射式的，引导模型转为规划。
+    if (this.mode === "plan" && !this.readOnly.has(req.toolName.toLowerCase())) {
+      return {
+        behavior: "deny",
+        message: t(
+          `Plan mode: read-only. Don't edit or run commands yet — first lay out a concise plan (files to change, steps). The user will approve and exit plan mode before you execute.`,
+          `计划模式：当前只读。先不要改文件或执行命令——请先给出简洁方案（要改哪些文件、分几步）。用户确认并退出计划模式后再执行。`,
+        ),
+      };
     }
     // ask：任一单元命中则强制走 confirm（压过 bypass / hook allow / 只读 / allowRules）
     const parts = req.ruleParts?.length ? req.ruleParts : [req.ruleKey];
@@ -140,9 +162,7 @@ export class PermissionEngine {
     }
     // 不能把「原始输入 → 经 UI 改写后才允许」记成原始输入的永久放行。
     // 否则下一次命中 remembered 时不会重放改写，会直接执行原始危险动作。
-    return decision.updatedInput && decision.remember
-      ? { ...decision, remember: false }
-      : decision;
+    return decision.updatedInput && decision.remember ? { ...decision, remember: false } : decision;
   }
 
   /**
@@ -152,7 +172,10 @@ export class PermissionEngine {
    */
   validateUpdatedInput(req: PermissionRequest): PermissionDecision {
     if (this.matchesDeny(req)) {
-      return { behavior: "deny", message: `修改后的操作被 deny 规则禁止: ${req.toolName}(${req.ruleKey})` };
+      return {
+        behavior: "deny",
+        message: `修改后的操作被 deny 规则禁止: ${req.toolName}(${req.ruleKey})`,
+      };
     }
     if (this.matchesAsk(req)) {
       return {

@@ -13,6 +13,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
 import React from "react";
 import { render } from "ink";
 import {
@@ -34,6 +36,11 @@ import {
   createDiagnosticsTool,
   LspPool,
   GENERAL_SUBAGENT,
+  AuthStore,
+  buildAuthUrl,
+  exchangeCode,
+  parseCallbackCode,
+  t,
   type SessionHost,
   type AnicodeConfig,
   type CustomCommand,
@@ -71,7 +78,7 @@ export interface CliArgs {
 function requiredValue(argv: string[], index: number, flag: string): string {
   const value = argv[index + 1];
   if (!value || value.startsWith("-")) {
-    throw new Error(`${flag} 需要一个值`);
+    throw new Error(t(`${flag} requires a value`, `${flag} 需要一个值`));
   }
   return value;
 }
@@ -96,7 +103,8 @@ export function parseArgs(argv: string[]): CliArgs {
   const seen = new Set<string>();
 
   const mark = (flag: string): void => {
-    if (seen.has(flag)) throw new Error(`${flag} 不能重复指定`);
+    if (seen.has(flag))
+      throw new Error(t(`${flag} cannot be specified more than once`, `${flag} 不能重复指定`));
     seen.add(flag);
   };
 
@@ -144,12 +152,24 @@ export function parseArgs(argv: string[]): CliArgs {
         break;
       case "--auto":
         mark(arg);
-        if (permissionMode !== "default") throw new Error("--auto 与 --accept-edits 不能同时使用");
+        if (permissionMode !== "default")
+          throw new Error(
+            t(
+              "--auto and --accept-edits cannot be used together",
+              "--auto 与 --accept-edits 不能同时使用",
+            ),
+          );
         permissionMode = "auto";
         break;
       case "--accept-edits":
         mark(arg);
-        if (permissionMode !== "default") throw new Error("--auto 与 --accept-edits 不能同时使用");
+        if (permissionMode !== "default")
+          throw new Error(
+            t(
+              "--auto and --accept-edits cannot be used together",
+              "--auto 与 --accept-edits 不能同时使用",
+            ),
+          );
         permissionMode = "acceptEdits";
         break;
       case "--debug-log": {
@@ -186,11 +206,19 @@ export function parseArgs(argv: string[]): CliArgs {
         version = true;
         break;
       default:
-        throw new Error(`未知参数: ${arg}\n使用 --help 查看可用参数。`);
+        throw new Error(
+          t(
+            `Unknown argument: ${arg}\nUse --help to see available options.`,
+            `未知参数: ${arg}\n使用 --help 查看可用参数。`,
+          ),
+        );
     }
   }
 
-  if (demo && seen.has("--model")) throw new Error("--demo 与 --model 不能同时使用");
+  if (demo && seen.has("--model"))
+    throw new Error(
+      t("--demo and --model cannot be used together", "--demo 与 --model 不能同时使用"),
+    );
   if (demo) model = "debug/demo";
 
   return {
@@ -214,38 +242,105 @@ export function parseArgs(argv: string[]): CliArgs {
 }
 
 export function helpText(): string {
-  return `anicode ${CLI_VERSION}\n\n` +
-    `用法: anicode [选项]\n\n` +
-    `  --demo                    使用零 Key 的确定性调试模型\n` +
-    `  --model <provider/model>  选择模型（不指定则自动挑已配置凭证的 provider，都没有则用零 Key 的 debug/demo）\n` +
-    `  --cwd <dir>               Agent 工作目录\n` +
-    `  --sessions <dir>          本地会话目录\n` +
-    `  --resume <id>             恢复已有会话\n` +
-    `  --auto                    自动允许编辑与命令\n` +
-    `  --accept-edits            自动允许编辑，命令仍询问\n` +
-    `  --daemon [socket]         连接共享守护进程\n` +
-    `  --debug-log [file]        写入 JSONL 调试日志（不污染终端）\n` +
-    `  --trace-content           调试日志包含提示/工具内容（可能敏感）\n` +
-    `  --list-providers          列出可用 provider\n` +
-    `  --list-models             列出内置模型目录（含免费/开源模型）\n` +
-    `  -h, --help                显示帮助\n` +
-    `  -v, --version             显示版本\n\n` +
-    `本地零配置调试: npm run dev:tui`;
+  return (
+    `anicode ${CLI_VERSION}\n\n` +
+    t(`Usage: anicode [options]\n\n`, `用法: anicode [选项]\n\n`) +
+    t(
+      `  --demo                    Use the zero-key deterministic debug model\n`,
+      `  --demo                    使用零 Key 的确定性调试模型\n`,
+    ) +
+    t(
+      `  --model <provider/model>  Select model (auto-picks a provider with configured credentials, else the zero-key debug/demo)\n`,
+      `  --model <provider/model>  选择模型（不指定则自动挑已配置凭证的 provider，都没有则用零 Key 的 debug/demo）\n`,
+    ) +
+    t(
+      `  --cwd <dir>               Agent working directory\n`,
+      `  --cwd <dir>               Agent 工作目录\n`,
+    ) +
+    t(
+      `  --sessions <dir>          Local session directory\n`,
+      `  --sessions <dir>          本地会话目录\n`,
+    ) +
+    t(
+      `  --resume <id>             Resume an existing session\n`,
+      `  --resume <id>             恢复已有会话\n`,
+    ) +
+    t(
+      `  --auto                    Automatically allow edits and commands\n`,
+      `  --auto                    自动允许编辑与命令\n`,
+    ) +
+    t(
+      `  --accept-edits            Automatically allow edits, still ask for commands\n`,
+      `  --accept-edits            自动允许编辑，命令仍询问\n`,
+    ) +
+    t(
+      `  --daemon [socket]         Connect to shared daemon\n`,
+      `  --daemon [socket]         连接共享守护进程\n`,
+    ) +
+    t(
+      `  --debug-log [file]        Write JSONL debug log (without polluting the terminal)\n`,
+      `  --debug-log [file]        写入 JSONL 调试日志（不污染终端）\n`,
+    ) +
+    t(
+      `  --trace-content           Debug log includes prompt/tool content (may be sensitive)\n`,
+      `  --trace-content           调试日志包含提示/工具内容（可能敏感）\n`,
+    ) +
+    t(
+      `  --list-providers          List available providers\n`,
+      `  --list-providers          列出可用 provider\n`,
+    ) +
+    t(
+      `  --list-models             List the built-in model catalog (including Free/open-weight models)\n`,
+      `  --list-models             列出内置模型目录（含免费/开源模型）\n`,
+    ) +
+    t(`  -h, --help                Show help\n`, `  -h, --help                显示帮助\n`) +
+    t(`  -v, --version             Show version\n\n`, `  -v, --version             显示版本\n\n`) +
+    t(`Subcommands:\n`, `子命令:\n`) +
+    t(
+      `  auth login [provider]     Log in with a Claude subscription (default anthropic), no API key needed\n`,
+      `  auth login [provider]     用 Claude 订阅登录（默认 anthropic），免 API key\n`,
+    ) +
+    t(
+      `  auth logout [provider]    Log out and delete local credentials\n`,
+      `  auth logout [provider]    登出并删除本地凭证\n`,
+    ) +
+    t(
+      `  auth list                 View logged-in credentials\n\n`,
+      `  auth list                 查看已登录凭证\n\n`,
+    ) +
+    t(`Local zero-config debugging: npm run dev:tui`, `本地零配置调试: npm run dev:tui`)
+  );
 }
 
 /** daemon 的权限策略属于守护进程内的 SessionManager，客户端连接不能静默覆盖。 */
 export function validateArgs(args: CliArgs): void {
   if (args.traceContent && !args.debugLog) {
-    throw new Error("--trace-content 必须与 --debug-log 一起使用");
+    throw new Error(
+      t(
+        "--trace-content must be used together with --debug-log",
+        "--trace-content 必须与 --debug-log 一起使用",
+      ),
+    );
   }
   if (args.daemon && args.sessionsExplicit) {
-    throw new Error("--sessions 不能用于 --daemon 客户端：会话目录由 daemon 管理");
+    throw new Error(
+      t(
+        "--sessions cannot be used with a --daemon client: the session directory is managed by the daemon",
+        "--sessions 不能用于 --daemon 客户端：会话目录由 daemon 管理",
+      ),
+    );
   }
   if (args.daemon && args.permissionMode !== "default") {
     const flag = args.permissionMode === "auto" ? "--auto" : "--accept-edits";
     throw new Error(
-      `${flag} 不能用于 --daemon 客户端：权限策略由 daemon 进程统一决定。` +
-        `请在启动 anicode-daemon 时传入 ${flag}；已运行 daemon 的策略不会被当前连接修改。`,
+      t(
+        `${flag} cannot be used with a --daemon client: the permission policy is decided uniformly by the daemon process.`,
+        `${flag} 不能用于 --daemon 客户端：权限策略由 daemon 进程统一决定。`,
+      ) +
+        t(
+          `Pass ${flag} when starting anicode-daemon; the policy of an already-running daemon will not be modified by the current connection.`,
+          `请在启动 anicode-daemon 时传入 ${flag}；已运行 daemon 的策略不会被当前连接修改。`,
+        ),
     );
   }
 }
@@ -316,8 +411,11 @@ export function assertProviderConfigured(model: string): void {
   const diagnostics = diagnoseProvider(model);
   if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
     throw new Error(
-      `${diagnostics.warnings.join("；")}。` +
-        `也可以用 --demo（或根目录 npm run dev:tui）进行零 Key 调试。`,
+      t(`${diagnostics.warnings.join("；")}.`, `${diagnostics.warnings.join("；")}。`) +
+        t(
+          `You can also use --demo (or npm run dev:tui at the repo root) for zero-key debugging.`,
+          `也可以用 --demo（或根目录 npm run dev:tui）进行零 Key 调试。`,
+        ),
     );
   }
 }
@@ -346,6 +444,9 @@ export async function buildHost(
     permission: { mode: args.permissionMode },
     skills: true,
     subagents,
+    checkpoints: true, // 每轮前记工作区 git 快照，支持 /undo 回滚文件改动
+    repoMap: true, // 会话开始注入代码骨架（repo map），帮模型少盲 grep、首次定位更准
+
     // MCP / diagnostics 等附加工具与内置工具合流；无附加工具时沿用默认工具集。
     ...(extraTools.length > 0
       ? {
@@ -370,7 +471,136 @@ export async function selectSessionId(
   return (await host.createSession({ cwd: args.cwd, model: args.model })).id;
 }
 
+/**
+ * `anicode auth <login|logout|list> [provider]` —— 订阅登录（目前 Anthropic Claude Pro/Max）。
+ * login 走 PKCE：打开浏览器授权 → 用户粘回 `code#state` → 换 token 存 ~/.anicode/auth.json。
+ */
+export async function runAuthCommand(
+  argv: string[],
+  io: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {},
+): Promise<void> {
+  const sub = argv[0] ?? "";
+  const provider = argv[1] ?? "anthropic";
+  const store = new AuthStore();
+  const out = io.output ?? process.stdout;
+  const log = (s: string) => out.write(s + "\n");
+
+  if (sub === "list") {
+    const creds = await store.list();
+    if (creds.length === 0) {
+      log(
+        t(
+          "No logged-in credentials yet. Run `anicode auth login` to log in with a Claude subscription.",
+          "尚无已登录凭证。运行 `anicode auth login` 用 Claude 订阅登录。",
+        ),
+      );
+      return;
+    }
+    for (const c of creds) {
+      const exp = c.expiresAt
+        ? t(
+            `, access expires at ${new Date(c.expiresAt).toLocaleString()}`,
+            `，access 过期于 ${new Date(c.expiresAt).toLocaleString()}`,
+          )
+        : "";
+      log(`${c.providerId}\t${c.type}${exp}`);
+    }
+    return;
+  }
+
+  if (sub === "logout") {
+    const removed = await store.remove(provider);
+    log(
+      removed
+        ? t(`Logged out ${provider}`, `已登出 ${provider}`)
+        : t(`${provider} not logged in`, `${provider} 未登录`),
+    );
+    return;
+  }
+
+  if (sub === "login") {
+    if (provider !== "anthropic") {
+      throw new Error(
+        t(
+          `Only anthropic subscription login is supported for now, received: ${provider}`,
+          `暂仅支持 anthropic 的订阅登录，收到: ${provider}`,
+        ),
+      );
+    }
+    const { url, verifier, state } = buildAuthUrl();
+    log(
+      t(
+        "Open the following link in your browser and authorize (auto-open attempted):\n",
+        "请在浏览器中打开以下链接并授权（已尝试自动打开）：\n",
+      ),
+    );
+    log(url + "\n");
+    tryOpenBrowser(url);
+    log(
+      t(
+        "After authorizing, the page shows a `code#state`; paste it here and press Enter:",
+        "授权后页面会显示一段 `code#state`，粘贴到这里后回车：",
+      ),
+    );
+    const pasted = await readLine(io.input ?? process.stdin);
+    const { code, state: pastedState } = parseCallbackCode(pasted);
+    if (!code) throw new Error(t("No authorization code read", "未读到授权码"));
+    const tokens = await exchangeCode({ code, verifier, state: pastedState ?? state });
+    await store.set("anthropic", store.fromTokens(tokens));
+    log(
+      t(
+        "\n✅ Login successful. You can now run anicode with a Claude subscription without ANTHROPIC_API_KEY.",
+        "\n✅ 登录成功。现在无需 ANTHROPIC_API_KEY 即可用 Claude 订阅运行 anicode。",
+      ),
+    );
+    return;
+  }
+
+  throw new Error(
+    t(
+      `Usage: anicode auth <login|logout|list> [provider]`,
+      `用法: anicode auth <login|logout|list> [provider]`,
+    ),
+  );
+}
+
+/** 读一行（去掉换行）。 */
+function readLine(input: NodeJS.ReadableStream): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({ input });
+    rl.once("line", (line) => {
+      rl.close();
+      resolve(line.trim());
+    });
+    rl.once("close", () => resolve(""));
+    rl.once("error", reject);
+  });
+}
+
+/** 尽力打开系统浏览器；失败静默（用户仍可手动复制链接）。 */
+function tryOpenBrowser(url: string): void {
+  const cmd =
+    process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  try {
+    const child = spawn(cmd, [url], {
+      stdio: "ignore",
+      detached: true,
+      shell: process.platform === "win32",
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    /* 手动复制链接即可 */
+  }
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  // auth 子命令在 parseArgs 之前拦截（订阅登录/登出/查看，不进会话流程）。
+  if (argv[0] === "auth") {
+    await runAuthCommand(argv.slice(1));
+    return;
+  }
+
   const args = parseArgs(argv);
   validateArgs(args);
 
@@ -417,7 +647,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   // 读取 anicode.json（全局+项目合并）；非法配置只提示不致命。
   const { config, warnings: configWarnings } = await loadConfig({ cwd: args.cwd });
-  for (const w of configWarnings) console.error(`anicode 配置告警: ${w}`);
+  for (const w of configWarnings)
+    console.error(t(`anicode config warning: ${w}`, `anicode 配置告警: ${w}`));
 
   // 未显式指定模型时挑默认：配置 model → 本地 Ollama（优先 DeepSeek）→
   // 已配置凭证的云端（DeepSeek 优先）→ 零网络 debug/demo。绝不因缺 ANTHROPIC_API_KEY 报错退出。
@@ -431,7 +662,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       // 这里只做无副作用诊断；真正创建 provider 由 createSession 唯一执行。
       assertProviderConfigured(args.model);
     } catch (err) {
-      throw new Error(`模型配置无效: ${String((err as Error).message)}`);
+      throw new Error(
+        t(
+          `Invalid model configuration: ${String((err as Error).message)}`,
+          `模型配置无效: ${String((err as Error).message)}`,
+        ),
+      );
     }
   }
 
@@ -445,9 +681,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         const connected = await connectMcpServers(mcpConfigs);
         mcpTools = connected.tools;
         mcpClients = connected.clients;
-        console.error(`anicode: 已连接 ${mcpClients.length} 个 MCP 服务器，${mcpTools.length} 个工具`);
+        console.error(
+          t(
+            `anicode: connected ${mcpClients.length} MCP servers, ${mcpTools.length} tools`,
+            `anicode: 已连接 ${mcpClients.length} 个 MCP 服务器，${mcpTools.length} 个工具`,
+          ),
+        );
       } catch (err) {
-        console.error(`anicode: MCP 连接失败（已跳过）: ${(err as Error).message}`);
+        console.error(
+          t(
+            `anicode: MCP connection failed (skipped): ${(err as Error).message}`,
+            `anicode: MCP 连接失败（已跳过）: ${(err as Error).message}`,
+          ),
+        );
       }
     }
   }
@@ -462,7 +708,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   let host: SessionHost | undefined;
   try {
     const baseHost = await buildHost(args, { config, extraTools }).catch((err) => {
-      throw new Error(`无法建立会话宿主: ${(err as Error).message}`);
+      throw new Error(
+        t(
+          `Failed to establish session host: ${(err as Error).message}`,
+          `无法建立会话宿主: ${(err as Error).message}`,
+        ),
+      );
     });
     host = baseHost;
     if (args.debugLog) {
@@ -474,7 +725,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         permissionMode: args.permissionMode,
       });
       host = withDebugLogging(baseHost, logger);
-      console.error(`anicode 调试日志: ${logger.file}`);
+      console.error(t(`anicode debug log: ${logger.file}`, `anicode 调试日志: ${logger.file}`));
     }
     // 选定会话：--resume 用已有 ID，否则新建。订阅只由 App 负责。
     const sessionId = await selectSessionId(host, args);

@@ -260,4 +260,3 @@ export class LspPool {
     this.byExt.clear();
   }
 }
-

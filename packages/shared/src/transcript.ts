@@ -59,7 +59,10 @@ export function todosFromMessages(messages: readonly ChatMessage[]): TodoItem[] 
         const o = item as Record<string, unknown>;
         const content = typeof o["content"] === "string" ? o["content"] : "";
         const status = o["status"];
-        if (!content || (status !== "pending" && status !== "in_progress" && status !== "completed")) {
+        if (
+          !content ||
+          (status !== "pending" && status !== "in_progress" && status !== "completed")
+        ) {
           return [];
         }
         return [

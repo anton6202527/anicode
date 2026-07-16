@@ -13,6 +13,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { t } from "./i18n.js";
 
 export interface EnvInfo {
   cwd: string;
@@ -32,20 +33,21 @@ export interface EnvInfo {
 export function formatEnv(info: EnvInfo): string {
   const lines: string[] = [
     "<env>",
-    `工作目录: ${info.cwd}`,
-    `平台: ${info.platform}`,
-    `系统版本: ${info.osVersion}`,
-    `今天日期: ${info.date}`,
-    `是否 git 仓库: ${info.isGitRepo ? "是" : "否"}`,
+    `${t("Working directory", "工作目录")}: ${info.cwd}`,
+    `${t("Platform", "平台")}: ${info.platform}`,
+    `${t("OS version", "系统版本")}: ${info.osVersion}`,
+    `${t("Today's date", "今天日期")}: ${info.date}`,
+    `${t("Is a git repo", "是否 git 仓库")}: ${info.isGitRepo ? t("yes", "是") : t("no", "否")}`,
   ];
-  if (info.isGitRepo && info.gitBranch) lines.push(`当前分支: ${info.gitBranch}`);
+  if (info.isGitRepo && info.gitBranch)
+    lines.push(`${t("Current branch", "当前分支")}: ${info.gitBranch}`);
   lines.push("</env>");
 
   if (info.isGitRepo && (info.gitStatus || info.recentCommits)) {
     lines.push("", "<git-status>");
-    if (info.gitStatus) lines.push("工作区改动:", info.gitStatus);
-    else lines.push("工作区干净");
-    if (info.recentCommits) lines.push("最近提交:", info.recentCommits);
+    if (info.gitStatus) lines.push(`${t("Working tree changes", "工作区改动")}:`, info.gitStatus);
+    else lines.push(t("Working tree clean", "工作区干净"));
+    if (info.recentCommits) lines.push(`${t("Recent commits", "最近提交")}:`, info.recentCommits);
     lines.push("</git-status>");
   }
   return lines.join("\n");
@@ -112,7 +114,10 @@ function clampLines(text: string, n: number): string {
   if (!text) return "";
   const lines = text.split("\n");
   if (lines.length <= n) return text;
-  return [...lines.slice(0, n), `…（另有 ${lines.length - n} 处改动）`].join("\n");
+  const more = lines.length - n;
+  return [...lines.slice(0, n), t(`…(${more} more changes)`, `…（另有 ${more} 处改动）`)].join(
+    "\n",
+  );
 }
 
 /** 跑一条 git 子命令，带 3s 超时；任何失败返回 null（不抛）。 */

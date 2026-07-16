@@ -54,6 +54,9 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
     },
     async send() {},
     async interrupt() {},
+    async undo() {
+      return { restored: 0, deleted: 0 };
+    },
     async answerPermission() {
       return true;
     },

@@ -1,0 +1,18 @@
+{
+  "name": "@anicode/eval",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "编辑准确率评测 harness：用真实 Agent 跑一组编辑任务，量化通过率/轮数/token/编辑失败率。",
+  "scripts": {
+    "eval": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@anicode/core": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

@@ -10,6 +10,7 @@
  * 解析容错：文件缺失跳过；JSON 非法只记 warning，不抛（避免一处手误锁死整个 CLI）。
  */
 import { promises as fs } from "node:fs";
+import { t } from "./i18n.js";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { McpServerConfig } from "./mcp.js";
@@ -30,8 +31,16 @@ export interface AnicodeConfig {
   model?: string;
   /** 小模型路由用的模型；true=启用默认小模型，字符串=指定 spec。 */
   smallModel?: string | boolean;
-  /** MCP 服务器：name → 启动配置。 */
-  mcp?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+  /**
+   * MCP 服务器：name → 启动配置。两种形态：
+   *   - 本地进程（stdio）：{ command, args?, env? }
+   *   - 远程（Streamable HTTP）：{ url, headers? }
+   */
+  mcp?: Record<
+    string,
+    | { command: string; args?: string[]; env?: Record<string, string> }
+    | { url: string; headers?: Record<string, string> }
+  >;
   /** 自定义子 agent：name → 定义。 */
   agents?: Record<string, ConfigAgent>;
   /** 语言服务器：name → 配置（命令 + 负责扩展名）。 */
@@ -68,15 +77,25 @@ async function readOne(file: string, warnings: string[]): Promise<AnicodeConfig 
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      warnings.push(`${file}: 顶层必须是对象，已忽略`);
+      warnings.push(
+        t(`${file}: top level must be an object; ignored`, `${file}: 顶层必须是对象，已忽略`),
+      );
       return null;
     }
     for (const k of Object.keys(parsed)) {
-      if (!KNOWN_KEYS.has(k)) warnings.push(`${file}: 未知配置项 "${k}"，已忽略`);
+      if (!KNOWN_KEYS.has(k))
+        warnings.push(
+          t(`${file}: unknown config key "${k}"; ignored`, `${file}: 未知配置项 "${k}"，已忽略`),
+        );
     }
     return parsed as AnicodeConfig;
   } catch (err) {
-    warnings.push(`${file}: JSON 解析失败（${err instanceof Error ? err.message : String(err)}）`);
+    warnings.push(
+      t(
+        `${file}: JSON parse failed (${err instanceof Error ? err.message : String(err)})`,
+        `${file}: JSON 解析失败（${err instanceof Error ? err.message : String(err)}）`,
+      ),
+    );
     return null;
   }
 }
@@ -116,12 +135,17 @@ export async function loadConfig(
 /** 把配置里的 mcp 映射转成 connectMcpServers 需要的数组（注入 name）。 */
 export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
   if (!config.mcp) return [];
-  return Object.entries(config.mcp).map(([name, c]) => ({
-    name,
-    command: c.command,
-    ...(c.args ? { args: c.args } : {}),
-    ...(c.env ? { env: c.env } : {}),
-  }));
+  return Object.entries(config.mcp).map(([name, c]) => {
+    if ("url" in c) {
+      return { name, url: c.url, ...(c.headers ? { headers: c.headers } : {}) };
+    }
+    return {
+      name,
+      command: c.command,
+      ...(c.args ? { args: c.args } : {}),
+      ...(c.env ? { env: c.env } : {}),
+    };
+  });
 }
 
 /** 把配置里的 lsp 映射转成 LspServerConfig[]（name 只是标识，运行期按扩展名路由）。 */

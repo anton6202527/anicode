@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from "react";
+import { t } from "@anicode/core";
 import type { ChatState, PendingPerm } from "../useSession.js";
 import type { Item } from "../transcript.js";
 import { Markdown } from "../markdown.js";
@@ -32,10 +33,14 @@ export function ChatView({ state, onAnswerPermission }: Props) {
         ))}
         {state.todos.length > 0 ? <TodoCard todos={state.todos} /> : null}
         {state.pendings[0] ? (
-          <PermissionCard pending={state.pendings[0]} onAnswer={onAnswerPermission} extra={state.pendings.length - 1} />
+          <PermissionCard
+            pending={state.pendings[0]}
+            onAnswer={onAnswerPermission}
+            extra={state.pendings.length - 1}
+          />
         ) : null}
         {state.running && !state.liveText && activeTools.length === 0 ? (
-          <div className="thinking">● 思考中…</div>
+          <div className="thinking">● {t("Thinking…", "思考中…")}</div>
         ) : null}
         <div ref={endRef} />
       </div>
@@ -47,8 +52,13 @@ function EmptyState() {
   return (
     <div className="empty">
       <div className="empty-logo">◆</div>
-      <h1>今天需要做点什么？</h1>
-      <p>输入需求开始对话。默认使用零网络的 debug/demo 模型，可在右下角切换。</p>
+      <h1>{t("What would you like to do today?", "今天需要做点什么？")}</h1>
+      <p>
+        {t(
+          "Type a request to start chatting. Uses the zero-network debug/demo model by default; switch it in the bottom-right.",
+          "输入需求开始对话。默认使用零网络的 debug/demo 模型，可在右下角切换。",
+        )}
+      </p>
     </div>
   );
 }
@@ -68,10 +78,18 @@ function ItemRow({ item }: { item: Item }) {
   }
 }
 
-function Bubble({ role, text, streaming }: { role: "user" | "assistant"; text: string; streaming?: boolean }) {
+function Bubble({
+  role,
+  text,
+  streaming,
+}: {
+  role: "user" | "assistant";
+  text: string;
+  streaming?: boolean;
+}) {
   return (
     <div className={`row ${role}`}>
-      <div className="avatar">{role === "user" ? "你" : "◆"}</div>
+      <div className="avatar">{role === "user" ? t("You", "你") : "◆"}</div>
       <div className="bubble">
         {role === "assistant" ? <Markdown text={text} /> : text}
         {streaming ? <span className="caret" /> : null}
@@ -96,7 +114,7 @@ function ToolRow({ item }: { item: Extract<Item, { kind: "tool" }> }) {
 function TodoCard({ todos }: { todos: ChatState["todos"] }) {
   return (
     <div className="todo-card">
-      <div className="todo-title">任务清单</div>
+      <div className="todo-title">{t("Task list", "任务清单")}</div>
       {todos.map((t, i) => {
         const mark = t.status === "completed" ? "✔" : t.status === "in_progress" ? "●" : "○";
         const text = t.status === "in_progress" && t.activeForm ? t.activeForm : t.content;
@@ -122,14 +140,25 @@ function PermissionCard({
   return (
     <div className="perm-card">
       <div className="perm-title">
-        ⚠ 授权请求：<strong>{pending.toolName}</strong>
-        {extra > 0 ? <span className="perm-more">（还有 {extra} 个待裁决）</span> : null}
+        ⚠ {t("Permission request:", "授权请求：")}
+        <strong>{pending.toolName}</strong>
+        {extra > 0 ? (
+          <span className="perm-more">
+            {t(`(${extra} more pending)`, `（还有 ${extra} 个待裁决）`)}
+          </span>
+        ) : null}
       </div>
       <div className="perm-key">{pending.ruleKey}</div>
       <div className="perm-actions">
-        <button className="btn allow" onClick={() => onAnswer(pending.permId, "allow")}>允许</button>
-        <button className="btn remember" onClick={() => onAnswer(pending.permId, "allow_remember")}>允许并记住</button>
-        <button className="btn deny" onClick={() => onAnswer(pending.permId, "deny")}>拒绝</button>
+        <button className="btn allow" onClick={() => onAnswer(pending.permId, "allow")}>
+          {t("Allow", "允许")}
+        </button>
+        <button className="btn remember" onClick={() => onAnswer(pending.permId, "allow_remember")}>
+          {t("Allow and remember", "允许并记住")}
+        </button>
+        <button className="btn deny" onClick={() => onAnswer(pending.permId, "deny")}>
+          {t("Deny", "拒绝")}
+        </button>
       </div>
     </div>
   );

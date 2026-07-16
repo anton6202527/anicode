@@ -53,20 +53,14 @@ export class OpenAICompatProvider implements Provider {
     if (!this.client) {
       const officialOpenAI = this.name === "openai";
       const apiKey =
-        this.options.apiKey !== undefined
-          ? this.options.apiKey
-          : officialOpenAI
-            ? undefined
-            : "";
+        this.options.apiKey !== undefined ? this.options.apiKey : officialOpenAI ? undefined : "";
       const clientOptions: ConstructorParameters<typeof OpenAI>[0] = {
         // 显式空 key 也要传递：DeepSeek 等端点缺自己的 key 时，不能悄悄回退
         // 到 OPENAI_API_KEY 并把错误凭证发往第三方。
         ...(apiKey !== undefined ? { apiKey } : {}),
         // OpenAI SDK 还会隐式读取管理员 key/组织/项目。其中管理员 key
         // 会覆盖上面显式传入的第三方 key，所以非官方端点必须显式隔离。
-        ...(!officialOpenAI
-          ? { adminAPIKey: null, organization: null, project: null }
-          : {}),
+        ...(!officialOpenAI ? { adminAPIKey: null, organization: null, project: null } : {}),
         ...(this.options.baseURL !== undefined ? { baseURL: this.options.baseURL } : {}),
         maxRetries: this.options.maxRetries ?? 0,
         ...(this.options.defaultHeaders ? { defaultHeaders: this.options.defaultHeaders } : {}),
@@ -85,29 +79,27 @@ export class OpenAICompatProvider implements Provider {
   async *stream(req: StreamRequest): AsyncIterable<StreamEvent> {
     const maxTokensField = this.options.maxTokensField ?? "max_completion_tokens";
     const body: Record<string, unknown> = {
-        model: req.model,
-        stream: true,
-        ...(this.options.streamUsage !== false
-          ? { stream_options: { include_usage: true } }
-          : {}),
-        ...(req.maxTokens && maxTokensField ? { [maxTokensField]: req.maxTokens } : {}),
-        ...(req.effort && this.options.reasoningEffort !== false
-          ? { reasoning_effort: mapEffort(req.effort) }
-          : {}),
-        ...(req.tools?.length
-          ? {
-              tools: req.tools.map((t) => ({
-                type: "function" as const,
-                function: {
-                  name: t.name,
-                  description: t.description,
-                  parameters: t.parameters,
-                },
-              })),
-            }
-          : {}),
-        messages: toOpenAIMessages(req.system, req.messages),
-      };
+      model: req.model,
+      stream: true,
+      ...(this.options.streamUsage !== false ? { stream_options: { include_usage: true } } : {}),
+      ...(req.maxTokens && maxTokensField ? { [maxTokensField]: req.maxTokens } : {}),
+      ...(req.effort && this.options.reasoningEffort !== false
+        ? { reasoning_effort: mapEffort(req.effort) }
+        : {}),
+      ...(req.tools?.length
+        ? {
+            tools: req.tools.map((t) => ({
+              type: "function" as const,
+              function: {
+                name: t.name,
+                description: t.description,
+                parameters: t.parameters,
+              },
+            })),
+          }
+        : {}),
+      messages: toOpenAIMessages(req.system, req.messages),
+    };
     const stream = await this.getClient().chat.completions.create(
       body as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
       { ...(req.signal ? { signal: req.signal } : {}) },

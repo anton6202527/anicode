@@ -17,7 +17,11 @@ function handle(msg: any): void {
     writeFrame({
       jsonrpc: "2.0",
       id: msg.id,
-      result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } },
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "fake", version: "1" },
+      },
     });
   } else if (msg.method === "notifications/initialized") {
     // 通知，无需回应

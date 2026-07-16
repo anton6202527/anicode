@@ -19,7 +19,9 @@ test("fileChangeFor: write → 全部新增，路径与统计正确", () => {
 });
 
 test("fileChangeFor: edit → old/new 的行级 diff", () => {
-  const msgs = [toolMsg("t2", "edit", { path: "b.py", old_string: "a\nb\nc", new_string: "a\nB\nc\nd" })];
+  const msgs = [
+    toolMsg("t2", "edit", { path: "b.py", old_string: "a\nb\nc", new_string: "a\nB\nc\nd" }),
+  ];
   const fc = fileChangeFor(msgs, "t2");
   assert.ok(fc);
   assert.equal(fc!.kind, "edit");

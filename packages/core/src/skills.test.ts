@@ -86,10 +86,7 @@ test("skills: skill 工具拒绝未知名称并列出可用项", async () => {
 
   await assert.rejects(
     () =>
-      tool.run(
-        { name: "missing" },
-        { cwd: "/tmp/project", signal: new AbortController().signal },
-      ),
+      tool.run({ name: "missing" }, { cwd: "/tmp/project", signal: new AbortController().signal }),
     /未知技能: missing（可用: known）/,
   );
 });

@@ -8,6 +8,7 @@ import * as path from "node:path";
 import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
 import { ripgrepAvailable, runRipgrep } from "./ripgrep.js";
+import { t } from "../i18n.js";
 
 const MAX_RESULTS = 200;
 
@@ -19,7 +20,7 @@ const MAX_RESULTS = 200;
  *      能骗过纯字符串检查，必须解析到真实文件系统位置再比对）
  * 对尚不存在的路径（write 新文件），realpath 其最深的已存在祖先目录。
  */
-async function resolveInside(cwd: string, p: unknown): Promise<string> {
+export async function resolveInside(cwd: string, p: unknown): Promise<string> {
   if (typeof p !== "string" || !p) throw new ToolError("path 必须是非空字符串");
   const root = path.resolve(cwd);
   const abs = path.resolve(root, p);
@@ -61,13 +62,28 @@ export const readTool: Tool = {
   readOnly: true,
   def: {
     name: "read",
-    description: "读取文件内容，返回带行号的文本。可选 offset/limit 分段读取大文件。",
+    description: t(
+      "Read a file's contents, returning text with line numbers. Optionally use offset/limit to read a large file in chunks.",
+      "读取文件内容，返回带行号的文本。可选 offset/limit 分段读取大文件。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "相对 cwd 的文件路径" },
-        offset: { type: "number", description: "起始行（1 起，默认 1）" },
-        limit: { type: "number", description: "最多读取行数（默认 2000）" },
+        path: {
+          type: "string",
+          description: t("File path relative to cwd", "相对 cwd 的文件路径"),
+        },
+        offset: {
+          type: "number",
+          description: t("Starting line (1-based, default 1)", "起始行（1 起，默认 1）"),
+        },
+        limit: {
+          type: "number",
+          description: t(
+            "Maximum number of lines to read (default 2000)",
+            "最多读取行数（默认 2000）",
+          ),
+        },
       },
       required: ["path"],
       additionalProperties: false,
@@ -94,9 +110,7 @@ export const readTool: Tool = {
     const slice = lines.slice(offset - 1, offset - 1 + limit);
     if (slice.length === 0) return `(文件 ${rel(ctx.cwd, abs)} 在该范围内为空)`;
     const width = String(offset + slice.length - 1).length;
-    return slice
-      .map((l, i) => `${String(offset + i).padStart(width)}\t${clampLine(l)}`)
-      .join("\n");
+    return slice.map((l, i) => `${String(offset + i).padStart(width)}\t${clampLine(l)}`).join("\n");
   },
 };
 
@@ -120,12 +134,18 @@ export const writeTool: Tool = {
   mutatesFiles: true,
   def: {
     name: "write",
-    description: "创建或完全覆盖一个文件。父目录会自动创建。",
+    description: t(
+      "Create or completely overwrite a file. Parent directories are created automatically.",
+      "创建或完全覆盖一个文件。父目录会自动创建。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "相对 cwd 的文件路径" },
-        content: { type: "string", description: "文件完整内容" },
+        path: {
+          type: "string",
+          description: t("File path relative to cwd", "相对 cwd 的文件路径"),
+        },
+        content: { type: "string", description: t("Full file content", "文件完整内容") },
       },
       required: ["path", "content"],
       additionalProperties: false,
@@ -149,15 +169,26 @@ export const editTool: Tool = {
   mutatesFiles: true,
   def: {
     name: "edit",
-    description:
+    description: t(
+      "Make an exact string replacement in a file. old_string must occur uniquely in the file (otherwise it errors), unless replace_all=true.",
       "在文件中做精确字符串替换。old_string 必须在文件中唯一出现（否则报错），除非 replace_all=true。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "相对 cwd 的文件路径" },
-        old_string: { type: "string", description: "要替换的原文（需唯一）" },
-        new_string: { type: "string", description: "替换后的内容" },
-        replace_all: { type: "boolean", description: "替换全部出现（默认 false）" },
+        path: {
+          type: "string",
+          description: t("File path relative to cwd", "相对 cwd 的文件路径"),
+        },
+        old_string: {
+          type: "string",
+          description: t("The original text to replace (must be unique)", "要替换的原文（需唯一）"),
+        },
+        new_string: { type: "string", description: t("The replacement text", "替换后的内容") },
+        replace_all: {
+          type: "boolean",
+          description: t("Replace all occurrences (default false)", "替换全部出现（默认 false）"),
+        },
       },
       required: ["path", "old_string", "new_string"],
       additionalProperties: false,
@@ -201,11 +232,15 @@ export function applyEdit(
 ): { updated: string; replaced: number; mode: "exact" | "fuzzy" } {
   const exact = content.split(oldStr).length - 1;
   if (exact === 1 || (exact > 1 && replaceAll)) {
-    const updated = replaceAll ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
+    const updated = replaceAll
+      ? content.split(oldStr).join(newStr)
+      : content.replace(oldStr, newStr);
     return { updated, replaced: replaceAll ? exact : 1, mode: "exact" };
   }
   if (exact > 1 && !replaceAll) {
-    throw new ToolError(`old_string 出现 ${exact} 次，不唯一；请扩大上下文（多带几行）或用 replace_all`);
+    throw new ToolError(
+      `old_string 出现 ${exact} 次，不唯一；请扩大上下文（多带几行）或用 replace_all`,
+    );
   }
 
   // exact === 0：按行去空白模糊定位。
@@ -262,7 +297,10 @@ function locateFuzzy(content: string, oldStr: string): { start: number; end: num
 
 /** 找出与 old_string 首行最相似的行，返回其起始的等长窗口，供反射式错误展示。 */
 function nearestSnippet(content: string, oldStr: string): string | null {
-  const anchor = oldStr.split("\n").map((l) => l.trim()).find(Boolean);
+  const anchor = oldStr
+    .split("\n")
+    .map((l) => l.trim())
+    .find(Boolean);
   if (!anchor) return null;
   const lines = content.split("\n");
   const n = oldStr.split("\n").length;
@@ -300,13 +338,18 @@ export const globTool: Tool = {
   readOnly: true,
   def: {
     name: "glob",
-    description:
+    description: t(
+      "Find files by glob pattern (e.g. **/*.ts), returning a list of relative paths sorted by modification time, newest first (recently changed files are more likely relevant). Respects .gitignore when ripgrep is available; otherwise skips common directories like node_modules/.git/dist.",
       "按 glob 模式查找文件（如 **/*.ts），返回相对路径列表，按修改时间倒序（近期改动更可能相关）。" +
-      "有 ripgrep 时尊重 .gitignore；否则跳过 node_modules/.git/dist 等常见目录。",
+        "有 ripgrep 时尊重 .gitignore；否则跳过 node_modules/.git/dist 等常见目录。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        pattern: { type: "string", description: "glob 模式，如 src/**/*.ts" },
+        pattern: {
+          type: "string",
+          description: t("Glob pattern, e.g. src/**/*.ts", "glob 模式，如 src/**/*.ts"),
+        },
       },
       required: ["pattern"],
       additionalProperties: false,
@@ -329,7 +372,9 @@ export const globTool: Tool = {
       if (rg) {
         if (rg.lines.length === 0) return `(无文件匹配 ${pattern})`;
         const body = rg.lines.join("\n");
-        return rg.truncated ? `${body}\n…（超过 ${MAX_RESULTS} 个匹配，仅显示最近修改的部分）` : body;
+        return rg.truncated
+          ? `${body}\n…（超过 ${MAX_RESULTS} 个匹配，仅显示最近修改的部分）`
+          : body;
       }
     }
 
@@ -415,23 +460,46 @@ export const grepTool: Tool = {
   readOnly: true,
   def: {
     name: "grep",
-    description:
+    description: t(
+      "Search file contents with a regex (uses ripgrep when available, respecting .gitignore and skipping binaries). output_mode: content=file:line:content (default), files_with_matches=list matching files only, count=matches per file. Optionally: glob to limit files, path to limit to a subdirectory, ignore_case to ignore case, context to include surrounding lines (content mode only).",
       "在文件内容中用正则搜索（有 ripgrep 时走 ripgrep，尊重 .gitignore、跳过二进制）。" +
-      "output_mode: content=文件:行号:内容（默认）、files_with_matches=仅列命中文件、count=每文件命中数。" +
-      "可选 glob 限定文件、path 限定子目录、ignore_case 忽略大小写、context 附带前后行（仅 content）。",
+        "output_mode: content=文件:行号:内容（默认）、files_with_matches=仅列命中文件、count=每文件命中数。" +
+        "可选 glob 限定文件、path 限定子目录、ignore_case 忽略大小写、context 附带前后行（仅 content）。",
+    ),
     parameters: {
       type: "object",
       properties: {
-        pattern: { type: "string", description: "正则表达式" },
-        glob: { type: "string", description: "限定搜索的文件 glob（如 *.ts）" },
-        path: { type: "string", description: "限定搜索的子目录（相对 cwd）" },
+        pattern: { type: "string", description: t("Regular expression", "正则表达式") },
+        glob: {
+          type: "string",
+          description: t(
+            "File glob to limit the search (e.g. *.ts)",
+            "限定搜索的文件 glob（如 *.ts）",
+          ),
+        },
+        path: {
+          type: "string",
+          description: t(
+            "Subdirectory to limit the search (relative to cwd)",
+            "限定搜索的子目录（相对 cwd）",
+          ),
+        },
         output_mode: {
           type: "string",
           enum: ["content", "files_with_matches", "count"],
-          description: "输出模式，默认 content",
+          description: t("Output mode, default content", "输出模式，默认 content"),
         },
-        ignore_case: { type: "boolean", description: "忽略大小写（默认 false）" },
-        context: { type: "number", description: "content 模式下附带的前后行数（默认 0）" },
+        ignore_case: {
+          type: "boolean",
+          description: t("Ignore case (default false)", "忽略大小写（默认 false）"),
+        },
+        context: {
+          type: "number",
+          description: t(
+            "Number of surrounding lines to include in content mode (default 0)",
+            "content 模式下附带的前后行数（默认 0）",
+          ),
+        },
       },
       required: ["pattern"],
       additionalProperties: false,
@@ -445,7 +513,8 @@ export const grepTool: Tool = {
     const mode = normalizeMode(input["output_mode"]);
     const ignoreCase = Boolean(input["ignore_case"]);
     const globFilter = input["glob"] ? String(input["glob"]) : undefined;
-    const context = mode === "content" ? Math.max(0, Math.min(20, Number(input["context"]) || 0)) : 0;
+    const context =
+      mode === "content" ? Math.max(0, Math.min(20, Number(input["context"]) || 0)) : 0;
     const root = path.resolve(ctx.cwd);
     // 子目录限定：约束在 cwd 内，防穿越。
     const searchDir = input["path"] ? await resolveInside(root, input["path"]) : root;
@@ -463,7 +532,15 @@ export const grepTool: Tool = {
       });
       if (out !== null) return out;
     }
-    return grepViaJs(pattern, { mode, ignoreCase, context, globFilter, root, searchDir, signal: ctx.signal });
+    return grepViaJs(pattern, {
+      mode,
+      ignoreCase,
+      context,
+      globFilter,
+      root,
+      searchDir,
+      signal: ctx.signal,
+    });
   },
 };
 

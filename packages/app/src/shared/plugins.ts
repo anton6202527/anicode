@@ -6,6 +6,8 @@
  * （见 main/bridge.ts 里的 TODO）。市场 UI 现在负责浏览、启用/停用并持久化选择。
  */
 
+import { t } from "@anicode/core";
+
 export type PluginCategory = "mcp" | "skill" | "tool";
 
 /** MCP 类插件的 stdio 启动配置（对齐 core 的 McpServerConfig）。 */
@@ -56,8 +58,11 @@ export interface PluginEntry extends PluginManifest {
 export const PLUGIN_CATALOG: readonly PluginManifest[] = [
   {
     id: "core.filesystem",
-    name: "文件工具",
-    description: "读写、检索工作区文件（read / write / edit / glob / grep），带沙箱与权限确认。",
+    name: t("File tools", "文件工具"),
+    description: t(
+      "Read, write, and search workspace files (read / write / edit / glob / grep), with sandbox and permission confirmation.",
+      "读写、检索工作区文件（read / write / edit / glob / grep），带沙箱与权限确认。",
+    ),
     category: "tool",
     author: "anicode",
     icon: "📁",
@@ -67,8 +72,11 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
   },
   {
     id: "core.bash",
-    name: "Bash 终端",
-    description: "在工作目录执行 shell 命令，受权限规则约束。",
+    name: t("Bash terminal", "Bash 终端"),
+    description: t(
+      "Run shell commands in the working directory, constrained by permission rules.",
+      "在工作目录执行 shell 命令，受权限规则约束。",
+    ),
     category: "tool",
     author: "anicode",
     icon: "⌨️",
@@ -78,8 +86,11 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
   },
   {
     id: "core.todo",
-    name: "任务清单",
-    description: "让 agent 维护结构化 todo，界面实时展示进度。",
+    name: t("Task list", "任务清单"),
+    description: t(
+      "Let the agent maintain a structured todo; the UI shows progress in real time.",
+      "让 agent 维护结构化 todo，界面实时展示进度。",
+    ),
     category: "tool",
     author: "anicode",
     icon: "✅",
@@ -89,32 +100,49 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
   },
   {
     id: "mcp.websearch",
-    name: "Web 搜索",
-    description: "通过 MCP 联网检索与抓取网页，为回答补充实时信息。",
+    name: t("Web search", "Web 搜索"),
+    description: t(
+      "Search and fetch web pages over MCP to enrich answers with real-time information.",
+      "通过 MCP 联网检索与抓取网页，为回答补充实时信息。",
+    ),
     category: "mcp",
     author: "community",
     icon: "🔎",
     version: "0.3.0",
-    mcpServer: { name: "websearch", command: "npx", args: ["-y", "@modelcontextprotocol/server-web-search"] },
+    mcpServer: {
+      name: "websearch",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-web-search"],
+    },
     requiresEnv: ["BRAVE_API_KEY"],
     homepage: "https://modelcontextprotocol.io",
   },
   {
     id: "mcp.github",
     name: "GitHub",
-    description: "读写 issue / PR、检索仓库、管理分支的 GitHub MCP server。",
+    description: t(
+      "GitHub MCP server for reading/writing issues / PRs, searching repositories, and managing branches.",
+      "读写 issue / PR、检索仓库、管理分支的 GitHub MCP server。",
+    ),
     category: "mcp",
     author: "github",
     icon: "🐙",
     version: "0.6.0",
-    mcpServer: { name: "github", command: "npx", args: ["-y", "@modelcontextprotocol/server-github"] },
+    mcpServer: {
+      name: "github",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-github"],
+    },
     requiresEnv: ["GITHUB_TOKEN"],
     homepage: "https://github.com/github/github-mcp-server",
   },
   {
     id: "mcp.playwright",
-    name: "Playwright 浏览器",
-    description: "驱动真实浏览器做点击、填表、截图与端到端验证。",
+    name: t("Playwright browser", "Playwright 浏览器"),
+    description: t(
+      "Drive a real browser to click, fill forms, screenshot, and run end-to-end verification.",
+      "驱动真实浏览器做点击、填表、截图与端到端验证。",
+    ),
     category: "mcp",
     author: "microsoft",
     icon: "🎭",
@@ -124,8 +152,11 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
   },
   {
     id: "skill.pdf",
-    name: "PDF 阅读",
-    description: "解析 PDF 文本与表格，支持长文档分页读取的 skill。",
+    name: t("PDF reader", "PDF 阅读"),
+    description: t(
+      "A skill that parses PDF text and tables, with paginated reading for long documents.",
+      "解析 PDF 文本与表格，支持长文档分页读取的 skill。",
+    ),
     category: "skill",
     author: "community",
     icon: "📄",
@@ -133,8 +164,11 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
   },
   {
     id: "skill.dataviz",
-    name: "数据可视化",
-    description: "生成图表与仪表盘的设计指引与代码 skill。",
+    name: t("Data visualization", "数据可视化"),
+    description: t(
+      "A skill with design guidance and code for generating charts and dashboards.",
+      "生成图表与仪表盘的设计指引与代码 skill。",
+    ),
     category: "skill",
     author: "anicode",
     icon: "📊",

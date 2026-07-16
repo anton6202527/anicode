@@ -9,6 +9,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
+import { t } from "../i18n.js";
 import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DaemonServer } from "./server.js";
@@ -31,14 +32,16 @@ export interface DaemonArgs {
 }
 
 export function daemonHelpText(): string {
-  return `anicode-daemon ${DAEMON_VERSION}\n\n` +
+  return (
+    `anicode-daemon ${DAEMON_VERSION}\n\n` +
     `用法: anicode-daemon [选项]\n\n` +
     `  --socket <path>       Unix socket 路径（默认 ${defaultSocketPath()}）\n` +
     `  --sessions <dir>      会话目录（默认 ~/.anicode/sessions）\n` +
     `  --auto                自动允许工具操作\n` +
     `  --accept-edits        自动允许文件编辑，命令仍询问\n` +
     `  -h, --help            显示帮助\n` +
-    `  -v, --version         显示版本`;
+    `  -v, --version         显示版本`
+  );
 }
 
 export function parseDaemonArgs(argv: string[]): DaemonArgs {
@@ -49,12 +52,14 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
   let version = false;
   const seen = new Set<string>();
   const mark = (flag: string) => {
-    if (seen.has(flag)) throw new Error(`${flag} 不能重复指定`);
+    if (seen.has(flag))
+      throw new Error(t(`${flag} cannot be specified more than once`, `${flag} 不能重复指定`));
     seen.add(flag);
   };
   const valueAfter = (index: number, flag: string): string => {
     const value = argv[index + 1];
-    if (!value || value.startsWith("-")) throw new Error(`${flag} 需要一个值`);
+    if (!value || value.startsWith("-"))
+      throw new Error(t(`${flag} requires a value`, `${flag} 需要一个值`));
     return value;
   };
 
@@ -75,7 +80,12 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
       case "--accept-edits":
         mark(arg);
         if (permissionMode !== "default") {
-          throw new Error("--auto 与 --accept-edits 不能同时使用");
+          throw new Error(
+            t(
+              "--auto and --accept-edits cannot be used together",
+              "--auto 与 --accept-edits 不能同时使用",
+            ),
+          );
         }
         permissionMode = arg === "--auto" ? "auto" : "acceptEdits";
         break;
@@ -90,7 +100,12 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
         version = true;
         break;
       default:
-        throw new Error(`未知参数: ${arg}\n使用 --help 查看可用参数。`);
+        throw new Error(
+          t(
+            `Unknown argument: ${arg}\nUse --help to see available arguments.`,
+            `未知参数: ${arg}\n使用 --help 查看可用参数。`,
+          ),
+        );
     }
   }
   return { socketPath, sessionsDir, permissionMode, help, version };
@@ -100,7 +115,10 @@ function resolveConfiguredProvider(model: string) {
   const diagnostics = diagnoseProvider(model);
   if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
     throw new Error(
-      `${diagnostics.warnings.join("；")}（请在 daemon 进程环境中配置，或使用 debug/demo）`,
+      t(
+        `${diagnostics.warnings.join("; ")} (configure it in the daemon process environment, or use debug/demo)`,
+        `${diagnostics.warnings.join("；")}（请在 daemon 进程环境中配置，或使用 debug/demo）`,
+      ),
     );
   }
   return createProvider(model);
@@ -147,10 +165,17 @@ export async function removeStaleSocket(socketPath: string): Promise<void> {
   try {
     const stat = await fs.lstat(socketPath);
     if (!stat.isSocket()) {
-      throw new Error(`拒绝删除非 socket 路径: ${socketPath}`);
+      throw new Error(
+        t(
+          `Refusing to delete non-socket path: ${socketPath}`,
+          `拒绝删除非 socket 路径: ${socketPath}`,
+        ),
+      );
     }
     if (await socketIsActive(socketPath)) {
-      throw new Error(`daemon 已在监听: ${socketPath}`);
+      throw new Error(
+        t(`daemon is already listening: ${socketPath}`, `daemon 已在监听: ${socketPath}`),
+      );
     }
     await fs.rm(socketPath);
   } catch (error) {
@@ -164,7 +189,14 @@ function socketIsActive(socketPath: string): Promise<boolean> {
     const timer = setTimeout(() => {
       cleanup();
       socket.destroy();
-      reject(new Error(`无法确认 socket 是否陈旧: ${socketPath}`));
+      reject(
+        new Error(
+          t(
+            `Cannot determine whether socket is stale: ${socketPath}`,
+            `无法确认 socket 是否陈旧: ${socketPath}`,
+          ),
+        ),
+      );
     }, 500);
     const cleanup = () => {
       clearTimeout(timer);

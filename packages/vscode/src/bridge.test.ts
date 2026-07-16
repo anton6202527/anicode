@@ -42,7 +42,9 @@ test("ChatBridge: send 驱动回合，事件回流并按首句自动命名", asy
     posted.length = 0;
     await bridge.handle({ type: "send", text: "帮我看看这个 bug" });
 
-    const events = posted.filter((m) => m.type === "event").map((m) => (m.type === "event" ? m.event : null));
+    const events = posted
+      .filter((m) => m.type === "event")
+      .map((m) => (m.type === "event" ? m.event : null));
     const agentKinds = new Set(events.map((e) => (e && e.type === "agent" ? e.event.type : "")));
     assert.ok(agentKinds.has("text"), "缺少流式 text");
     assert.ok(agentKinds.has("done"), "缺少 done");
@@ -115,7 +117,10 @@ test("ChatBridge: 切到缺凭证的云端模型时回发 error，不抛出", as
     await bridge.handle({ type: "ready" });
     posted.length = 0;
     await bridge.switchModel("openai/gpt-nonexistent");
-    assert.ok(posted.some((m) => m.type === "error"), "应回发 error 消息");
+    assert.ok(
+      posted.some((m) => m.type === "error"),
+      "应回发 error 消息",
+    );
   } finally {
     bridge.dispose();
     manager.dispose();

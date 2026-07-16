@@ -4,18 +4,24 @@
 import * as path from "node:path";
 import { type Tool, type ToolContext } from "./tool.js";
 import { type LspPool } from "../lsp.js";
+import { t } from "../i18n.js";
 
 export function createDiagnosticsTool(pool: LspPool): Tool {
   return {
     readOnly: true,
     def: {
       name: "diagnostics",
-      description:
+      description: t(
+        "Get language server diagnostics for a file (type/syntax errors and warnings). Useful for self-checking after editing code.",
         "获取某文件的语言服务器诊断（类型/语法错误与告警）。改完代码后自查很有用。",
+      ),
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "相对 cwd 的文件路径" },
+          path: {
+            type: "string",
+            description: t("File path relative to cwd", "相对 cwd 的文件路径"),
+          },
         },
         required: ["path"],
         additionalProperties: false,

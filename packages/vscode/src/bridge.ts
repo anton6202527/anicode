@@ -3,6 +3,7 @@
  * 维护「当前活动会话」：VSCode 侧边栏是单一活动对话，切模型/新建/恢复都换这个活动会话。
  */
 
+import { t } from "@anicode/core";
 import type { SessionEvent, SessionManager } from "@anicode/core";
 import type { HostToWebview, PendingPerm, PermissionDecision, WebviewToHost } from "./protocol.js";
 import { fileChangeFor } from "./filechange.js";
@@ -54,7 +55,12 @@ export class ChatBridge {
         if (this.currentId) await this.manager.interrupt(this.currentId);
         return;
       case "answer":
-        if (this.currentId) await this.manager.answerPermission(this.currentId, msg.permId, msg.decision as PermissionDecision);
+        if (this.currentId)
+          await this.manager.answerPermission(
+            this.currentId,
+            msg.permId,
+            msg.decision as PermissionDecision,
+          );
         return;
       case "newSession":
         await this.newSession(this.currentModel);
@@ -151,7 +157,7 @@ export class ChatBridge {
 function deriveTitle(text: string): string {
   const line = text.trim().split("\n")[0]?.trim() ?? "";
   const title = line.length > 40 ? line.slice(0, 40) + "…" : line;
-  return title || "新对话";
+  return title || t("New chat", "新对话");
 }
 
 function errorMessage(value: unknown): string {

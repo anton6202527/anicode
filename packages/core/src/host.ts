@@ -14,6 +14,7 @@ import type {
   SessionSummary,
   SessionManager,
 } from "./session-manager.js";
+import type { PermissionMode } from "./permission.js";
 
 export type PermissionDecisionKind = PermissionAnswer;
 
@@ -37,6 +38,13 @@ export interface SessionHost {
     permId: string,
     decision: PermissionDecisionKind,
   ): Promise<boolean | void>;
+  /** 撤销：把工作区文件回滚到某快照（缺省=最近一个）。仅回滚文件，不改对话历史。 */
+  undo(sessionId: string, checkpointId?: string): Promise<{ restored: number; deleted: number }>;
+  /**
+   * 运行时切换权限模式（如 /plan 计划模式）。可选：不支持的传输（暂未接线的 daemon）
+   * 可不实现，前端应在调用前判空。
+   */
+  setPermissionMode?(sessionId: string, mode: PermissionMode): Promise<void>;
   /** 释放资源：远程断开 socket；本地中断本进程持有的 live drive。 */
   dispose(): void;
 }
@@ -60,8 +68,18 @@ export class LocalSessionHost implements SessionHost {
   interrupt(sessionId: string): Promise<void> {
     return this.manager.interrupt(sessionId);
   }
-  answerPermission(sessionId: string, permId: string, decision: PermissionDecisionKind): Promise<boolean> {
+  answerPermission(
+    sessionId: string,
+    permId: string,
+    decision: PermissionDecisionKind,
+  ): Promise<boolean> {
     return this.manager.answerPermission(sessionId, permId, decision);
+  }
+  undo(sessionId: string, checkpointId?: string): Promise<{ restored: number; deleted: number }> {
+    return this.manager.undo(sessionId, checkpointId);
+  }
+  setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
+    return this.manager.setPermissionMode(sessionId, mode);
   }
   dispose(): void {
     this.manager.dispose();

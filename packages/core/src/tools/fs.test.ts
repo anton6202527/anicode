@@ -100,7 +100,12 @@ test("applyEdit: 精确多处不唯一时报错，replace_all 全替换", () => 
 test("applyEdit: 精确失败时按行空白容差模糊匹配", () => {
   // 文件里是 4 空格缩进，模型给的 old_string 缩进不同 → 精确失败、模糊命中。
   const content = "function f() {\n    return 1\n}";
-  const r = applyEdit(content, "function f() {\nreturn 1\n}", "function f() {\n    return 2\n}", false);
+  const r = applyEdit(
+    content,
+    "function f() {\nreturn 1\n}",
+    "function f() {\n    return 2\n}",
+    false,
+  );
   assert.equal(r.mode, "fuzzy");
   assert.equal(r.updated, "function f() {\n    return 2\n}");
 });

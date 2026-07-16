@@ -4,6 +4,8 @@
  * 所有模型输出都用 textContent/DOM 构建，绝不用 innerHTML，天然无 XSS。
  */
 
+// 走零依赖子路径，避免把 core 的 Node-only 依赖（Anthropic/OpenAI SDK）打进浏览器 bundle。
+import { t } from "@anicode/core/i18n";
 import type { SessionEvent, TodoItem, Usage } from "@anicode/core";
 import type { FileChange, HostToWebview, PendingPerm, SessionInfo } from "../protocol.js";
 import { messagesToItems, todosFromMessages, firstLine, type Item } from "../transcript.js";
@@ -38,9 +40,9 @@ root.innerHTML = "";
 const header = div("header");
 const modelChip = button("chip", () => post({ type: "pickModel" }));
 const newBtn = button("chip ghost", () => post({ type: "newSession" }));
-newBtn.textContent = "＋ 新对话";
+newBtn.textContent = t("＋ New chat", "＋ 新对话");
 const resumeBtn = button("chip ghost", () => post({ type: "resume" }));
-resumeBtn.textContent = "↺ 恢复";
+resumeBtn.textContent = t("↺ Resume", "↺ 恢复");
 header.append(modelChip, spacer(), newBtn, resumeBtn);
 
 const scroll = div("scroll");
@@ -51,7 +53,10 @@ const composer = div("composer");
 const textarea = document.createElement("textarea");
 textarea.className = "input";
 textarea.rows = 1;
-textarea.placeholder = "给 anicode 发消息…（Enter 发送，Shift+Enter 换行）";
+textarea.placeholder = t(
+  "Message anicode… (Enter to send, Shift+Enter for newline)",
+  "给 anicode 发消息…（Enter 发送，Shift+Enter 换行）",
+);
 const sendBtn = button("send", submit);
 sendBtn.textContent = "↑";
 composer.append(textarea, sendBtn);
@@ -115,6 +120,17 @@ function applyEvent(se: SessionEvent): void {
     render();
     return;
   }
+  if (se.type === "reverted") {
+    state.items.push({
+      kind: "info",
+      text: t(
+        `↩ Workspace reverted: restored ${se.restored} files, removed ${se.deleted} newly added files`,
+        `↩ 工作区已回滚：恢复 ${se.restored} 个文件，删除 ${se.deleted} 个新增文件`,
+      ),
+    });
+    render();
+    return;
+  }
   const ev = se.event;
   switch (ev.type) {
     case "user_message":
@@ -138,7 +154,13 @@ function applyEvent(se: SessionEvent): void {
       break;
     case "tool_start":
       flushLive();
-      state.activeTools.set(ev.id, { kind: "tool", id: ev.id, name: ev.name, ruleKey: ev.ruleKey, status: "run" });
+      state.activeTools.set(ev.id, {
+        kind: "tool",
+        id: ev.id,
+        name: ev.name,
+        ruleKey: ev.ruleKey,
+        status: "run",
+      });
       render();
       break;
     case "tool_permission":
@@ -165,7 +187,13 @@ function applyEvent(se: SessionEvent): void {
       state.usage = ev.usage;
       break;
     case "compacted":
-      state.items.push({ kind: "info", text: `上下文已压缩 ${ev.beforeTokens}→${ev.afterTokens} tokens` });
+      state.items.push({
+        kind: "info",
+        text: t(
+          `Context compacted ${ev.beforeTokens}→${ev.afterTokens} tokens`,
+          `上下文已压缩 ${ev.beforeTokens}→${ev.afterTokens} tokens`,
+        ),
+      });
       render();
       break;
     case "done":
@@ -208,7 +236,8 @@ function render(): void {
   }
   for (const t of state.activeTools.values()) messages.append(renderItem(t));
   if (state.todos.length) messages.append(renderTodos(state.todos));
-  if (state.pendings[0]) messages.append(renderPermission(state.pendings[0], state.pendings.length - 1));
+  if (state.pendings[0])
+    messages.append(renderPermission(state.pendings[0], state.pendings.length - 1));
 
   modelChip.textContent = `${state.info?.model ?? "—"} ▾`;
   sendBtn.textContent = state.running ? "■" : "↑";
@@ -239,8 +268,19 @@ function renderItem(item: Item): HTMLElement {
       return assistantBubble(item.text, false);
     case "tool": {
       const el = div(`tool status-${item.status}`);
-      const mark = item.status === "run" ? "⚙" : item.status === "ok" ? "✔" : item.status === "deny" ? "⊘" : "✖";
-      el.append(span("tool-mark", mark), span("tool-name", item.name), span("tool-key", item.ruleKey));
+      const mark =
+        item.status === "run"
+          ? "⚙"
+          : item.status === "ok"
+            ? "✔"
+            : item.status === "deny"
+              ? "⊘"
+              : "✖";
+      el.append(
+        span("tool-mark", mark),
+        span("tool-name", item.name),
+        span("tool-key", item.ruleKey),
+      );
       if (item.detail) el.append(span("tool-detail", "— " + item.detail));
       return el;
     }
@@ -270,7 +310,7 @@ function renderFileChange(change: FileChange): HTMLElement {
   if (change.added) stat.append(span("fc-add", `+${change.added}`));
   if (change.removed) stat.append(span("fc-del", `-${change.removed}`));
   const open = button("fc-open", () => post({ type: "openFile", path: change.path }));
-  open.textContent = "打开文件";
+  open.textContent = t("Open file", "打开文件");
   head.append(path, stat, spacer(), open);
   box.append(head);
 
@@ -279,14 +319,15 @@ function renderFileChange(change: FileChange): HTMLElement {
     const sign = line.t === "add" ? "+" : line.t === "del" ? "-" : " ";
     body.append(div(`fc-line ${line.t}`, sign + " " + line.text));
   }
-  if (change.truncated) body.append(div("fc-line ctx", "… 差异过长，已截断"));
+  if (change.truncated)
+    body.append(div("fc-line ctx", t("… diff too long, truncated", "… 差异过长，已截断")));
   box.append(body);
   return box;
 }
 
 function renderTodos(todos: TodoItem[]): HTMLElement {
   const box = div("todo-card");
-  box.append(div("todo-title", "任务清单"));
+  box.append(div("todo-title", t("Task list", "任务清单")));
   for (const t of todos) {
     const mark = t.status === "completed" ? "✔" : t.status === "in_progress" ? "●" : "○";
     const text = t.status === "in_progress" && t.activeForm ? t.activeForm : t.content;
@@ -298,20 +339,27 @@ function renderTodos(todos: TodoItem[]): HTMLElement {
 function renderPermission(p: PendingPerm, extra: number): HTMLElement {
   const card = div("perm-card");
   const title = div("perm-title");
-  title.textContent = `⚠ 授权请求：${p.toolName}` + (extra > 0 ? `（还有 ${extra} 个待裁决）` : "");
+  title.textContent =
+    t(`⚠ Permission request: ${p.toolName}`, `⚠ 授权请求：${p.toolName}`) +
+    (extra > 0 ? t(`(${extra} more pending)`, `（还有 ${extra} 个待裁决）`) : "");
   const key = div("perm-key");
   key.textContent = p.ruleKey;
   const actions = div("perm-actions");
   actions.append(
-    permButton("允许", "allow", p.permId, "allow"),
-    permButton("允许并记住", "remember", p.permId, "allow_remember"),
-    permButton("拒绝", "deny", p.permId, "deny"),
+    permButton(t("Allow", "允许"), "allow", p.permId, "allow"),
+    permButton(t("Allow and remember", "允许并记住"), "remember", p.permId, "allow_remember"),
+    permButton(t("Deny", "拒绝"), "deny", p.permId, "deny"),
   );
   card.append(title, key, actions);
   return card;
 }
 
-function permButton(label: string, cls: string, permId: string, decision: "allow" | "allow_remember" | "deny"): HTMLElement {
+function permButton(
+  label: string,
+  cls: string,
+  permId: string,
+  decision: "allow" | "allow_remember" | "deny",
+): HTMLElement {
   const b = button(`btn ${cls}`, () => post({ type: "answer", permId, decision }));
   b.textContent = label;
   return b;

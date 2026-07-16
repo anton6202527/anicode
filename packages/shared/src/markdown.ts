@@ -119,7 +119,10 @@ export function parseInline(text: string): Span[] {
   const patterns: { re: RegExp; make: (m: RegExpExecArray) => Span }[] = [
     { re: /`([^`]+)`/, make: (m) => ({ t: "code", value: m[1]! }) },
     { re: /\*\*([^*]+)\*\*/, make: (m) => ({ t: "strong", children: parseInline(m[1]!) }) },
-    { re: /(?:\*([^*]+)\*|_([^_]+)_)/, make: (m) => ({ t: "em", children: parseInline(m[1] ?? m[2] ?? "") }) },
+    {
+      re: /(?:\*([^*]+)\*|_([^_]+)_)/,
+      make: (m) => ({ t: "em", children: parseInline(m[1] ?? m[2] ?? "") }),
+    },
     {
       re: /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/,
       make: (m) => ({ t: "link", href: m[2]!, children: parseInline(m[1]!) }),

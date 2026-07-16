@@ -50,10 +50,7 @@ test("CLI: 非 resume 路径只创建一次会话", async () => {
 test("CLI: daemon 客户端拒绝静默忽略权限模式", () => {
   for (const flag of ["--auto", "--accept-edits"]) {
     const args = parseArgs(["--daemon", flag]);
-    assert.throws(
-      () => validateArgs(args),
-      new RegExp(`${flag}.*daemon 进程.*不会被当前连接修改`),
-    );
+    assert.throws(() => validateArgs(args), new RegExp(`${flag}.*daemon 进程.*不会被当前连接修改`));
   }
 
   assert.doesNotThrow(() => validateArgs(parseArgs(["--daemon"])));
@@ -93,10 +90,7 @@ test("CLI: daemon 拒绝本地专属会话目录，trace 必须配日志", () =>
     () => validateArgs(parseArgs(["--daemon", "--sessions", "/tmp/sessions"])),
     /会话目录由 daemon 管理/,
   );
-  assert.throws(
-    () => validateArgs(parseArgs(["--trace-content"])),
-    /必须与 --debug-log 一起使用/,
-  );
+  assert.throws(() => validateArgs(parseArgs(["--trace-content"])), /必须与 --debug-log 一起使用/);
 });
 
 test("CLI: 无 --model 时不硬耦合 ANTHROPIC_API_KEY，无凭证回退 debug/demo", () => {
@@ -134,14 +128,19 @@ test("CLI: 无 --model 时不硬耦合 ANTHROPIC_API_KEY，无凭证回退 debug
 
 test("CLI: detectLocalModel 探测到 Ollama 时优先返回本地 DeepSeek 模型", async () => {
   const okFetch = (async () =>
-    new Response(JSON.stringify({ models: [{ name: "llama3.2:latest" }, { name: "deepseek-r1:latest" }] }), {
-      status: 200,
-    })) as unknown as typeof fetch;
+    new Response(
+      JSON.stringify({ models: [{ name: "llama3.2:latest" }, { name: "deepseek-r1:latest" }] }),
+      {
+        status: 200,
+      },
+    )) as unknown as typeof fetch;
   assert.equal(await detectLocalModel(okFetch), "ollama/deepseek-r1:latest");
 
   // 无 deepseek → 用第一个本地模型
   const noDeepseek = (async () =>
-    new Response(JSON.stringify({ models: [{ name: "qwen2.5-coder" }] }), { status: 200 })) as unknown as typeof fetch;
+    new Response(JSON.stringify({ models: [{ name: "qwen2.5-coder" }] }), {
+      status: 200,
+    })) as unknown as typeof fetch;
   assert.equal(await detectLocalModel(noDeepseek), "ollama/qwen2.5-coder");
 
   // 未运行 / 出错 → null（回退云端或 debug/demo）

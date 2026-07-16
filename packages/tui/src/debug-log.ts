@@ -1,11 +1,6 @@
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import * as path from "node:path";
-import type {
-  OpenHandle,
-  PermissionDecisionKind,
-  SessionEvent,
-  SessionHost,
-} from "@anicode/core";
+import type { OpenHandle, PermissionDecisionKind, SessionEvent, SessionHost } from "@anicode/core";
 
 const SECRET_PATTERNS = [
   /\b(sk-[A-Za-z0-9_-]{8,})\b/g,
@@ -48,7 +43,10 @@ export class DebugLogger {
   readonly file: string;
   private failed = false;
 
-  constructor(file: string, private readonly traceContent = false) {
+  constructor(
+    file: string,
+    private readonly traceContent = false,
+  ) {
     this.file = path.resolve(file);
     mkdirSync(path.dirname(this.file), { recursive: true });
     // 启动阶段就验证路径可写；运行中的磁盘错误则降级停记，不能截断 TUI 事件。
@@ -130,9 +128,7 @@ function summarizeEvent(event: SessionEvent, traceContent: boolean): Record<stri
         type: "agent.tool_start",
         id: agent.id,
         name: agent.name,
-        ...(traceContent
-          ? { ruleKey: agent.ruleKey }
-          : { ruleKeyChars: agent.ruleKey.length }),
+        ...(traceContent ? { ruleKey: agent.ruleKey } : { ruleKeyChars: agent.ruleKey.length }),
       };
     case "tool_permission":
       return {
@@ -245,11 +241,11 @@ export function withDebugLogging(host: SessionHost, logger: DebugLogger): Sessio
       ),
     interrupt: (sessionId) =>
       timed(logger, "interrupt", { sessionId }, () => host.interrupt(sessionId)),
-    answerPermission: (
-      sessionId: string,
-      permId: string,
-      decision: PermissionDecisionKind,
-    ) =>
+    undo: (sessionId, checkpointId) =>
+      timed(logger, "undo", { sessionId, ...(checkpointId ? { checkpointId } : {}) }, () =>
+        host.undo(sessionId, checkpointId),
+      ),
+    answerPermission: (sessionId: string, permId: string, decision: PermissionDecisionKind) =>
       timed(logger, "answerPermission", { sessionId, permId, decision }, () =>
         host.answerPermission(sessionId, permId, decision),
       ),

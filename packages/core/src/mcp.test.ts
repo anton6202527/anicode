@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
+import * as http from "node:http";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
@@ -49,6 +50,72 @@ test("MCP: 握手 → 列工具 → 调用 → 错误路径", async () => {
   client.close();
 });
 
+test("MCP(HTTP): 握手带 session、tools/list 走 SSE、tools/call 走 JSON", async () => {
+  const seenSession: string[] = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const sid = req.headers["mcp-session-id"];
+      if (sid) seenSession.push(String(sid));
+      const msg = body ? JSON.parse(body) : {};
+      if (msg.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-123" });
+        res.end(
+          JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05" } }),
+        );
+        return;
+      }
+      if (msg.method === "notifications/initialized" || msg.id === undefined) {
+        res.writeHead(202).end();
+        return;
+      }
+      if (msg.method === "tools/list") {
+        // SSE 路径
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const payload = {
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            tools: [{ name: "ping", description: "远程 ping", inputSchema: { type: "object" } }],
+          },
+        };
+        res.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+        res.end();
+        return;
+      }
+      if (msg.method === "tools/call") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { content: [{ type: "text", text: `pong:${msg.params.arguments.x}` }] },
+          }),
+        );
+        return;
+      }
+      res.writeHead(400).end();
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as any).port;
+  try {
+    const client = await McpClient.start({ name: "remote", url: `http://127.0.0.1:${port}/mcp` });
+    const tools = await client.listTools();
+    const ping = tools.find((t) => t.def.name === "remote__ping");
+    assert.ok(ping, "应包装出 remote__ping");
+    assert.equal(ping!.readOnly, false);
+    const out = await ping!.run({ x: 42 }, { cwd: ".", signal: new AbortController().signal });
+    assert.equal(out, "pong:42");
+    // 初始化返回的 session id 必须在后续请求回带。
+    assert.ok(seenSession.includes("sess-123"), "后续请求应回带 Mcp-Session-Id");
+    client.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
   return {
@@ -77,9 +144,14 @@ test("MCP: 工具挂进 Agent，端到端调用", async () => {
 
   const agent = new Agent({
     provider: scriptedProvider([
-      [{ role: "assistant", content: [
-        { type: "tool_call", id: "c1", name: "fake__echo", args: { text: "从 agent 调 MCP" } },
-      ] }],
+      [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_call", id: "c1", name: "fake__echo", args: { text: "从 agent 调 MCP" } },
+          ],
+        },
+      ],
       [{ role: "assistant", content: [{ type: "text", text: "MCP 工具返回了内容" }] }],
     ]),
     model: "scripted",

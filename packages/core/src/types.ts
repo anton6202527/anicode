@@ -52,12 +52,7 @@ export interface ImagePart {
   data: string;
 }
 
-export type ContentPart =
-  | TextPart
-  | ThinkingPart
-  | ToolCallPart
-  | ToolResultPart
-  | ImagePart;
+export type ContentPart = TextPart | ThinkingPart | ToolCallPart | ToolResultPart | ImagePart;
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -98,12 +93,7 @@ export interface Usage {
   cacheWriteTokens: number;
 }
 
-export type StopReason =
-  | "end_turn"
-  | "tool_use"
-  | "max_tokens"
-  | "refusal"
-  | "other";
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "other";
 
 export type StreamEvent =
   | { type: "text_delta"; text: string }

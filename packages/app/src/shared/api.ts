@@ -75,7 +75,11 @@ export interface AgentxApi {
   interrupt(sessionId: string): Promise<void>;
   setTitle(sessionId: string, title: string): Promise<void>;
   deleteSession(sessionId: string): Promise<void>;
-  answerPermission(sessionId: string, permId: string, decision: PermissionDecisionKind): Promise<boolean>;
+  answerPermission(
+    sessionId: string,
+    permId: string,
+    decision: PermissionDecisionKind,
+  ): Promise<boolean>;
   /** 注册事件监听；返回取消函数。 */
   onEvent(listener: (envelope: EventEnvelope) => void): () => void;
 

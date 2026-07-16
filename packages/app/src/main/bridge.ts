@@ -17,6 +17,7 @@ import {
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
+  t,
   type OpenHandle,
   type PermissionDecisionKind,
 } from "@anicode/core";
@@ -42,7 +43,10 @@ function resolveConfiguredProvider(model: string) {
   const diagnostics = diagnoseProvider(model);
   if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
     throw new Error(
-      `${diagnostics.warnings.join("；")}。可在设置里配置密钥，或改用 debug/demo 等免 key 模型。`,
+      t(
+        `${diagnostics.warnings.join("；")}. You can configure the key in settings, or switch to a key-free model like debug/demo.`,
+        `${diagnostics.warnings.join("；")}。可在设置里配置密钥，或改用 debug/demo 等免 key 模型。`,
+      ),
     );
   }
   return createProvider(model);
@@ -80,8 +84,10 @@ export class Bridge {
     ipcMain.handle("app:info", (): AppInfo => this.appInfo());
 
     ipcMain.handle("host:listSessions", () => this.manager.listSessions());
-    ipcMain.handle("host:createSession", (_e, input: { cwd: string; model: string; title?: string }) =>
-      this.manager.createSession(input),
+    ipcMain.handle(
+      "host:createSession",
+      (_e, input: { cwd: string; model: string; title?: string }) =>
+        this.manager.createSession(input),
     );
     ipcMain.handle("host:send", (_e, sessionId: string, text: string) =>
       this.manager.send(sessionId, text),
@@ -131,10 +137,14 @@ export class Bridge {
   private async catalogRows(): Promise<ModelRow[]> {
     // 本地 provider「免 key」不等于「在跑」；探测存活，避免把连不上的本地模型标成就绪。
     const details = listProviderDetails();
-    const probed = new Set(details.filter((d) => d.local && (d.baseURL || d.baseURLEnv)).map((d) => d.id));
+    const probed = new Set(
+      details.filter((d) => d.local && (d.baseURL || d.baseURLEnv)).map((d) => d.id),
+    );
     const live = await probeLocalProviders(details);
     const status = { probed, live };
-    const builtin: ModelRow[] = listModelCatalog().map((entry) => this.toRow(entry, "builtin", status));
+    const builtin: ModelRow[] = listModelCatalog().map((entry) =>
+      this.toRow(entry, "builtin", status),
+    );
     const userRows = (await this.readUserModels()).flatMap((m) => {
       const row = this.userModelToRow(m, status);
       return row ? [row] : [];
@@ -166,15 +176,23 @@ export class Bridge {
     if (status.probed.has(entry.providerId)) {
       // 有本地端点的 provider：以存活探测为准，别被「免 key」误导。
       ready = status.live.has(entry.providerId);
-      readyHint = ready ? `${entry.providerName} 已就绪` : `需先启动 ${entry.providerName}`;
+      readyHint = ready
+        ? t(`${entry.providerName} ready`, `${entry.providerName} 已就绪`)
+        : t(`Start ${entry.providerName} first`, `需先启动 ${entry.providerName}`);
     } else if (!d.requiresApiKey) {
       ready = true;
-      readyHint = entry.local ? "本地 / 免 key" : "免 key";
+      readyHint = entry.local ? t("Local / key-free", "本地 / 免 key") : t("Key-free", "免 key");
     } else {
       ready = d.hasCredentials;
       readyHint = d.hasCredentials
-        ? `${d.credentialEnv ?? "凭证"} 已配置`
-        : `缺 ${d.apiKeyEnv.join(" / ") || "API key"}`;
+        ? t(
+            `${d.credentialEnv ?? t("credential", "凭证")} configured`,
+            `${d.credentialEnv ?? t("credential", "凭证")} 已配置`,
+          )
+        : t(
+            `Missing ${d.apiKeyEnv.join(" / ") || "API key"}`,
+            `缺 ${d.apiKeyEnv.join(" / ") || "API key"}`,
+          );
     }
     return { ...entry, ready, readyHint, source };
   }
@@ -212,7 +230,11 @@ export class Bridge {
       if (!Array.isArray(list)) return [];
       return list.filter(
         (m): m is UserModel =>
-          m && typeof m.provider === "string" && typeof m.model === "string" && m.provider !== "" && m.model !== "",
+          m &&
+          typeof m.provider === "string" &&
+          typeof m.model === "string" &&
+          m.provider !== "" &&
+          m.model !== "",
       );
     } catch {
       return [];
@@ -227,9 +249,15 @@ export class Bridge {
   private async addUserModel(model: UserModel): Promise<ModelRow[]> {
     const provider = model.provider?.trim();
     const id = model.model?.trim();
-    if (!provider || !id) throw new Error("provider 与 model 均不能为空");
+    if (!provider || !id)
+      throw new Error(t("provider and model must not be empty", "provider 与 model 均不能为空"));
     if (!listProviderDetails().some((p) => p.id === provider)) {
-      throw new Error(`未知 provider "${provider}"，请先选择已有 provider`);
+      throw new Error(
+        t(
+          `Unknown provider "${provider}", please pick an existing provider first`,
+          `未知 provider "${provider}"，请先选择已有 provider`,
+        ),
+      );
     }
     const spec = `${provider}/${id}`;
     const existing = await this.readUserModels();
@@ -280,7 +308,7 @@ export class Bridge {
 
   private async setPluginEnabled(id: string, enabled: boolean): Promise<PluginEntry[]> {
     const manifest = PLUGIN_CATALOG.find((p) => p.id === id);
-    if (!manifest) throw new Error(`未知插件: ${id}`);
+    if (!manifest) throw new Error(t(`Unknown plugin: ${id}`, `未知插件: ${id}`));
     const saved = await this.readSavedPlugins();
     const next = applyPluginToggle(saved, id, enabled, Boolean(manifest.builtin));
     await fs.mkdir(path.dirname(this.options.pluginsFile), { recursive: true });

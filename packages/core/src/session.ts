@@ -11,6 +11,7 @@
  */
 
 import { promises as fs, createReadStream } from "node:fs";
+import { t } from "./i18n.js";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -37,7 +38,9 @@ function defaultDir(): string {
 /** 生成一个可排序（时间前缀）的会话 id，无外部依赖 */
 export function newSessionId(now: number, rand: () => number): string {
   const ts = now.toString(36).padStart(9, "0");
-  const suffix = Math.floor(rand() * 0xfffff).toString(36).padStart(4, "0");
+  const suffix = Math.floor(rand() * 0xfffff)
+    .toString(36)
+    .padStart(4, "0");
   return `s_${ts}_${suffix}`;
 }
 
@@ -56,14 +59,23 @@ export class SessionStore {
   private async ensurePrivateDir(): Promise<void> {
     await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
     const stat = await fs.lstat(this.dir);
-    if (!stat.isDirectory()) throw new Error(`会话路径不是普通目录: ${this.dir}`);
+    if (!stat.isDirectory())
+      throw new Error(
+        t(
+          `Session path is not a regular directory: ${this.dir}`,
+          `会话路径不是普通目录: ${this.dir}`,
+        ),
+      );
     // mkdir 的 mode 受 umask 影响且不会修复既有目录，因此始终显式收紧。
     await fs.chmod(this.dir, 0o700);
   }
 
   private async secureExistingFile(file: string): Promise<void> {
     const stat = await fs.lstat(file);
-    if (!stat.isFile()) throw new Error(`会话路径不是普通文件: ${file}`);
+    if (!stat.isFile())
+      throw new Error(
+        t(`Session path is not a regular file: ${file}`, `会话路径不是普通文件: ${file}`),
+      );
     await fs.chmod(file, 0o600);
   }
 
@@ -134,9 +146,15 @@ export class SessionStore {
       if (obj.__meta) meta = obj.__meta;
       else messages.push(obj as ChatMessage);
     }
-    if (!meta) throw new Error(`会话 ${id} 缺少 meta 头`);
+    if (!meta)
+      throw new Error(t(`Session ${id} is missing its meta header`, `会话 ${id} 缺少 meta 头`));
     if (meta.id !== id) {
-      throw new Error(`会话 ${id} 的 meta id 不匹配: ${meta.id}`);
+      throw new Error(
+        t(
+          `Session ${id} has a mismatched meta id: ${meta.id}`,
+          `会话 ${id} 的 meta id 不匹配: ${meta.id}`,
+        ),
+      );
     }
     return { ...(await withFileActivity(meta, file)), messages };
   }
@@ -177,12 +195,10 @@ export class SessionStore {
 }
 
 function assertSessionId(id: string): void {
-  if (
-    id.length === 0 ||
-    id.length > 128 ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)
-  ) {
-    throw new Error(`非法会话 id: ${JSON.stringify(id)}`);
+  if (id.length === 0 || id.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+    throw new Error(
+      t(`Invalid session id: ${JSON.stringify(id)}`, `非法会话 id: ${JSON.stringify(id)}`),
+    );
   }
 }
 
@@ -193,9 +209,7 @@ function assertSessionId(id: string): void {
 async function withFileActivity(meta: SessionMeta, file: string): Promise<SessionMeta> {
   const stat = await fs.stat(file);
   const stored = Date.parse(meta.updatedAt);
-  const activityMs = Number.isFinite(stored)
-    ? Math.max(stored, stat.mtimeMs)
-    : stat.mtimeMs;
+  const activityMs = Number.isFinite(stored) ? Math.max(stored, stat.mtimeMs) : stat.mtimeMs;
   return { ...meta, updatedAt: new Date(activityMs).toISOString() };
 }
 

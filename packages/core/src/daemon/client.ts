@@ -6,6 +6,7 @@
  */
 
 import * as net from "node:net";
+import { t } from "../i18n.js";
 import type { SessionEvent, SessionSnapshot, SessionSummary } from "../session-manager.js";
 import type { SessionHost, OpenHandle, PermissionDecisionKind } from "../host.js";
 import {
@@ -50,7 +51,7 @@ export class DaemonClient implements SessionHost {
     sock.on("data", (chunk) => this.onData(chunk as unknown as string));
     sock.on("error", (error) => this.markTerminal(error));
     sock.on("close", () => {
-      this.markTerminal(new Error("daemon 连接已断开"));
+      this.markTerminal(new Error(t("daemon connection lost", "daemon 连接已断开")));
     });
   }
 
@@ -67,11 +68,18 @@ export class DaemonClient implements SessionHost {
       const { messages, rest } = decodeLines<unknown>(this.buffer);
       this.buffer = rest;
       for (const frame of messages) {
-        if (!isServerFrame(frame)) throw new Error("无效 daemon frame");
+        if (!isServerFrame(frame)) throw new Error(t("Invalid daemon frame", "无效 daemon frame"));
         this.dispatch(frame);
       }
     } catch {
-      this.markTerminal(new Error("daemon 返回了无效或过大的协议帧"));
+      this.markTerminal(
+        new Error(
+          t(
+            "daemon returned an invalid or oversized protocol frame",
+            "daemon 返回了无效或过大的协议帧",
+          ),
+        ),
+      );
       this.sock.destroy();
     }
   }
@@ -106,13 +114,23 @@ export class DaemonClient implements SessionHost {
       const pending = this.pending.get(frame.id);
       if (!pending) return;
       pending.chunks ??= [];
-      pending.chunkBytes =
-        (pending.chunkBytes ?? 0) + Buffer.byteLength(frame.chunk, "utf8");
+      pending.chunkBytes = (pending.chunkBytes ?? 0) + Buffer.byteLength(frame.chunk, "utf8");
       // daemon 是本机受信进程，但仍给损坏/恶意 peer 一个总结果硬上限。
       if (pending.chunkBytes > MAX_RESULT_BYTES) {
         this.pending.delete(frame.id);
-        pending.reject(new Error(`daemon 分块结果超过 ${MAX_RESULT_BYTES} bytes`));
-        this.markTerminal(new Error("daemon 分块结果超过安全上限"));
+        pending.reject(
+          new Error(
+            t(
+              `daemon chunked result exceeds ${MAX_RESULT_BYTES} bytes`,
+              `daemon 分块结果超过 ${MAX_RESULT_BYTES} bytes`,
+            ),
+          ),
+        );
+        this.markTerminal(
+          new Error(
+            t("daemon chunked result exceeds the safety limit", "daemon 分块结果超过安全上限"),
+          ),
+        );
         this.sock.destroy();
         return;
       }
@@ -122,8 +140,12 @@ export class DaemonClient implements SessionHost {
         try {
           pending.resolve(JSON.parse(pending.chunks.join("")) as unknown);
         } catch {
-          pending.reject(new Error("daemon 分块结果不是有效 JSON"));
-          this.markTerminal(new Error("daemon 分块结果不是有效 JSON"));
+          pending.reject(
+            new Error(t("daemon chunked result is not valid JSON", "daemon 分块结果不是有效 JSON")),
+          );
+          this.markTerminal(
+            new Error(t("daemon chunked result is not valid JSON", "daemon 分块结果不是有效 JSON")),
+          );
           this.sock.destroy();
         }
       }
@@ -137,7 +159,9 @@ export class DaemonClient implements SessionHost {
 
   private request<T>(build: (id: number) => ClientRequest): Promise<T> {
     if (this.terminalError || this.sock.destroyed) {
-      return Promise.reject(this.terminalError ?? new Error("daemon 连接已关闭"));
+      return Promise.reject(
+        this.terminalError ?? new Error(t("daemon connection closed", "daemon 连接已关闭")),
+      );
     }
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
@@ -249,6 +273,23 @@ export class DaemonClient implements SessionHost {
     await this.request((id) => ({ id, method: "interrupt", sessionId }));
   }
 
+  async undo(
+    sessionId: string,
+    checkpointId?: string,
+  ): Promise<{ restored: number; deleted: number }> {
+    const data = await this.request((id) => ({
+      id,
+      method: "undo",
+      sessionId,
+      ...(checkpointId ? { checkpointId } : {}),
+    }));
+    const r = (data ?? {}) as { restored?: unknown; deleted?: unknown };
+    return {
+      restored: typeof r.restored === "number" ? r.restored : 0,
+      deleted: typeof r.deleted === "number" ? r.deleted : 0,
+    };
+  }
+
   answerPermission(
     sessionId: string,
     permId: string,
@@ -263,7 +304,7 @@ export class DaemonClient implements SessionHost {
       if (sub.activation) clearImmediate(sub.activation);
     }
     this.listeners.clear();
-    this.markTerminal(new Error("daemon client 已释放"));
+    this.markTerminal(new Error(t("daemon client has been disposed", "daemon client 已释放")));
     // end() 只关闭 writable half；异常/旧 daemon 若不回 FIN，会留下 readOnly
     // socket 挂住进程退出。dispose 是终态，直接销毁双向连接。
     this.sock.destroy();

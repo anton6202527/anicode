@@ -133,7 +133,9 @@ test("Agent: 对话自动持久化，可 resume 续接", async () => {
 
   // 第一段会话
   const agent1 = new Agent({
-    provider: scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "记住：项目叫 X" }] }]]),
+    provider: scriptedProvider([
+      [{ role: "assistant", content: [{ type: "text", text: "记住：项目叫 X" }] }],
+    ]),
     model: "m",
     cwd: dir,
     projectMemory: false,
@@ -147,7 +149,9 @@ test("Agent: 对话自动持久化，可 resume 续接", async () => {
 
   // resume：新 Agent 载入历史续接
   const agent2 = new Agent({
-    provider: scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "项目叫 X" }] }]]),
+    provider: scriptedProvider([
+      [{ role: "assistant", content: [{ type: "text", text: "项目叫 X" }] }],
+    ]),
     model: "m",
     cwd: dir,
     projectMemory: false,
@@ -159,7 +163,7 @@ test("Agent: 对话自动持久化，可 resume 续接", async () => {
   // 续接后文件应有 4 条（2 旧 + 2 新），且不重复旧消息
   const after = await store.load(id);
   assert.equal(after.messages.length, 4);
-  assert.equal((after.messages[0]!.content[0] as any).text, "hi" === "hi" ? "项目叫什么，先记住" : "");
+  assert.equal((after.messages[0]!.content[0] as any).text, "项目叫什么，先记住");
 
   await fs.rm(dir, { recursive: true, force: true });
 });

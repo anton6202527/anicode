@@ -14,7 +14,7 @@
     "watch": "node esbuild.mjs --watch",
     "vscode:prepublish": "node esbuild.mjs --production",
     "package": "vsce package --no-dependencies -o anicode.vsix",
-    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "test": "ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "activationEvents": ["onView:anicode.chat"],

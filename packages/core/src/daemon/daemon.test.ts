@@ -28,7 +28,8 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
     async *stream(): AsyncIterable<StreamEvent> {
       const content = scripts[turn++]?.[0]?.content ?? [];
       const hasTool = content.some((p) => p.type === "tool_call");
-      for (const part of content) if (part.type === "text") yield { type: "text_delta", text: part.text };
+      for (const part of content)
+        if (part.type === "text") yield { type: "text_delta", text: part.text };
       yield {
         type: "done",
         stopReason: hasTool ? "tool_use" : "end_turn",
@@ -52,13 +53,26 @@ async function startDaemon(dir: string, provider: Provider) {
 
 test("daemon: 两个客户端共享同一会话，一个 send 两个都收事件", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-"));
-  const { server, sockPath } = await startDaemon(dir, scriptedProvider([
-    [{ role: "assistant", content: [
-      { type: "text", text: "写文件" },
-      { type: "tool_call", id: "c1", name: "write", args: { path: "d.txt", content: "shared" } },
-    ] }],
-    [{ role: "assistant", content: [{ type: "text", text: "完成" }] }],
-  ]));
+  const { server, sockPath } = await startDaemon(
+    dir,
+    scriptedProvider([
+      [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "写文件" },
+            {
+              type: "tool_call",
+              id: "c1",
+              name: "write",
+              args: { path: "d.txt", content: "shared" },
+            },
+          ],
+        },
+      ],
+      [{ role: "assistant", content: [{ type: "text", text: "完成" }] }],
+    ]),
+  );
 
   // 客户端 A 建会话并订阅
   const clientA: SessionHost = await DaemonClient.connect(sockPath);
@@ -89,7 +103,10 @@ test("daemon: 两个客户端共享同一会话，一个 send 两个都收事件
   assert.equal(await answerResult, true);
 
   // B（没发 send）收到了完整事件流：权限广播 + done
-  assert.ok(eventsB.some((e) => e.type === "permission_request"), "B 应看到权限请求广播");
+  assert.ok(
+    eventsB.some((e) => e.type === "permission_request"),
+    "B 应看到权限请求广播",
+  );
   const bRequest = eventsB.findIndex((e) => e.type === "permission_request" && e.permId === "c1");
   const bResolved = eventsB.findIndex(
     (e) => e.type === "permission_resolved" && e.permId === "c1" && e.decision === "allow",
@@ -249,10 +266,7 @@ test("daemon: 同一客户端并发 open 同一冷会话不会重复订阅事件
     second.filter((event) => event.type === "agent" && event.event.type === "text").length,
     1,
   );
-  assert.equal(
-    second.filter((event) => event.type === "state" && event.running).length,
-    1,
-  );
+  assert.equal(second.filter((event) => event.type === "state" && event.running).length, 1);
 
   client.dispose();
   await server.close();
@@ -266,10 +280,12 @@ test("daemon server: 请求 UTF-8 字符跨 socket chunk 时不损坏", async ()
   const provider: Provider = {
     name: "utf8-capture",
     async *stream(req): AsyncIterable<StreamEvent> {
-      const text = req.messages
-        .at(-1)?.content.filter((part) => part.type === "text")
-        .map((part) => part.text)
-        .join("") ?? "";
+      const text =
+        req.messages
+          .at(-1)
+          ?.content.filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("") ?? "";
       capture(text);
       yield {
         type: "done",
@@ -311,7 +327,12 @@ test("daemon: open 返回 snapshot；resume 已有会话", async () => {
 
   const manager = new SessionManager({
     store,
-    resolveProvider: () => ({ provider: scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "ok" }] }]]), model: "scripted" }),
+    resolveProvider: () => ({
+      provider: scriptedProvider([
+        [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+      ]),
+      model: "scripted",
+    }),
   });
   const server = new DaemonServer({ manager });
   const sockPath = path.join(dir, "d.sock");
@@ -339,9 +360,7 @@ test("daemon: close 后立即 reopen 串行生效，listener 异常不截断后�
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-reopen-"));
   const { server, sockPath } = await startDaemon(
     dir,
-    scriptedProvider([
-      [{ role: "assistant", content: [{ type: "text", text: "after reopen" }] }],
-    ]),
+    scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "after reopen" }] }]]),
   );
   const client = await DaemonClient.connect(sockPath);
   const meta = await client.createSession({ cwd: dir, model: "scripted" });

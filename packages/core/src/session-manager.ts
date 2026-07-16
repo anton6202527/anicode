@@ -14,20 +14,21 @@
  * 传输无关：进程内前端直接用它；daemon 只是它之上的一层 socket 转发。
  */
 
+import { t } from "./i18n.js";
 import type { ChatMessage, Usage } from "./types.js";
-import {
-  Agent,
-  type AgentEvent,
-  type AgentOptions,
-  type AgentResolvedModel,
-} from "./agent.js";
+import { Agent, type AgentEvent, type AgentOptions, type AgentResolvedModel } from "./agent.js";
 import type { ToolRegistry } from "./tools/tool.js";
 import type { HookRegistration } from "./hooks.js";
 import type { SubagentDefinition } from "./subagent.js";
 import type { CompactionConfig } from "./context.js";
 import { SessionStore, newSessionId, type SessionMeta } from "./session.js";
 import { defaultSmallModel } from "./provider/registry.js";
-import type { PermissionConfig, PermissionDecision, PermissionRequest } from "./permission.js";
+import type {
+  PermissionConfig,
+  PermissionDecision,
+  PermissionRequest,
+  PermissionMode,
+} from "./permission.js";
 
 // ---------- 对外事件与快照 ----------
 
@@ -36,7 +37,15 @@ export type SessionEvent =
   | { type: "agent"; event: AgentEvent }
   | { type: "permission_request"; permId: string; toolName: string; ruleKey: string }
   | { type: "permission_resolved"; permId: string; decision: PermissionAnswer }
+  | { type: "reverted"; checkpointId: string; restored: number; deleted: number }
   | { type: "state"; running: boolean };
+
+/** 一个可撤销点：某轮用户输入前的工作区快照。 */
+export interface Checkpoint {
+  id: string;
+  tree: string;
+  label: string;
+}
 
 export type PermissionAnswer = "allow" | "allow_remember" | "deny";
 
@@ -78,6 +87,10 @@ export interface SessionManagerOptions {
   smallModel?: boolean | string;
   /** OS 级 bash 沙箱策略（macOS 第一阶段）；也可由 AGENTX_BASH_SANDBOX 覆盖。 */
   sandbox?: AgentOptions["sandbox"];
+  /** 每轮用户输入前记工作区 git 快照，支持 undo 回滚文件改动。默认关。 */
+  checkpoints?: boolean;
+  /** 会话开始时注入 repo map（代码骨架）帮助模型定位。默认关。 */
+  repoMap?: AgentOptions["repoMap"];
   /** 生成会话 id 的时钟/随机源（测试可注入） */
   now?: () => number;
   rand?: () => number;
@@ -113,6 +126,7 @@ class ManagedSession {
   private abort: AbortController | null = null;
   private permSeq = 0;
   private driving = false;
+  private checkpoints: Checkpoint[] = [];
   private pendingSends: PendingSend[] = [];
   private currentWaiters: SendWaiter[] = [];
 
@@ -227,6 +241,9 @@ class ManagedSession {
         this.abort = new AbortController();
         try {
           for await (const ev of this.agent.send(next.text, this.abort.signal)) {
+            if (ev.type === "checkpoint") {
+              this.checkpoints.push({ id: ev.id, tree: ev.tree, label: ev.label });
+            }
             this.emit({ type: "agent", event: ev });
           }
           for (const waiter of this.currentWaiters) waiter.resolve();
@@ -254,7 +271,7 @@ class ManagedSession {
     // 可能同步重入 send；该消息应排入下一 drive，而非注入即将终止的本轮。
     this.agent.clearQueue();
     this.abort?.abort();
-    const interrupted = new Error("会话已中断");
+    const interrupted = new Error(t("Session interrupted", "会话已中断"));
     for (const waiter of this.currentWaiters.filter((w) => w.steering)) waiter.reject(interrupted);
     this.currentWaiters = this.currentWaiters.filter((w) => !w.steering);
     for (const pending of this.pendingSends.splice(0)) pending.reject(interrupted);
@@ -262,12 +279,55 @@ class ManagedSession {
     for (const [permId] of this.pending) this.answerPermission(permId, "deny");
   }
 
+  setPermissionMode(mode: PermissionMode): void {
+    this.agent.setPermissionMode(mode);
+  }
+
+  getPermissionMode(): PermissionMode {
+    return this.agent.getPermissionMode();
+  }
+
+  listCheckpoints(): Checkpoint[] {
+    return [...this.checkpoints];
+  }
+
+  /**
+   * 撤销：把工作区文件回滚到某个快照（缺省=最近一个）。回滚后丢弃该快照及其之后的快照，
+   * 使连续 undo 逐步回退。运行中拒绝（避免与工具写入竞争）。仅回滚文件，不改对话历史。
+   */
+  async undo(checkpointId?: string): Promise<{ restored: number; deleted: number }> {
+    if (this.driving)
+      throw new Error(
+        t("Session is running; interrupt it before undoing", "会话运行中，请先中断再撤销"),
+      );
+    const store = this.agent.snapshotStore;
+    if (!store)
+      throw new Error(
+        t("This session has no workspace snapshots enabled", "该会话未启用工作区快照"),
+      );
+    if (this.checkpoints.length === 0)
+      throw new Error(t("No snapshot available to undo", "没有可撤销的快照"));
+    const idx = checkpointId
+      ? this.checkpoints.findIndex((c) => c.id === checkpointId)
+      : this.checkpoints.length - 1;
+    if (idx < 0)
+      throw new Error(t(`Snapshot ${checkpointId} not found`, `未找到快照 ${checkpointId}`));
+    const target = this.checkpoints[idx]!;
+    const res = await store.restore({ tree: target.tree });
+    this.checkpoints.splice(idx); // 丢弃目标及其之后的快照
+    this.emit({
+      type: "reverted",
+      checkpointId: target.id,
+      restored: res.restored,
+      deleted: res.deleted,
+    });
+    return res;
+  }
+
   /** 同一毫秒内的连续活动也保持严格递增，便于稳定排序与 snapshot 比较。 */
   private touch(): void {
     const previous = Date.parse(this.meta.updatedAt);
-    const next = Number.isFinite(previous)
-      ? Math.max(Date.now(), previous + 1)
-      : Date.now();
+    const next = Number.isFinite(previous) ? Math.max(Date.now(), previous + 1) : Date.now();
     this.meta.updatedAt = new Date(next).toISOString();
   }
 }
@@ -299,7 +359,11 @@ export class SessionManager {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  async createSession(input: { cwd: string; model: string; title?: string }): Promise<SessionSummary> {
+  async createSession(input: {
+    cwd: string;
+    model: string;
+    title?: string;
+  }): Promise<SessionSummary> {
     // provider 解析可能因未知配置失败；必须在落盘前完成，避免留下一个永远
     // 无法 open/resume 的孤儿 JSONL。解析结果直接交给 instantiate，勿重复创建。
     const resolved = this.opts.resolveProvider(input.model);
@@ -350,6 +414,26 @@ export class SessionManager {
 
   async interrupt(sessionId: string): Promise<void> {
     this.sessions.get(sessionId)?.interrupt();
+  }
+
+  /** 列出会话的可撤销点（最近的在末尾）。未加载/未启用快照时返回空数组。 */
+  listCheckpoints(sessionId: string): Checkpoint[] {
+    return this.sessions.get(sessionId)?.listCheckpoints() ?? [];
+  }
+
+  /** 撤销会话的文件改动到某快照（缺省=最近一个）。仅回滚文件，不改对话历史。 */
+  async undo(
+    sessionId: string,
+    checkpointId?: string,
+  ): Promise<{ restored: number; deleted: number }> {
+    const session = await this.ensureLive(sessionId);
+    return session.undo(checkpointId);
+  }
+
+  /** 运行时切换会话的权限模式（如 /plan 进入/退出计划模式）。 */
+  async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
+    const session = await this.ensureLive(sessionId);
+    session.setPermissionMode(mode);
   }
 
   /** 同步读取一个 live 会话的当前快照；未加载则返回 undefined（不触发磁盘载入）。 */
@@ -421,27 +505,31 @@ export class SessionManager {
     resumeMessages: ChatMessage[],
     resolved: ResolvedProvider,
   ): ManagedSession {
-    const session = new ManagedSession(meta, (confirm) =>
-      new Agent({
-        provider: resolved.provider,
-        model: resolved.model,
-        ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
-        resolveModel: this.opts.resolveProvider,
-        ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
-        ...(this.opts.sandbox ? { sandbox: this.opts.sandbox } : {}),
-        cwd: meta.cwd,
-        permission: { mode: "default", ...this.opts.permission, confirm },
-        ...(this.opts.tools ? { tools: this.opts.tools() } : {}),
-        ...(this.opts.hooks ? { hooks: this.opts.hooks } : {}),
-        ...(this.opts.subagents !== undefined ? { subagents: this.opts.subagents } : {}),
-        ...(this.opts.skills !== undefined ? { skills: this.opts.skills } : {}),
-        ...(this.opts.compaction !== undefined ? { compaction: this.opts.compaction } : {}),
-        persistence: {
-          store: this.opts.store,
-          meta,
-          ...(resumeMessages.length ? { resumeMessages } : {}),
-        },
-      }),
+    const session = new ManagedSession(
+      meta,
+      (confirm) =>
+        new Agent({
+          provider: resolved.provider,
+          model: resolved.model,
+          ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
+          resolveModel: this.opts.resolveProvider,
+          ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
+          ...(this.opts.sandbox ? { sandbox: this.opts.sandbox } : {}),
+          ...(this.opts.checkpoints ? { checkpoints: true } : {}),
+          ...(this.opts.repoMap !== undefined ? { repoMap: this.opts.repoMap } : {}),
+          cwd: meta.cwd,
+          permission: { mode: "default", ...this.opts.permission, confirm },
+          ...(this.opts.tools ? { tools: this.opts.tools() } : {}),
+          ...(this.opts.hooks ? { hooks: this.opts.hooks } : {}),
+          ...(this.opts.subagents !== undefined ? { subagents: this.opts.subagents } : {}),
+          ...(this.opts.skills !== undefined ? { skills: this.opts.skills } : {}),
+          ...(this.opts.compaction !== undefined ? { compaction: this.opts.compaction } : {}),
+          persistence: {
+            store: this.opts.store,
+            meta,
+            ...(resumeMessages.length ? { resumeMessages } : {}),
+          },
+        }),
     );
     this.sessions.set(meta.id, session);
     return session;

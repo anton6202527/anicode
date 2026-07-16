@@ -13,16 +13,13 @@
 import {
   connectMcpServers,
   defaultTools,
+  t,
   type McpClient,
   type McpServerConfig,
   type Tool,
   type ToolRegistry,
 } from "@anicode/core";
-import {
-  mergePluginState,
-  type PluginEntry,
-  type PluginRuntimeStatus,
-} from "../shared/plugins.js";
+import { mergePluginState, type PluginEntry, type PluginRuntimeStatus } from "../shared/plugins.js";
 
 export type McpConnector = (
   configs: McpServerConfig[],
@@ -72,7 +69,13 @@ export class PluginRuntime {
       if (this.connections.has(entry.id)) continue;
       const missing = (entry.requiresEnv ?? []).filter((name) => !this.env[name]?.trim());
       if (missing.length > 0) {
-        this.status.set(entry.id, { connected: false, error: `缺少环境变量 ${missing.join(", ")}` });
+        this.status.set(entry.id, {
+          connected: false,
+          error: t(
+            `Missing environment variable ${missing.join(", ")}`,
+            `缺少环境变量 ${missing.join(", ")}`,
+          ),
+        });
         continue;
       }
       const spec = entry.mcpServer!;

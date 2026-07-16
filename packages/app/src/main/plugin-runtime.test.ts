@@ -74,7 +74,12 @@ test("PluginRuntime: 缺环境变量的 MCP 不连接，状态标记缺失凭证
   const rt = new PluginRuntime(fake.connect, {}); // 无 BRAVE_API_KEY
   await rt.setState(["mcp.websearch"]);
   assert.equal(fake.calls.length, 0, "缺凭证不应尝试连接");
-  assert.ok(!rt.buildToolRegistry().names().some((n) => n.startsWith("websearch__")));
+  assert.ok(
+    !rt
+      .buildToolRegistry()
+      .names()
+      .some((n) => n.startsWith("websearch__")),
+  );
   const status = rt.entriesWithStatus().find((e) => e.id === "mcp.websearch")?.runtime;
   assert.equal(status?.connected, false);
   assert.match(status?.error ?? "", /BRAVE_API_KEY/);

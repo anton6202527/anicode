@@ -6,13 +6,13 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { t } from "@anicode/core";
 import { ChatBridge } from "./bridge.js";
 import { buildManager, modelChoices, DEFAULT_MODEL } from "./host.js";
 import type { HostToWebview, WebviewToHost } from "./protocol.js";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const cwd =
-    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd() ?? os.homedir();
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd() ?? os.homedir();
   const sessionsDir = path.join(context.globalStorageUri.fsPath, "sessions");
   const manager = buildManager(sessionsDir);
 
@@ -22,7 +22,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const provider = new ChatViewProvider(context.extensionUri, manager, cwd, () => {
     status.text = `$(sparkle) ${provider.model}`;
-    status.tooltip = `anicode 模型：${provider.model}（点击切换）`;
+    status.tooltip = t(
+      `anicode model: ${provider.model} (click to switch)`,
+      `anicode 模型：${provider.model}（点击切换）`,
+    );
     status.show();
   });
 
@@ -90,7 +93,11 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     const choices = await modelChoices();
     const pick = await vscode.window.showQuickPick(
       choices.map((c) => ({ label: c.label, detail: c.detail, spec: c.spec })),
-      { title: "选择模型", placeHolder: "✔ 可直接使用 · ✖ 缺凭证", matchOnDetail: true },
+      {
+        title: t("Select model", "选择模型"),
+        placeHolder: t("✔ ready to use · ✖ missing credential", "✔ 可直接使用 · ✖ 缺凭证"),
+        matchOnDetail: true,
+      },
     );
     if (!pick) return;
     await this.reveal();
@@ -100,23 +107,27 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   async resume(): Promise<void> {
     type Item = vscode.QuickPickItem & { id: string };
-    const toItems = (sessions: readonly { id: string; title?: string; model: string; running: boolean }[]): Item[] =>
+    const toItems = (
+      sessions: readonly { id: string; title?: string; model: string; running: boolean }[],
+    ): Item[] =>
       sessions.map((s) => ({
-        label: s.title ?? "未命名对话",
-        description: `${s.model}${s.running ? " · 运行中" : ""}`,
+        label: s.title ?? t("Untitled chat", "未命名对话"),
+        description: `${s.model}${s.running ? t(" · running", " · 运行中") : ""}`,
         detail: s.id,
         id: s.id,
-        buttons: [{ iconPath: new vscode.ThemeIcon("trash"), tooltip: "删除会话" }],
+        buttons: [
+          { iconPath: new vscode.ThemeIcon("trash"), tooltip: t("Delete session", "删除会话") },
+        ],
       }));
 
     const initial = await this.manager.listSessions();
     if (initial.length === 0) {
-      void vscode.window.showInformationMessage("暂无历史会话");
+      void vscode.window.showInformationMessage(t("No past sessions", "暂无历史会话"));
       return;
     }
 
     const qp = vscode.window.createQuickPick<Item>();
-    qp.title = "会话（Enter 恢复 · 🗑 删除）";
+    qp.title = t("Sessions (Enter to resume · 🗑 to delete)", "会话（Enter 恢复 · 🗑 删除）");
     qp.items = toItems(initial);
 
     qp.onDidTriggerItemButton(async (e) => {
@@ -144,10 +155,17 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async openFile(relPath: string): Promise<void> {
     try {
-      const uri = vscode.Uri.file(path.isAbsolute(relPath) ? relPath : path.join(this.cwd, relPath));
+      const uri = vscode.Uri.file(
+        path.isAbsolute(relPath) ? relPath : path.join(this.cwd, relPath),
+      );
       await vscode.window.showTextDocument(uri, { preview: true });
     } catch (err) {
-      void vscode.window.showErrorMessage(`打开文件失败：${err instanceof Error ? err.message : String(err)}`);
+      void vscode.window.showErrorMessage(
+        t(
+          `Failed to open file: ${err instanceof Error ? err.message : String(err)}`,
+          `打开文件失败：${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
     }
   }
 
@@ -162,8 +180,12 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private html(webview: vscode.Webview): string {
     const nonce = makeNonce();
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "out", "webview.js"));
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "media", "style.css"));
+    const scriptUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, "out", "webview.js"),
+    );
+    const styleUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, "media", "style.css"),
+    );
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} data:`,

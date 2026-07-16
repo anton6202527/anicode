@@ -10,10 +10,8 @@
  */
 
 import * as net from "node:net";
-import {
-  SessionManager,
-  type SessionEvent,
-} from "../session-manager.js";
+import { t } from "../i18n.js";
+import { SessionManager, type SessionEvent } from "../session-manager.js";
 import {
   decodeLines,
   encodeFrame,
@@ -90,7 +88,7 @@ export class DaemonServer {
         };
         const onClose = () => {
           cleanupWait();
-          reject(new Error("客户端连接已关闭"));
+          reject(new Error(t("Client connection closed", "客户端连接已关闭")));
         };
         const onError = (error: Error) => {
           cleanupWait();
@@ -111,14 +109,7 @@ export class DaemonServer {
             sock.destroy();
             return;
           }
-          void this.handle(
-            req,
-            write,
-            waitForDrain,
-            subs,
-            subscriptionOps,
-            () => connectionClosed,
-          );
+          void this.handle(req, write, waitForDrain, subs, subscriptionOps, () => connectionClosed);
         }
       } catch {
         // 协议错误只关闭当前连接，不能让未捕获的 JSON.parse 异常击穿 daemon。
@@ -186,7 +177,12 @@ export class DaemonServer {
     const serialized = JSON.stringify(data) ?? "null";
     const serializedBytes = Buffer.byteLength(serialized, "utf8");
     if (serializedBytes > MAX_RESULT_BYTES) {
-      throw new Error(`daemon 结果超过 ${MAX_RESULT_BYTES} bytes`);
+      throw new Error(
+        t(
+          `daemon result exceeds ${MAX_RESULT_BYTES} bytes`,
+          `daemon 结果超过 ${MAX_RESULT_BYTES} bytes`,
+        ),
+      );
     }
     // 固定字段开销远小于 256 bytes；这里保守预留，边界附近宁可分块。
     if (serializedBytes + 256 <= MAX_FRAME_BYTES) {
@@ -224,7 +220,8 @@ export class DaemonServer {
           ...(req.title ? { title: req.title } : {}),
         });
       case "open": {
-        if (isConnectionClosed()) throw new Error("客户端连接已关闭");
+        if (isConnectionClosed())
+          throw new Error(t("Client connection closed", "客户端连接已关闭"));
         if (subs.has(req.sessionId)) {
           // 同一连接重复 open 时复用已有订阅，但仍必须履行
           // SessionHost.open 的快照契约。临时 open 只用于取最新 snapshot，
@@ -251,6 +248,8 @@ export class DaemonServer {
       case "interrupt":
         await this.manager.interrupt(req.sessionId);
         return null;
+      case "undo":
+        return this.manager.undo(req.sessionId, req.checkpointId);
       case "answerPermission":
         return this.manager.answerPermission(req.sessionId, req.permId, req.decision);
     }

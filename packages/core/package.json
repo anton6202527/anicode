@@ -4,14 +4,15 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./i18n": "./src/i18n.ts"
   },
   "bin": {
     "anicode-daemon": "./bin/anicode-daemon.mjs"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "test": "ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
     "demo": "tsx src/demo.ts",
     "daemon": "tsx src/daemon/launch.ts"
   },

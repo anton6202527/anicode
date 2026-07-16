@@ -35,7 +35,12 @@ function parseFrontmatter(text: string): { meta: Record<string, string>; body: s
 }
 
 function firstLine(s: string): string {
-  return s.split(/\r?\n/).find((l) => l.trim())?.trim() ?? "";
+  return (
+    s
+      .split(/\r?\n/)
+      .find((l) => l.trim())
+      ?.trim() ?? ""
+  );
 }
 
 async function readDir(dir: string): Promise<{ name: string; file: string }[]> {

@@ -43,7 +43,10 @@ test("DebugProvider: 四种指令生成可执行的工具场景", async () => {
     const done = events.at(-1);
     assert.ok(done && done.type === "done");
     assert.equal(done.stopReason, "tool_use");
-    assert.deepEqual(toolCallsOf(done.message).map((call) => call.name), names);
+    assert.deepEqual(
+      toolCallsOf(done.message).map((call) => call.name),
+      names,
+    );
     assert.equal(events.filter((event) => event.type === "tool_call_start").length, names.length);
     assert.equal(events.filter((event) => event.type === "tool_call_end").length, names.length);
   }
@@ -75,7 +78,10 @@ test("DebugProvider: 工具结果后收尾，不重复发起同一指令", async
   assert.equal(secondDone.stopReason, "end_turn");
   assert.equal(toolCallsOf(secondDone.message).length, 0);
   assert.match(
-    second.filter((event) => event.type === "text_delta").map((event) => event.text).join(""),
+    second
+      .filter((event) => event.type === "text_delta")
+      .map((event) => event.text)
+      .join(""),
     /bash: 完成/,
   );
 });
@@ -84,13 +90,16 @@ test("DebugProvider: 已中断请求不会产出事件", async () => {
   const controller = new AbortController();
   controller.abort();
   const provider = new DebugProvider({ delayMs: 0 });
-  await assert.rejects(async () => {
-    for await (const _event of provider.stream({
-      model: "demo",
-      messages: [textMessage("user", "hello")],
-      signal: controller.signal,
-    })) {
-      // drain
-    }
-  }, { name: "AbortError" });
+  await assert.rejects(
+    async () => {
+      for await (const _event of provider.stream({
+        model: "demo",
+        messages: [textMessage("user", "hello")],
+        signal: controller.signal,
+      })) {
+        // drain
+      }
+    },
+    { name: "AbortError" },
+  );
 });

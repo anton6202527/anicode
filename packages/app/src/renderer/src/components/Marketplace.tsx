@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { t } from "@anicode/core";
 import type { PluginEntry, PluginCategory } from "../../../shared/plugins.js";
 
 interface Props {
@@ -7,10 +8,10 @@ interface Props {
 }
 
 const CATEGORY_LABEL: Record<PluginCategory | "all", string> = {
-  all: "全部",
-  tool: "内建工具",
-  mcp: "MCP 服务",
-  skill: "技能",
+  all: t("All", "全部"),
+  tool: t("Built-in tools", "内建工具"),
+  mcp: t("MCP services", "MCP 服务"),
+  skill: t("Skills", "技能"),
 };
 
 export function Marketplace({ plugins, onToggle }: Props) {
@@ -26,14 +27,23 @@ export function Marketplace({ plugins, onToggle }: Props) {
     <div className="market">
       <header className="market-head">
         <div>
-          <h1>插件市场</h1>
-          <p>为 agent 扩展能力：内建工具、MCP 服务与技能。已启用 {enabledCount} / {plugins.length}。</p>
+          <h1>{t("Marketplace", "插件市场")}</h1>
+          <p>
+            {t(
+              `Extend agent capabilities: built-in tools, MCP services, and skills. Enabled ${enabledCount} / ${plugins.length}.`,
+              `为 agent 扩展能力：内建工具、MCP 服务与技能。已启用 ${enabledCount} / ${plugins.length}。`,
+            )}
+          </p>
         </div>
       </header>
 
       <div className="market-tabs">
         {(["all", "tool", "mcp", "skill"] as const).map((c) => (
-          <button key={c} className={`market-tab ${filter === c ? "active" : ""}`} onClick={() => setFilter(c)}>
+          <button
+            key={c}
+            className={`market-tab ${filter === c ? "active" : ""}`}
+            onClick={() => setFilter(c)}
+          >
             {CATEGORY_LABEL[c]}
           </button>
         ))}
@@ -47,7 +57,9 @@ export function Marketplace({ plugins, onToggle }: Props) {
               <div className="plugin-meta">
                 <div className="plugin-name">
                   {p.name}
-                  {p.builtin ? <span className="plugin-badge builtin">内建</span> : null}
+                  {p.builtin ? (
+                    <span className="plugin-badge builtin">{t("Built-in", "内建")}</span>
+                  ) : null}
                   <span className="plugin-badge cat">{CATEGORY_LABEL[p.category]}</span>
                 </div>
                 <div className="plugin-sub">
@@ -55,7 +67,11 @@ export function Marketplace({ plugins, onToggle }: Props) {
                 </div>
               </div>
               <label className="switch">
-                <input type="checkbox" checked={p.enabled} onChange={(e) => onToggle(p.id, e.target.checked)} />
+                <input
+                  type="checkbox"
+                  checked={p.enabled}
+                  onChange={(e) => onToggle(p.id, e.target.checked)}
+                />
                 <span className="slider" />
               </label>
             </div>
@@ -66,16 +82,29 @@ export function Marketplace({ plugins, onToggle }: Props) {
               </code>
             ) : null}
             {p.toolNames && p.toolNames.length > 0 ? (
-              <div className="plugin-tools">工具：{p.toolNames.join(" · ")}</div>
+              <div className="plugin-tools">
+                {t(`Tools: ${p.toolNames.join(" · ")}`, `工具：${p.toolNames.join(" · ")}`)}
+              </div>
             ) : null}
             {p.requiresEnv && p.requiresEnv.length > 0 ? (
-              <div className="plugin-env">需要环境变量：{p.requiresEnv.join(", ")}</div>
+              <div className="plugin-env">
+                {t(
+                  `Requires env vars: ${p.requiresEnv.join(", ")}`,
+                  `需要环境变量：${p.requiresEnv.join(", ")}`,
+                )}
+              </div>
             ) : null}
             {p.enabled && p.runtime ? (
               <div className={`plugin-status ${p.runtime.connected ? "ok" : "err"}`}>
                 {p.runtime.connected
-                  ? `● 已连接${p.runtime.toolCount != null ? ` · ${p.runtime.toolCount} 个工具` : ""}`
-                  : `● 未连接：${p.runtime.error ?? "连接失败"}`}
+                  ? t(
+                      `● Connected${p.runtime.toolCount != null ? ` · ${p.runtime.toolCount} tools` : ""}`,
+                      `● 已连接${p.runtime.toolCount != null ? ` · ${p.runtime.toolCount} 个工具` : ""}`,
+                    )
+                  : t(
+                      `● Not connected: ${p.runtime.error ?? t("Connection failed", "连接失败")}`,
+                      `● 未连接：${p.runtime.error ?? t("Connection failed", "连接失败")}`,
+                    )}
               </div>
             ) : null}
           </div>

@@ -1,0 +1,9 @@
+node_modules
+**/dist
+**/out
+**/build
+**/release
+**/*.vsix
+package-lock.json
+**/.anicode-dev
+**/coverage

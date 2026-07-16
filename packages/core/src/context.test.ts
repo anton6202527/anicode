@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadProjectMemory, composeSystem, estimateTokens, maybeCompact, microcompact } from "./context.js";
+import {
+  loadProjectMemory,
+  composeSystem,
+  estimateTokens,
+  maybeCompact,
+  microcompact,
+} from "./context.js";
 import { textMessage, type ChatMessage } from "./types.js";
 
 test("项目记忆: 逐级向上收集 AGENTS.md，止于 .git", async () => {
@@ -45,18 +51,64 @@ test("compaction: 未超阈值不压缩", async () => {
   assert.equal(res.messages.length, 2);
 });
 
+test("compaction: 真实 token 高于 char/4 估算时按实际触发（估算未过阈但实际过阈）", async () => {
+  const history: ChatMessage[] = [textMessage("user", "hi"), textMessage("assistant", "hello")];
+  // 估算仅几个 token，远低于阈值；但真实输入 token 传入 5000 > trigger 1000 → 应触发。
+  // 历史太短无法摘要，但会走 micro/短历史分支，beforeTokens 用真实值。
+  const res = await maybeCompact(
+    history,
+    { triggerTokens: 1_000, summarizer: async () => "S" },
+    5_000,
+  );
+  assert.equal(res.beforeTokens, 5_000, "beforeTokens 应为真实输入 token");
+  // 未传真实值时，同样历史不触发（估算远低于阈值）。
+  const res2 = await maybeCompact(history, { triggerTokens: 1_000, summarizer: async () => "S" });
+  assert.equal(res2.compacted, false);
+  assert.equal(res2.beforeTokens < 1_000, true);
+});
+
+test("compaction: 真实 token 尺度缩放后 afterTokens 也按真实尺度报告", async () => {
+  const big = "x".repeat(16_000);
+  const history: ChatMessage[] = [];
+  for (let i = 0; i < 4; i++) {
+    history.push({ role: "user", content: [{ type: "text", text: `${big} 任务${i}` }] });
+    history.push({
+      role: "assistant",
+      content: [{ type: "tool_call", id: `c${i}`, name: "read", args: {} }],
+    });
+    history.push({
+      role: "user",
+      content: [{ type: "tool_result", toolCallId: `c${i}`, toolName: "read", content: big }],
+    });
+    history.push({ role: "assistant", content: [{ type: "text", text: `完成${i}` }] });
+  }
+  const est = estimateTokens(history);
+  // 传入 2×估算的真实值 → scale≈2；afterTokens 应明显大于纯估算口径。
+  const res = await maybeCompact(
+    history,
+    { triggerTokens: 20_000, keepRecentMessages: 6, summarizer: async () => "【摘要】" },
+    est * 2,
+  );
+  assert.equal(res.compacted, true);
+  assert.equal(res.beforeTokens, est * 2);
+  // afterTokens 用 scale≈2 投影，应大于压缩后消息的纯 char/4 估算。
+  assert.ok(res.afterTokens > estimateTokens(res.messages), "afterTokens 应按真实尺度放大");
+});
+
 test("compaction: 切割点避开 tool_use/tool_result 对（向后找安全边界）", async () => {
   const big = "x".repeat(16_000);
   const history: ChatMessage[] = [];
   // 4 组完整轮次：user → assistant(tool_call) → user(tool_result) → assistant(text)
   for (let i = 0; i < 4; i++) {
     history.push({ role: "user", content: [{ type: "text", text: `${big} 任务${i}` }] });
-    history.push({ role: "assistant", content: [
-      { type: "tool_call", id: `c${i}`, name: "read", args: { path: "f" } },
-    ] });
-    history.push({ role: "user", content: [
-      { type: "tool_result", toolCallId: `c${i}`, toolName: "read", content: big },
-    ] });
+    history.push({
+      role: "assistant",
+      content: [{ type: "tool_call", id: `c${i}`, name: "read", args: { path: "f" } }],
+    });
+    history.push({
+      role: "user",
+      content: [{ type: "tool_result", toolCallId: `c${i}`, toolName: "read", content: big }],
+    });
     history.push({ role: "assistant", content: [{ type: "text", text: `完成${i}` }] });
   }
   // 期望 cutoff = 16-6 = 10 → 恰落在 user(tool_result) 上，必须向后挪到安全边界
@@ -76,7 +128,9 @@ test("compaction: 切割点避开 tool_use/tool_result 对（向后找安全边�
   );
   // 保留窗口内的 tool_result 必有配对的 tool_use 在窗口内
   const keptIds = new Set(
-    res.messages.flatMap((m) => m.content.filter((p) => p.type === "tool_call").map((p: any) => p.id)),
+    res.messages.flatMap((m) =>
+      m.content.filter((p) => p.type === "tool_call").map((p: any) => p.id),
+    ),
   );
   for (const m of res.messages) {
     for (const p of m.content) {
@@ -93,13 +147,25 @@ test("compaction: 无安全切割点时放弃压缩（不产出坏历史）", as
   const history: ChatMessage[] = [
     { role: "user", content: [{ type: "text", text: "唯一的开头" }] },
     { role: "assistant", content: [{ type: "tool_call", id: "c1", name: "read", args: {} }] },
-    { role: "user", content: [{ type: "tool_result", toolCallId: "c1", toolName: "read", content: big }] },
+    {
+      role: "user",
+      content: [{ type: "tool_result", toolCallId: "c1", toolName: "read", content: big }],
+    },
     { role: "assistant", content: [{ type: "tool_call", id: "c2", name: "read", args: {} }] },
-    { role: "user", content: [{ type: "tool_result", toolCallId: "c2", toolName: "read", content: big }] },
+    {
+      role: "user",
+      content: [{ type: "tool_result", toolCallId: "c2", toolName: "read", content: big }],
+    },
     { role: "assistant", content: [{ type: "tool_call", id: "c3", name: "read", args: {} }] },
-    { role: "user", content: [{ type: "tool_result", toolCallId: "c3", toolName: "read", content: big }] },
+    {
+      role: "user",
+      content: [{ type: "tool_result", toolCallId: "c3", toolName: "read", content: big }],
+    },
     { role: "assistant", content: [{ type: "tool_call", id: "c4", name: "read", args: {} }] },
-    { role: "user", content: [{ type: "tool_result", toolCallId: "c4", toolName: "read", content: big }] },
+    {
+      role: "user",
+      content: [{ type: "tool_result", toolCallId: "c4", toolName: "read", content: big }],
+    },
   ];
   const res = await maybeCompact(history, {
     triggerTokens: 10_000,
@@ -145,8 +211,21 @@ test("compaction: 超阈值时旧轮被摘要，最近轮保留", async () => {
 
 test("microcompaction: 只清旧工具结果且不修改传入历史", () => {
   const history: ChatMessage[] = [0, 1, 2].flatMap((i) => [
-    { role: "assistant" as const, content: [{ type: "tool_call" as const, id: `c${i}`, name: "read", args: {} }] },
-    { role: "user" as const, content: [{ type: "tool_result" as const, toolCallId: `c${i}`, toolName: "read", content: `${i}:` + "x".repeat(500) }] },
+    {
+      role: "assistant" as const,
+      content: [{ type: "tool_call" as const, id: `c${i}`, name: "read", args: {} }],
+    },
+    {
+      role: "user" as const,
+      content: [
+        {
+          type: "tool_result" as const,
+          toolCallId: `c${i}`,
+          toolName: "read",
+          content: `${i}:` + "x".repeat(500),
+        },
+      ],
+    },
   ]);
   const res = microcompact(history, 1);
   assert.equal(res.cleared, 2);
@@ -159,13 +238,21 @@ test("compaction: L2 摘要读取原始工具结果，而不是 microcompaction 
   const history: ChatMessage[] = [];
   for (let i = 0; i < 4; i++) {
     history.push(textMessage("user", `任务 ${i} ` + "u".repeat(2_000)));
-    history.push({ role: "assistant", content: [{ type: "tool_call", id: `c${i}`, name: "read", args: {} }] });
-    history.push({ role: "user", content: [{
-      type: "tool_result",
-      toolCallId: `c${i}`,
-      toolName: "read",
-      content: `ORIGINAL_RESULT_${i}:` + "r".repeat(2_000),
-    }] });
+    history.push({
+      role: "assistant",
+      content: [{ type: "tool_call", id: `c${i}`, name: "read", args: {} }],
+    });
+    history.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          toolCallId: `c${i}`,
+          toolName: "read",
+          content: `ORIGINAL_RESULT_${i}:` + "r".repeat(2_000),
+        },
+      ],
+    });
     history.push(textMessage("assistant", `完成 ${i}`));
   }
   let summaryInput: ChatMessage[] = [];

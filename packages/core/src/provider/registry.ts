@@ -6,14 +6,13 @@
  * 凭证只通过 descriptor 声明的环境变量读取，绝不会回退到其他 provider 的 key。
  */
 
+import { t } from "../i18n.js";
 import type { Provider } from "../types.js";
 import { AnthropicProvider } from "./anthropic.js";
+import { AuthStore } from "../auth/store.js";
+import { AnthropicOAuthTokenSource } from "../auth/token-source.js";
 import { DebugProvider } from "./debug.js";
-import {
-  OpenAICompatProvider,
-  type MaxTokensField,
-  type OpenAICompatOptions,
-} from "./openai-compat.js";
+import { OpenAICompatProvider, type MaxTokensField } from "./openai-compat.js";
 
 export type ProviderKind = "native" | "openai-compatible" | "debug";
 export type ProviderProtocol = "anthropic-messages" | "openai-chat" | "debug" | "custom";
@@ -162,6 +161,13 @@ export interface OpenAICompatibleProviderRegistration {
 const providers = new Map<string, RegisteredProvider>();
 const canonical = new Map<string, RegisteredProvider>();
 
+/** 进程内共享的凭证存储（OAuth 等）；路径可由 ANICODE_AUTH_FILE 覆盖。 */
+let sharedAuthStore: AuthStore | null = null;
+export function defaultAuthStore(): AuthStore {
+  if (!sharedAuthStore) sharedAuthStore = new AuthStore();
+  return sharedAuthStore;
+}
+
 const cloudDefaults: ProviderCapabilities = { tools: true, reasoning: false, images: false };
 const localDefaults: ProviderCapabilities = { tools: true, reasoning: false, images: false };
 
@@ -242,11 +248,27 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
     capabilities: cloudDefaults,
     // OpenCode Zen 的免费模型：需 OPENCODE_API_KEY（opencode 账号），无按量计费。名单会随平台轮换。
     catalog: [
-      { model: "big-pickle", label: "Big Pickle（免费）", free: true, recommended: true, note: "OpenCode Zen 免费" },
+      {
+        model: "big-pickle",
+        label: "Big Pickle（免费）",
+        free: true,
+        recommended: true,
+        note: "OpenCode Zen 免费",
+      },
       { model: "mimo-v2.5-free", label: "MiMo V2.5（免费）", free: true, openWeight: true },
-      { model: "deepseek-v4-flash-free", label: "DeepSeek V4 Flash（免费）", free: true, openWeight: true },
+      {
+        model: "deepseek-v4-flash-free",
+        label: "DeepSeek V4 Flash（免费）",
+        free: true,
+        openWeight: true,
+      },
       { model: "north-mini-code-free", label: "North Mini Code（免费）", free: true },
-      { model: "nemotron-3-ultra-free", label: "Nemotron 3 Ultra（免费）", free: true, openWeight: true },
+      {
+        model: "nemotron-3-ultra-free",
+        label: "Nemotron 3 Ultra（免费）",
+        free: true,
+        openWeight: true,
+      },
       { model: "glm-4.7-free", label: "GLM-4.7（免费）", free: true, openWeight: true },
       { model: "kimi-k2.5-free", label: "Kimi K2.5（免费）", free: true, openWeight: true },
       { model: "minimax-m3-free", label: "MiniMax-M3（免费）", free: true, openWeight: true },
@@ -343,20 +365,32 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
     reasoningEffort: false,
     capabilities: cloudDefaults,
   }),
-  openAI("together", "Together AI", "https://api.together.xyz/v1", ["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"], {
-    baseURLEnv: "TOGETHER_BASE_URL",
-    streamUsage: false,
-    maxTokensField: "max_tokens",
-    reasoningEffort: false,
-    capabilities: cloudDefaults,
-  }),
-  openAI("fireworks", "Fireworks AI", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY", {
-    baseURLEnv: "FIREWORKS_BASE_URL",
-    streamUsage: false,
-    maxTokensField: "max_tokens",
-    reasoningEffort: false,
-    capabilities: cloudDefaults,
-  }),
+  openAI(
+    "together",
+    "Together AI",
+    "https://api.together.xyz/v1",
+    ["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"],
+    {
+      baseURLEnv: "TOGETHER_BASE_URL",
+      streamUsage: false,
+      maxTokensField: "max_tokens",
+      reasoningEffort: false,
+      capabilities: cloudDefaults,
+    },
+  ),
+  openAI(
+    "fireworks",
+    "Fireworks AI",
+    "https://api.fireworks.ai/inference/v1",
+    "FIREWORKS_API_KEY",
+    {
+      baseURLEnv: "FIREWORKS_BASE_URL",
+      streamUsage: false,
+      maxTokensField: "max_tokens",
+      reasoningEffort: false,
+      capabilities: cloudDefaults,
+    },
+  ),
   openAI("cerebras", "Cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", {
     baseURLEnv: "CEREBRAS_BASE_URL",
     streamUsage: false,
@@ -439,15 +473,21 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
     reasoningEffort: false,
     capabilities: localDefaults,
   }),
-  openAI("custom", "Custom OpenAI-compatible", "http://127.0.0.1:8000/v1", "CUSTOM_OPENAI_API_KEY", {
-    baseURLEnv: "CUSTOM_OPENAI_BASE_URL",
-    requiresApiKey: false,
-    local: true,
-    streamUsage: false,
-    maxTokensField: "max_tokens",
-    reasoningEffort: false,
-    capabilities: localDefaults,
-  }),
+  openAI(
+    "custom",
+    "Custom OpenAI-compatible",
+    "http://127.0.0.1:8000/v1",
+    "CUSTOM_OPENAI_API_KEY",
+    {
+      baseURLEnv: "CUSTOM_OPENAI_BASE_URL",
+      requiresApiKey: false,
+      local: true,
+      streamUsage: false,
+      maxTokensField: "max_tokens",
+      reasoningEffort: false,
+      capabilities: localDefaults,
+    },
+  ),
 ];
 
 install({
@@ -475,10 +515,21 @@ install({
   factory: () => {
     const d = canonical.get("anthropic")!.descriptor;
     const runtime = runtimeConfig(d);
+    const adaptiveThinking = (model: string) => resolveModelInfo(d, model).capabilities.reasoning;
+    // 优先 OAuth 订阅登录（Claude Pro/Max）：存在 oauth 凭证即走 Bearer + 自动续期，
+    // 无需 ANTHROPIC_API_KEY；否则回退环境变量里的 API key。
+    const oauth = defaultAuthStore().getSync("anthropic");
+    if (oauth && oauth.type === "oauth") {
+      return new AnthropicProvider({
+        tokenSource: new AnthropicOAuthTokenSource(defaultAuthStore(), "anthropic"),
+        ...(runtime.baseURL ? { baseURL: runtime.baseURL } : {}),
+        adaptiveThinking,
+      });
+    }
     return new AnthropicProvider({
       apiKey: runtime.apiKey,
       ...(runtime.baseURL ? { baseURL: runtime.baseURL } : {}),
-      adaptiveThinking: (model) => resolveModelInfo(d, model).capabilities.reasoning,
+      adaptiveThinking,
     });
   },
 });
@@ -702,16 +753,24 @@ function envNames(value: string | readonly string[] | undefined): string[] {
 function validId(value: string): string {
   const id = value.trim();
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) {
-    throw new Error(`非法 provider id: ${JSON.stringify(value)}`);
+    throw new Error(
+      t(
+        `Invalid provider id: ${JSON.stringify(value)}`,
+        `非法 provider id: ${JSON.stringify(value)}`,
+      ),
+    );
   }
   return id;
 }
 
-function runtimeConfig(d: ProviderDescriptor, directApiKey?: string): { baseURL?: string; apiKey: string } {
+function runtimeConfig(
+  d: ProviderDescriptor,
+  directApiKey?: string,
+): { baseURL?: string; apiKey: string } {
   const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv) : undefined;
   const credential = directApiKey ?? findCredential(d.apiKeyEnv)?.value;
   return {
-    ...(envBase ?? d.baseURL ? { baseURL: envBase ?? d.baseURL } : {}),
+    ...((envBase ?? d.baseURL) ? { baseURL: envBase ?? d.baseURL } : {}),
     // 本地匿名服务仍给 SDK 一个无敏感性的占位 key；云端缺 key 用空串尽早失败。
     apiKey: credential ?? (d.requiresApiKey ? "" : "anicode-local"),
   };
@@ -723,11 +782,19 @@ function diagnosticsFor(entry: RegisteredProvider, model: string): ProviderDiagn
   const credential = findCredential(d.apiKeyEnv);
   const baseURL = envBase ?? d.baseURL;
   const warnings: string[] = [];
-  const hasCredentials = Boolean(credential) || Boolean(entry.directCredential);
+  // OAuth 订阅登录也算有凭证（无需 API key）。
+  const hasOAuth = defaultAuthStore().getSync(d.id)?.type === "oauth";
+  const hasCredentials = Boolean(credential) || Boolean(entry.directCredential) || hasOAuth;
   if (d.requiresApiKey && !hasCredentials) {
-    warnings.push(`缺少凭证：请设置 ${d.apiKeyEnv.join(" 或 ") || "provider 对应的 API key"}`);
+    warnings.push(
+      t(
+        `Missing credentials: set ${d.apiKeyEnv.join(" or ") || "the provider's API key"}, or run auth login to sign in with a subscription`,
+        `缺少凭证：请设置 ${d.apiKeyEnv.join(" 或 ") || "provider 对应的 API key"}，或运行 auth login 用订阅登录`,
+      ),
+    );
   }
-  if (!baseURL && d.kind !== "debug") warnings.push("未配置 provider baseURL");
+  if (!baseURL && d.kind !== "debug")
+    warnings.push(t("provider baseURL is not configured", "未配置 provider baseURL"));
   return {
     providerId: d.id,
     model,
@@ -759,14 +826,26 @@ function nonEmptyEnv(name: string): string | undefined {
 
 function resolveSpec(spec: string): { entry: RegisteredProvider; model: string } {
   const value = spec.trim();
-  if (!value) throw new Error("model spec 不能为空（应为 provider/model）");
+  if (!value)
+    throw new Error(
+      t(
+        "model spec cannot be empty (should be provider/model)",
+        "model spec 不能为空（应为 provider/model）",
+      ),
+    );
   const slash = value.indexOf("/");
   let prefix: string;
   let model: string;
   if (slash >= 0) {
     prefix = value.slice(0, slash);
     model = value.slice(slash + 1);
-    if (!prefix || !model) throw new Error(`非法 model spec ${JSON.stringify(spec)}（应为 provider/model）`);
+    if (!prefix || !model)
+      throw new Error(
+        t(
+          `Invalid model spec ${JSON.stringify(spec)} (should be provider/model)`,
+          `非法 model spec ${JSON.stringify(spec)}（应为 provider/model）`,
+        ),
+      );
   } else {
     model = value;
     prefix = value.startsWith("claude") ? "anthropic" : "openai";

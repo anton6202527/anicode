@@ -6,6 +6,7 @@
  * 这让多个连接（CLI + App）观察/接管同一会话成为可能。
  */
 
+import { t } from "../i18n.js";
 import type { SessionEvent, SessionSnapshot, SessionSummary } from "../session-manager.js";
 import type { PermissionDecisionKind } from "../host.js";
 
@@ -20,7 +21,14 @@ export type ClientRequest =
   | { id: number; method: "close"; sessionId: string }
   | { id: number; method: "send"; sessionId: string; text: string }
   | { id: number; method: "interrupt"; sessionId: string }
-  | { id: number; method: "answerPermission"; sessionId: string; permId: string; decision: PermissionDecisionKind };
+  | { id: number; method: "undo"; sessionId: string; checkpointId?: string }
+  | {
+      id: number;
+      method: "answerPermission";
+      sessionId: string;
+      permId: string;
+      decision: PermissionDecisionKind;
+    };
 
 // ---------- 守护进程 → 客户端 ----------
 
@@ -62,12 +70,19 @@ export function decodeLines<T>(
     const line = rest.slice(0, idx);
     rest = rest.slice(idx + 1);
     if (Buffer.byteLength(line, "utf8") > maxFrameBytes) {
-      throw new Error(`daemon frame 超过 ${maxFrameBytes} bytes`);
+      throw new Error(
+        t(
+          `daemon frame exceeds ${maxFrameBytes} bytes`,
+          `daemon frame 超过 ${maxFrameBytes} bytes`,
+        ),
+      );
     }
     if (line.trim()) messages.push(JSON.parse(line) as T);
   }
   if (Buffer.byteLength(rest, "utf8") > maxFrameBytes) {
-    throw new Error(`daemon frame 超过 ${maxFrameBytes} bytes`);
+    throw new Error(
+      t(`daemon frame exceeds ${maxFrameBytes} bytes`, `daemon frame 超过 ${maxFrameBytes} bytes`),
+    );
   }
   return { messages, rest };
 }
@@ -86,7 +101,8 @@ export function isClientRequest(value: unknown): value is ClientRequest {
     typeof frame.id !== "number" ||
     !Number.isSafeInteger(frame.id) ||
     typeof frame.method !== "string"
-  ) return false;
+  )
+    return false;
   switch (frame.method) {
     case "listSessions":
       return true;
@@ -100,6 +116,11 @@ export function isClientRequest(value: unknown): value is ClientRequest {
     case "close":
     case "interrupt":
       return typeof frame.sessionId === "string";
+    case "undo":
+      return (
+        typeof frame.sessionId === "string" &&
+        (frame.checkpointId === undefined || typeof frame.checkpointId === "string")
+      );
     case "send":
       return typeof frame.sessionId === "string" && typeof frame.text === "string";
     case "answerPermission":
@@ -120,13 +141,15 @@ export function isServerFrame(value: unknown): value is ServerFrame {
   if (!frame || typeof frame.type !== "string") return false;
   if (frame.type === "result") {
     return (
-      typeof frame.id === "number" && Number.isSafeInteger(frame.id) &&
+      typeof frame.id === "number" &&
+      Number.isSafeInteger(frame.id) &&
       (frame.ok === true || (frame.ok === false && typeof frame.error === "string"))
     );
   }
   if (frame.type === "result_chunk") {
     return (
-      typeof frame.id === "number" && Number.isSafeInteger(frame.id) &&
+      typeof frame.id === "number" &&
+      Number.isSafeInteger(frame.id) &&
       typeof frame.chunk === "string" &&
       typeof frame.done === "boolean"
     );

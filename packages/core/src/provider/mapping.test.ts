@@ -38,9 +38,24 @@ test("registry: 裸模型名按前缀推断", () => {
 
 test("registry: 内置 provider 数据完整，模型 id 中的斜杠不丢失", () => {
   const expected = [
-    "anthropic", "openai", "openrouter", "deepseek", "gemini", "xai", "groq",
-    "mistral", "together", "fireworks", "cerebras", "ollama", "lmstudio", "vllm",
-    "llamacpp", "custom", "debug", "demo",
+    "anthropic",
+    "openai",
+    "openrouter",
+    "deepseek",
+    "gemini",
+    "xai",
+    "groq",
+    "mistral",
+    "together",
+    "fireworks",
+    "cerebras",
+    "ollama",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "custom",
+    "debug",
+    "demo",
   ];
   for (const id of expected) assert.ok(listProviders().includes(id), `缺少 ${id}`);
 
@@ -203,7 +218,10 @@ test("registry: DeepSeek 缺 key 时不会回退并泄露 OPENAI_API_KEY", async
   try {
     const resolved = createProvider("deepseek/deepseek-chat");
     await assert.rejects(async () => {
-      for await (const _event of resolved.provider.stream({ model: resolved.model, messages: [] })) {
+      for await (const _event of resolved.provider.stream({
+        model: resolved.model,
+        messages: [],
+      })) {
         // 显式空 DeepSeek key 应在任何网络请求前失败。
       }
     }, /Missing credentials/);
@@ -223,7 +241,10 @@ test("registry: 其他兼容 provider 也不会回退 OPENAI_API_KEY", async () 
   try {
     const resolved = createProvider("openrouter/anthropic/claude-sonnet-4");
     await assert.rejects(async () => {
-      for await (const _event of resolved.provider.stream({ model: resolved.model, messages: [] })) {
+      for await (const _event of resolved.provider.stream({
+        model: resolved.model,
+        messages: [],
+      })) {
         // 缺 provider 自己的 key 时必须在网络前失败。
       }
     }, /Missing credentials/);

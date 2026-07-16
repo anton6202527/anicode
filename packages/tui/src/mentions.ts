@@ -9,6 +9,7 @@
  */
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { t } from "@anicode/core";
 
 const MAX_BYTES = 100 * 1024;
 const MENTION_RE = /(^|\s)@([^\s@]+)/g;
@@ -34,15 +35,21 @@ export async function expandFileMentions(
       const buf = await fs.readFile(abs);
       const truncated = buf.length > MAX_BYTES;
       const content = buf.subarray(0, MAX_BYTES).toString("utf8");
-      found.push({ rel, content: truncated ? `${content}\n…（已截断，文件超过 100KB）` : content });
+      found.push({
+        rel,
+        content: truncated
+          ? `${content}\n${t("…(truncated, file exceeds 100KB)", "…（已截断，文件超过 100KB）")}`
+          : content,
+      });
     } catch {
       missing.push(rel);
     }
   }
 
   if (found.length === 0) return { text, missing };
-  const blocks = found
-    .map(({ rel, content }) => `=== ${rel} ===\n${content}`)
-    .join("\n\n");
-  return { text: `${text}\n\n以下是被引用文件的内容：\n${blocks}`, missing };
+  const blocks = found.map(({ rel, content }) => `=== ${rel} ===\n${content}`).join("\n\n");
+  return {
+    text: `${text}\n\n${t("Below is the content of the referenced files:", "以下是被引用文件的内容：")}\n${blocks}`,
+    missing,
+  };
 }
