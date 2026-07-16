@@ -29,6 +29,7 @@ import {
   providerSummarizer,
   type CompactionConfig,
 } from "./context.js";
+import { gatherEnv } from "./env.js";
 import type { SessionStore, SessionMeta } from "./session.js";
 
 // ---------- 对外事件 ----------
@@ -112,6 +113,8 @@ export interface AgentOptions {
   retry?: RetryConfig | false;
   /** 是否加载 AGENTS.md/CLAUDE.md 项目记忆（默认开） */
   projectMemory?: boolean;
+  /** 是否在会话开始时注入环境接地块（cwd/OS/日期/git 状态）。默认开。 */
+  injectEnv?: boolean;
   /** OS 级命令沙箱策略（bash 工具用）；默认 none（也可由环境变量 AGENTX_BASH_SANDBOX 覆盖）。 */
   sandbox?: "none" | "read-only" | "workspace-write";
   /** 上下文压缩配置。传入即启用；summarizer 缺省用当前 provider 自摘要 */
@@ -160,10 +163,33 @@ export function repairHistory(messages: ChatMessage[]): ChatMessage[] {
   ];
 }
 
-const DEFAULT_SYSTEM = `你是一个运行在用户终端里的 AI 编程助手。你可以读写文件、执行 shell 命令来完成编码任务。
-- 动手前先了解相关代码；修改要精确、最小化。
-- 有副作用的操作（写文件、执行命令）会经过用户授权，被拒绝时请换一种方式或询问用户。
-- 完成后用一两句话说明你做了什么。`;
+const DEFAULT_SYSTEM = `你是运行在用户终端里的 AI 编程助手，通过读写文件、执行命令来完成软件工程任务。
+
+# 工作方式
+- 动手前先了解相关代码：用 read/grep/glob 摸清结构与约定，不要凭猜测改动。
+- 修改精确、最小化，只做被要求的事；不顺手重构、不留无关改动。
+- 一次任务涉及多个不确定步骤时，用 todo_write 列清单并随进度更新，让用户看到规划。
+- 遇到无法自行判断的分叉（有破坏性、需求含糊、多种合理方案）时，停下来问用户，而不是赌一个。
+
+# 工具使用
+- 检索代码优先用 grep / glob / read，不要用 bash 的 cat / find / grep / ls —— 专用工具更快、结果更规整、还能并行。
+- 改文件用 edit / write，不要用 shell 重定向（echo >> / sed -i）去改源码。
+- bash 留给构建、测试、git、包管理等真正需要 shell 的场景。
+- 多个相互独立的只读调用（读几个文件、跑几处搜索）请在同一轮里一起发出，让它们并行执行，别一个个串着来。
+
+# 代码规范
+- 新代码要融入现有风格：先看邻近代码的命名、缩进、注释密度和惯用法，照着写。
+- 不加多余注释，不写没被要求的文档；不引入未在项目中出现过的依赖（先确认它已被使用）。
+- 不主动提交或推送（git commit/push），除非用户明确要求。
+
+# 验证与收尾
+- 改完代码后，若项目有测试 / 类型检查 / lint，尽量跑一遍确认没引入问题；跑不了就如实说明。
+- 不要谎报完成：测试失败就带上输出说失败，跳过的步骤就说跳过。确实做完并验证过才平实地说做好了。
+- 收尾用一两句话说明做了什么，面向终端、简洁，不要长篇复述。
+
+# 安全
+- 有副作用的操作（写文件、执行命令）会经过用户授权；被拒绝时换方式或询问，不要绕过。
+- 协助授权范围内的防御性安全与正常工程工作；拒绝明显用于破坏、攻击或规避检测的请求。`;
 
 /** Stop hook 单次 drive 内最多强制续跑的轮数（防 hook 造成死循环） */
 const MAX_STOP_CONTINUATIONS = 3;
@@ -192,6 +218,7 @@ export class Agent {
   private readonly maxToolResultChars: number;
   private readonly retry: Required<RetryConfig> | null;
   private readonly useProjectMemory: boolean;
+  private readonly injectEnv: boolean;
   private readonly sandbox: AgentOptions["sandbox"];
   private readonly skillsOpt: AgentOptions["skills"];
   private readonly compaction: CompactionConfig | null;
@@ -248,6 +275,7 @@ export class Agent {
             baseDelayMs: Math.max(0, opts.retry?.baseDelayMs ?? DEFAULT_RETRY_BASE_MS),
           };
     this.useProjectMemory = opts.projectMemory ?? true;
+    this.injectEnv = opts.injectEnv ?? true;
     this.sandbox = opts.sandbox;
     this.skillsOpt = opts.skills;
     this.compaction = this.resolveCompaction(opts.compaction, opts.modelInfo);
@@ -523,9 +551,12 @@ export class Agent {
         return res;
       }
       if (res.partial) yield { type: "turn_reset" };
-      const delayMs = Math.round(
+      const backoff = Math.round(
         this.retry!.baseDelayMs * 2 ** attempt * (1 + Math.random() * 0.25),
       );
+      // 服务端给了 Retry-After 就尊重它（取与退避的较大值，封顶 60s 防呆滞）。
+      const serverHint = retryAfterMs(res.cause);
+      const delayMs = serverHint !== null ? Math.min(60_000, Math.max(backoff, serverHint)) : backoff;
       yield { type: "retry", attempt: attempt + 1, delayMs, reason: res.message };
       try {
         await sleep(delayMs, signal);
@@ -882,6 +913,14 @@ export class Agent {
     if (this.memoryLoaded) return;
     this.memoryLoaded = true;
     const sections: string[] = [];
+    // 环境接地：会话开始时快照一次（cwd/OS/日期/git），缓存友好，对齐 Claude Code/Codex。
+    if (this.injectEnv) {
+      try {
+        sections.push(await gatherEnv(this.cwd));
+      } catch {
+        /* 采集失败不影响主流程 */
+      }
+    }
     if (this.useProjectMemory) {
       const memory = await loadProjectMemory(this.cwd);
       if (memory) sections.push(memory);
@@ -1004,6 +1043,30 @@ function isTransientError(err: unknown): boolean {
   return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EPIPE|EAI_AGAIN|fetch failed|network|socket hang up|overloaded|connection error/i.test(
     msg,
   );
+}
+
+/**
+ * 从 provider 错误里解析 Retry-After（秒数或 HTTP 日期），返回毫秒；无则 null。
+ * SDK 错误通常带 headers（Headers 实例或普通对象）。
+ */
+export function retryAfterMs(err: unknown, now: number = Date.now()): number | null {
+  const headers = (err as { headers?: unknown })?.headers;
+  if (!headers) return null;
+  let raw: string | null = null;
+  if (typeof (headers as Headers).get === "function") {
+    raw = (headers as Headers).get("retry-after");
+  } else if (typeof headers === "object") {
+    const rec = headers as Record<string, unknown>;
+    const v = rec["retry-after"] ?? rec["Retry-After"];
+    if (typeof v === "string") raw = v;
+    else if (Array.isArray(v) && typeof v[0] === "string") raw = v[0];
+  }
+  if (!raw) return null;
+  const secs = Number(raw);
+  if (Number.isFinite(secs)) return secs >= 0 ? Math.round(secs * 1000) : null;
+  const when = Date.parse(raw);
+  if (Number.isFinite(when)) return Math.max(0, when - now);
+  return null;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

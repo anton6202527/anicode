@@ -148,6 +148,8 @@ export function createTaskTool(opts: TaskToolOptions): Tool {
         cwd: opts.cwd,
         ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
         system: def.system ?? SUBAGENT_SYSTEM,
+        // 子 agent 不重复采集环境（每次都 spawn git，量大时拖慢）；父会话已接地。
+        injectEnv: false,
         tools: opts.tools.subset(allowedNames),
         ...(opts.permission ? { permission: opts.permission } : {}),
         ...(opts.hooks?.length ? { hooks: opts.hooks } : {}),

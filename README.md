@@ -15,7 +15,7 @@ packages/
 Electron IPC、VSCode webview postMessage 只是同一契约的不同「传输」实现，可互换。transcript / Markdown /
 diff 等前端无关的纯逻辑集中在 `@anicode/shared`，三端共用、单独测试。
 
-当前全仓类型检查通过，离线测试 **core 136 + shared 6 + TUI 24 + app 16 + vscode 8，共 190 个**。测试不需要真实 API key。
+当前全仓类型检查通过，离线测试 **core 166 + shared 6 + TUI 32 + app 16 + vscode 8，共 228 个**。测试不需要真实 API key。
 
 ## 先本地调试 TUI
 
@@ -221,9 +221,14 @@ registerOpenAICompatibleProvider({
 
 - 统一内容块消息与流式事件协议，支持文本、thinking、图片、并行工具调用和 usage。
 - Agent loop：工具执行、steering、重试、hooks、skills、subagents、todo 与中断。
+- **工程化系统提示**：内置对齐 Claude Code/Codex 的行为准则——先探后改、工具路由（检索走 grep/glob、改文件走 edit、独立只读调用并行批处理）、代码规范（融入现有风格、最小改动、不擅自提交）、改完自验证、简洁收尾与安全边界。见 `agent.ts` 的 `DEFAULT_SYSTEM`。
+- **环境接地**：会话开始时快照 `<env>`（cwd/平台/系统/日期/是否 git 仓库/当前分支）+ `<git-status>`（工作区改动与最近提交）注入 system，缓存友好，让模型不再盲飞。见 `env.ts`。
 - 模型能力驱动请求：按 profile 控制 tools、reasoning、输出上限和 compaction 阈值；未知兼容模型不会被强塞 16k 输出参数。
 - 子 agent 的 `provider/model` override 会重新解析 provider，不再错误复用父 provider。
-- 默认工具：`read / write / edit / glob / grep / bash / todo_write / task / skill`。
+- 默认工具：`read / write / edit / glob / grep / bash / webfetch / todo_write / task / skill`。
+- **ripgrep 后端检索**：检测到 `rg` 时 grep/glob 走 ripgrep（尊重 .gitignore、跳过二进制、按 mtime 排序），无 rg 自动回退纯 JS。grep 支持 `output_mode`（content/files_with_matches/count）、`ignore_case`、`context` 前后行、`path`/`glob` 限定。
+- **read 加固**：NUL 字节识别二进制（不返回乱码）、超长单行截断（防炸上下文）。
+- **重试尊重 `Retry-After`**：429/503 带该头时按服务端节流等待（与指数退避取较大值，封顶 60s）。
 - 权限模式：`default / acceptEdits / auto / bypass`，支持 allow/ask/deny glob 规则和运行时记忆。
 - 项目记忆：向上发现 `AGENTS.md` / `CLAUDE.md`，止于 `.git` 边界。
 - 两级 compaction：先清理旧工具输出，再在安全边界生成摘要，保持 tool call/result 配对。
@@ -275,21 +280,24 @@ npm run typecheck
 npm test
 ```
 
-当前覆盖 138 个离线测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试、权限、hooks、skills、subagents、compaction、沙箱路径检查、私有会话权限、会话竞态、daemon 多客户端与大快照，以及 Ink TUI 交互。
+当前覆盖 228 个离线测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限、hooks、skills、subagents、compaction、沙箱路径检查、环境接地渲染、ripgrep/JS 双后端检索（grep 各输出模式、read 二进制/长行加固）、私有会话权限、会话竞态、daemon 多客户端与大快照，以及 Ink TUI 交互。
 
 ## 采各家之所长（对标 Claude Code / Codex / opencode / Aider·Cline 的增强）
 
 - **小模型路由（Claude Code）**：摘要压缩等杂活自动走便宜快速模型（`SessionManagerOptions.smallModel: true` 按 provider 推导，如 anthropic→haiku、groq→llama-3.1-8b），解析失败静默回退主模型。省这类调用 70–80% 成本。见 `provider/registry.ts` 的 `defaultSmallModel`、`agent.ts` 的 `streamText`。
 - **编辑自愈 + 反射（Aider/Cline）**：`edit` 精确匹配失败时退到「按行去空白」的模糊匹配；全都匹配不上则抛出附「文件中最接近片段」的反射式错误，让模型据此自我纠正（Aider 经验：关掉自愈编辑错误率数倍上升）。见 `tools/fs.ts` 的 `applyEdit`。
 - **macOS 沙箱第一阶段（Codex/Claude Code）**：bash 可选用 Seatbelt `sandbox-exec` 包裹——只放行「工作区 + 临时目录」写入、默认断网，纵深防御 prompt 注入。opt-in：`AGENTX_BASH_SANDBOX=workspace-write`（或 `SessionManagerOptions.sandbox`）。非 macOS 自动裸跑。见 `tools/sandbox.ts`。已实测：越界写被拒、出网被拒、工作区内写正常。
+- **工程化系统提示 + 环境接地（Claude Code/Codex）**：把「先探后改、工具路由、并行批处理、最小改动、改完自验证」写进默认系统提示，并在会话开始注入 `<env>` + `<git-status>` 快照。这是把通用模型行为收敛到「优秀 coding agent」的最大杠杆，且缓存友好。见 `agent.ts`、`env.ts`。
+- **ripgrep 检索后端（Claude Code）**：grep/glob 优先走 ripgrep（尊重 .gitignore、跳过二进制、mtime 排序），支持输出模式/上下文行/大小写；无 rg 回退 JS。检索更快、结果更规整。见 `tools/ripgrep.ts`、`tools/fs.ts`。
 
 ## 安全边界与下一步
 
 路径工具会阻止 `..` 和符号链接逃逸；shell 权限会保守解析复合命令；macOS 上可开启 Seatbelt 沙箱（见上）。后续：Linux bubblewrap/Landlock、以及「先沙箱后询问、撞墙才升级」的 Codex 双轴审批闭环。
 
-后续优先级（据架构评审）：
+后续优先级（据架构评审，均为需要动结构的较大项，故单独列出）：
 
-1. OS 沙箱补齐 Linux + 双轴审批（sandbox-first, approve-on-failure）。
-2. LSP 诊断反馈回路 / 工作区检查点（shadow-git undo）/ Plan 模式。
-3. daemon 升级为 HTTP+SSE + OpenAPI 生成 SDK。
-4. 结构化 headless 输出、延迟工具加载（ToolSearch）。
+1. **多模态 read**：工具结果目前只回文本；让 `read` 能返回图片内容块（截图/图表），配合已支持 image 的 provider，是多模态 agent 的关键缺口。
+2. **结构化编辑**：引入 `multi_edit` 或 Codex 风格 `apply_patch`（一次原子多处改动 + 统一 diff 格式），减少多次 edit 往返。
+3. OS 沙箱补齐 Linux（bubblewrap/Landlock）+ 双轴审批（sandbox-first, approve-on-failure）。
+4. 工作区检查点（shadow-git undo）/ Plan 模式。
+5. daemon 升级为 HTTP+SSE + OpenAPI 生成 SDK；结构化 headless 输出、延迟工具加载（ToolSearch）。

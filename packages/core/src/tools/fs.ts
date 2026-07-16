@@ -7,6 +7,9 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
+import { ripgrepAvailable, runRipgrep } from "./ripgrep.js";
+
+const MAX_RESULTS = 200;
 
 /**
  * 把 model 给的路径解析为绝对路径，并确保**真实落点**在 cwd 内。
@@ -74,12 +77,17 @@ export const readTool: Tool = {
   async run(input, ctx: ToolContext) {
     ensureActive(ctx);
     const abs = await resolveInside(ctx.cwd, input["path"]);
-    let content: string;
+    let buf: Buffer;
     try {
-      content = await fs.readFile(abs, "utf8");
+      buf = await fs.readFile(abs);
     } catch (e: any) {
       throw new ToolError(`读取失败: ${e?.code ?? e?.message ?? e}`);
     }
+    // 二进制识别：NUL 字节几乎必是二进制；返回提示而非乱码撑爆上下文。
+    if (isBinary(buf)) {
+      return `(文件 ${rel(ctx.cwd, abs)} 看起来是二进制/非文本，${buf.length} 字节，未按文本读取)`;
+    }
+    const content = buf.toString("utf8");
     const lines = content.split("\n");
     const offset = Math.max(1, Number(input["offset"] ?? 1));
     const limit = Math.max(1, Number(input["limit"] ?? 2000));
@@ -87,10 +95,25 @@ export const readTool: Tool = {
     if (slice.length === 0) return `(文件 ${rel(ctx.cwd, abs)} 在该范围内为空)`;
     const width = String(offset + slice.length - 1).length;
     return slice
-      .map((l, i) => `${String(offset + i).padStart(width)}\t${l}`)
+      .map((l, i) => `${String(offset + i).padStart(width)}\t${clampLine(l)}`)
       .join("\n");
   },
 };
+
+const MAX_LINE_CHARS = 2000;
+
+/** 超长单行会挤爆上下文（如压缩后的 JS、data URI）；截断并标注原长度。 */
+function clampLine(line: string): string {
+  if (line.length <= MAX_LINE_CHARS) return line;
+  return `${line.slice(0, MAX_LINE_CHARS)}…（本行共 ${line.length} 字符，已截断）`;
+}
+
+/** 采样前 8KB：含 NUL 字节判为二进制。 */
+function isBinary(buf: Buffer): boolean {
+  const n = Math.min(buf.length, 8192);
+  for (let i = 0; i < n; i++) if (buf[i] === 0) return true;
+  return false;
+}
 
 export const writeTool: Tool = {
   readOnly: false,
@@ -277,7 +300,9 @@ export const globTool: Tool = {
   readOnly: true,
   def: {
     name: "glob",
-    description: "按 glob 模式查找文件（如 **/*.ts）。返回相对路径列表，按修改时间倒序。",
+    description:
+      "按 glob 模式查找文件（如 **/*.ts），返回相对路径列表，按修改时间倒序（近期改动更可能相关）。" +
+      "有 ripgrep 时尊重 .gitignore；否则跳过 node_modules/.git/dist 等常见目录。",
     parameters: {
       type: "object",
       properties: {
@@ -290,15 +315,36 @@ export const globTool: Tool = {
   ruleKey: (i) => String(i["pattern"] ?? ""),
   async run(input, ctx) {
     const pattern = String(input["pattern"] ?? "");
-    const matches: { path: string; mtime: number }[] = [];
+    if (!pattern) throw new ToolError("pattern 不能为空");
     const root = path.resolve(ctx.cwd);
+
+    // 优先 ripgrep：--files 列全部（尊重 .gitignore），-g 过滤，--sortr modified 按 mtime 倒序。
+    if (await ripgrepAvailable()) {
+      const rg = await runRipgrep(
+        ["--files", "--sortr", "modified", "-g", pattern],
+        root,
+        ctx.signal,
+        MAX_RESULTS,
+      );
+      if (rg) {
+        if (rg.lines.length === 0) return `(无文件匹配 ${pattern})`;
+        const body = rg.lines.join("\n");
+        return rg.truncated ? `${body}\n…（超过 ${MAX_RESULTS} 个匹配，仅显示最近修改的部分）` : body;
+      }
+    }
+
+    // 回退：JS 递归遍历 + mtime 排序。
+    const matches: { path: string; mtime: number }[] = [];
     await walk(root, root, globToRegExp(pattern), matches, ctx.signal);
     matches.sort((a, b) => b.mtime - a.mtime);
     if (matches.length === 0) return `(无文件匹配 ${pattern})`;
-    return matches
-      .slice(0, 200)
+    const body = matches
+      .slice(0, MAX_RESULTS)
       .map((m) => path.relative(root, m.path))
       .join("\n");
+    return matches.length > MAX_RESULTS
+      ? `${body}\n…（超过 ${MAX_RESULTS} 个匹配，仅显示最近修改的部分）`
+      : body;
   },
 };
 
@@ -363,53 +409,168 @@ function globToRegExp(pattern: string): RegExp {
 
 // ---------- Grep ----------
 
+type GrepMode = "content" | "files_with_matches" | "count";
+
 export const grepTool: Tool = {
   readOnly: true,
   def: {
     name: "grep",
-    description: "在文件内容中用正则搜索。返回 文件:行号:内容。可选 glob 限定文件范围。",
+    description:
+      "在文件内容中用正则搜索（有 ripgrep 时走 ripgrep，尊重 .gitignore、跳过二进制）。" +
+      "output_mode: content=文件:行号:内容（默认）、files_with_matches=仅列命中文件、count=每文件命中数。" +
+      "可选 glob 限定文件、path 限定子目录、ignore_case 忽略大小写、context 附带前后行（仅 content）。",
     parameters: {
       type: "object",
       properties: {
         pattern: { type: "string", description: "正则表达式" },
-        glob: { type: "string", description: "限定搜索的文件 glob（默认全部文本文件）" },
+        glob: { type: "string", description: "限定搜索的文件 glob（如 *.ts）" },
+        path: { type: "string", description: "限定搜索的子目录（相对 cwd）" },
+        output_mode: {
+          type: "string",
+          enum: ["content", "files_with_matches", "count"],
+          description: "输出模式，默认 content",
+        },
+        ignore_case: { type: "boolean", description: "忽略大小写（默认 false）" },
+        context: { type: "number", description: "content 模式下附带的前后行数（默认 0）" },
       },
       required: ["pattern"],
       additionalProperties: false,
     },
   },
   ruleKey: (i) => String(i["pattern"] ?? ""),
+  isConcurrencySafe: () => true,
   async run(input, ctx) {
-    let re: RegExp;
-    try {
-      re = new RegExp(String(input["pattern"] ?? ""));
-    } catch (e: any) {
-      throw new ToolError(`无效正则: ${e?.message ?? e}`);
-    }
+    const pattern = String(input["pattern"] ?? "");
+    if (!pattern) throw new ToolError("pattern 不能为空");
+    const mode = normalizeMode(input["output_mode"]);
+    const ignoreCase = Boolean(input["ignore_case"]);
+    const globFilter = input["glob"] ? String(input["glob"]) : undefined;
+    const context = mode === "content" ? Math.max(0, Math.min(20, Number(input["context"]) || 0)) : 0;
     const root = path.resolve(ctx.cwd);
-    const fileRe = input["glob"] ? globToRegExp(String(input["glob"])) : /.*/;
-    const files: { path: string; mtime: number }[] = [];
-    await walk(root, root, fileRe, files, ctx.signal);
+    // 子目录限定：约束在 cwd 内，防穿越。
+    const searchDir = input["path"] ? await resolveInside(root, input["path"]) : root;
+    const searchArg = searchDir === root ? "." : path.relative(root, searchDir);
 
-    const results: string[] = [];
-    for (const f of files) {
-      if (ctx.signal.aborted) break;
-      let text: string;
-      try {
-        text = await fs.readFile(f.path, "utf8");
-      } catch {
-        continue; // 跳过二进制/不可读
-      }
-      const lines = text.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        if (re.test(lines[i]!)) {
-          results.push(`${path.relative(root, f.path)}:${i + 1}:${lines[i]!.slice(0, 200)}`);
-          if (results.length >= 200) break;
-        }
-      }
-      if (results.length >= 200) break;
+    if (await ripgrepAvailable()) {
+      const out = await grepViaRipgrep(pattern, {
+        mode,
+        ignoreCase,
+        context,
+        ...(globFilter ? { glob: globFilter } : {}),
+        searchArg,
+        root,
+        signal: ctx.signal,
+      });
+      if (out !== null) return out;
     }
-    if (results.length === 0) return `(无匹配 /${input["pattern"]}/)`;
-    return results.join("\n");
+    return grepViaJs(pattern, { mode, ignoreCase, context, globFilter, root, searchDir, signal: ctx.signal });
   },
 };
+
+function normalizeMode(v: unknown): GrepMode {
+  return v === "files_with_matches" || v === "count" ? v : "content";
+}
+
+async function grepViaRipgrep(
+  pattern: string,
+  o: {
+    mode: GrepMode;
+    ignoreCase: boolean;
+    context: number;
+    glob?: string;
+    searchArg: string;
+    root: string;
+    signal: AbortSignal;
+  },
+): Promise<string | null> {
+  const args: string[] = ["--color", "never"];
+  if (o.ignoreCase) args.push("-i");
+  if (o.glob) args.push("-g", o.glob);
+  if (o.mode === "files_with_matches") args.push("--files-with-matches");
+  else if (o.mode === "count") args.push("--count");
+  else {
+    args.push("--line-number", "--no-heading");
+    if (o.context > 0) args.push("-C", String(o.context));
+  }
+  args.push("-e", pattern);
+  // 搜索根目录时不传路径参数，让 rg 默认用 cwd —— 输出不带 "./" 前缀，与 JS 回退一致。
+  if (o.searchArg !== ".") args.push(o.searchArg);
+
+  const rg = await runRipgrep(args, o.root, o.signal, MAX_RESULTS);
+  if (!rg) return null;
+  // rg exit: 0=有匹配, 1=无匹配, 2=错误（如非法正则）。null=被中断，也当空结果。
+  if (rg.code === 2) throw new ToolError(`ripgrep 搜索失败（可能是非法正则）: /${pattern}/`);
+  if (rg.lines.length === 0) return emptyGrep(pattern, o.mode);
+  const body = rg.lines.join("\n");
+  return rg.truncated ? `${body}\n…（超过 ${MAX_RESULTS} 条，已截断）` : body;
+}
+
+async function grepViaJs(
+  pattern: string,
+  o: {
+    mode: GrepMode;
+    ignoreCase: boolean;
+    context: number;
+    globFilter: string | undefined;
+    root: string;
+    searchDir: string;
+    signal: AbortSignal;
+  },
+): Promise<string> {
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, o.ignoreCase ? "i" : "");
+  } catch (e: any) {
+    throw new ToolError(`无效正则: ${e?.message ?? e}`);
+  }
+  const fileRe = o.globFilter ? globToRegExp(o.globFilter) : /.*/;
+  const files: { path: string; mtime: number }[] = [];
+  await walk(o.searchDir, o.searchDir, fileRe, files, o.signal);
+
+  const results: string[] = [];
+  const counts: string[] = [];
+  outer: for (const f of files) {
+    if (o.signal.aborted) break;
+    let text: string;
+    try {
+      text = await fs.readFile(f.path, "utf8");
+    } catch {
+      continue; // 跳过二进制/不可读
+    }
+    const relPath = path.relative(o.root, f.path);
+    const lines = text.split("\n");
+    let fileHits = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (!re.test(lines[i]!)) continue;
+      fileHits++;
+      if (o.mode === "files_with_matches") {
+        results.push(relPath);
+        continue outer; // 一命中即够，转下一个文件
+      }
+      if (o.mode === "content") {
+        if (o.context > 0) {
+          const from = Math.max(0, i - o.context);
+          const to = Math.min(lines.length - 1, i + o.context);
+          for (let j = from; j <= to; j++) {
+            results.push(`${relPath}:${j + 1}:${lines[j]!.slice(0, 200)}`);
+          }
+          if (results.length >= MAX_RESULTS) break outer;
+        } else {
+          results.push(`${relPath}:${i + 1}:${lines[i]!.slice(0, 200)}`);
+          if (results.length >= MAX_RESULTS) break outer;
+        }
+      }
+    }
+    if (o.mode === "count" && fileHits > 0) {
+      counts.push(`${relPath}:${fileHits}`);
+      if (counts.length >= MAX_RESULTS) break;
+    }
+  }
+
+  if (o.mode === "count") return counts.length ? counts.join("\n") : emptyGrep(pattern, o.mode);
+  return results.length ? results.join("\n") : emptyGrep(pattern, o.mode);
+}
+
+function emptyGrep(pattern: string, mode: GrepMode): string {
+  return mode === "content" ? `(无匹配 /${pattern}/)` : `(无文件匹配 /${pattern}/)`;
+}
