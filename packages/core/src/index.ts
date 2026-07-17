@@ -148,10 +148,12 @@ export {
 export {
   PermissionEngine,
   globMatch,
+  BUILTIN_PROFILES,
   type PermissionConfig,
   type PermissionDecision,
   type PermissionRequest,
   type PermissionMode,
+  type PermissionProfile,
   type ConfirmFn,
 } from "./permission.js";
 export {

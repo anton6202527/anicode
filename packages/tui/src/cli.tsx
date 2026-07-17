@@ -442,6 +442,9 @@ export async function buildHost(
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: { mode: args.permissionMode },
+    // 配置里的权限档位：自定义档位表 + 启动即生效的档位名（/profile 运行时可再切）。
+    ...(config.permissionProfiles ? { permissionProfiles: config.permissionProfiles } : {}),
+    ...(config.permissionProfile ? { permissionProfile: config.permissionProfile } : {}),
     skills: true,
     subagents,
     checkpoints: true, // 每轮前记工作区 git 快照，支持 /undo 回滚文件改动

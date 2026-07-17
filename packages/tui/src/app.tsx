@@ -213,6 +213,13 @@ function builtinCommands(): CommandMenuRow[] {
       ),
     },
     {
+      name: "profile",
+      description: t(
+        "Switch permission profile /profile [name] (readonly/default/workspace/full)",
+        "切换权限档位 /profile [name]（readonly/default/workspace/full）",
+      ),
+    },
+    {
       name: "lang",
       description: t("Switch UI language /lang <en|zh>", "切换界面语言 /lang <en|zh>"),
     },
@@ -790,6 +797,56 @@ export function App({
                     "已进入计划模式：只读。先让它给方案，再 /plan off 退出执行。",
                   )
                 : t("Plan mode OFF.", "已退出计划模式。"),
+            },
+          });
+        } catch (err) {
+          dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+        }
+        return true;
+      }
+      if (cmd === "profile") {
+        if (!host.setPermissionProfile || !host.listPermissionProfiles) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(
+                "This transport doesn't support runtime permission profiles.",
+                "当前传输不支持运行时权限档位。",
+              ),
+            },
+          });
+          return true;
+        }
+        const name = (rest[0] ?? "").trim();
+        try {
+          if (!name) {
+            // 无参：列出可用档位。
+            const profiles = await host.listPermissionProfiles(sessionId);
+            const lines = Object.entries(profiles).map(
+              ([n, p]) =>
+                `  ${n}${p.mode ? ` → ${p.mode}` : ""}${p.description ? ` · ${p.description}` : ""}`,
+            );
+            dispatch({
+              t: "push",
+              item: {
+                kind: "info",
+                text:
+                  t("Available permission profiles:", "可用权限档位：") + "\n" + lines.join("\n"),
+              },
+            });
+            return true;
+          }
+          const mode = await host.setPermissionProfile(sessionId, name);
+          setPlanMode(mode === "plan"); // 只读指示与档位保持一致
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                `Permission profile: ${name} (mode: ${mode})`,
+                `已切换权限档位：${name}（模式 ${mode}）`,
+              ),
             },
           });
         } catch (err) {

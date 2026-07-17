@@ -30,6 +30,7 @@ import type {
   PermissionDecision,
   PermissionRequest,
   PermissionMode,
+  PermissionProfile,
 } from "./permission.js";
 
 // ---------- 对外事件与快照 ----------
@@ -76,6 +77,10 @@ export interface SessionManagerOptions {
   compaction?: Partial<CompactionConfig> | boolean;
   /** 会话权限策略；confirm 始终由 SessionManager 接管并广播给前端。 */
   permission?: Omit<PermissionConfig, "confirm">;
+  /** 自定义权限档位（叠加内置 readonly/default/workspace/full），/profile 运行时可切。 */
+  permissionProfiles?: AgentOptions["permissionProfiles"];
+  /** 新会话启动时应用的档位名（如配置 permissionProfile: "workspace"）。 */
+  permissionProfile?: string;
   /** 所有会话共用的 hooks（PreToolUse/PostToolUse/UserPromptSubmit/Stop） */
   hooks?: HookRegistration[];
   /** 启用 task 工具（子 agent 委派）：true=内置 general；数组=追加自定义类型 */
@@ -299,6 +304,14 @@ class ManagedSession {
     return this.agent.getPermissionMode();
   }
 
+  setPermissionProfile(name: string): PermissionMode {
+    return this.agent.setPermissionProfile(name);
+  }
+
+  listPermissionProfiles(): Record<string, PermissionProfile> {
+    return this.agent.listPermissionProfiles();
+  }
+
   listCheckpoints(): Checkpoint[] {
     return [...this.checkpoints];
   }
@@ -450,6 +463,18 @@ export class SessionManager {
     session.setPermissionMode(mode);
   }
 
+  /** 运行时切换会话的权限档位；返回切换后的生效模式。 */
+  async setPermissionProfile(sessionId: string, name: string): Promise<PermissionMode> {
+    const session = await this.ensureLive(sessionId);
+    return session.setPermissionProfile(name);
+  }
+
+  /** 会话可用的权限档位（内置 + 自定义）。 */
+  async listPermissionProfiles(sessionId: string): Promise<Record<string, PermissionProfile>> {
+    const session = await this.ensureLive(sessionId);
+    return session.listPermissionProfiles();
+  }
+
   /** 同步读取一个 live 会话的当前快照；未加载则返回 undefined（不触发磁盘载入）。 */
   peek(sessionId: string): SessionSnapshot | undefined {
     return this.sessions.get(sessionId)?.snapshot();
@@ -530,8 +555,8 @@ export class SessionManager {
   ): ManagedSession {
     const session = new ManagedSession(
       meta,
-      (confirm) =>
-        new Agent({
+      (confirm) => {
+        const agent = new Agent({
           provider: resolved.provider,
           model: resolved.model,
           ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
@@ -544,6 +569,9 @@ export class SessionManager {
           ...(this.opts.lsp?.length ? { lsp: this.lspPoolFor(meta.cwd) } : {}),
           cwd: meta.cwd,
           permission: { mode: "default", ...this.opts.permission, confirm },
+          ...(this.opts.permissionProfiles
+            ? { permissionProfiles: this.opts.permissionProfiles }
+            : {}),
           ...(this.opts.tools ? { tools: this.opts.tools() } : {}),
           ...(this.opts.hooks ? { hooks: this.opts.hooks } : {}),
           ...(this.opts.subagents !== undefined ? { subagents: this.opts.subagents } : {}),
@@ -554,7 +582,10 @@ export class SessionManager {
             meta,
             ...(resumeMessages.length ? { resumeMessages } : {}),
           },
-        }),
+        });
+        if (this.opts.permissionProfile) agent.setPermissionProfile(this.opts.permissionProfile);
+        return agent;
+      },
     );
     this.sessions.set(meta.id, session);
     return session;

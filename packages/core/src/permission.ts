@@ -67,6 +67,30 @@ export interface PermissionConfig {
   confirm?: ConfirmFn;
 }
 
+/**
+ * 权限档位（profile）：一组可整体切换的 mode + 规则叠加层。
+ *
+ * 语义：profile 的规则**叠加**在构造时的基础配置之上（绝不替换用户既有的
+ * deny/ask 基础规则——deny 永远最高优先级，切档位洗不掉）；mode 有值时覆盖当前模式。
+ * 运行时 /profile <name> 一次切换整套行为，对齐 Codex 的 permission profiles。
+ */
+export interface PermissionProfile {
+  mode?: PermissionMode;
+  allowRules?: string[];
+  denyRules?: string[];
+  askRules?: string[];
+  /** 展示用一句话说明。 */
+  description?: string;
+}
+
+/** 内置档位：readonly（只读探索）/ default（逐项确认）/ workspace（编辑自动放行）/ full（全自动）。 */
+export const BUILTIN_PROFILES: Record<string, PermissionProfile> = {
+  readonly: { mode: "plan", description: "read-only: explore & plan, no writes/exec" },
+  default: { mode: "default", description: "confirm each side-effecting action" },
+  workspace: { mode: "acceptEdits", description: "auto-approve file edits; bash still asks" },
+  full: { mode: "auto", description: "auto-approve everything except deny/ask rules" },
+};
+
 const DEFAULT_READONLY = ["read", "grep", "glob", "list"];
 
 export class PermissionEngine {
@@ -76,6 +100,11 @@ export class PermissionEngine {
   private allowRules: string[];
   private denyRules: string[];
   private askRules: string[];
+  /** 构造时的基础规则——profile 叠加层永远建立在它之上，切档位不丢用户配置。 */
+  private readonly baseAllow: string[];
+  private readonly baseDeny: string[];
+  private readonly baseAsk: string[];
+  private profileName: string | null = null;
   private remembered = new Set<string>();
   private confirm?: ConfirmFn;
 
@@ -83,9 +112,12 @@ export class PermissionEngine {
     this.mode = cfg.mode ?? "default";
     this.readOnly = new Set((cfg.readOnlyTools ?? DEFAULT_READONLY).map((s) => s.toLowerCase()));
     this.editTools = new Set((cfg.editTools ?? []).map((s) => s.toLowerCase()));
-    this.allowRules = cfg.allowRules ?? [];
-    this.denyRules = cfg.denyRules ?? [];
-    this.askRules = cfg.askRules ?? [];
+    this.baseAllow = cfg.allowRules ?? [];
+    this.baseDeny = cfg.denyRules ?? [];
+    this.baseAsk = cfg.askRules ?? [];
+    this.allowRules = this.baseAllow;
+    this.denyRules = this.baseDeny;
+    this.askRules = this.baseAsk;
     if (cfg.confirm) this.confirm = cfg.confirm;
   }
 
@@ -98,13 +130,31 @@ export class PermissionEngine {
     for (const name of names) this.editTools.add(name.toLowerCase());
   }
 
-  /** 运行时切换权限模式（如 /plan 进入/退出计划模式）。 */
+  /** 运行时切换权限模式（如 /plan 进入/退出计划模式）。直接切模式后档位名不再准确，清掉。 */
   setMode(mode: PermissionMode): void {
     this.mode = mode;
+    this.profileName = null;
   }
 
   getMode(): PermissionMode {
     return this.mode;
+  }
+
+  /**
+   * 应用一个权限档位：规则叠加在基础配置之上（替换上一个档位的叠加层），
+   * mode 有值时覆盖当前模式。
+   */
+  applyProfile(name: string, profile: PermissionProfile): void {
+    this.profileName = name;
+    this.allowRules = [...this.baseAllow, ...(profile.allowRules ?? [])];
+    this.denyRules = [...this.baseDeny, ...(profile.denyRules ?? [])];
+    this.askRules = [...this.baseAsk, ...(profile.askRules ?? [])];
+    if (profile.mode) this.mode = profile.mode;
+  }
+
+  /** 当前生效的档位名；直接 setMode 或从未切过档位时为 null。 */
+  getProfile(): string | null {
+    return this.profileName;
   }
 
   async check(req: PermissionRequest): Promise<PermissionDecision> {

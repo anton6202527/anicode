@@ -16,6 +16,7 @@ import * as path from "node:path";
 import type { McpServerConfig } from "./mcp.js";
 import type { SubagentDefinition } from "./subagent.js";
 import type { LspServerConfig } from "./lsp.js";
+import type { PermissionProfile } from "./permission.js";
 
 /** 配置里的单个 agent 定义（比 SubagentDefinition 更贴近用户书写习惯）。 */
 export interface ConfigAgent {
@@ -47,6 +48,10 @@ export interface AnicodeConfig {
   lsp?: Record<string, LspServerConfig>;
   /** 额外注入 system 的规则文件路径（相对 cwd 或绝对）。 */
   instructions?: string[];
+  /** 启动时应用的权限档位名（内置 readonly/default/workspace/full 或自定义）。 */
+  permissionProfile?: string;
+  /** 自定义权限档位：name → { mode?, allowRules?, denyRules?, askRules?, description? }。 */
+  permissionProfiles?: Record<string, PermissionProfile>;
 }
 
 export interface LoadedConfig {
@@ -57,7 +62,16 @@ export interface LoadedConfig {
   warnings: string[];
 }
 
-const KNOWN_KEYS = new Set(["model", "smallModel", "mcp", "agents", "lsp", "instructions"]);
+const KNOWN_KEYS = new Set([
+  "model",
+  "smallModel",
+  "mcp",
+  "agents",
+  "lsp",
+  "instructions",
+  "permissionProfile",
+  "permissionProfiles",
+]);
 
 function candidatePaths(cwd: string, home: string): string[] {
   return [
@@ -108,6 +122,9 @@ function merge(base: AnicodeConfig, over: AnicodeConfig): AnicodeConfig {
     ...(base.mcp || over.mcp ? { mcp: { ...base.mcp, ...over.mcp } } : {}),
     ...(base.agents || over.agents ? { agents: { ...base.agents, ...over.agents } } : {}),
     ...(base.lsp || over.lsp ? { lsp: { ...base.lsp, ...over.lsp } } : {}),
+    ...(base.permissionProfiles || over.permissionProfiles
+      ? { permissionProfiles: { ...base.permissionProfiles, ...over.permissionProfiles } }
+      : {}),
     ...(base.instructions || over.instructions
       ? { instructions: [...new Set([...(base.instructions ?? []), ...(over.instructions ?? [])])] }
       : {}),

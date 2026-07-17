@@ -17,10 +17,12 @@ import { t } from "./i18n.js";
 import type { ChatMessage, ImagePart, Provider, ToolResultPart, Usage } from "./types.js";
 import { emptyUsage, toolCallsOf } from "./types.js";
 import {
+  BUILTIN_PROFILES,
   PermissionEngine,
   type PermissionConfig,
   type PermissionDecision,
   type PermissionMode,
+  type PermissionProfile,
 } from "./permission.js";
 import { ToolRegistry, ToolError, type Tool } from "./tools/tool.js";
 import { defaultTools } from "./tools/index.js";
@@ -102,6 +104,8 @@ export interface AgentOptions {
   system?: string;
   tools?: ToolRegistry;
   permission?: PermissionConfig;
+  /** 自定义权限档位（叠加/覆盖内置 readonly/default/workspace/full），/profile 可切。 */
+  permissionProfiles?: Record<string, PermissionProfile>;
   /** loop 关键节点的用户扩展（PreToolUse/PostToolUse/UserPromptSubmit/Stop） */
   hooks?: HookRegistration[];
   /** 启用 task 工具（子 agent 委派）。true=仅内置 general 类型；数组=追加自定义类型 */
@@ -278,6 +282,7 @@ export class Agent {
   private readonly baseSystem: string;
   private readonly tools: ToolRegistry;
   private readonly perm: PermissionEngine;
+  private readonly permissionProfiles: Record<string, PermissionProfile>;
   private readonly hooks: HookRunner;
   private readonly maxTurns: number;
   private readonly maxTokens: number | undefined;
@@ -404,6 +409,7 @@ export class Agent {
       readOnlyTools: [...(opts.permission?.readOnlyTools ?? []), ...this.tools.readOnlyNames()],
       editTools: [...(opts.permission?.editTools ?? []), ...this.tools.editNames()],
     });
+    this.permissionProfiles = { ...BUILTIN_PROFILES, ...opts.permissionProfiles };
     // 并发分组发生在执行前。只要 PreToolUse 或只读 ask-confirm 可能改写入参，
     // 就保守串行，避免按旧参数判成安全、最终却执行写操作。
     this.parallelInputsStable =
@@ -437,6 +443,33 @@ export class Agent {
 
   getPermissionMode(): PermissionMode {
     return this.perm.getMode();
+  }
+
+  /**
+   * 运行时切换权限档位（内置 readonly/default/workspace/full + AgentOptions.permissionProfiles
+   * 自定义档位）。返回切换后的生效模式；未知档位名抛错并列出可用档位。
+   */
+  setPermissionProfile(name: string): PermissionMode {
+    const profile = this.permissionProfiles[name];
+    if (!profile) {
+      throw new Error(
+        t(
+          `Unknown permission profile "${name}". Available: ${Object.keys(this.permissionProfiles).join(", ")}`,
+          `未知权限档位 "${name}"。可用: ${Object.keys(this.permissionProfiles).join(", ")}`,
+        ),
+      );
+    }
+    this.perm.applyProfile(name, profile);
+    return this.perm.getMode();
+  }
+
+  getPermissionProfile(): string | null {
+    return this.perm.getProfile();
+  }
+
+  /** 所有可切换的档位（内置 + 自定义），供 UI 列表展示。 */
+  listPermissionProfiles(): Record<string, PermissionProfile> {
+    return { ...this.permissionProfiles };
   }
 
   // ---------- 驱动 ----------

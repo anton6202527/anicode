@@ -14,7 +14,7 @@ import type {
   SessionSummary,
   SessionManager,
 } from "./session-manager.js";
-import type { PermissionMode } from "./permission.js";
+import type { PermissionMode, PermissionProfile } from "./permission.js";
 
 export type PermissionDecisionKind = PermissionAnswer;
 
@@ -45,6 +45,13 @@ export interface SessionHost {
    * 可不实现，前端应在调用前判空。
    */
   setPermissionMode?(sessionId: string, mode: PermissionMode): Promise<void>;
+  /**
+   * 运行时切换权限档位（内置 readonly/default/workspace/full + 配置自定义）。
+   * 返回切换后的生效模式。可选，同 setPermissionMode 的接线边界。
+   */
+  setPermissionProfile?(sessionId: string, name: string): Promise<PermissionMode>;
+  /** 会话可用的权限档位（供 /profile 无参列表）。可选。 */
+  listPermissionProfiles?(sessionId: string): Promise<Record<string, PermissionProfile>>;
   /** 释放资源：远程断开 socket；本地中断本进程持有的 live drive。 */
   dispose(): void;
 }
@@ -80,6 +87,12 @@ export class LocalSessionHost implements SessionHost {
   }
   setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
     return this.manager.setPermissionMode(sessionId, mode);
+  }
+  setPermissionProfile(sessionId: string, name: string): Promise<PermissionMode> {
+    return this.manager.setPermissionProfile(sessionId, name);
+  }
+  listPermissionProfiles(sessionId: string): Promise<Record<string, PermissionProfile>> {
+    return this.manager.listPermissionProfiles(sessionId);
   }
   dispose(): void {
     this.manager.dispose();
