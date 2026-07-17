@@ -185,8 +185,8 @@ function builtinCommands(): CommandMenuRow[] {
     {
       name: "model",
       description: t(
-        "Open the built-in model picker (incl. free/open)",
-        "打开内置模型选择器（含免费/开源）",
+        "Model picker (Tab=next prompt only); /model <spec> [once]",
+        "模型选择器（Tab=仅下一条）；/model <spec> [once]",
       ),
     },
     { name: "sessions", description: t("List recent sessions", "列出最近会话") },
@@ -485,6 +485,8 @@ export function App({
   const menuIndexRef = useRef(0);
   // 计划模式：/plan 切换；只读规划，退出后执行。会话切换时回到默认。
   const [planMode, setPlanMode] = useState(false);
+  // per-prompt 模型覆盖：仅下一条消息生效（/model <spec> once 或选择器里 Tab 设定）。
+  const [nextModel, setNextModel] = useState<string | null>(null);
   // 超窄终端下弹框横向滚动偏移（列）；仅当弹框比屏还宽时生效，切换弹框时归零。
   const [hoff, setHoff] = useState(0);
   const hoffRef = useRef(0);
@@ -718,6 +720,21 @@ export function App({
           setPicker({ rows, index: 0, filter: "" });
           return true;
         }
+        // `/model <spec> once`：仅下一条消息用该模型（per-prompt 覆盖），不新建会话。
+        if ((rest[1] ?? "").toLowerCase() === "once") {
+          setNextModel(spec);
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                `Next message will use ${spec} (this prompt only)`,
+                `下一条消息将使用 ${spec}（仅这一条）`,
+              ),
+            },
+          });
+          return true;
+        }
         await selectModel(spec);
         return true;
       }
@@ -938,6 +955,8 @@ export function App({
       }
       // 运行中发送 = steering（core 在 turn 边界注入）；user 条目由事件渲染。
       // 先展开 @文件引用（把文件内容拼进消息），再发送。
+      const modelOverride = nextModel; // per-prompt 覆盖：本条消费掉即清
+      if (modelOverride) setNextModel(null);
       dispatch({ t: "running", v: true });
       void expandFileMentions(text, state.meta.cwd)
         .then(({ text: expanded, missing }) => {
@@ -950,14 +969,14 @@ export function App({
               },
             });
           }
-          return host.send(sessionId, expanded);
+          return host.send(sessionId, expanded, modelOverride ? { model: modelOverride } : undefined);
         })
         .catch((err) => {
           dispatch({ t: "running", v: false });
           dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
         });
     },
-    [host, runSlash, sessionId, state.meta.cwd],
+    [host, runSlash, sessionId, state.meta.cwd, nextModel],
   );
 
   useInput((ch, key) => {
@@ -1014,6 +1033,25 @@ export function App({
           void selectModel(spec).catch((err) => {
             setPicker(null);
             dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+          });
+        }
+        return;
+      }
+      // Tab：per-prompt 覆盖——仅下一条消息用选中模型，不新建会话。
+      if (key.tab) {
+        const spec = visible[picker.index]?.spec;
+        if (spec) {
+          setPicker(null);
+          setNextModel(spec);
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                `Next message will use ${spec} (this prompt only)`,
+                `下一条消息将使用 ${spec}（仅这一条）`,
+              ),
+            },
           });
         }
         return;
@@ -1307,6 +1345,9 @@ export function App({
               : [
                   // 计划模式置顶提示：让「现在是只读」这件事一眼可见。
                   ...(planMode ? [t("◆ plan mode (read-only)", "◆ 计划模式（只读）")] : []),
+                  ...(nextModel
+                    ? [t(`↳ next: ${nextModel} (once)`, `↳ 下一条: ${nextModel}（仅一次）`)]
+                    : []),
                   t("/model switch model", "/model 换模型"),
                   t("↑↓ history", "↑↓ 历史"),
                   t("PageUp scroll back", "PageUp 回看"),

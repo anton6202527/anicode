@@ -243,7 +243,7 @@ export class DaemonServer {
         return null;
       }
       case "send":
-        await this.manager.send(req.sessionId, req.text);
+        await this.manager.send(req.sessionId, req.text, req.model ? { model: req.model } : undefined);
         return null;
       case "interrupt":
         await this.manager.interrupt(req.sessionId);

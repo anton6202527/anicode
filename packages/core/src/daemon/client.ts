@@ -265,8 +265,14 @@ export class DaemonClient implements SessionHost {
     };
   }
 
-  async send(sessionId: string, text: string): Promise<void> {
-    await this.request((id) => ({ id, method: "send", sessionId, text }));
+  async send(sessionId: string, text: string, opts?: { model?: string }): Promise<void> {
+    await this.request((id) => ({
+      id,
+      method: "send",
+      sessionId,
+      text,
+      ...(opts?.model ? { model: opts.model } : {}),
+    }));
   }
 
   async interrupt(sessionId: string): Promise<void> {

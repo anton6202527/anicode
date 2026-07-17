@@ -33,6 +33,7 @@ function makeHost(
     createdAt: "2026-07-17T00:00:00.000Z",
     updatedAt: "2026-07-17T00:00:00.000Z",
   };
+  const sendLog: { text: string; model?: string }[] = [];
   const host: SessionHost = {
     async listSessions() {
       return [];
@@ -62,7 +63,8 @@ function makeHost(
         close() {},
       };
     },
-    async send(_sessionId, text) {
+    async send(_sessionId, text, opts) {
+      sendLog.push({ text, ...(opts?.model ? { model: opts.model } : {}) });
       options.onSend?.(text);
     },
     async interrupt() {},
@@ -75,6 +77,7 @@ function makeHost(
     },
     dispose() {},
   };
+  (host as SessionHost & { sendLog: typeof sendLog }).sendLog = sendLog;
   if (options.setPermissionMode) host.setPermissionMode = options.setPermissionMode;
   if (options.setPermissionProfile) {
     const spp = options.setPermissionProfile;
@@ -347,6 +350,36 @@ test("TUI 回归: host 不支持档位时 /profile 明确提示", async () => {
     view.stdin.write("\r");
     await tick(80);
     assert.match(view.lastFrame() ?? "", /不支持运行时权限档位/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: /model <spec> once 仅覆盖下一条消息的模型，随后自动还原", async () => {
+  const host = makeHost();
+  const sendLog = (host as SessionHost & { sendLog: { text: string; model?: string }[] }).sendLog;
+  const view = mount(host);
+  await tick();
+  try {
+    for (const ch of "/model alt/fast once") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(80);
+    const hint = view.lastFrame() ?? "";
+    assert.match(hint, /下一条消息将使用 alt\/fast/);
+    assert.match(hint, /下一条: alt\/fast/); // 输入区上方的待用指示
+
+    for (const ch of "第一条") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(100);
+    for (const ch of "第二条") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(100);
+
+    assert.deepEqual(sendLog, [
+      { text: "第一条", model: "alt/fast" }, // 覆盖仅一次
+      { text: "第二条" }, // 自动还原
+    ]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /下一条: alt\/fast/);
   } finally {
     view.unmount();
   }

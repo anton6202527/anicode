@@ -29,8 +29,11 @@ export interface SessionHost {
   createSession(input: { cwd: string; model: string; title?: string }): Promise<SessionSummary>;
   /** 订阅一个会话：立即拿 snapshot，之后经 listener 实时收事件 */
   open(sessionId: string, listener: (ev: SessionEvent) => void): Promise<OpenHandle>;
-  /** 发消息驱动 loop；事件经 open 的 listener 回流；resolve 于本次 loop 结束 */
-  send(sessionId: string, text: string): Promise<void>;
+  /**
+   * 发消息驱动 loop；事件经 open 的 listener 回流；resolve 于本次 loop 结束。
+   * opts.model：per-prompt 模型覆盖——仅这一次 drive 用该模型（steering 时忽略）。
+   */
+  send(sessionId: string, text: string, opts?: { model?: string }): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
   /** true 表示本次成功裁决；false 表示已被其他观察者抢先处理或请求已失效。 */
   answerPermission(
@@ -69,8 +72,8 @@ export class LocalSessionHost implements SessionHost {
   async open(sessionId: string, listener: (ev: SessionEvent) => void): Promise<OpenHandle> {
     return this.manager.open(sessionId, listener);
   }
-  send(sessionId: string, text: string): Promise<void> {
-    return this.manager.send(sessionId, text);
+  send(sessionId: string, text: string, opts?: { model?: string }): Promise<void> {
+    return this.manager.send(sessionId, text, opts);
   }
   interrupt(sessionId: string): Promise<void> {
     return this.manager.interrupt(sessionId);

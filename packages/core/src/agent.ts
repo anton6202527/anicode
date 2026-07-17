@@ -276,8 +276,10 @@ type TurnOutcome =
   | { type: "error"; message: string; cause?: unknown; partial: boolean };
 
 export class Agent {
-  private readonly provider: Provider;
-  private readonly model: string;
+  // 非 readonly：per-prompt 模型覆盖会在单次 drive 内临时换掉、结束即还原（send 不可重入保证安全）。
+  private provider: Provider;
+  private model: string;
+  private readonly resolveModelFn?: (spec: string) => AgentResolvedModel;
   private readonly cwd: string;
   private readonly baseSystem: string;
   private readonly tools: ToolRegistry;
@@ -287,9 +289,9 @@ export class Agent {
   private readonly maxTurns: number;
   private readonly maxTokens: number | undefined;
   private readonly effort: AgentOptions["effort"];
-  private readonly supportsTools: boolean;
+  private supportsTools: boolean;
   /** 模型是否支持视觉；未知能力按 false（宁可降级为文本，也不要整轮请求被拒）。 */
-  private readonly supportsImages: boolean;
+  private supportsImages: boolean;
   private readonly maxToolResultChars: number;
   private readonly retry: Required<RetryConfig> | null;
   private readonly useProjectMemory: boolean;
@@ -318,6 +320,7 @@ export class Agent {
   constructor(opts: AgentOptions) {
     this.provider = opts.provider;
     this.model = opts.model;
+    if (opts.resolveModel) this.resolveModelFn = opts.resolveModel;
     // 小模型：解析失败（拼写/缺凭证）就静默回退主模型，绝不因杂活模型而拖垮主流程。
     let smallProvider = opts.provider;
     let smallModelId = opts.model;
@@ -478,7 +481,11 @@ export class Agent {
    * 发一条用户消息，驱动 loop，产出事件流直到本次 done。
    * 并发护栏：上一轮未结束时再次调用会抛错（运行中请改用 queue()）。
    */
-  async *send(userText: string, signal?: AbortSignal): AsyncGenerator<AgentEvent> {
+  async *send(
+    userText: string,
+    signal?: AbortSignal,
+    opts?: { model?: string },
+  ): AsyncGenerator<AgentEvent> {
     if (this.running)
       throw new Error(
         t(
@@ -490,9 +497,50 @@ export class Agent {
     // 主输入尚在加载记忆 / 跑 UserPromptSubmit hook 时不接 steering；否则主输入
     // 被 block 时，准备期间到达的消息会跟着它的 queue 一起被清掉。
     this.acceptingQueuedInput = false;
+    // per-prompt 模型覆盖：本次 drive 全程（含工具后的后续 turn）用覆盖模型，结束还原。
+    // send 不可重入（running 护栏），临时换字段是安全的。
+    const saved = {
+      provider: this.provider,
+      model: this.model,
+      supportsTools: this.supportsTools,
+      supportsImages: this.supportsImages,
+    };
     try {
+      if (opts?.model) {
+        if (!this.resolveModelFn) {
+          yield {
+            type: "error",
+            message: t(
+              "Per-prompt model override requires the resolveModel option",
+              "单条消息模型覆盖需要配置 resolveModel 选项",
+            ),
+          };
+          return;
+        }
+        let resolved: AgentResolvedModel;
+        try {
+          resolved = this.resolveModelFn(opts.model);
+        } catch (err) {
+          yield {
+            type: "error",
+            message: t(
+              `Cannot resolve model "${opts.model}": ${err instanceof Error ? err.message : String(err)}`,
+              `无法解析模型 "${opts.model}"：${err instanceof Error ? err.message : String(err)}`,
+            ),
+          };
+          return;
+        }
+        this.provider = resolved.provider;
+        this.model = resolved.model;
+        this.supportsTools = resolved.modelInfo?.capabilities.tools ?? true;
+        this.supportsImages = resolved.modelInfo?.capabilities.images ?? false;
+      }
       yield* this.drive(userText, signal ?? new AbortController().signal);
     } finally {
+      this.provider = saved.provider;
+      this.model = saved.model;
+      this.supportsTools = saved.supportsTools;
+      this.supportsImages = saved.supportsImages;
       this.acceptingQueuedInput = false;
       this.queued = [];
       this.running = false;

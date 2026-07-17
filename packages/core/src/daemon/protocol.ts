@@ -19,7 +19,7 @@ export type ClientRequest =
   | { id: number; method: "open"; sessionId: string }
   /** 取消订阅 */
   | { id: number; method: "close"; sessionId: string }
-  | { id: number; method: "send"; sessionId: string; text: string }
+  | { id: number; method: "send"; sessionId: string; text: string; model?: string }
   | { id: number; method: "interrupt"; sessionId: string }
   | { id: number; method: "undo"; sessionId: string; checkpointId?: string }
   | {

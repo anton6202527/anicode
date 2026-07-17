@@ -127,6 +127,8 @@ interface SendWaiter {
 
 interface PendingSend extends SendWaiter {
   text: string;
+  /** per-prompt 模型覆盖：仅这一次 drive 用该模型。 */
+  model?: string;
 }
 
 type ResolvedProvider = ReturnType<SessionManagerOptions["resolveProvider"]>;
@@ -232,17 +234,24 @@ class ManagedSession {
    * 对应的 user_message(queued) 事件由 Agent 在注入时广播；Promise 在该 drive
    * 真正收尾后才 resolve，避免持久化尚未完成就向调用方报告成功。
    */
-  send(text: string): Promise<void> {
+  send(text: string, opts?: { model?: string }): Promise<void> {
     this.touch();
     return new Promise((resolve, reject) => {
       if (this.agent.queue(text)) {
         // steering 属于当前 drive；直到该 drive 真正收尾才向调用方报告完成。
+        // 注：steering 注入进行中的 drive，per-prompt 模型覆盖不适用（静默忽略）。
         this.currentWaiters.push({ resolve, reject, steering: true });
         return;
       }
       // Agent 已决定 done/error 但 generator 尚在收尾时，作为下一次 drive 排队，
       // 不能塞回一个再也不会 drain 的 Agent 队列。
-      this.pendingSends.push({ text, resolve, reject, steering: false });
+      this.pendingSends.push({
+        text,
+        resolve,
+        reject,
+        steering: false,
+        ...(opts?.model ? { model: opts.model } : {}),
+      });
       if (!this.driving) void this.pump();
     });
   }
@@ -257,7 +266,11 @@ class ManagedSession {
         this.currentWaiters = [next];
         this.abort = new AbortController();
         try {
-          for await (const ev of this.agent.send(next.text, this.abort.signal)) {
+          for await (const ev of this.agent.send(
+            next.text,
+            this.abort.signal,
+            next.model ? { model: next.model } : undefined,
+          )) {
             if (ev.type === "checkpoint") {
               this.checkpoints.push({ id: ev.id, tree: ev.tree, label: ev.label });
             }
@@ -434,9 +447,9 @@ export class SessionManager {
     return { snapshot: session.snapshot(), close };
   }
 
-  async send(sessionId: string, text: string): Promise<void> {
+  async send(sessionId: string, text: string, opts?: { model?: string }): Promise<void> {
     const session = await this.ensureLive(sessionId);
-    await session.send(text);
+    await session.send(text, opts);
   }
 
   async interrupt(sessionId: string): Promise<void> {
