@@ -130,6 +130,18 @@ export interface Sprite {
   width: number;
   /** 逐行 ANSI 串，每行显示宽度均为 width。 */
   lines: string[];
+  /** 可点击精灵每个本地行对应的选项索引；标题、留白等不可点击行用 null。 */
+  hitRows?: Array<number | null>;
+}
+
+/** 用 xterm SGR 的 1 基坐标命中精灵选项；弹框外或不可点击行返回 null。 */
+export function hitTestSprite(sprite: Sprite, column: number, row: number): number | null {
+  const x = column - 1;
+  const y = row - 1;
+  if (x < sprite.left || x >= sprite.left + sprite.width) return null;
+  const localRow = y - sprite.top;
+  if (localRow < 0 || localRow >= sprite.lines.length) return null;
+  return sprite.hitRows?.[localRow] ?? null;
 }
 
 /** 去掉 ANSI 控制序列，仅留可见字符（用于量可见宽度）。 */
@@ -278,13 +290,36 @@ export function windowHorizontally(sprite: Sprite, termCols: number, hoff: numbe
   const lines = sprite.lines.map((l) => sliceAnsi(l, off, off + view));
   lines.push(hbar(view, sprite.width, off));
   // 多出的滚动条行占一行高度：整体上移一行，避免越过屏底。
-  return { top: Math.max(0, sprite.top - 1), left: 0, width: view, lines };
+  return {
+    top: Math.max(0, sprite.top - 1),
+    left: 0,
+    width: view,
+    lines,
+    ...(sprite.hitRows ? { hitRows: [...sprite.hitRows, null] } : {}),
+  };
 }
 
-/** 弹框列表最多占屏高的比例上限：留出可见背景边距，绝不铺满整屏。 */
-function maxListItems(termRows: number, chrome: number, hardCap: number): number {
-  const byHeight = Math.floor(termRows * 0.6) - chrome;
-  return Math.max(3, Math.min(byHeight, hardCap));
+/** 固定高度仍需适配矮终端：正常取 ideal，放不下时留出上下各 2 行背景。 */
+function fixedOverlayHeight(termRows: number, ideal: number, minimum: number): number {
+  return Math.min(termRows, Math.min(ideal, Math.max(minimum, termRows - 4)));
+}
+
+/** 围绕当前高亮行开窗；内容不足时补满，保证弹框高度不随筛选结果跳动。 */
+function scrollWindow<T>(
+  rows: readonly T[],
+  selected: number,
+  height: number,
+  filler: () => T,
+): T[] {
+  if (height <= 0) return [];
+  const idx = Math.max(0, Math.min(selected, rows.length - 1));
+  const start =
+    rows.length > height
+      ? Math.min(Math.max(0, idx - Math.floor(height / 2)), rows.length - height)
+      : 0;
+  const visible = rows.slice(start, start + height);
+  while (visible.length < height) visible.push(filler());
+  return visible;
 }
 
 /** 模型选择器精灵（对齐截图：标题/esc、搜索行、紫色分组标题、暖橙整行高亮、右侧 Free 标签）。 */
@@ -304,6 +339,8 @@ export function buildModelPickerOverlay(
   termCols: number,
 ): Sprite {
   const width = dialogWidth(termCols);
+  const height = fixedOverlayHeight(termRows, 22, 8);
+  const viewportHeight = Math.max(1, height - 6);
   const inner = width - 2 * PADX;
   const blank = () => line(width, []);
   const bodyL = (spans: Span[], baseBg: string = DLG.bg) => line(width, [PAD, ...spans], baseBg);
@@ -332,53 +369,52 @@ export function buildModelPickerOverlay(
         ]),
   );
 
+  L.push(blank());
+  const content: Array<{ rendered: string; modelIndex?: number }> = [];
   if (visible.length === 0) {
-    L.push(blank());
-    L.push(bodyL([{ text: t("(no matching models)", "（无匹配模型）"), fg: DLG.dim }]));
+    content.push({
+      rendered: bodyL([{ text: t("(no matching models)", "（无匹配模型）"), fg: DLG.dim }]),
+    });
   } else {
-    // 列表开窗：让高亮项始终可见，超长目录只画一段；高度封顶不铺满整屏。
-    const maxItems = maxListItems(termRows, 10, 14);
-    let start = 0;
-    if (visible.length > maxItems) {
-      start = Math.min(Math.max(0, index - Math.floor(maxItems / 2)), visible.length - maxItems);
-    }
-    const win = visible.slice(start, start + maxItems);
-    L.push(blank());
-    win.forEach((row, i) => {
-      const gi = start + i;
-      const selected = gi === index;
-      const prev = win[i - 1];
-      const header = i === 0 || prev?.providerName !== row.providerName;
-      if (header) {
-        L.push(blank());
-        L.push(bodyL([{ text: row.providerName, fg: DLG.section, bold: true }]));
+    visible.forEach((row, modelIndex) => {
+      const prev = visible[modelIndex - 1];
+      if (modelIndex === 0 || prev?.providerName !== row.providerName) {
+        content.push({ rendered: blank() });
+        content.push({
+          rendered: bodyL([{ text: row.providerName, fg: DLG.section, bold: true }]),
+        });
       }
       const tag = row.free ? "Free" : row.ready === false ? row.readyHint : "";
-      if (selected) {
+      if (modelIndex === index) {
         const label = truncWidth(`● ${row.label}`, inner - dispWidth(tag) - 1);
-        L.push(
-          bodyLR(
+        content.push({
+          modelIndex,
+          rendered: bodyLR(
             [{ text: label, fg: DLG.hlFg, bold: true }],
             [{ text: tag, fg: DLG.hlFg }],
             DLG.hlBg,
           ),
-        );
+        });
       } else {
         const label = truncWidth(row.label, inner - dispWidth(tag) - 3);
-        L.push(bodyLR([{ text: `  ${label}`, fg: DLG.text }], [{ text: tag, fg: DLG.dim }]));
+        content.push({
+          modelIndex,
+          rendered: bodyLR([{ text: `  ${label}`, fg: DLG.text }], [{ text: tag, fg: DLG.dim }]),
+        });
       }
     });
   }
-
-  L.push(blank());
-  L.push(
-    bodyLR(
-      [{ text: t("↑/↓ select · Enter confirm", "↑/↓ 选择 · Enter 确认"), fg: DLG.dim }],
-      [{ text: t("esc cancel", "esc 取消"), fg: DLG.dim }],
-    ),
+  const selectedLine = Math.max(
+    0,
+    content.findIndex((entry) => entry.modelIndex === index),
   );
+  const win = scrollWindow(content, selectedLine, viewportHeight, () => ({ rendered: blank() }));
+  L.push(...win.map((entry) => entry.rendered));
   L.push(blank());
-  return place(L, width, termRows, termCols);
+  return {
+    ...place(L, width, termRows, termCols),
+    hitRows: [null, null, null, null, null, ...win.map((entry) => entry.modelIndex ?? null), null],
+  };
 }
 
 /** 会话列表精灵。 */
@@ -502,8 +538,8 @@ export interface CommandMenuRow {
 
 /**
  * 斜杠命令补全菜单精灵：钉在输入框正上方、方向朝上（对齐截图 #1）。
- * 左列命令名对齐、右侧描述灰字；高亮项整行暖橙底。超长列表开窗并以 ↑/↓ 计数提示，
- * 高度封顶不铺满整屏。anchorTop 为输入框首行的整帧行号，菜单末行落在其上一行。
+ * 左列命令名对齐、右侧描述灰字；高亮项整行暖橙底。菜单固定高度，超长列表在
+ * 内容区域内随高亮项滚动。anchorTop 为输入框首行的整帧行号，菜单末行落在其上一行。
  */
 export function buildCommandMenuOverlay(
   rows: readonly CommandMenuRow[],
@@ -517,18 +553,17 @@ export function buildCommandMenuOverlay(
   const inner = Math.max(1, width - 2 * PADX);
   const blank = () => line(width, []);
   const bodyL = (spans: Span[], baseBg: string = DLG.bg) => line(width, [PAD, ...spans], baseBg);
-  const bodyLR = (l: Span[], r: Span[], baseBg: string = DLG.bg) =>
-    lineLR(width, [PAD, ...l], [...r, PAD], baseBg);
 
   // 命令名列宽：取最长命令名（含 `/`）但不超过 18 列，之后留 2 列间隔再接描述。
   const nameCol = Math.min(18, Math.max(1, ...rows.map((r) => dispWidth("/" + r.name)))) + 2;
-  const maxItems = maxListItems(termRows, 3, 10);
-  let start = 0;
+  const height = Math.max(1, Math.min(12, anchorTop, termRows));
+  const viewportHeight = Math.max(0, height - 2);
   const idx = Math.max(0, Math.min(index, rows.length - 1));
-  if (rows.length > maxItems) {
-    start = Math.min(Math.max(0, idx - Math.floor(maxItems / 2)), rows.length - maxItems);
-  }
-  const win = rows.slice(start, start + maxItems);
+  const start =
+    rows.length > viewportHeight
+      ? Math.min(Math.max(0, idx - Math.floor(viewportHeight / 2)), rows.length - viewportHeight)
+      : 0;
+  const win = rows.slice(start, start + viewportHeight);
 
   const L: string[] = [];
   L.push(blank());
@@ -557,19 +592,15 @@ export function buildCommandMenuOverlay(
       );
     }
   });
-  L.push(blank());
-  L.push(
-    bodyLR(
-      [
-        {
-          text: t("↑/↓ select · Tab complete · Enter run", "↑/↓ 选择 · Tab 补全 · Enter 执行"),
-          fg: DLG.dim,
-        },
-      ],
-      [{ text: t("esc close", "esc 关闭"), fg: DLG.dim }],
-    ),
-  );
-  L.push(blank());
+  while (L.length < height - 1) L.push(blank());
+  if (L.length < height) L.push(blank());
   // 与输入框左缘对齐（列 0），末行停在输入框上一行。
-  return placeAbove(L, width, anchorTop, 0);
+  return {
+    ...placeAbove(L, width, anchorTop, 0),
+    hitRows: [
+      null,
+      ...win.map((_, i) => start + i),
+      ...Array.from({ length: Math.max(0, height - win.length - 1) }, () => null),
+    ],
+  };
 }

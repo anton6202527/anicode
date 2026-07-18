@@ -7,8 +7,31 @@ import {
   resolveConfiguredProvider,
   resolveDefaultModel,
   selectSessionId,
+  startRawModeWatchdog,
   validateArgs,
 } from "./cli.js";
+
+test("CLI: TUI 运行期间持续重申 raw mode，停止后不再改写终端", async () => {
+  const calls: boolean[] = [];
+  const input = {
+    isTTY: true,
+    destroyed: false,
+    setRawMode(enabled: boolean) {
+      calls.push(enabled);
+    },
+  };
+  const stop = startRawModeWatchdog(input, 10);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.ok(calls.length >= 6);
+  for (let i = 0; i < calls.length; i += 2) {
+    assert.deepEqual(calls.slice(i, i + 2), [false, true]);
+  }
+
+  stop();
+  const stoppedAt = calls.length;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(calls.length, stoppedAt);
+});
 
 test("CLI: --daemon --resume 只传递会话 ID，不预先 open", async () => {
   let createCalls = 0;

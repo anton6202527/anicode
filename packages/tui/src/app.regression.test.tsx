@@ -9,11 +9,19 @@ import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
 import type { ProviderDescriptor, SessionEvent, SessionHost } from "@anicode/core";
-import { App } from "./app.js";
+import { App, parseMouseInput } from "./app.js";
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
 const zeroUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
+test("TUI 回归: SGR 左键点击解析坐标，释放事件不重复触发", () => {
+  assert.deepEqual(parseMouseInput("\u001b[<0;20;10M\u001b[<0;20;10m"), {
+    wheelDelta: 0,
+    leftClick: { column: 20, row: 10 },
+  });
+  assert.deepEqual(parseMouseInput("\u001b[<0;20;10m"), { wheelDelta: 0 });
+});
 
 /** 最小离线 host：可注入历史事件与 undo/setPermissionMode 行为。 */
 function makeHost(
@@ -161,7 +169,7 @@ test("TUI 回归: PageUp 进入回看（有指示条），PageDown 回到底部"
   }
 });
 
-test("TUI 回归: 斜杠菜单 ↓ 移动高亮后 Enter 运行选中命令", async () => {
+test("TUI 回归: 斜杠菜单滚轮移动高亮后 Enter 运行选中命令", async () => {
   const host = makeHost();
   const view = mount(host);
   await tick();
@@ -172,7 +180,8 @@ test("TUI 回归: 斜杠菜单 ↓ 移动高亮后 Enter 运行选中命令", as
     const menu = view.lastFrame() ?? "";
     assert.match(menu, /\/status/);
     assert.match(menu, /\/sessions/);
-    view.stdin.write("[B"); // ↓ 高亮移到 sessions
+    // 同一 chunk 内 4 次向下 + 3 次向上，净向下 1 项；覆盖触控板事件合并。
+    view.stdin.write("\u001b[<65;10;10M".repeat(4) + "\u001b[<64;10;10M".repeat(3));
     await tick(20);
     view.stdin.write("\r"); // 运行高亮命令
     await tick(80);
@@ -243,7 +252,8 @@ test("TUI 回归: /model 选择器键入即过滤，Enter 选中过滤后的首�
     await tick(40);
     assert.match(view.lastFrame() ?? "", /Debug Demo/);
 
-    for (const ch of "llama") view.stdin.write(ch); // 键入即过滤
+    // 真实 PTY 可能把连续输入合成一个 data chunk；选择器仍应整块接收并过滤。
+    view.stdin.write("llama");
     await tick(40);
     const filtered = view.lastFrame() ?? "";
     assert.match(filtered, /Llama 3\.3/);

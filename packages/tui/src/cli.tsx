@@ -57,6 +57,41 @@ const CLI_VERSION = "0.1.2";
 // （无 DeepSeek key 时优雅回退，见 resolveDefaultModel）。
 const DEFAULT_MODEL = "deepseek/deepseek-chat";
 
+interface RawModeInput {
+  isTTY?: boolean;
+  destroyed?: boolean;
+  setRawMode?: (enabled: boolean) => unknown;
+}
+
+/**
+ * Ink 只在组件挂载/卸载时切 raw mode；若 IDE 任务面板、job control 或其它 TTY
+ * 状态切换在运行期间把终端恢复成 canonical mode，Ink 的内部计数仍认为 raw mode
+ * 已开启，按键就会在屏幕底部回显成 `^[[B`，useInput 则完全收不到。
+ *
+ * Node 的 `stdin.isRaw` 与 libuv 的 TTY mode 都是上次 setRawMode 的缓存，不能反映
+ * 外部 termios 改动；单独重复 `setRawMode(true)` 也会被 libuv 当作无变化而跳过。
+ * 因此 TUI 存活期间需要先 false 再 true 强制重申。停止后仍由 Ink 恢复原始状态。
+ */
+export function startRawModeWatchdog(
+  input: RawModeInput = process.stdin,
+  intervalMs = 200,
+): () => void {
+  if (!input.isTTY || typeof input.setRawMode !== "function") return () => {};
+  const restore = () => {
+    if (input.destroyed) return;
+    input.setRawMode?.(false);
+    input.setRawMode?.(true);
+  };
+  restore();
+  process.on("SIGCONT", restore);
+  const timer = setInterval(restore, intervalMs);
+  timer.unref?.();
+  return () => {
+    process.off("SIGCONT", restore);
+    clearInterval(timer);
+  };
+}
+
 export interface CliArgs {
   model: string;
   /** 用户是否显式传了 --model；否则运行时按已配置凭证挑默认模型。 */
@@ -963,7 +998,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         version={CLI_VERSION}
       />,
     );
-    await instance.waitUntilExit();
+    const stopRawModeWatchdog = startRawModeWatchdog();
+    try {
+      await instance.waitUntilExit();
+    } finally {
+      stopRawModeWatchdog();
+    }
   } finally {
     host?.dispose();
     lspPool?.closeAll();

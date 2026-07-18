@@ -44,6 +44,7 @@ import {
   buildSessionsOverlay,
   buildPermissionOverlay,
   buildCommandMenuOverlay,
+  hitTestSprite,
   windowHorizontally,
   dispWidth,
   truncWidth,
@@ -480,6 +481,7 @@ export function App({
     out.write("\x1b]11;#0a0a0a\x07");
     out.write("\x1b]17;#264f78\x07\x1b]19;#dcdcdc\x07");
     return () => {
+      out.write("\x1b[?1006l\x1b[?1000l"); // 确保退出时关闭鼠标跟踪
       out.write("\x1b]111\x07"); // 复位背景
       out.write("\x1b]117\x07\x1b]119\x07");
       out.write("\x1b[?1049l");
@@ -557,6 +559,18 @@ export function App({
     menuIndexRef.current = i;
     setMenuIndex(i);
   }, []);
+  const mouseMenuOpen =
+    !picker && !pendings[0] && !sessions && matchCommands(allCommands, input).length > 0;
+  const mousePickerOpen = Boolean(picker);
+  // 选择型弹框打开时临时启用 xterm 鼠标/滚轮跟踪与 SGR 坐标编码；关闭即恢复，
+  // 避免常驻鼠标模式影响终端正常选中文本。iTerm2、Terminal.app、VS Code Terminal 均支持。
+  useEffect(() => {
+    if (!overlayMode || (!mousePickerOpen && !mouseMenuOpen)) return;
+    stdout.write("\x1b[?1000h\x1b[?1006h");
+    return () => {
+      stdout.write("\x1b[?1006l\x1b[?1000l");
+    };
+  }, [mouseMenuOpen, mousePickerOpen, overlayMode, stdout]);
   // 回看滚动偏移：0=贴底看最新，>0=向上回看的条目数。
   const [scrollOffset, setScrollOffset] = useState(0);
   const closeRef = useRef<(() => void) | null>(null);
@@ -1182,6 +1196,7 @@ export function App({
   );
 
   useInput((ch, key) => {
+    const mouse = parseMouseInput(ch);
     // Ctrl+Z 退出（与 Ctrl+C 一致）；raw 模式下 Ctrl+Z 可能是 "z" 或 SUB 字符。
     if (key.ctrl && (ch === "z" || ch === "\u001a")) {
       exit();
@@ -1206,6 +1221,34 @@ export function App({
     }
     if (picker) {
       const visible = filterPickerRows(picker.rows, picker.filter);
+      if (mouse !== null) {
+        if (mouse.wheelDelta !== 0) {
+          setPicker((p) => {
+            if (!p) return p;
+            const n = filterPickerRows(p.rows, p.filter).length;
+            if (n === 0) return p;
+            return {
+              ...p,
+              index: Math.max(0, Math.min(p.index + mouse.wheelDelta, n - 1)),
+            };
+          });
+        } else if (mouse.leftClick) {
+          const sprite = windowHorizontally(
+            buildModelPickerOverlay(visible, picker.index, picker.filter, termRows, termCols),
+            termCols,
+            hoffRef.current,
+          );
+          const clicked = hitTestSprite(sprite, mouse.leftClick.column, mouse.leftClick.row);
+          const spec = clicked === null ? undefined : visible[clicked]?.spec;
+          if (spec) {
+            void selectModel(spec).catch((err) => {
+              setPicker(null);
+              dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+            });
+          }
+        }
+        return;
+      }
       if (key.escape) {
         setPicker(null);
         return;
@@ -1342,6 +1385,27 @@ export function App({
     if (menuOpen) {
       const n = menuRows.length;
       const cur = Math.min(menuIndexRef.current, n - 1);
+      if (mouse !== null) {
+        if (mouse.wheelDelta !== 0) {
+          setMenuIdx(Math.max(0, Math.min(cur + mouse.wheelDelta, n - 1)));
+        } else if (mouse.leftClick && panelRef.current) {
+          const sprite = buildCommandMenuOverlay(
+            menuRows,
+            cur,
+            absoluteTop(panelRef.current),
+            termRows,
+            termCols,
+          );
+          const clicked = hitTestSprite(sprite, mouse.leftClick.column, mouse.leftClick.row);
+          const command = clicked === null ? undefined : menuRows[clicked]?.name;
+          if (command) {
+            setMenuIdx(clicked!);
+            setBuf("", 0);
+            submitLine(`/${command}`);
+          }
+        }
+        return;
+      }
       if (key.upArrow) return setMenuIdx((cur - 1 + n) % n);
       if (key.downArrow) return setMenuIdx((cur + 1) % n);
       if (key.escape) return setBuf("", 0); // 关闭菜单（清掉半截命令）
@@ -1561,6 +1625,9 @@ export function App({
           )}
         </Text>
       </Box>
+      {conversationEmpty && termRows >= 22 && !picker && !pendings[0] && !sessions ? (
+        <WelcomeTip width={termCols} />
+      ) : null}
     </Box>
   ) : null;
 
@@ -2071,9 +2138,10 @@ function ModelPicker({
   maxRows?: number;
 }) {
   const visible = filterPickerRows(rows, filter);
+  const height = Math.min(maxRows, Math.min(22, Math.max(8, maxRows - 4)));
   const inner = Math.max(24, width - 6); // 扣掉边框(2) + 左右内边距(4)
   // 列表开窗：让高亮项始终可见，超长目录只画一段。
-  const maxItems = Math.max(6, maxRows - 10);
+  const maxItems = Math.max(1, height - 6);
   let start = 0;
   if (visible.length > maxItems) {
     start = Math.min(Math.max(0, index - Math.floor(maxItems / 2)), visible.length - maxItems);
@@ -2088,6 +2156,7 @@ function ModelPicker({
       paddingX={2}
       paddingY={1}
       width={width}
+      height={height}
     >
       <Box justifyContent="space-between">
         <Text bold>{t("Select model", "选择模型")}</Text>
@@ -2113,7 +2182,7 @@ function ModelPicker({
         </Box>
       ) : null}
 
-      <Box flexDirection="column" marginTop={1}>
+      <Box flexDirection="column" marginTop={1} flexGrow={1} overflow="hidden">
         {windowRows.map((row, i) => {
           const globalIdx = start + i;
           const selected = globalIdx === index;
@@ -2149,11 +2218,6 @@ function ModelPicker({
             </React.Fragment>
           );
         })}
-      </Box>
-
-      <Box marginTop={1} justifyContent="space-between">
-        <Text dimColor>{t("↑/↓ select · Enter confirm", "↑/↓ 选择 · Enter 确认")}</Text>
-        <Text dimColor>{t("esc cancel", "esc 取消")}</Text>
       </Box>
     </Box>
   );
@@ -2224,6 +2288,32 @@ export function Welcome({ width }: { width: number }) {
   );
 }
 
+/** 空会话欢迎页提示：对齐 opencode 的橙色 Tip 标记与命令高亮。 */
+export function WelcomeTip({ width }: { width: number }) {
+  if (width < 28) return null;
+  const cardWidth = Math.min(64, width - 4);
+  return (
+    <Box width={width} justifyContent="center" marginTop={1}>
+      <Box width={cardWidth}>
+        <Text wrap="wrap">
+          <Text color="#f59e0b">● </Text>
+          <Text color="#f59e0b" bold>
+            Tip
+          </Text>
+          <Text dimColor>{t(" Run ", " 运行 ")}</Text>
+          <Text bold>/init</Text>
+          <Text dimColor>
+            {t(
+              " to analyze this repository and generate AGENTS.md project memory",
+              " 分析当前仓库并生成 AGENTS.md 项目记忆",
+            )}
+          </Text>
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
 function errorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
 }
@@ -2232,6 +2322,31 @@ function mergePendings(a: PendingPerm[], b: PendingPerm[]): PendingPerm[] {
   const merged = new Map<string, PendingPerm>();
   for (const p of [...a, ...b]) merged.set(p.permId, p);
   return [...merged.values()];
+}
+
+interface MouseInput {
+  wheelDelta: number;
+  leftClick?: { column: number; row: number };
+}
+
+/**
+ * 批量解析一个 stdin chunk 里的 xterm SGR 鼠标事件。触控板常把十几条序列合并；
+ * Ink 只会剥掉第一个 ESC，所以全局扫描并同时接受后续仍带 ESC 的序列。
+ */
+export function parseMouseInput(input: string): MouseInput | null {
+  const event = /(?:\x1b)?\[<(\d+);(\d+);(\d+)([mM])/g;
+  let found = false;
+  const result: MouseInput = { wheelDelta: 0 };
+  for (const match of input.matchAll(event)) {
+    found = true;
+    const button = Number(match[1]);
+    if ((button & 64) !== 0) {
+      result.wheelDelta += (button & 1) === 0 ? -1 : 1;
+    } else if (match[4] === "M" && (button & 3) === 0 && (button & 32) === 0) {
+      result.leftClick = { column: Number(match[2]), row: Number(match[3]) };
+    }
+  }
+  return found ? result : null;
 }
 
 function isTodoProgress(value: unknown): value is { type: "todos"; todos: TodoItem[] } {
@@ -2272,13 +2387,27 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
 /** 斜杠命令补全菜单（in-tree 版，用于非浮层模式/测试）；高亮项暖橙底。 */
 function CommandMenu({ rows, index }: { rows: CommandMenuRow[]; index: number }) {
   const idx = Math.max(0, Math.min(index, rows.length - 1));
+  const viewportHeight = 10;
+  const start =
+    rows.length > viewportHeight
+      ? Math.min(Math.max(0, idx - Math.floor(viewportHeight / 2)), rows.length - viewportHeight)
+      : 0;
+  const visible = rows.slice(start, start + viewportHeight);
   const nameCol = Math.min(18, Math.max(1, ...rows.map((r) => dispWidth("/" + r.name)))) + 2;
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}>
-      {rows.map((r, i) => {
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="gray"
+      paddingX={1}
+      height={12}
+      overflow="hidden"
+    >
+      {visible.map((r, i) => {
+        const globalIndex = start + i;
         const name = "/" + r.name;
         const namePad = name + " ".repeat(Math.max(1, nameCol - dispWidth(name)));
-        if (i === idx) {
+        if (globalIndex === idx) {
           return (
             <Text key={r.name} backgroundColor={PICKER_HL} color="black">
               {namePad}
