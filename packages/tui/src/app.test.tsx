@@ -328,7 +328,7 @@ test("TUI: 键入 / 弹出命令补全菜单，Enter 直接运行高亮命令", 
   // Enter 运行高亮命令（此刻输入只有 /hel，无需补全完整）。
   stdin.write("\r");
   await tick(80);
-  assert.match(lastFrame() ?? "", /git 快照回滚/); // 仅 /help 运行后才出现的帮助正文
+  assert.match(lastFrame() ?? "", /回滚上一轮/); // 仅 /help 运行后才出现的帮助正文
 
   host.dispose();
 });
@@ -910,4 +910,56 @@ test("TUI: 中文与窄屏下真实光标列都落在窗口内", () => {
       }
     }
   }
+});
+
+test("TUI: /mcp 未配置时提示；配置后展示状态与 MCP prompt 命令可执行", async () => {
+  const host = offlineHost();
+  const view1 = render(<App host={host} cwd="/x" model="m" sessionId="s_offline" />);
+  await tick();
+  for (const ch of "/mcp") view1.stdin.write(ch);
+  await tick();
+  view1.stdin.write("\r");
+  await tick(80);
+  assert.match(view1.lastFrame() ?? "", /未配置 MCP 服务器/);
+  view1.unmount();
+  host.dispose();
+
+  // 配置了 mcpStatus 与 resolve 型命令：/mcp 输出状态，MCP prompt 命令渲染后发送
+  const host2 = offlineHost();
+  const resolved: string[] = [];
+  const view2 = render(
+    <App
+      host={host2}
+      cwd="/x"
+      model="m"
+      sessionId="s_offline"
+      mcpStatus={async () => "▸ srv  tools:✓ resources:✓ prompts:✓\n    提示 /mcp__srv__review"}
+      commands={[
+        {
+          name: "mcp__srv__review",
+          description: "审查提示",
+          template: "",
+          source: "mcp:srv",
+          resolve: async (a: string) => {
+            resolved.push(a);
+            return `请审查 ${a}`;
+          },
+        },
+      ]}
+    />,
+  );
+  await tick();
+  // 带空格结尾使输入不再匹配命令菜单前缀，回车走完整命令解析路径。
+  for (const ch of "/mcp ") view2.stdin.write(ch);
+  view2.stdin.write("\r");
+  await tick(80);
+  assert.match(view2.lastFrame() ?? "", /tools:✓/);
+
+  for (const ch of "/mcp__srv__review a.ts") view2.stdin.write(ch);
+  view2.stdin.write("\r");
+  await tick(80);
+  assert.deepEqual(resolved, ["a.ts"]);
+  // 发送后 running 挂起 spinner（离线 host 无 state 事件），必须 unmount 让事件循环收尾。
+  view2.unmount();
+  host2.dispose();
 });

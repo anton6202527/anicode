@@ -23,6 +23,8 @@ export interface ConfigAgent {
   description: string;
   prompt?: string;
   tools?: string[];
+  /** 禁用工具（支持 * glob）；在 tools/继承集确定后剔除。 */
+  disallowedTools?: string[];
   model?: string;
   maxTurns?: number;
 }
@@ -32,6 +34,8 @@ export interface AnicodeConfig {
   model?: string;
   /** 小模型路由用的模型；true=启用默认小模型，字符串=指定 spec。 */
   smallModel?: string | boolean;
+  /** 模型降级链：主模型重试仍失败时按序切换的 spec 列表。 */
+  fallbackModels?: string[];
   /**
    * MCP 服务器：name → 启动配置。两种形态：
    *   - 本地进程（stdio）：{ command, args?, env? }
@@ -39,8 +43,8 @@ export interface AnicodeConfig {
    */
   mcp?: Record<
     string,
-    | { command: string; args?: string[]; env?: Record<string, string> }
-    | { url: string; headers?: Record<string, string> }
+    | { command: string; args?: string[]; env?: Record<string, string>; timeoutMs?: number }
+    | { url: string; headers?: Record<string, string>; timeoutMs?: number }
   >;
   /** 自定义子 agent：name → 定义。 */
   agents?: Record<string, ConfigAgent>;
@@ -48,10 +52,26 @@ export interface AnicodeConfig {
   lsp?: Record<string, LspServerConfig>;
   /** 额外注入 system 的规则文件路径（相对 cwd 或绝对）。 */
   instructions?: string[];
+  /**
+   * 命令式 hooks：event + 可选 matcher + shell 命令（payload JSON 走 stdin，
+   * exit 2=block，stdout JSON=HookResult；见 hooks-exec.ts）。
+   */
+  hooks?: { event: string; matcher?: string; command: string; timeoutMs?: number }[];
+  /**
+   * 基础权限规则（叠加在权限模式之下、档位之外，永不被切档位洗掉）：
+   * allow/deny/ask，规则语法同 "Tool" / "Tool(glob)"。
+   * .anicode/settings.local.json 的同名键会合并进来（allow_always 写回处）。
+   */
+  permissions?: { allow?: string[]; deny?: string[]; ask?: string[] };
   /** 启动时应用的权限档位名（内置 readonly/default/workspace/full 或自定义）。 */
   permissionProfile?: string;
   /** 自定义权限档位：name → { mode?, allowRules?, denyRules?, askRules?, description? }。 */
   permissionProfiles?: Record<string, PermissionProfile>;
+  /**
+   * 配置档（对齐 Codex --profile）：name → 局部配置，启动时用 --profile <name>
+   * 叠加到主配置之上（同 merge 语义）。档内不允许再嵌套 profiles。
+   */
+  profiles?: Record<string, Omit<AnicodeConfig, "profiles">>;
 }
 
 export interface LoadedConfig {
@@ -65,12 +85,16 @@ export interface LoadedConfig {
 const KNOWN_KEYS = new Set([
   "model",
   "smallModel",
+  "fallbackModels",
   "mcp",
   "agents",
   "lsp",
+  "hooks",
   "instructions",
+  "permissions",
   "permissionProfile",
   "permissionProfiles",
+  "profiles",
 ]);
 
 function candidatePaths(cwd: string, home: string): string[] {
@@ -78,6 +102,8 @@ function candidatePaths(cwd: string, home: string): string[] {
     path.join(home, ".config", "anicode", "anicode.json"),
     path.join(cwd, "anicode.json"),
     path.join(cwd, ".anicode", "anicode.json"),
+    // 项目本地设置（个人授权清单等，不建议入库）；allow_always 写回这里
+    path.join(cwd, ".anicode", "settings.local.json"),
   ];
 }
 
@@ -125,14 +151,53 @@ function merge(base: AnicodeConfig, over: AnicodeConfig): AnicodeConfig {
     ...(base.permissionProfiles || over.permissionProfiles
       ? { permissionProfiles: { ...base.permissionProfiles, ...over.permissionProfiles } }
       : {}),
+    // 权限规则拼接去重：全局 deny + 项目 deny 都要生效，覆盖语义会静默丢安全规则。
+    ...(base.permissions || over.permissions
+      ? {
+          permissions: {
+            ...(base.permissions?.allow || over.permissions?.allow
+              ? {
+                  allow: [
+                    ...new Set([
+                      ...(base.permissions?.allow ?? []),
+                      ...(over.permissions?.allow ?? []),
+                    ]),
+                  ],
+                }
+              : {}),
+            ...(base.permissions?.deny || over.permissions?.deny
+              ? {
+                  deny: [
+                    ...new Set([
+                      ...(base.permissions?.deny ?? []),
+                      ...(over.permissions?.deny ?? []),
+                    ]),
+                  ],
+                }
+              : {}),
+            ...(base.permissions?.ask || over.permissions?.ask
+              ? {
+                  ask: [
+                    ...new Set([
+                      ...(base.permissions?.ask ?? []),
+                      ...(over.permissions?.ask ?? []),
+                    ]),
+                  ],
+                }
+              : {}),
+          },
+        }
+      : {}),
     ...(base.instructions || over.instructions
       ? { instructions: [...new Set([...(base.instructions ?? []), ...(over.instructions ?? [])])] }
       : {}),
+    // hooks 全局+项目拼接（同一事件多个 hook 顺序执行，不去重——同命令可有意重复）。
+    ...(base.hooks || over.hooks ? { hooks: [...(base.hooks ?? []), ...(over.hooks ?? [])] } : {}),
   };
 }
 
 export async function loadConfig(
-  opts: { cwd?: string; home?: string } = {},
+  opts: { cwd?: string; home?: string; profile?: string } = {},
 ): Promise<LoadedConfig> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? os.homedir();
@@ -146,6 +211,21 @@ export async function loadConfig(
       sources.push(file);
     }
   }
+  // 配置档叠加（对齐 Codex --profile）：选中档的局部配置覆盖主配置。
+  if (opts.profile) {
+    const profile = config.profiles?.[opts.profile];
+    if (profile) {
+      config = merge(config, profile as AnicodeConfig);
+    } else {
+      warnings.push(
+        t(
+          `profile "${opts.profile}" not found (available: ${Object.keys(config.profiles ?? {}).join(", ") || "none"})`,
+          `未找到配置档 "${opts.profile}"（可用: ${Object.keys(config.profiles ?? {}).join(", ") || "无"}）`,
+        ),
+      );
+    }
+    delete config.profiles; // 档位已消费；避免下游误用
+  }
   return { config, sources, warnings };
 }
 
@@ -154,13 +234,19 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
   if (!config.mcp) return [];
   return Object.entries(config.mcp).map(([name, c]) => {
     if ("url" in c) {
-      return { name, url: c.url, ...(c.headers ? { headers: c.headers } : {}) };
+      return {
+        name,
+        url: c.url,
+        ...(c.headers ? { headers: c.headers } : {}),
+        ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
+      };
     }
     return {
       name,
       command: c.command,
       ...(c.args ? { args: c.args } : {}),
       ...(c.env ? { env: c.env } : {}),
+      ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     };
   });
 }
@@ -179,6 +265,7 @@ export function toSubagentDefinitions(config: AnicodeConfig): SubagentDefinition
     description: a.description,
     ...(a.prompt ? { system: a.prompt } : {}),
     ...(a.tools ? { tools: a.tools } : {}),
+    ...(a.disallowedTools ? { disallowedTools: a.disallowedTools } : {}),
     ...(a.model ? { model: a.model } : {}),
     ...(a.maxTurns ? { maxTurns: a.maxTurns } : {}),
   }));

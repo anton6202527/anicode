@@ -131,6 +131,10 @@ function applyEvent(se: SessionEvent): void {
     render();
     return;
   }
+  if (se.type === "title") {
+    // 标题变化：webview 暂不展示标题，忽略。
+    return;
+  }
   const ev = se.event;
   switch (ev.type) {
     case "user_message":
@@ -348,6 +352,7 @@ function renderPermission(p: PendingPerm, extra: number): HTMLElement {
   actions.append(
     permButton(t("Allow", "允许"), "allow", p.permId, "allow"),
     permButton(t("Allow and remember", "允许并记住"), "remember", p.permId, "allow_remember"),
+    permButton(t("Always allow (persist)", "永久允许（写入项目）"), "remember", p.permId, "allow_always"),
     permButton(t("Deny", "拒绝"), "deny", p.permId, "deny"),
   );
   card.append(title, key, actions);
@@ -358,7 +363,7 @@ function permButton(
   label: string,
   cls: string,
   permId: string,
-  decision: "allow" | "allow_remember" | "deny",
+  decision: "allow" | "allow_remember" | "allow_always" | "deny",
 ): HTMLElement {
   const b = button(`btn ${cls}`, () => post({ type: "answer", permId, decision }));
   b.textContent = label;

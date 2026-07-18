@@ -116,6 +116,45 @@ test("MCP(HTTP): 握手带 session、tools/list 走 SSE、tools/call 走 JSON", 
   }
 });
 
+test("MCP: capabilities + resources/prompts 客户端方法", async () => {
+  const client = await McpClient.start(serverCfg);
+  assert.deepEqual(client.capabilities, { tools: true, resources: true, prompts: true });
+
+  const resources = await client.listResources();
+  assert.equal(resources[0]?.uri, "fake://readme");
+  const content = await client.readResource("fake://readme");
+  assert.equal(content, "content of fake://readme");
+
+  const prompts = await client.listPrompts();
+  assert.equal(prompts[0]?.name, "review");
+  const rendered = await client.getPrompt("review", { file: "a.ts" });
+  assert.equal(rendered, "请审查 a.ts");
+
+  client.close();
+});
+
+test("MCP: per-request 超时（hang 工具在时限内报错，不永久挂起）", async () => {
+  const client = await McpClient.start({ ...serverCfg, timeoutMs: 400 });
+  const tools = await client.listTools();
+  const hang = tools.find((t) => t.def.name === "fake__hang")!;
+  await assert.rejects(
+    () => hang.run({}, { cwd: ".", signal: new AbortController().signal }),
+    /超时|timed out/,
+  );
+  client.close();
+});
+
+test("MCP: notifications/tools/list_changed → onToolsChanged 回调", async () => {
+  let changed = 0;
+  const client = await McpClient.start(serverCfg, { onToolsChanged: () => changed++ });
+  const tools = await client.listTools();
+  const notify = tools.find((t) => t.def.name === "fake__notify_changed")!;
+  const out = await notify.run({}, { cwd: ".", signal: new AbortController().signal });
+  assert.equal(out, "notified");
+  assert.equal(changed, 1, "通知应触发 onToolsChanged");
+  client.close();
+});
+
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
   return {

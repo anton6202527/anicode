@@ -33,11 +33,25 @@ export interface ProviderLimits {
   maxOutputTokens?: number;
 }
 
+/**
+ * 模型单价（美元 / 每百万 token）。用于会话成本估算展示（对齐 Claude Code /usage），
+ * 不用于计费——各家价格会变，这里是内置目录的近似值，未知模型不填即不显示成本。
+ */
+export interface ModelCost {
+  input: number;
+  output: number;
+  /** 缓存读；缺省按 0.1 × input 估算。 */
+  cacheRead?: number;
+  /** 缓存写；缺省按 1.25 × input 估算。 */
+  cacheWrite?: number;
+}
+
 export interface ProviderModelProfile {
   /** 简单 glob：`*` 匹配任意字符，`?` 匹配单字符；按声明顺序叠加覆盖。 */
   pattern: string;
   capabilities?: Partial<ProviderCapabilities>;
   limits?: ProviderLimits;
+  cost?: ModelCost;
 }
 
 /** 内置模型目录里的一条具体、可直接选用的模型。 */
@@ -82,6 +96,30 @@ export interface ProviderModelInfo {
   model: string;
   capabilities: ProviderCapabilities;
   limits: ProviderLimits;
+  /** 命中内置价格表时填充；未知模型缺省。 */
+  cost?: ModelCost;
+}
+
+/** 按用量与单价估算美元成本；无价格信息返回 undefined。 */
+export function estimateCostUSD(
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+  },
+  cost: ModelCost | undefined,
+): number | undefined {
+  if (!cost) return undefined;
+  const per = 1 / 1_000_000;
+  const cacheRead = cost.cacheRead ?? cost.input * 0.1;
+  const cacheWrite = cost.cacheWrite ?? cost.input * 1.25;
+  return (
+    usage.inputTokens * cost.input * per +
+    usage.outputTokens * cost.output * per +
+    usage.cacheReadTokens * cacheRead * per +
+    usage.cacheWriteTokens * cacheWrite * per
+  );
 }
 
 /** 打平后的目录条目：已带上 provider 归属和可直接用于 createProvider 的 spec。 */
@@ -194,6 +232,7 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
         pattern: "gpt-5*",
         capabilities: { reasoning: true, images: true, tools: true },
         limits: { contextWindow: 400_000, maxOutputTokens: 128_000 },
+        cost: { input: 1.25, output: 10, cacheRead: 0.125 },
       },
       { pattern: "o?*", capabilities: { reasoning: true } },
     ],
@@ -283,7 +322,10 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
     reasoningEffort: false,
     capabilities: cloudDefaults,
     limits: { contextWindow: 128_000, maxOutputTokens: 8_000 },
-    models: [{ pattern: "deepseek-reasoner*", capabilities: { reasoning: true } }],
+    models: [
+      { pattern: "deepseek-*", cost: { input: 0.27, output: 1.1, cacheRead: 0.027 } },
+      { pattern: "deepseek-reasoner*", capabilities: { reasoning: true } },
+    ],
     catalog: [
       {
         model: "deepseek-chat",
@@ -504,6 +546,11 @@ install({
     capabilities: { tools: true, reasoning: false, images: true },
     limits: { contextWindow: 200_000, maxOutputTokens: 32_000 },
     models: [
+      // 价格（$/MTok）来自 Anthropic 官方价目（2026-06 快照）：Opus 4.x $5/$25、
+      // Sonnet $3/$15、Haiku 4.5 $1/$5；cache 读 0.1×、写 1.25× 用 estimateCostUSD 默认。
+      { pattern: "claude-haiku-*", cost: { input: 1, output: 5 } },
+      { pattern: "claude-sonnet-*", cost: { input: 3, output: 15 } },
+      { pattern: "claude-opus-*", cost: { input: 5, output: 25 } },
       { pattern: "claude-opus-4-6*", capabilities: { reasoning: true } },
       { pattern: "claude-opus-4-7*", capabilities: { reasoning: true } },
       { pattern: "claude-opus-4-8*", capabilities: { reasoning: true } },
@@ -862,12 +909,14 @@ function resolveSpec(spec: string): { entry: RegisteredProvider; model: string }
 function resolveModelInfo(d: ProviderDescriptor, model: string): ProviderModelInfo {
   const capabilities = { ...d.capabilities };
   const limits = { ...d.limits };
+  let cost: ModelCost | undefined;
   for (const profile of d.models) {
     if (!globModel(profile.pattern, model)) continue;
     Object.assign(capabilities, profile.capabilities ?? {});
     Object.assign(limits, profile.limits ?? {});
+    if (profile.cost) cost = profile.cost;
   }
-  return { providerId: d.id, model, capabilities, limits };
+  return { providerId: d.id, model, capabilities, limits, ...(cost ? { cost } : {}) };
 }
 
 function globModel(pattern: string, model: string): boolean {

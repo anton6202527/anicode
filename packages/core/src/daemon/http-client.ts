@@ -7,7 +7,12 @@
  */
 
 import { t } from "../i18n.js";
-import type { SessionEvent, SessionSnapshot, SessionSummary } from "../session-manager.js";
+import type {
+  RewindMode,
+  SessionEvent,
+  SessionSnapshot,
+  SessionSummary,
+} from "../session-manager.js";
 import type { OpenHandle, PermissionDecisionKind, SessionHost } from "../host.js";
 import type { PermissionMode, PermissionProfile } from "../permission.js";
 
@@ -177,9 +182,30 @@ export class HttpSessionHost implements SessionHost {
     return r.answered;
   }
 
-  undo(sessionId: string, checkpointId?: string): Promise<{ restored: number; deleted: number }> {
+  undo(
+    sessionId: string,
+    checkpointId?: string,
+    mode?: RewindMode,
+  ): Promise<{ restored: number; deleted: number; removedMessages?: number }> {
     return this.call("POST", `/sessions/${encodeURIComponent(sessionId)}/undo`, {
       ...(checkpointId ? { checkpointId } : {}),
+      ...(mode ? { mode } : {}),
+    });
+  }
+
+  compact(
+    sessionId: string,
+  ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
+    return this.call("POST", `/sessions/${encodeURIComponent(sessionId)}/compact`, {});
+  }
+
+  forkSession(
+    sessionId: string,
+    opts?: { title?: string; upToMessage?: number },
+  ): Promise<SessionSummary> {
+    return this.call("POST", `/sessions/${encodeURIComponent(sessionId)}/fork`, {
+      ...(opts?.title !== undefined ? { title: opts.title } : {}),
+      ...(opts?.upToMessage !== undefined ? { upToMessage: opts.upToMessage } : {}),
     });
   }
 

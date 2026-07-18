@@ -7,8 +7,15 @@
  */
 
 import { t } from "../i18n.js";
-import type { SessionEvent, SessionSnapshot, SessionSummary } from "../session-manager.js";
+import type {
+  RewindMode,
+  SessionEvent,
+  SessionSnapshot,
+  SessionSummary,
+} from "../session-manager.js";
 import type { PermissionDecisionKind } from "../host.js";
+
+const REWIND_MODES: readonly string[] = ["files", "conversation", "both"];
 
 // ---------- 客户端 → 守护进程 ----------
 
@@ -21,7 +28,11 @@ export type ClientRequest =
   | { id: number; method: "close"; sessionId: string }
   | { id: number; method: "send"; sessionId: string; text: string; model?: string }
   | { id: number; method: "interrupt"; sessionId: string }
-  | { id: number; method: "undo"; sessionId: string; checkpointId?: string }
+  | { id: number; method: "undo"; sessionId: string; checkpointId?: string; mode?: RewindMode }
+  /** fork：复制会话历史成新会话（可截断到前 upToMessage 条）。 */
+  | { id: number; method: "fork"; sessionId: string; title?: string; upToMessage?: number }
+  /** 手动压缩上下文（/compact）。 */
+  | { id: number; method: "compact"; sessionId: string }
   | {
       id: number;
       method: "answerPermission";
@@ -115,11 +126,21 @@ export function isClientRequest(value: unknown): value is ClientRequest {
     case "open":
     case "close":
     case "interrupt":
+    case "compact":
       return typeof frame.sessionId === "string";
     case "undo":
       return (
         typeof frame.sessionId === "string" &&
-        (frame.checkpointId === undefined || typeof frame.checkpointId === "string")
+        (frame.checkpointId === undefined || typeof frame.checkpointId === "string") &&
+        (frame.mode === undefined ||
+          (typeof frame.mode === "string" && REWIND_MODES.includes(frame.mode)))
+      );
+    case "fork":
+      return (
+        typeof frame.sessionId === "string" &&
+        (frame.title === undefined || typeof frame.title === "string") &&
+        (frame.upToMessage === undefined ||
+          (typeof frame.upToMessage === "number" && Number.isSafeInteger(frame.upToMessage)))
       );
     case "send":
       return typeof frame.sessionId === "string" && typeof frame.text === "string";
@@ -129,6 +150,7 @@ export function isClientRequest(value: unknown): value is ClientRequest {
         typeof frame.permId === "string" &&
         (frame.decision === "allow" ||
           frame.decision === "allow_remember" ||
+          frame.decision === "allow_always" ||
           frame.decision === "deny")
       );
     default:

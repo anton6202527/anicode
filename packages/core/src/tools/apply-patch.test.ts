@@ -186,3 +186,47 @@ test("apply_patch: patch 内依赖——先 Add 再 Update 同一文件按序生
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test("@@ 上下文消歧：相同代码块出现两处时改中 @@ 指定的那处", () => {
+  const content = [
+    "function a() {",
+    "  return 1;",
+    "}",
+    "function b() {",
+    "  return 1;",
+    "}",
+  ].join("\n");
+  const ops = parsePatch(
+    [
+      "*** Begin Patch",
+      "*** Update File: f.ts",
+      "@@ function b() {",
+      "-  return 1;",
+      "+  return 2;",
+      "*** End Patch",
+    ].join("\n"),
+  );
+  const op = ops[0]!;
+  if (op.kind !== "update") throw new Error("应为 update");
+  const out = applyHunks(content, op.hunks);
+  assert.equal(
+    out,
+    ["function a() {", "  return 1;", "}", "function b() {", "  return 2;", "}"].join("\n"),
+  );
+});
+
+test("@@ 上下文找不到时回退全局顺序匹配（不报错）", () => {
+  const ops = parsePatch(
+    [
+      "*** Begin Patch",
+      "*** Update File: f.ts",
+      "@@ 这行上下文不存在",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n"),
+  );
+  const op = ops[0]!;
+  if (op.kind !== "update") throw new Error("应为 update");
+  assert.equal(applyHunks("old", op.hunks), "new");
+});

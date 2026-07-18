@@ -18,8 +18,8 @@
 import type { Tool, ToolContext, ToolRegistry } from "./tools/tool.js";
 import { ToolError } from "./tools/tool.js";
 import { t } from "./i18n.js";
-import type { PermissionConfig } from "./permission.js";
-import type { HookRegistration } from "./hooks.js";
+import { globMatch, type PermissionConfig } from "./permission.js";
+import type { HookRegistration, HookRunner } from "./hooks.js";
 import type { Provider } from "./types.js";
 import type {
   Agent,
@@ -38,6 +38,11 @@ export interface SubagentDefinition {
   system?: string;
   /** 允许的工具名子集；缺省继承父的全部工具（除 task） */
   tools?: string[];
+  /**
+   * 禁用的工具名（支持 * glob，如 "mcp__*"）；在 tools/继承集确定后剔除
+   * （对齐 Claude Code 的 disallowedTools）。
+   */
+  disallowedTools?: string[];
   /** 覆盖模型；裸 id 沿用父 provider，provider/model 可跨 provider（需 resolver）。 */
   model?: string;
   maxTurns?: number;
@@ -93,6 +98,11 @@ export interface TaskToolOptions {
   permission?: PermissionConfig;
   /** 继承父级工具策略/审计 hooks（PreToolUse / PostToolUse）。 */
   hooks?: HookRegistration[];
+  /**
+   * 父 agent 的 HookRunner —— 触发 SubagentStart（可 block 阻止派生）与
+   * SubagentStop（观察性）。matcher 匹配的是子 agent 类型名。
+   */
+  parentHooks?: HookRunner;
   /** 自定义 subagent 类型；general 始终可用 */
   definitions?: SubagentDefinition[];
   defaultMaxTurns?: number;
@@ -151,10 +161,23 @@ export function createTaskTool(opts: TaskToolOptions): Tool {
     async run(input, ctx: ToolContext): Promise<string> {
       const type = String(input["subagent_type"] ?? "general");
       const prompt = String(input["prompt"] ?? "");
+      const description = String(input["description"] ?? "");
       if (!prompt) throw new ToolError("prompt 不能为空");
       const def = defs.get(type);
       if (!def)
         throw new ToolError(`未知 subagent 类型: ${type}（可选: ${[...defs.keys()].join(", ")}）`);
+
+      // SubagentStart：父级 hook 可否决派生（如策略禁止某类型/预算控制）。
+      if (opts.parentHooks?.has("SubagentStart")) {
+        const h = await opts.parentHooks.run({
+          event: "SubagentStart",
+          cwd: opts.cwd,
+          toolName: type,
+          subagentType: type,
+          taskDescription: description,
+        });
+        if (h.blocked) throw new ToolError(`SubagentStart hook 拦截: ${h.reason}`);
+      }
 
       let resolved: AgentResolvedModel | undefined;
       const resolvedSpec = def.model?.includes("/")
@@ -192,6 +215,11 @@ export function createTaskTool(opts: TaskToolOptions): Tool {
         const readOnlySet = new Set(opts.tools.readOnlyNames());
         base = base.filter((n) => readOnlySet.has(n));
       }
+      // disallowedTools 最后应用：无论来自显式 tools 还是继承集，命中即剔除。
+      if (def.disallowedTools?.length) {
+        const denied = def.disallowedTools;
+        base = base.filter((n) => !denied.some((pattern) => globMatch(pattern, n)));
+      }
       const allowedNames = base.filter((n) => n !== "task");
       const child = opts.makeAgent({
         provider: resolved?.provider ?? opts.provider,
@@ -222,9 +250,21 @@ export function createTaskTool(opts: TaskToolOptions): Tool {
       } finally {
         ctx.addUsage?.(child.totalUsage);
       }
+      const answer = finalAssistantText(child);
+      // SubagentStop：观察性，成功/失败都触发（审计/统计用）。
+      if (opts.parentHooks?.has("SubagentStop")) {
+        await opts.parentHooks.run({
+          event: "SubagentStop",
+          cwd: opts.cwd,
+          toolName: type,
+          subagentType: type,
+          taskDescription: description,
+          isError: errorMsg !== null,
+          toolResult: errorMsg ?? answer,
+        });
+      }
       if (errorMsg) throw new ToolError(`子 agent 失败: ${errorMsg}`);
 
-      const answer = finalAssistantText(child);
       return answer || "（子 agent 未产出文本结论）";
     },
   };

@@ -21,6 +21,7 @@ import {
   PermissionEngine,
   type PermissionConfig,
   type PermissionDecision,
+  type PermissionRequest,
   type PermissionMode,
   type PermissionProfile,
 } from "./permission.js";
@@ -35,10 +36,12 @@ import { Chan } from "./chan.js";
 import { HookRunner, type HookRegistration } from "./hooks.js";
 import { createTaskTool, type SubagentDefinition } from "./subagent.js";
 import { discoverSkills, skillListPrompt, createSkillTool } from "./skills.js";
+import { discoverSubagents } from "./agents-fs.js";
 import {
   loadProjectMemory,
   composeSystem,
   maybeCompact,
+  compactionPending,
   providerSummarizer,
   type CompactionConfig,
 } from "./context.js";
@@ -59,11 +62,15 @@ export type AgentEvent =
   | { type: "tool_progress"; id: string; name: string; event: unknown } // 工具执行中的进度（如子 agent 内部事件）
   | { type: "tool_result"; id: string; name: string; content: string; isError: boolean }
   | { type: "turn_end"; usage: Usage } // 一个模型轮结束（可能还要继续 loop）
+  // 主模型持续失败，已切换到降级链中的下一个模型（本次 drive 内生效）
+  | { type: "model_fallback"; from: string; to: string; reason: string }
   | { type: "turn_reset" } // 一次流式尝试失败（重试或终止）；消费者应丢弃该尝试的残留增量
   | { type: "retry"; attempt: number; delayMs: number; reason: string } // provider 瞬时错误，退避重试中
   | { type: "compacted"; beforeTokens: number; afterTokens: number } // 上下文被压缩
-  | { type: "checkpoint"; id: string; tree: string; label: string } // 本轮开始前的工作区快照（供 undo）
-  | { type: "done"; usage: Usage; turns: number } // 整个 loop 结束，等待下一条用户输入
+  // 本轮开始前的工作区快照（供 undo/rewind）；messageCount = 本轮用户输入进入历史前的消息数
+  | { type: "checkpoint"; id: string; tree: string; label: string; messageCount: number }
+  // 整个 loop 结束，等待下一条用户输入；costUSD 为会话累计成本估算（模型无价格信息时缺省）
+  | { type: "done"; usage: Usage; turns: number; costUSD?: number }
   | { type: "error"; message: string };
 
 export interface RetryConfig {
@@ -86,6 +93,8 @@ export interface AgentModelInfo {
     contextWindow?: number;
     maxOutputTokens?: number;
   };
+  /** 单价（$/MTok，registry 内置价格表命中时填充）；用于会话成本估算展示。 */
+  cost?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
 }
 
 export interface AgentResolvedModel {
@@ -109,8 +118,16 @@ export interface AgentOptions {
   permissionProfiles?: Record<string, PermissionProfile>;
   /** loop 关键节点的用户扩展（PreToolUse/PostToolUse/UserPromptSubmit/Stop） */
   hooks?: HookRegistration[];
-  /** 启用 task 工具（子 agent 委派）。true=仅内置 general 类型；数组=追加自定义类型 */
-  subagents?: boolean | SubagentDefinition[];
+  /**
+   * 启用 task 工具（子 agent 委派）。true=仅内置 general 类型；数组=追加自定义类型；
+   * 对象形态可再开 discover：首次 send 时扫描 .claude/agents/*.md（用户级+项目级
+   * + .anicode/agents，对齐 Claude Code 的文件系统 agents），文件定义排在
+   * definitions 之前（程序化定义同名覆盖文件定义）。
+   */
+  subagents?:
+    | boolean
+    | SubagentDefinition[]
+    | { definitions?: SubagentDefinition[]; discover?: boolean; dirs?: string[] };
   /**
    * 启用 skills 渐进加载：扫描 .claude/skills（项目级+用户级），
    * 清单注入 system 提示（L1），正文经 skill 工具按需加载（L2）。
@@ -124,6 +141,12 @@ export interface AgentOptions {
    * 「大量调用走小模型」的成本策略）。需要 resolveModel 才能实例化；解析失败静默回退主模型。
    */
   smallModel?: string;
+  /**
+   * 模型降级链（对齐 Claude Code fallbackModel）：主模型在重试仍失败（限流/过载/
+   * 服务故障）时按序切换到这些模型继续本次 drive；下一次 drive 仍从主模型开始。
+   * 需要 resolveModel。每个 spec 为 `provider/model` 或裸 model id（沿用当前 provider 解析）。
+   */
+  fallbackModels?: string[];
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** 单个工具结果注入历史的字符上限（超出截中段），默认 30000 */
   maxToolResultChars?: number;
@@ -301,6 +324,18 @@ export class Agent {
   private readonly snapshots: SnapshotStore | null;
   private readonly sandbox: AgentOptions["sandbox"];
   private readonly skillsOpt: AgentOptions["skills"];
+  /** 归一化后的 subagents 选项；discover=true 时 task 工具推迟到首次 send 注册。 */
+  private subagentsOpt: {
+    definitions: SubagentDefinition[];
+    discover: boolean;
+    dirs: string[];
+  } | null = null;
+  private readonly modelInfoOpt: AgentModelInfo | undefined;
+  private readonly permissionOpt: PermissionConfig | undefined;
+  private readonly hooksOpt: HookRegistration[];
+  /** 配置的降级链（不可变）；每次 drive 复制一份消耗。 */
+  private readonly fallbackModels: string[];
+  private fallbackQueue: string[] = [];
   private readonly compaction: CompactionConfig | null;
   private readonly persist: PersistenceConfig | null;
   /** 摘要等杂活用的小模型；未配置或解析失败时等于主 provider/model。 */
@@ -368,6 +403,10 @@ export class Agent {
           : null;
     this.sandbox = opts.sandbox;
     this.skillsOpt = opts.skills;
+    this.modelInfoOpt = opts.modelInfo;
+    this.permissionOpt = opts.permission;
+    this.hooksOpt = opts.hooks ?? [];
+    this.fallbackModels = opts.fallbackModels ?? [];
     this.compaction = this.resolveCompaction(opts.compaction, opts.modelInfo);
     this.persist = opts.persistence ?? null;
     if (this.persist?.resumeMessages) {
@@ -387,32 +426,47 @@ export class Agent {
     // 有 deferred 工具（大量 MCP 场景）时自动挂上 tool_search 检索入口；
     // 只读，在 perm 引擎构建前注册即自动放行。
     if (this.tools.hasDeferred()) this.tools.register(createToolSearchTool(this.tools));
-    // 子 agent 委派：把 task 工具注册进本 agent 的工具集
+    // 子 agent 委派：把 task 工具注册进本 agent 的工具集。
+    // discover 形态下推迟到首次 send（ensureMemory）：文件系统发现是异步的。
     if (opts.subagents) {
-      // 子 agent 继承工具策略/审计 hooks，避免 task 成为绕过父级写入拦截的通道。
-      // UserPromptSubmit 与 Stop 属于父会话生命周期，不应用到模型生成的子任务提示。
-      const childHooks = (opts.hooks ?? []).filter(
-        (hook) => hook.event === "PreToolUse" || hook.event === "PostToolUse",
-      );
-      this.tools.register(
-        createTaskTool({
-          makeAgent: (o) => new Agent(o),
-          provider: this.provider,
-          model: this.model,
-          ...(opts.modelInfo ? { modelInfo: opts.modelInfo } : {}),
-          ...(opts.resolveModel ? { resolveModel: opts.resolveModel } : {}),
-          cwd: this.cwd,
-          tools: this.tools,
-          ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
-          ...(opts.permission ? { permission: opts.permission } : {}),
-          ...(childHooks.length > 0 ? { hooks: childHooks } : {}),
-          ...(Array.isArray(opts.subagents) ? { definitions: opts.subagents } : {}),
-        }),
-      );
+      const sub = opts.subagents;
+      const definitions = Array.isArray(sub)
+        ? sub
+        : typeof sub === "object"
+          ? (sub.definitions ?? [])
+          : [];
+      this.subagentsOpt = {
+        definitions,
+        discover: typeof sub === "object" && !Array.isArray(sub) && sub.discover === true,
+        dirs: (typeof sub === "object" && !Array.isArray(sub) && sub.dirs) || [],
+      };
+      if (!this.subagentsOpt.discover) this.registerTaskTool(definitions);
     }
+    // PermissionRequest hook：权限门确定要询问用户时先过 hook —— allow 自动批准、
+    // block 自动拒绝、无表态则照常弹确认。deny/ask 规则在引擎内更早判定，hook 压不过。
+    const baseConfirm = opts.permission?.confirm;
+    const confirm =
+      baseConfirm &&
+      (async (req: PermissionRequest): Promise<PermissionDecision> => {
+        if (this.hooks.has("PermissionRequest")) {
+          const h = await this.hooks.run({
+            event: "PermissionRequest",
+            cwd: this.cwd,
+            toolName: req.toolName,
+            toolInput: req.input,
+            ruleKey: req.ruleKey,
+          });
+          if (h.blocked) {
+            return { behavior: "deny", message: h.reason ?? "被 PermissionRequest hook 拒绝" };
+          }
+          if (h.allowed) return { behavior: "allow" };
+        }
+        return baseConfirm(req);
+      });
     // 只读/编辑类工具名并入权限引擎：只读自动放行，编辑类供 acceptEdits 决策
     this.perm = new PermissionEngine({
       ...opts.permission,
+      ...(confirm ? { confirm } : {}),
       readOnlyTools: [...(opts.permission?.readOnlyTools ?? []), ...this.tools.readOnlyNames()],
       editTools: [...(opts.permission?.editTools ?? []), ...this.tools.editNames()],
     });
@@ -424,6 +478,32 @@ export class Agent {
       !(opts.permission?.confirm && (opts.permission.askRules?.length ?? 0) > 0);
   }
 
+  /** 把 task 工具注册进本 agent 的工具集（构造期或首次 send 前调用）。 */
+  private registerTaskTool(definitions: SubagentDefinition[]): void {
+    // 子 agent 继承工具策略/审计 hooks，避免 task 成为绕过父级写入拦截的通道。
+    // UserPromptSubmit 与 Stop 属于父会话生命周期，不应用到模型生成的子任务提示。
+    const childHooks = this.hooksOpt.filter(
+      (hook) => hook.event === "PreToolUse" || hook.event === "PostToolUse",
+    );
+    this.tools.register(
+      createTaskTool({
+        makeAgent: (o) => new Agent(o),
+        provider: this.provider,
+        model: this.model,
+        ...(this.modelInfoOpt ? { modelInfo: this.modelInfoOpt } : {}),
+        ...(this.resolveModelFn ? { resolveModel: this.resolveModelFn } : {}),
+        cwd: this.cwd,
+        tools: this.tools,
+        ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+        ...(this.permissionOpt ? { permission: this.permissionOpt } : {}),
+        ...(childHooks.length > 0 ? { hooks: childHooks } : {}),
+        // SubagentStart/Stop 属父级生命周期事件，经父 HookRunner 触发（不下发给子 agent）。
+        parentHooks: this.hooks,
+        ...(definitions.length > 0 ? { definitions } : {}),
+      }),
+    );
+  }
+
   // ---------- 只读访问 ----------
 
   get isRunning(): boolean {
@@ -431,6 +511,23 @@ export class Agent {
   }
   get totalUsage(): Usage {
     return this.cumulative;
+  }
+  /**
+   * 会话累计成本估算（美元）。基于主模型单价的近似值：per-prompt 覆盖 / 小模型 /
+   * 降级链期间的用量也按主模型价折算。主模型无价格信息时返回 undefined。
+   */
+  get estimatedCostUSD(): number | undefined {
+    const cost = this.modelInfoOpt?.cost;
+    if (!cost) return undefined;
+    const per = 1 / 1_000_000;
+    const cacheRead = cost.cacheRead ?? cost.input * 0.1;
+    const cacheWrite = cost.cacheWrite ?? cost.input * 1.25;
+    return (
+      this.cumulative.inputTokens * cost.input * per +
+      this.cumulative.outputTokens * cost.output * per +
+      this.cumulative.cacheReadTokens * cacheRead * per +
+      this.cumulative.cacheWriteTokens * cacheWrite * per
+    );
   }
   get messages(): readonly ChatMessage[] {
     return this.history;
@@ -441,6 +538,63 @@ export class Agent {
   /** 工作区快照存储（供上层实现 undo）；未启用 checkpoints 时为 null。 */
   get snapshotStore(): SnapshotStore | null {
     return this.snapshots;
+  }
+
+  /**
+   * 手动压缩（对齐 Claude Code / Codex 的 /compact）：跳过触发线立即压缩一次。
+   * 未启用 compaction 或运行中抛错。返回压缩前后 token 规模与是否有实际收缩。
+   */
+  async compactNow(): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
+    if (this.running)
+      throw new Error(
+        t("Session is running; interrupt it before compacting", "会话运行中，请先中断再压缩"),
+      );
+    if (!this.compaction)
+      throw new Error(
+        t("Compaction is not enabled for this session", "该会话未启用上下文压缩"),
+      );
+    if (this.hooks.has("PreCompact")) {
+      await this.hooks.run({ event: "PreCompact", cwd: this.cwd, tokens: this.lastInputTokens });
+    }
+    const res = await maybeCompact(this.history, this.compaction, this.lastInputTokens, {
+      force: true,
+    });
+    if (res.compacted) {
+      this.history = res.messages;
+      await this.rewritePersist();
+      if (this.hooks.has("PostCompact")) {
+        await this.hooks.run({
+          event: "PostCompact",
+          cwd: this.cwd,
+          beforeTokens: res.beforeTokens,
+          afterTokens: res.afterTokens,
+        });
+      }
+    }
+    return {
+      compacted: res.compacted,
+      beforeTokens: res.beforeTokens,
+      afterTokens: res.afterTokens,
+    };
+  }
+
+  /**
+   * 对话回滚：把历史截断到前 messageCount 条并重写持久化（对齐 Claude Code /rewind
+   * 的「恢复对话」维度；文件恢复由上层用 snapshotStore 完成）。
+   * 返回删除的消息数。历史已被压缩到更短时（messageCount 过大）按无操作处理。
+   * 运行中调用抛错——不能截断正在被 drive 追加的历史。
+   */
+  async rewindConversation(messageCount: number): Promise<number> {
+    if (this.running)
+      throw new Error(
+        t("Session is running; interrupt it before rewinding", "会话运行中，请先中断再回滚"),
+      );
+    const target = Math.max(0, messageCount);
+    const removed = this.history.length - target;
+    if (removed <= 0) return 0;
+    this.history = this.history.slice(0, target);
+    await this.rewritePersist();
+    return removed;
   }
 
   /** 运行时切换权限模式（如 /plan 进入/退出计划模式）；下一轮工具授权即按新模式判定。 */
@@ -509,6 +663,8 @@ export class Agent {
       supportsTools: this.supportsTools,
       supportsImages: this.supportsImages,
     };
+    // 降级链每次 drive 重置：上一轮的降级不该让本轮少一个候选。
+    this.fallbackQueue = [...this.fallbackModels];
     try {
       if (opts?.model) {
         if (!this.resolveModelFn) {
@@ -575,6 +731,9 @@ export class Agent {
   private async *drive(userText: string, signal: AbortSignal): AsyncGenerator<AgentEvent> {
     await this.ensureMemory();
 
+    // rewind 需要「本轮开始前」的消息数；必须在 pushUser 之前取。
+    const preTurnCount = this.history.length;
+
     // UserPromptSubmit hook：可拦截输入，或注入 UI 不展示的内部上下文。
     const prepared = await this.prepareUserInput(userText);
     if (prepared.blocked) {
@@ -591,18 +750,41 @@ export class Agent {
     // 工作区快照：在模型动手前记一份，供用户 undo 回滚本轮的文件改动。尽力而为，失败不影响主流程。
     if (this.snapshots) {
       const snap = await this.snapshots.take(userText.replace(/\s+/g, " ").trim().slice(0, 60));
-      if (snap) yield { type: "checkpoint", id: snap.id, tree: snap.tree, label: snap.label };
+      if (snap) {
+        yield {
+          type: "checkpoint",
+          id: snap.id,
+          tree: snap.tree,
+          label: snap.label,
+          messageCount: preTurnCount,
+        };
+      }
     }
 
     let stopContinuations = 0;
     for (let turn = 1; turn <= this.maxTurns; turn++) {
       // 压缩：每轮 provider 调用前检查历史规模
       if (this.compaction) {
+        // PreCompact：达到触发线才响（与 maybeCompact 同一判定），观察性 hook。
+        if (
+          this.hooks.has("PreCompact") &&
+          compactionPending(this.history, this.compaction, this.lastInputTokens)
+        ) {
+          await this.hooks.run({ event: "PreCompact", cwd: this.cwd, tokens: this.lastInputTokens });
+        }
         const res = await maybeCompact(this.history, this.compaction, this.lastInputTokens);
         if (res.compacted) {
           this.history = res.messages;
           await this.rewritePersist(); // 历史被改写，整文件重写
           yield { type: "compacted", beforeTokens: res.beforeTokens, afterTokens: res.afterTokens };
+          if (this.hooks.has("PostCompact")) {
+            await this.hooks.run({
+              event: "PostCompact",
+              cwd: this.cwd,
+              beforeTokens: res.beforeTokens,
+              afterTokens: res.afterTokens,
+            });
+          }
         }
       }
 
@@ -666,7 +848,15 @@ export class Agent {
           }
         }
         this.acceptingQueuedInput = false;
-        yield { type: "done", usage: this.cumulative, turns: turn };
+        {
+          const costUSD = this.estimatedCostUSD;
+          yield {
+            type: "done",
+            usage: this.cumulative,
+            turns: turn,
+            ...(costUSD !== undefined ? { costUSD } : {}),
+          };
+        }
         return;
       }
 
@@ -756,6 +946,19 @@ export class Agent {
       if (!retriable) {
         // 即使不再重试，消费者也必须清掉未进入 Agent history 的流式残影。
         if (res.partial) yield { type: "turn_reset" };
+        // 降级链：主模型确定失败（非用户中断）时切到下一个可解析的 fallback 模型，
+        // 从头重试本轮。切换是 drive 局部的——send 的 finally 会还原主模型。
+        const switched = signal.aborted ? null : this.nextFallback();
+        if (switched) {
+          yield {
+            type: "model_fallback",
+            from: switched.from,
+            to: switched.to,
+            reason: res.message,
+          };
+          attempt = -1; // for 递增后归 0：新模型享有完整的重试预算
+          continue;
+        }
         return res;
       }
       if (res.partial) yield { type: "turn_reset" };
@@ -773,6 +976,26 @@ export class Agent {
         return res; // 等待期间被中断
       }
     }
+  }
+
+  /** 消耗降级链：切到下一个能解析的 fallback 模型；链空/无 resolver 返回 null。 */
+  private nextFallback(): { from: string; to: string } | null {
+    if (!this.resolveModelFn) return null;
+    while (this.fallbackQueue.length > 0) {
+      const spec = this.fallbackQueue.shift()!;
+      try {
+        const resolved = this.resolveModelFn(spec);
+        const from = this.model;
+        this.provider = resolved.provider;
+        this.model = resolved.model;
+        this.supportsTools = resolved.modelInfo?.capabilities.tools ?? true;
+        this.supportsImages = resolved.modelInfo?.capabilities.images ?? false;
+        return { from, to: resolved.model };
+      } catch {
+        /* 该 fallback 解析失败（拼写/缺凭证），试下一个 */
+      }
+    }
+    return null;
   }
 
   /** 跑一次模型补全，把流式增量转成 AgentEvent，聚合出最终消息 */
@@ -1192,6 +1415,23 @@ export class Agent {
         this.perm.addReadOnlyTools([skillTool.def.name]);
         sections.push(skillListPrompt(skills));
       }
+    }
+    // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
+    // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。
+    if (this.subagentsOpt?.discover) {
+      let discovered: SubagentDefinition[] = [];
+      try {
+        discovered = await discoverSubagents(this.cwd, this.subagentsOpt.dirs);
+      } catch {
+        /* 发现失败不影响主流程；仍注册内置类型 */
+      }
+      this.registerTaskTool([...discovered, ...this.subagentsOpt.definitions]);
+    }
+    // SessionStart hook：会话装配的最后一步，additionalContext 注入 system
+    //（对齐 Codex/Claude Code 的 SessionStart 注入上下文能力）。
+    if (this.hooks.has("SessionStart")) {
+      const h = await this.hooks.run({ event: "SessionStart", cwd: this.cwd });
+      if (h.additionalContext) sections.push(h.additionalContext);
     }
     if (sections.length > 0) {
       this.system = composeSystem(this.baseSystem, sections.join("\n\n"));

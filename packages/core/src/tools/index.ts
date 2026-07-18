@@ -4,7 +4,7 @@ import { bashTool } from "./bash.js";
 import { createTodoTool } from "./todo.js";
 import { webFetchTool } from "./webfetch.js";
 import { applyPatchTool } from "./apply-patch.js";
-import { bashOutputTool, killShellTool } from "./shells.js";
+import { bashOutputTool, killShellTool, writeStdinTool, listShellsTool } from "./shells.js";
 
 export * from "./tool.js";
 export { readTool, writeTool, editTool, globTool, grepTool } from "./fs.js";
@@ -40,6 +40,8 @@ export { buildShellSpawn, sanitizedShellEnv } from "./shell-spawn.js";
 export {
   bashOutputTool,
   killShellTool,
+  writeStdinTool,
+  listShellsTool,
   startBackgroundShell,
   shells,
   ShellRegistry,
@@ -69,6 +71,8 @@ export function defaultTools(): ToolRegistry {
     .register(bashTool)
     .register(bashOutputTool)
     .register(killShellTool)
+    .register(writeStdinTool)
+    .register(listShellsTool)
     .register(webFetchTool)
     .register(createTodoTool());
 }

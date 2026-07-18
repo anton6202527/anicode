@@ -21,6 +21,11 @@ export interface CustomCommand {
   description: string;
   template: string;
   source: string;
+  /**
+   * 动态命令（如 MCP prompt）：给定参数串异步产出最终提示文本。
+   * 存在时优先于 template/expandCommand。
+   */
+  resolve?: (args: string) => Promise<string>;
 }
 
 function parseFrontmatter(text: string): { meta: Record<string, string>; body: string } {

@@ -66,3 +66,83 @@ test("config: 无任何文件时返回空配置且无告警", async () => {
   assert.deepEqual(warnings, []);
   await cleanup();
 });
+
+test("config: profiles 配置档叠加与未知档警告；hooks 键合并", async () => {
+  const { home, cwd, cleanup } = await tmp();
+  await fs.writeFile(
+    path.join(home, ".config", "anicode", "anicode.json"),
+    JSON.stringify({
+      model: "base/model",
+      hooks: [{ event: "PreToolUse", command: "echo global" }],
+      profiles: {
+        cheap: { model: "cheap/model", smallModel: false },
+        strict: { permissionProfile: "readonly" },
+      },
+    }),
+  );
+  await fs.writeFile(
+    path.join(cwd, "anicode.json"),
+    JSON.stringify({ hooks: [{ event: "Stop", command: "echo proj" }] }),
+  );
+
+  // 无 profile：主配置生效，hooks 拼接
+  const base = await loadConfig({ cwd, home });
+  assert.equal(base.config.model, "base/model");
+  assert.equal(base.config.hooks?.length, 2);
+
+  // 选中 cheap：覆盖 model
+  const cheap = await loadConfig({ cwd, home, profile: "cheap" });
+  assert.equal(cheap.config.model, "cheap/model");
+  assert.equal(cheap.config.smallModel, false);
+  assert.equal(cheap.config.profiles, undefined, "档位应被消费移除");
+  assert.equal(cheap.warnings.length, 0);
+
+  // 未知档：警告 + 主配置不变
+  const bogus = await loadConfig({ cwd, home, profile: "nope" });
+  assert.equal(bogus.config.model, "base/model");
+  assert.ok(bogus.warnings.some((w) => /nope/.test(w)));
+
+  await cleanup();
+});
+
+test("config: permissions 规则跨层拼接去重，settings.local.json 参与合并", async () => {
+  const { home, cwd, cleanup } = await tmp();
+  await fs.writeFile(
+    path.join(home, ".config", "anicode", "anicode.json"),
+    JSON.stringify({ permissions: { deny: ["bash(rm *)"], allow: ["read"] } }),
+  );
+  await fs.writeFile(
+    path.join(cwd, "anicode.json"),
+    JSON.stringify({ permissions: { deny: ["bash(rm *)", "bash(sudo *)"] } }),
+  );
+  await fs.writeFile(
+    path.join(cwd, ".anicode", "settings.local.json"),
+    JSON.stringify({ permissions: { allow: ["bash(git status)"] } }),
+  );
+  const { config, warnings } = await loadConfig({ cwd, home });
+  assert.deepEqual(config.permissions?.deny, ["bash(rm *)", "bash(sudo *)"]); // 去重且都保留
+  assert.deepEqual(config.permissions?.allow, ["read", "bash(git status)"]);
+  assert.deepEqual(warnings, []);
+  await cleanup();
+});
+
+test("permission-store: appendLocalAllowRules 创建/追加/去重且保留其他键", async () => {
+  const { appendLocalAllowRules, localSettingsPath } = await import("./permission-store.js");
+  const { cwd, cleanup } = await tmp();
+  // 首次：文件不存在 → 创建
+  assert.equal(await appendLocalAllowRules(cwd, ["bash(git status)"]), true);
+  // 手写其他键 + 再追加：其他键保留、重复规则不再加
+  const file = localSettingsPath(cwd);
+  const cur = JSON.parse(await fs.readFile(file, "utf8"));
+  cur.custom = { keep: 1 };
+  await fs.writeFile(file, JSON.stringify(cur));
+  assert.equal(await appendLocalAllowRules(cwd, ["bash(git status)", "web_fetch(*)"]), true);
+  const after = JSON.parse(await fs.readFile(file, "utf8"));
+  assert.deepEqual(after.permissions.allow, ["bash(git status)", "web_fetch(*)"]);
+  assert.deepEqual(after.custom, { keep: 1 });
+  // JSON 损坏 → 不覆盖用户文件
+  await fs.writeFile(file, "{ broken");
+  assert.equal(await appendLocalAllowRules(cwd, ["x(y)"]), false);
+  assert.equal(await fs.readFile(file, "utf8"), "{ broken");
+  await cleanup();
+});

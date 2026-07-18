@@ -63,8 +63,12 @@ interface State {
   /** 尚未产生 tool_result 的调用，在 Static 下方动态渲染。 */
   activeTools: Map<string, Extract<Item, { kind: "tool" }>>;
   liveText: string;
+  /** 流式思考过程（thinking 增量）；正文开始后收起，不入 transcript。 */
+  liveThinking: string;
   running: boolean;
   usage: Usage;
+  /** 会话累计成本估算（美元）；模型无内置价格信息时为 undefined。 */
+  costUSD?: number;
   todos: TodoItem[];
   meta: { id: string; cwd: string; model: string; title?: string };
   /** 每次成功 open 都重挂 Static，避免会话切换时沿用旧索引。 */
@@ -78,6 +82,7 @@ type Action =
       items: Row[];
       activeTools: Map<string, Extract<Item, { kind: "tool" }>>;
       usage: Usage;
+      costUSD?: number;
       running: boolean;
       todos: TodoItem[];
       meta: State["meta"];
@@ -85,13 +90,15 @@ type Action =
   | { t: "opening"; v: boolean }
   | { t: "push"; item: Item }
   | { t: "live"; delta: string }
+  | { t: "liveThinking"; delta: string }
   | { t: "resetLive" }
   | { t: "flushLive" }
   | { t: "toolStart"; id: string; name: string; ruleKey: string }
   | { t: "toolDeny"; id: string }
   | { t: "toolFinish"; id: string; status: "ok" | "err"; detail?: string }
   | { t: "running"; v: boolean }
-  | { t: "usage"; u: Usage }
+  | { t: "usage"; u: Usage; costUSD?: number }
+  | { t: "title"; title: string }
   | { t: "todos"; todos: TodoItem[] };
 
 function reducer(s: State, a: Action): State {
@@ -101,8 +108,10 @@ function reducer(s: State, a: Action): State {
         items: a.items,
         activeTools: a.activeTools,
         liveText: "",
+        liveThinking: "",
         running: a.running,
         usage: a.usage,
+        ...(a.costUSD !== undefined ? { costUSD: a.costUSD } : {}),
         todos: a.todos,
         meta: a.meta,
         generation: s.generation + 1,
@@ -113,12 +122,20 @@ function reducer(s: State, a: Action): State {
     case "push":
       return { ...s, items: [...s.items, a.item] };
     case "live":
-      return { ...s, liveText: s.liveText + a.delta };
+      // 正文开始流式后收起思考展示（对齐 Claude Code：thinking 只在酝酿期可见）。
+      return { ...s, liveText: s.liveText + a.delta, liveThinking: "" };
+    case "liveThinking":
+      return { ...s, liveThinking: s.liveThinking + a.delta };
     case "resetLive":
-      return { ...s, liveText: "" };
+      return { ...s, liveText: "", liveThinking: "" };
     case "flushLive":
-      if (!s.liveText) return s;
-      return { ...s, items: [...s.items, { kind: "assistant", text: s.liveText }], liveText: "" };
+      if (!s.liveText) return s.liveThinking ? { ...s, liveThinking: "" } : s;
+      return {
+        ...s,
+        items: [...s.items, { kind: "assistant", text: s.liveText }],
+        liveText: "",
+        liveThinking: "",
+      };
     case "toolStart": {
       const activeTools = new Map(s.activeTools);
       const previous = activeTools.get(a.id);
@@ -154,10 +171,19 @@ function reducer(s: State, a: Action): State {
     case "running":
       return { ...s, running: a.v };
     case "usage":
-      return { ...s, usage: a.u };
+      return { ...s, usage: a.u, ...(a.costUSD !== undefined ? { costUSD: a.costUSD } : {}) };
+    case "title":
+      return { ...s, meta: { ...s.meta, title: a.title } };
     case "todos":
       return { ...s, todos: a.todos };
   }
+}
+
+/** 思考流只展示尾部：压平空白，按终端宽度截末尾——动态区高度不随思考长度增长。 */
+function thinkingTail(s: string, cols: number): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  const max = Math.max(40, Math.min(cols * 2, 240));
+  return flat.length > max ? `…${flat.slice(-max)}` : flat;
 }
 
 const emptyUsage: Usage = {
@@ -201,8 +227,15 @@ function builtinCommands(): CommandMenuRow[] {
     {
       name: "undo",
       description: t(
-        "Undo the last turn's file changes (git rollback)",
-        "撤销上一轮文件改动（git 回滚）",
+        "Rewind the last turn /undo [files|conversation|both] (default files)",
+        "回滚上一轮 /undo [files|conversation|both]（默认仅文件）",
+      ),
+    },
+    {
+      name: "fork",
+      description: t(
+        "Fork this session into a new one /fork [title]",
+        "把当前会话分叉成新会话 /fork [标题]",
       ),
     },
     {
@@ -217,6 +250,27 @@ function builtinCommands(): CommandMenuRow[] {
       description: t(
         "Switch permission profile /profile [name] (readonly/default/workspace/full)",
         "切换权限档位 /profile [name]（readonly/default/workspace/full）",
+      ),
+    },
+    {
+      name: "init",
+      description: t(
+        "Analyze this repo and generate AGENTS.md project memory",
+        "分析当前仓库并生成 AGENTS.md 项目记忆",
+      ),
+    },
+    {
+      name: "compact",
+      description: t(
+        "Compact conversation context now (summarize older turns)",
+        "立即压缩上下文（把较早的对话折叠成摘要）",
+      ),
+    },
+    {
+      name: "mcp",
+      description: t(
+        "Show MCP servers, resources and prompts",
+        "查看 MCP 服务器、资源与提示模板",
       ),
     },
     {
@@ -390,6 +444,8 @@ export interface AppProps {
   inspectProviderCredentials?: boolean;
   /** 自定义斜杠命令（.anicode/command/*.md）。 */
   commands?: readonly CustomCommand[];
+  /** /mcp 状态查询（server/工具/资源/prompts 概览）；未配置 MCP 时省略。 */
+  mcpStatus?: () => Promise<string>;
   /** CLI 版本号，显示在底部状态栏。 */
   version?: string;
 }
@@ -403,6 +459,7 @@ export function App({
   catalog = [],
   inspectProviderCredentials = false,
   commands = [],
+  mcpStatus,
   version = "0.0.1",
 }: AppProps) {
   const { exit } = useApp();
@@ -433,6 +490,7 @@ export function App({
     items: [],
     activeTools: new Map(),
     liveText: "",
+    liveThinking: "",
     running: false,
     usage: emptyUsage,
     todos: [],
@@ -631,6 +689,7 @@ export function App({
           items: initialItems,
           activeTools: restored.activeTools,
           usage: snap.usage,
+          ...(snap.costUSD !== undefined ? { costUSD: snap.costUSD } : {}),
           running: snap.running,
           todos: todosFromMessages(snap.messages),
           meta: {
@@ -771,15 +830,58 @@ export function App({
         return true;
       }
       if (cmd === "undo") {
+        // 参数：可选 mode（files/conversation/both）与可选 checkpoint id，顺序任意。
+        const MODES = ["files", "conversation", "both"] as const;
+        const modeArg = rest.find((a) => (MODES as readonly string[]).includes(a)) as
+          | (typeof MODES)[number]
+          | undefined;
+        const ckptArg = rest.find((a) => !(MODES as readonly string[]).includes(a));
         // 成功提示由广播的 reverted 事件统一渲染（所有订阅者一致）；这里只兜错误。
         try {
-          await host.undo(sessionId, rest[0]);
+          await host.undo(sessionId, ckptArg, modeArg);
         } catch (err) {
           dispatch({
             t: "push",
             item: {
               kind: "error",
               text: t(`Undo failed: ${errorMessage(err)}`, `撤销失败：${errorMessage(err)}`),
+            },
+          });
+        }
+        return true;
+      }
+      if (cmd === "fork") {
+        if (!host.forkSession) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t("This transport doesn't support fork.", "当前传输不支持 fork。"),
+            },
+          });
+          return true;
+        }
+        try {
+          const title = rest.join(" ") || undefined;
+          const meta = await host.forkSession(sessionId, title ? { title } : undefined);
+          setSessions(null);
+          setSessionId(meta.id); // 切到分叉出的新会话；原会话保持不动
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                `⑂ Forked to new session ${meta.id}`,
+                `⑂ 已分叉到新会话 ${meta.id}`,
+              ),
+            },
+          });
+        } catch (err) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(`Fork failed: ${errorMessage(err)}`, `分叉失败：${errorMessage(err)}`),
             },
           });
         }
@@ -890,10 +992,105 @@ export function App({
         });
         return true;
       }
-      // 自定义命令（.anicode/command/*.md）：展开模板后作为提示发送。
+      if (cmd === "init") {
+        // 对齐 Claude Code /init：引导 agent 调研仓库并沉淀 AGENTS.md（项目记忆，下次会话自动注入）。
+        const prompt = t(
+          "Analyze this repository (build/test/lint commands, architecture, code conventions, directory layout) and write an AGENTS.md at the repo root as project memory for coding agents. Keep it concise (under ~60 lines), focused on what an agent must know to work here: commands to run, conventions to follow, pitfalls to avoid. If AGENTS.md or CLAUDE.md already exists, improve it instead of overwriting blindly.",
+          "请调研当前仓库（构建/测试/lint 命令、架构、代码约定、目录结构），在仓库根目录写一份 AGENTS.md 作为编码 agent 的项目记忆。保持精炼（约 60 行内），聚焦 agent 在这里干活必须知道的信息：要跑的命令、要遵守的约定、要避开的坑。若已存在 AGENTS.md 或 CLAUDE.md，请在其基础上改进而不是盲目覆盖。",
+        );
+        dispatch({ t: "running", v: true });
+        void host.send(sessionId, prompt).catch((err) => {
+          dispatch({ t: "running", v: false });
+          dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+        });
+        return true;
+      }
+      if (cmd === "compact") {
+        if (!host.compact) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t("This transport doesn't support /compact.", "当前传输不支持 /compact。"),
+            },
+          });
+          return true;
+        }
+        try {
+          const r = await host.compact(sessionId);
+          // compacted=true 时广播的 compacted 事件已渲染提示；这里只兜「无可压缩」。
+          if (!r.compacted) {
+            dispatch({
+              t: "push",
+              item: {
+                kind: "info",
+                text: t(
+                  "Nothing to compact (history is still short).",
+                  "没有可压缩的内容（历史还很短）。",
+                ),
+              },
+            });
+          }
+        } catch (err) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(`Compact failed: ${errorMessage(err)}`, `压缩失败：${errorMessage(err)}`),
+            },
+          });
+        }
+        return true;
+      }
+      if (cmd === "mcp") {
+        if (!mcpStatus) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                "No MCP servers configured (anicode.json `mcp`).",
+                "未配置 MCP 服务器（anicode.json 的 mcp 键）。",
+              ),
+            },
+          });
+          return true;
+        }
+        try {
+          dispatch({ t: "push", item: { kind: "info", text: await mcpStatus() } });
+        } catch (err) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(`MCP query failed: ${errorMessage(err)}`, `MCP 查询失败：${errorMessage(err)}`),
+            },
+          });
+        }
+        return true;
+      }
+      // 自定义命令（.anicode/command/*.md 或 MCP prompt）：产出提示后发送。
       const custom = commands.find((c) => c.name === cmd);
       if (custom) {
-        const prompt = expandCommand(custom, rest.join(" "));
+        let prompt: string;
+        try {
+          // resolve 型（MCP prompt）异步渲染；静态模板走 expandCommand。
+          prompt = custom.resolve
+            ? await custom.resolve(rest.join(" "))
+            : expandCommand(custom, rest.join(" "));
+        } catch (err) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(
+                `Command render failed: ${errorMessage(err)}`,
+                `命令渲染失败：${errorMessage(err)}`,
+              ),
+            },
+          });
+          return true;
+        }
         dispatch({ t: "running", v: true });
         void host.send(sessionId, prompt).catch((err) => {
           dispatch({ t: "running", v: false });
@@ -917,6 +1114,7 @@ export function App({
       state.running,
       exit,
       commands,
+      mcpStatus,
       sessionId,
       planMode,
     ],
@@ -1093,9 +1291,11 @@ export function App({
           ? "allow"
           : ch === "a" || ch === "A"
             ? "allow_remember"
-            : ch === "n" || ch === "N"
-              ? "deny"
-              : null;
+            : ch === "p" || ch === "P"
+              ? "allow_always"
+              : ch === "n" || ch === "N"
+                ? "deny"
+                : null;
       if (!kind) return; // 方向键/误触等不应被当成拒绝
       setPendings((q) => q.slice(1));
       void host
@@ -1366,7 +1566,10 @@ export function App({
 
   // 底部状态栏（窄屏下逐段让位，避免折行把整屏布局顶掉）。
   const brand = `${APP_NAME} v${version}`;
-  const statusLine = `${state.meta.model} · in ${u.inputTokens} / out ${u.outputTokens} tokens`;
+  // 成本估算跟在 token 后展示（对齐 Claude Code /usage 的美元维度）；无价格信息时省略。
+  const costPart =
+    state.costUSD !== undefined && state.costUSD > 0 ? ` · $${state.costUSD.toFixed(4)}` : "";
+  const statusLine = `${state.meta.model} · in ${u.inputTokens} / out ${u.outputTokens} tokens${costPart}`;
 
   // 底部控件：会话列表 / 授权弹窗 / 输入框。浮层模式下前两者改为盖屏合成，这里只留输入框。
   const controls = (
@@ -1392,6 +1595,8 @@ export function App({
             {t("] allow [", "] 允许 [")}
             <Text color="cyan">a</Text>
             {t("] allow and remember [", "] 允许并记住 [")}
+            <Text color="magenta">p</Text>
+            {t("] always allow (persist) [", "] 永久允许（写入项目）[")}
             <Text color="red">n</Text>
             {t("] deny", "] 拒绝")}
           </Text>
@@ -1428,6 +1633,14 @@ export function App({
               <Box>
                 <Text color="green">{spinner} </Text>
                 <Text>{state.liveText}</Text>
+              </Box>
+            ) : state.running && state.liveThinking ? (
+              // 思考酝酿期：暗色斜体滚动展示尾部（对齐 Claude Code 的 thinking 可见性）。
+              <Box>
+                <Text color="magenta">✻ </Text>
+                <Text dimColor italic>
+                  {thinkingTail(state.liveThinking, termCols)}
+                </Text>
               </Box>
             ) : state.running ? (
               <Box>
@@ -1512,15 +1725,23 @@ function handleEvent(
     setPendings((q) => q.filter((p) => p.permId !== se.permId));
     return;
   }
+  if (se.type === "title") {
+    dispatch({ t: "title", title: se.title });
+    return;
+  }
   if (se.type === "reverted") {
-    // undo 也可能由其它订阅者（另一个 TUI/CLI）触发；所有观察者都提示一下。
+    // undo/rewind 也可能由其它订阅者（另一个 TUI/CLI）触发；所有观察者都提示一下。
+    const convPart =
+      (se.removedMessages ?? 0) > 0
+        ? t(`, rewound ${se.removedMessages} messages`, `，回退 ${se.removedMessages} 条对话`)
+        : "";
     dispatch({
       t: "push",
       item: {
         kind: "info",
         text: t(
-          `↩ Workspace rolled back: restored ${se.restored} files, deleted ${se.deleted} new files`,
-          `↩ 工作区已回滚：恢复 ${se.restored} 个文件，删除 ${se.deleted} 个新增文件`,
+          `↩ Rolled back: restored ${se.restored} files, deleted ${se.deleted} new files${convPart}`,
+          `↩ 已回滚：恢复 ${se.restored} 个文件，删除 ${se.deleted} 个新增文件${convPart}`,
         ),
       },
     });
@@ -1537,6 +1758,8 @@ function handleEvent(
       dispatch({ t: "live", delta: ev.text });
       break;
     case "thinking":
+      dispatch({ t: "liveThinking", delta: ev.text });
+      break;
     case "tool_input_delta":
       break;
     case "tool_progress":
@@ -1587,9 +1810,25 @@ function handleEvent(
         },
       });
       break;
+    case "model_fallback":
+      dispatch({
+        t: "push",
+        item: {
+          kind: "info",
+          text: t(
+            `⇄ Model fallback: ${ev.from} → ${ev.to} (${firstLine(ev.reason)})`,
+            `⇄ 模型降级：${ev.from} → ${ev.to}（${firstLine(ev.reason)}）`,
+          ),
+        },
+      });
+      break;
     case "done":
       dispatch({ t: "flushLive" });
-      dispatch({ t: "usage", u: ev.usage });
+      dispatch({
+        t: "usage",
+        u: ev.usage,
+        ...(ev.costUSD !== undefined ? { costUSD: ev.costUSD } : {}),
+      });
       break;
     case "error":
       dispatch({ t: "flushLive" });
@@ -1650,8 +1889,12 @@ function helpText(): string {
       "/new [标题]           以当前模型和目录新建会话",
     ),
     t(
-      "/undo                 Undo the last turn's file changes (git snapshot rollback, conversation unchanged)",
-      "/undo                 撤销上一轮的文件改动（git 快照回滚，不改对话）",
+      "/undo [mode]          Rewind the last turn; mode: files (default) / conversation / both",
+      "/undo [mode]          回滚上一轮；mode：files（默认，仅文件）/ conversation（仅对话）/ both（两者）",
+    ),
+    t(
+      "/fork [title]         Fork this session into a new one (original untouched)",
+      "/fork [标题]          把当前会话分叉成新会话（原会话不动）",
     ),
     t(
       "/plan [on|off]        Toggle plan mode: read-only planning; exit to execute",

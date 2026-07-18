@@ -302,3 +302,51 @@ test("权限: 计划模式下 deny 规则仍优先", async () => {
   assert.equal(d.behavior, "deny");
   assert.match(d.message!, /deny 规则/);
 });
+
+test("权限: remember='always' 持久化回调收到规则串，且切档位后仍生效", async () => {
+  const persisted: string[] = [];
+  let confirmations = 0;
+  const engine = new PermissionEngine({
+    confirm: async () => {
+      confirmations++;
+      return { behavior: "allow", remember: "always" };
+    },
+    persistAllowRule: (rule) => {
+      persisted.push(rule);
+    },
+  });
+  const request = req({ toolName: "bash", ruleKey: "git status", ruleParts: ["git status"] });
+  assert.equal((await engine.check(request)).behavior, "allow");
+  assert.deepEqual(persisted, ["bash(git status)"]);
+  // 本会话内直接命中 remembered
+  assert.equal((await engine.check(request)).behavior, "allow");
+  assert.equal(confirmations, 1);
+  // 切档位重建叠加层：持久化规则进入 baseAllow，不被洗掉
+  engine.applyProfile("workspace", { mode: "acceptEdits" });
+  assert.equal((await engine.check(request)).behavior, "allow");
+  assert.equal(confirmations, 1);
+});
+
+test("权限: remember='session' 不触发持久化回调", async () => {
+  const persisted: string[] = [];
+  const engine = new PermissionEngine({
+    confirm: async () => ({ behavior: "allow", remember: "session" }),
+    persistAllowRule: (rule) => {
+      persisted.push(rule);
+    },
+  });
+  const d = await engine.check(req({ toolName: "bash", ruleKey: "ls" }));
+  assert.equal(d.behavior, "allow");
+  assert.equal(persisted.length, 0);
+});
+
+test("权限: persistAllowRule 抛错不阻断本次放行", async () => {
+  const engine = new PermissionEngine({
+    confirm: async () => ({ behavior: "allow", remember: "always" }),
+    persistAllowRule: () => {
+      throw new Error("disk full");
+    },
+  });
+  const d = await engine.check(req({ toolName: "bash", ruleKey: "ls" }));
+  assert.equal(d.behavior, "allow");
+});

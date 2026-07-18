@@ -156,6 +156,10 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
     });
     return;
   }
+  if (se.type === "title") {
+    // 自动命名等标题变化：App 端暂无标题栏渲染需求，仅忽略（保持事件面完整）。
+    return;
+  }
   const ev = se.event;
   switch (ev.type) {
     case "user_message":
@@ -226,7 +230,7 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
 
 export interface SessionController {
   state: ChatState;
-  answerPermission: (permId: string, decision: "allow" | "allow_remember" | "deny") => void;
+  answerPermission: (permId: string, decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
 }
 
 export function useSession(sessionId: string | null): SessionController {
@@ -295,7 +299,7 @@ export function useSession(sessionId: string | null): SessionController {
     };
   }, [sessionId]);
 
-  const answerPermission = (permId: string, decision: "allow" | "allow_remember" | "deny") => {
+  const answerPermission = (permId: string, decision: "allow" | "allow_remember" | "allow_always" | "deny") => {
     const id = sessionRef.current;
     if (!id) return;
     dispatch({ t: "permRemove", permId });

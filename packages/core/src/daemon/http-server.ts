@@ -170,7 +170,19 @@ export class HttpDaemonServer {
           await this.manager.undo(
             sessionId,
             typeof body.checkpointId === "string" ? body.checkpointId : undefined,
+            body.mode === "conversation" || body.mode === "both" ? body.mode : "files",
           ),
+        );
+      case "compact":
+        return json(res, 200, await this.manager.compact(sessionId));
+      case "fork":
+        return json(
+          res,
+          200,
+          await this.manager.forkSession(sessionId, {
+            ...(typeof body.title === "string" ? { title: body.title } : {}),
+            ...(typeof body.upToMessage === "number" ? { upToMessage: body.upToMessage } : {}),
+          }),
         );
       case "permission": {
         const answered = await this.manager.answerPermission(

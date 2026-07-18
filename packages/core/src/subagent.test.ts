@@ -112,3 +112,30 @@ test("subagent: 显式 def.tools 也强制剔除 task", async () => {
   assert.ok(!childTools.includes("task"), "显式列出 task 也要剔除");
   assert.deepEqual(childTools.sort(), ["bash", "read"]);
 });
+
+test("subagent: disallowedTools 从继承集/显式集剔除（支持 glob）", async () => {
+  const sink: { opts?: AgentOptions } = {};
+  const registry = new ToolRegistry()
+    .register(fakeTool("read"))
+    .register(fakeTool("grep"))
+    .register(fakeTool("bash", false))
+    .register(fakeTool("mcp__srv__a", false))
+    .register(fakeTool("mcp__srv__b", false));
+  const tool = createTaskTool({
+    makeAgent: capturingMakeAgent(sink),
+    provider: { name: "p", async *stream() {} },
+    model: "m",
+    cwd: "/x",
+    tools: registry,
+    definitions: [
+      { name: "limited", description: "受限", disallowedTools: ["bash", "mcp__*"] },
+    ],
+  });
+  const signal = new AbortController().signal;
+  await tool.run(
+    { description: "t", prompt: "p", subagent_type: "limited" },
+    { cwd: "/x", signal },
+  );
+  const names = (sink.opts!.tools as ToolRegistry).names().sort();
+  assert.deepEqual(names, ["grep", "read"]);
+});

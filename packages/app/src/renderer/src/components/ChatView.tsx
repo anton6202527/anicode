@@ -6,7 +6,7 @@ import { Markdown } from "../markdown.js";
 
 interface Props {
   state: ChatState;
-  onAnswerPermission: (permId: string, decision: "allow" | "allow_remember" | "deny") => void;
+  onAnswerPermission: (permId: string, decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
 }
 
 export function ChatView({ state, onAnswerPermission }: Props) {
@@ -134,7 +134,7 @@ function PermissionCard({
   extra,
 }: {
   pending: PendingPerm;
-  onAnswer: (permId: string, decision: "allow" | "allow_remember" | "deny") => void;
+  onAnswer: (permId: string, decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
   extra: number;
 }) {
   return (
@@ -155,6 +155,9 @@ function PermissionCard({
         </button>
         <button className="btn remember" onClick={() => onAnswer(pending.permId, "allow_remember")}>
           {t("Allow and remember", "允许并记住")}
+        </button>
+        <button className="btn remember" onClick={() => onAnswer(pending.permId, "allow_always")}>
+          {t("Always allow (persist)", "永久允许（写入项目）")}
         </button>
         <button className="btn deny" onClick={() => onAnswer(pending.permId, "deny")}>
           {t("Deny", "拒绝")}

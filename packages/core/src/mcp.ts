@@ -9,6 +9,12 @@
  * （默认非只读——外部工具不可信，一律走权限门）。
  *
  * 自研、无外部依赖：stdio 可用「假 server 脚本」离线测试，HTTP 可用本地 http server 测试。
+ *
+ * 除 tools 外还支持：
+ *   - per-request 超时（对齐 Codex tool_timeout_sec；默认 60s，per-server 可配）
+ *   - notifications/tools/list_changed → onToolsChanged 回调（对齐 Claude Code 自动刷新）
+ *   - resources/prompts 的客户端方法（listResources/readResource/listPrompts/getPrompt），
+ *     供前端做 @资源 提及与 /prompt 命令；按 initialize 声明的能力裁剪。
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -29,6 +35,37 @@ interface McpToolSpec {
   inputSchema?: Record<string, unknown>;
 }
 
+/** MCP 请求默认超时；挂死的 server 不该无限期占住一次工具调用。 */
+const DEFAULT_TIMEOUT_MS = 60_000;
+
+/** server 声明的资源元数据（resources/list）。 */
+export interface McpResource {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+/** server 声明的 prompt 模板（prompts/list）。 */
+export interface McpPrompt {
+  name: string;
+  description?: string;
+  arguments?: { name: string; description?: string; required?: boolean }[];
+}
+
+/** initialize 握手里 server 声明的能力面（只保留我们关心的判定位）。 */
+export interface McpServerCapabilities {
+  tools: boolean;
+  resources: boolean;
+  prompts: boolean;
+}
+
+/** 客户端事件回调（按需传入 McpClient.start / connectMcpServers）。 */
+export interface McpClientHandlers {
+  /** server 广播 notifications/tools/list_changed 时触发；用 listTools() 重新拉取。 */
+  onToolsChanged?: () => void;
+}
+
 /** stdio 传输：本地进程 server。 */
 export interface McpStdioConfig {
   /** 前缀名，工具会以 "<name>__<tool>" 暴露，避免与内置工具重名 */
@@ -36,6 +73,8 @@ export interface McpStdioConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /** 单个请求的超时（毫秒）；默认 60000。 */
+  timeoutMs?: number;
 }
 
 /** Streamable HTTP 传输：远程 server（含云端官方 server）。 */
@@ -45,6 +84,8 @@ export interface McpHttpConfig {
   url: string;
   /** 附加请求头（如 Authorization: Bearer …）。 */
   headers?: Record<string, string>;
+  /** 单个请求的超时（毫秒）；默认 60000。 */
+  timeoutMs?: number;
 }
 
 export type McpServerConfig = McpStdioConfig | McpHttpConfig;
@@ -59,27 +100,49 @@ interface McpTransport {
   request(method: string, params: unknown): Promise<any>;
   notify(method: string, params: unknown): void;
   close(): void;
+  /** server 主动通知（notifications/*）的回调；由客户端在握手后设置。 */
+  onNotification?: (method: string, params: unknown) => void;
 }
 
 // ---------- 客户端 ----------
 
 export class McpClient {
+  /** initialize 握手取回的 server 能力面。 */
+  readonly capabilities: McpServerCapabilities;
+
+  /** 配置里的 server 名（工具/prompt 的前缀）。 */
+  get name(): string {
+    return this.serverName;
+  }
+
   private constructor(
     private readonly serverName: string,
     private readonly transport: McpTransport,
-  ) {}
+    capabilities: McpServerCapabilities,
+  ) {
+    this.capabilities = capabilities;
+  }
 
   /** 启动 server（按 config 选传输）并完成 initialize 握手。 */
-  static async start(cfg: McpServerConfig): Promise<McpClient> {
+  static async start(cfg: McpServerConfig, handlers?: McpClientHandlers): Promise<McpClient> {
+    const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const transport: McpTransport = isHttp(cfg)
-      ? new HttpTransport(cfg.url, cfg.headers)
-      : new StdioTransport(cfg.command, cfg.args ?? [], cfg.env);
-    const client = new McpClient(cfg.name, transport);
-    await transport.request("initialize", {
+      ? new HttpTransport(cfg.url, cfg.headers, timeoutMs)
+      : new StdioTransport(cfg.command, cfg.args ?? [], cfg.env, timeoutMs);
+    const init = await transport.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "anicode", version: "0.0.1" },
     });
+    const caps = init?.capabilities ?? {};
+    const client = new McpClient(cfg.name, transport, {
+      tools: Boolean(caps.tools),
+      resources: Boolean(caps.resources),
+      prompts: Boolean(caps.prompts),
+    });
+    transport.onNotification = (method) => {
+      if (method === "notifications/tools/list_changed") handlers?.onToolsChanged?.();
+    };
     transport.notify("notifications/initialized", {});
     return client;
   }
@@ -89,6 +152,55 @@ export class McpClient {
     const res = await this.transport.request("tools/list", {});
     const specs: McpToolSpec[] = res?.tools ?? [];
     return specs.map((spec) => this.wrap(spec));
+  }
+
+  /** 列出 server 声明的资源；server 未声明 resources 能力时返回空数组。 */
+  async listResources(): Promise<McpResource[]> {
+    if (!this.capabilities.resources) return [];
+    const res = await this.transport.request("resources/list", {});
+    return (res?.resources ?? []) as McpResource[];
+  }
+
+  /** 读取一个资源的文本内容（blob 内容以占位说明代替，不注入二进制）。 */
+  async readResource(uri: string): Promise<string> {
+    const res = await this.transport.request("resources/read", { uri });
+    const contents: any[] = res?.contents ?? [];
+    return contents
+      .map((c) =>
+        typeof c?.text === "string"
+          ? c.text
+          : t(`[binary content: ${c?.mimeType ?? "unknown"}]`, `[二进制内容: ${c?.mimeType ?? "未知类型"}]`),
+      )
+      .join("\n");
+  }
+
+  /** 列出 server 的 prompt 模板；未声明 prompts 能力时返回空数组。 */
+  async listPrompts(): Promise<McpPrompt[]> {
+    if (!this.capabilities.prompts) return [];
+    const res = await this.transport.request("prompts/list", {});
+    return (res?.prompts ?? []) as McpPrompt[];
+  }
+
+  /** 取一个 prompt 模板渲染后的消息文本（拼接为可直接作为用户输入的文本）。 */
+  async getPrompt(name: string, args?: Record<string, string>): Promise<string> {
+    const res = await this.transport.request("prompts/get", {
+      name,
+      ...(args ? { arguments: args } : {}),
+    });
+    const messages: any[] = res?.messages ?? [];
+    return messages
+      .map((m) => {
+        const content = m?.content;
+        if (typeof content?.text === "string") return content.text;
+        if (Array.isArray(content))
+          return content
+            .filter((c: any) => typeof c?.text === "string")
+            .map((c: any) => c.text)
+            .join("\n");
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
   }
 
   close(): void {
@@ -125,8 +237,14 @@ class StdioTransport implements McpTransport {
   private buffer = Buffer.alloc(0);
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+  onNotification?: (method: string, params: unknown) => void;
 
-  constructor(command: string, args: string[], env?: Record<string, string>) {
+  constructor(
+    command: string,
+    args: string[],
+    env: Record<string, string> | undefined,
+    private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  ) {
     this.proc = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...env },
@@ -142,7 +260,30 @@ class StdioTransport implements McpTransport {
   request(method: string, params: unknown): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      // 超时：挂死的 server 不该无限期占住一次工具调用；如实告知方法与时限。
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(
+            new Error(
+              t(
+                `MCP request timed out (${method}, ${this.timeoutMs}ms)`,
+                `MCP 请求超时（${method}，${this.timeoutMs}ms）`,
+              ),
+            ),
+          );
+        }
+      }, this.timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
       this.writeFrame({ jsonrpc: "2.0", id, method, params });
     });
   }
@@ -182,13 +323,27 @@ class StdioTransport implements McpTransport {
   }
 
   private handleMessage(body: string): void {
-    let msg: JsonRpcResponse;
+    let msg: JsonRpcResponse & { method?: string; params?: unknown };
     try {
       msg = JSON.parse(body);
     } catch {
       return;
     }
-    if (typeof msg.id !== "number") return;
+    if (typeof msg.id !== "number") {
+      // 无 id + 有 method = server 通知（如 notifications/tools/list_changed）。
+      if (typeof msg.method === "string") this.onNotification?.(msg.method, msg.params);
+      return;
+    }
+    if (typeof msg.method === "string") {
+      // server→client 请求（roots/list、sampling 等）：明确回「不支持」，
+      // 不能沉默 —— 等着响应的 server 会挂住。
+      this.writeFrame({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32601, message: "Method not supported by anicode client" },
+      });
+      return;
+    }
     const p = this.pending.get(msg.id);
     if (!p) return;
     this.pending.delete(msg.id);
@@ -202,21 +357,41 @@ class StdioTransport implements McpTransport {
 class HttpTransport implements McpTransport {
   private nextId = 1;
   private sessionId: string | null = null;
+  onNotification?: (method: string, params: unknown) => void;
 
   constructor(
     private readonly url: string,
     private readonly headers: Record<string, string> = {},
+    private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
   ) {}
 
   async request(method: string, params: unknown): Promise<any> {
     const id = this.nextId++;
-    const res = await this.post({ jsonrpc: "2.0", id, method, params });
-    // initialize 响应会带 Mcp-Session-Id，后续请求需回带。
-    const sid = res.headers.get("mcp-session-id");
-    if (sid) this.sessionId = sid;
-    const message = await this.readResponse(res, id);
-    if (message.error) throw new Error(`MCP ${message.error.code}: ${message.error.message}`);
-    return message.result;
+    // 超时覆盖整个请求（含 SSE 流式响应体的读取），abort 统一收束。
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), this.timeoutMs);
+    timer.unref?.();
+    try {
+      const res = await this.post({ jsonrpc: "2.0", id, method, params }, ac.signal);
+      // initialize 响应会带 Mcp-Session-Id，后续请求需回带。
+      const sid = res.headers.get("mcp-session-id");
+      if (sid) this.sessionId = sid;
+      const message = await this.readResponse(res, id);
+      if (message.error) throw new Error(`MCP ${message.error.code}: ${message.error.message}`);
+      return message.result;
+    } catch (err) {
+      if (ac.signal.aborted) {
+        throw new Error(
+          t(
+            `MCP request timed out (${method}, ${this.timeoutMs}ms)`,
+            `MCP 请求超时（${method}，${this.timeoutMs}ms）`,
+          ),
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   notify(method: string, params: unknown): void {
@@ -233,7 +408,7 @@ class HttpTransport implements McpTransport {
     }).catch(() => {});
   }
 
-  private post(body: unknown): Promise<Response> {
+  private post(body: unknown, signal?: AbortSignal): Promise<Response> {
     return fetch(this.url, {
       method: "POST",
       headers: {
@@ -243,6 +418,7 @@ class HttpTransport implements McpTransport {
         ...this.headers,
       },
       body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
     });
   }
 
@@ -258,7 +434,7 @@ class HttpTransport implements McpTransport {
       return (await res.json()) as JsonRpcResponse;
     }
     if (ctype.includes("text/event-stream")) {
-      const msg = await readSseForId(res, id);
+      const msg = await readSseForId(res, id, this.onNotification);
       if (!msg)
         throw new Error(
           t("MCP SSE stream returned no matching response", "MCP SSE 流未返回匹配的响应"),
@@ -280,8 +456,12 @@ class HttpTransport implements McpTransport {
   }
 }
 
-/** 从 SSE 流里读出 id 匹配的 JSON-RPC 响应（读到即返回）。 */
-async function readSseForId(res: Response, id: number): Promise<JsonRpcResponse | null> {
+/** 从 SSE 流里读出 id 匹配的 JSON-RPC 响应（读到即返回）；流内通知转交回调。 */
+async function readSseForId(
+  res: Response,
+  id: number,
+  onNotification?: (method: string, params: unknown) => void,
+): Promise<JsonRpcResponse | null> {
   const body = res.body;
   if (!body) return null;
   const reader = body.getReader();
@@ -300,8 +480,10 @@ async function readSseForId(res: Response, id: number): Promise<JsonRpcResponse 
         const data = sseData(rawEvent);
         if (!data) continue;
         try {
-          const msg = JSON.parse(data) as JsonRpcResponse;
+          const msg = JSON.parse(data) as JsonRpcResponse & { method?: string; params?: unknown };
           if (msg.id === id) return msg;
+          if (msg.id === undefined && typeof msg.method === "string")
+            onNotification?.(msg.method, msg.params);
         } catch {
           /* 非 JSON 或部分事件，跳过 */
         }
@@ -350,15 +532,24 @@ function extractText(res: any): string {
     .join("\n");
 }
 
-/** 便捷函数：启动多个 MCP server，收集全部工具 */
-export async function connectMcpServers(configs: McpServerConfig[]): Promise<{
+/** 便捷函数：启动多个 MCP server，收集全部工具。
+ * handlers.onToolsChanged 在任一 server 广播工具变更时触发（带 server 名），
+ * 调用方可对该 client 重新 listTools() 并更新自己的注册表。 */
+export async function connectMcpServers(
+  configs: McpServerConfig[],
+  handlers?: { onToolsChanged?: (serverName: string, client: McpClient) => void },
+): Promise<{
   tools: Tool[];
   clients: McpClient[];
 }> {
   const clients: McpClient[] = [];
   const tools: Tool[] = [];
   for (const cfg of configs) {
-    const client = await McpClient.start(cfg);
+    let client: McpClient;
+    const perServer: McpClientHandlers = {
+      onToolsChanged: () => handlers?.onToolsChanged?.(cfg.name, client),
+    };
+    client = await McpClient.start(cfg, perServer);
     clients.push(client);
     tools.push(...(await client.listTools()));
   }

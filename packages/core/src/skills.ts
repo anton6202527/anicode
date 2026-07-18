@@ -7,8 +7,8 @@
  *   L2 模型判定相关时经 skill 工具按名加载正文（作为工具结果进入对话）
  *
  * 发现路径：<cwd>/.claude/skills/<名字>/SKILL.md 与 ~/.claude/skills/<名字>/SKILL.md
- * （项目级优先，同名覆盖用户级）。frontmatter 解析只取顶层 `key: value` 行，
- * 不实现完整 YAML —— 够用且零依赖。
+ * （项目级优先，同名覆盖用户级）。frontmatter 用共享的 YAML 子集解析
+ * （frontmatter.ts：块标量/列表/嵌套 map），零依赖。
  */
 
 import { promises as fs } from "node:fs";
@@ -17,12 +17,17 @@ import * as path from "node:path";
 import type { Tool } from "./tools/tool.js";
 import { ToolError } from "./tools/tool.js";
 import { t } from "./i18n.js";
+import { parseFrontmatter, stripFrontmatter, fmString, fmStringList } from "./frontmatter.js";
 
 export interface SkillMeta {
   name: string;
   description: string;
   /** SKILL.md 的绝对路径（L2 加载正文用） */
   file: string;
+  /** frontmatter `allowed-tools`：技能宣称需要的工具子集（供上层裁决/提示用） */
+  allowedTools?: string[];
+  /** frontmatter `model`：技能建议使用的模型 */
+  model?: string;
 }
 
 const MAX_DESCRIPTION = 1024;
@@ -47,9 +52,19 @@ export async function discoverSkills(cwd: string, extraDirs: string[] = []): Pro
       try {
         const text = await fs.readFile(file, "utf8");
         const fm = parseFrontmatter(text);
-        const name = (fm["name"] ?? entry).trim();
-        const description = (fm["description"] ?? "").trim().slice(0, MAX_DESCRIPTION);
-        if (name) byName.set(name, { name, description, file });
+        const name = (fmString(fm["name"]) ?? entry).trim();
+        const description = (fmString(fm["description"]) ?? "").trim().slice(0, MAX_DESCRIPTION);
+        const allowedTools = fmStringList(fm["allowed-tools"] ?? fm["allowedTools"]);
+        const model = fmString(fm["model"]);
+        if (name) {
+          byName.set(name, {
+            name,
+            description,
+            file,
+            ...(allowedTools ? { allowedTools } : {}),
+            ...(model ? { model } : {}),
+          });
+        }
       } catch {
         /* 无 SKILL.md，跳过 */
       }
@@ -106,33 +121,19 @@ export function createSkillTool(skills: SkillMeta[]): Tool {
       const text = await fs.readFile(meta.file, "utf8");
       const body = stripFrontmatter(text).trim();
       const dir = path.dirname(meta.file);
+      // allowed-tools 以指引形式传达（frontmatter 声明的工具面约束）；
+      // 硬性收窄工具集需要「技能激活期」状态机，当前工具模型下先做软约束。
+      const toolsNote = meta.allowedTools?.length
+        ? `\n${t(
+            `(While following this skill, prefer using only these tools: ${meta.allowedTools.join(", ")})`,
+            `（执行本技能期间，优先只使用这些工具：${meta.allowedTools.join("、")}）`,
+          )}`
+        : "";
       return `${t(
         `Below is the guidance for skill “${name}” (companion resources are relative to ${dir}):`,
         `以下是技能「${name}」的指引（附属资源相对目录 ${dir}）：`,
-      )}\n\n${body}`;
+      )}${toolsNote}\n\n${body}`;
     },
   };
 }
 
-// ---------- frontmatter ----------
-
-function frontmatterBlock(text: string): string | null {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/.exec(text);
-  return m ? m[1]! : null;
-}
-
-function parseFrontmatter(text: string): Record<string, string> {
-  const block = frontmatterBlock(text);
-  const out: Record<string, string> = {};
-  if (!block) return out;
-  for (const line of block.split(/\r?\n/)) {
-    const m = /^(\w[\w-]*):\s*(.*)$/.exec(line);
-    if (m) out[m[1]!] = m[2]!.replace(/^["']|["']$/g, "");
-  }
-  return out;
-}
-
-function stripFrontmatter(text: string): string {
-  const m = /^---\r?\n[\s\S]*?\r?\n---(\r?\n|$)/.exec(text);
-  return m ? text.slice(m[0].length) : text;
-}

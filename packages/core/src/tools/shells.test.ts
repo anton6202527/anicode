@@ -295,3 +295,58 @@ test("回归：bash_output 在 filter 略过内容时给出明确提示", async 
   assert.match(text, /略过|skipped/, "应提示有行被 filter 略过");
   shells.killAll();
 });
+
+test("ShellRegistry.write: 向 cat 进程写 stdin 并回显；end 发 EOF 使其退出", async () => {
+  const dir = await scratch("anicode-shell-stdin-");
+  const reg = new ShellRegistry();
+  const id = reg.start({ command: "cat", cwd: dir, file: "/bin/cat", args: [] });
+  assert.equal(reg.write(id, "你好 stdin\n"), true);
+  let seen = "";
+  await until(() => {
+    const r = reg.read(id);
+    if (r) seen += r.chunk;
+    return seen.includes("你好 stdin");
+  });
+  reg.write(id, "", true); // EOF
+  await until(() => {
+    const r = reg.read(id);
+    return (r?.status ?? "running") !== "running";
+  });
+  assert.equal(reg.write("bash_nonexistent", "x"), false);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("ShellRegistry.write: 已结束的 shell 报错", async () => {
+  const dir = await scratch("anicode-shell-stdin-dead-");
+  const reg = new ShellRegistry();
+  const id = reg.start({ command: "true", cwd: dir, file: "/usr/bin/true", args: [] });
+  await until(() => {
+    const r = reg.read(id);
+    return (r?.status ?? "running") !== "running";
+  });
+  assert.throws(() => reg.write(id, "x"), /不在运行|not running/);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("write_stdin / list_shells 工具：走共享注册表", async () => {
+  const dir = await scratch("anicode-shell-tools2-");
+  const { writeStdinTool, listShellsTool, startBackgroundShell } = await import("./shells.js");
+  const c = ctx(dir);
+  const started = startBackgroundShell("cat", { ...c, sandbox: "none" } as any);
+  const id = /shell id: (bash_\d+)/.exec(started)![1]!;
+
+  const listed = await listShellsTool.run({}, c);
+  assert.match(listed, new RegExp(`${id} \\[running\\]`));
+
+  const wrote = await writeStdinTool.run({ shell_id: id, input: "ping\n" }, c);
+  assert.match(wrote, /5 字符|5 chars/);
+  let seen = "";
+  await until(() => {
+    const r = shells.read(id);
+    if (r) seen += r.chunk;
+    return seen.includes("ping");
+  });
+  shells.kill(id);
+  await assert.rejects(() => writeStdinTool.run({ shell_id: "bash_none", input: "x" }, c), /未知|Unknown/);
+  await fs.rm(dir, { recursive: true, force: true });
+});

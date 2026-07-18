@@ -26,8 +26,12 @@ export interface PermissionDecision {
   updatedInput?: Record<string, unknown>;
   /** deny 时给模型看的原因，让它自行改路 */
   message?: string;
-  /** 记住本次决定：后续同 (tool,ruleKey) 直接放行 */
-  remember?: boolean;
+  /**
+   * 记住本次决定：true/"session" 仅本会话内存；"always" 额外持久化——
+   * 追加为 allow 规则并通过 persistAllowRule 写盘（跨会话生效，对齐
+   * Claude Code 的 .claude/settings.local.json 允许清单）。
+   */
+  remember?: boolean | "session" | "always";
 }
 
 export interface PermissionRequest {
@@ -65,6 +69,11 @@ export interface PermissionConfig {
   /** 文件编辑类工具名集合（acceptEdits 模式自动放行这些） */
   editTools?: string[];
   confirm?: ConfirmFn;
+  /**
+   * remember="always" 时的持久化回调：收到形如 "Tool(ruleKey)" 的规则串，
+   * 由调用方写入项目本地设置（.anicode/settings.local.json）。失败不影响本次放行。
+   */
+  persistAllowRule?: (rule: string) => void | Promise<void>;
 }
 
 /**
@@ -107,6 +116,7 @@ export class PermissionEngine {
   private profileName: string | null = null;
   private remembered = new Set<string>();
   private confirm?: ConfirmFn;
+  private persistAllowRule?: (rule: string) => void | Promise<void>;
 
   constructor(cfg: PermissionConfig = {}) {
     this.mode = cfg.mode ?? "default";
@@ -119,6 +129,7 @@ export class PermissionEngine {
     this.denyRules = this.baseDeny;
     this.askRules = this.baseAsk;
     if (cfg.confirm) this.confirm = cfg.confirm;
+    if (cfg.persistAllowRule) this.persistAllowRule = cfg.persistAllowRule;
   }
 
   /** 动态注册工具时同步其权限元数据（skills 在首次 send 时才会被发现）。 */
@@ -209,6 +220,21 @@ export class PermissionEngine {
     const decision = await this.confirm(req);
     if (decision.behavior === "allow" && decision.remember && !decision.updatedInput) {
       this.remembered.add(`${req.toolName}::${req.ruleKey}`);
+      if (decision.remember === "always") {
+        // 持久化为 allow 规则：写进 baseAllow（切档位重建叠加层时不丢），
+        // 并回调写盘。写盘失败只影响下次会话，本会话已经 remembered。
+        const rule = `${req.toolName}(${req.ruleKey})`;
+        this.baseAllow.push(rule);
+        // 未切过档位时 allowRules 与 baseAllow 同引用，避免重复推入
+        if (this.allowRules !== this.baseAllow) this.allowRules.push(rule);
+        if (this.persistAllowRule) {
+          try {
+            await this.persistAllowRule(rule);
+          } catch {
+            /* 写盘失败不阻断本次放行 */
+          }
+        }
+      }
     }
     // 不能把「原始输入 → 经 UI 改写后才允许」记成原始输入的永久放行。
     // 否则下一次命中 remembered 时不会重放改写，会直接执行原始危险动作。

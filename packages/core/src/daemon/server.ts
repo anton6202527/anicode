@@ -253,7 +253,14 @@ export class DaemonServer {
         await this.manager.interrupt(req.sessionId);
         return null;
       case "undo":
-        return this.manager.undo(req.sessionId, req.checkpointId);
+        return this.manager.undo(req.sessionId, req.checkpointId, req.mode);
+      case "compact":
+        return this.manager.compact(req.sessionId);
+      case "fork":
+        return this.manager.forkSession(req.sessionId, {
+          ...(req.title !== undefined ? { title: req.title } : {}),
+          ...(req.upToMessage !== undefined ? { upToMessage: req.upToMessage } : {}),
+        });
       case "answerPermission":
         return this.manager.answerPermission(req.sessionId, req.permId, req.decision);
     }

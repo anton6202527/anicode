@@ -189,6 +189,23 @@ export function microcompact(
  *   - 第一条一定是 user（摘要包成 user→assistant 对，满足角色交替）
  *   - 保留窗口始于纯文本 user 消息，绝不切断 tool_use/tool_result 对
  */
+/**
+ * 是否已达压缩触发线（与 maybeCompact 的触发判定完全一致）。
+ * 供调用方在真正压缩前触发 PreCompact hook 等前置动作。
+ */
+export function compactionPending(
+  history: ChatMessage[],
+  cfg: CompactionConfig,
+  actualInputTokens?: number,
+): boolean {
+  const trigger = cfg.triggerTokens ?? 120_000;
+  const before =
+    actualInputTokens !== undefined && actualInputTokens > 0
+      ? actualInputTokens
+      : estimateTokens(history);
+  return before >= trigger;
+}
+
 export async function maybeCompact(
   history: ChatMessage[],
   cfg: CompactionConfig,
@@ -198,6 +215,8 @@ export async function maybeCompact(
    * 中文/代码下 char/4 会显著低估，容易压缩过晚。缺省回退纯估算。
    */
   actualInputTokens?: number,
+  /** force：跳过触发线判定，立即压缩（手动 /compact）。 */
+  opts?: { force?: boolean },
 ): Promise<CompactionResult> {
   const original = history;
   const trigger = cfg.triggerTokens ?? 120_000;
@@ -209,7 +228,7 @@ export async function maybeCompact(
   const scale = hasActual && estBefore > 0 ? actualInputTokens! / estBefore : 1;
   const real = (msgs: ChatMessage[]): number => Math.round(estimateTokens(msgs) * scale);
 
-  if (before < trigger) {
+  if (!opts?.force && before < trigger) {
     return { messages: history, compacted: false, beforeTokens: before, afterTokens: before };
   }
 

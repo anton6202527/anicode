@@ -29,6 +29,7 @@ import {
   HttpSessionHost,
   HttpDaemonServer,
   loadConfig,
+  commandHooksFromConfig,
   toMcpServerConfigs,
   toSubagentDefinitions,
   toLspServers,
@@ -37,7 +38,6 @@ import {
   defaultTools,
   createDiagnosticsTool,
   LspPool,
-  GENERAL_SUBAGENT,
   AuthStore,
   buildAuthUrl,
   exchangeCode,
@@ -68,6 +68,8 @@ export interface CliArgs {
   http?: string;
   httpToken?: string;
   permissionMode: "default" | "acceptEdits" | "auto";
+  /** 配置档名（anicode.json 的 profiles 键，对齐 Codex --profile）。 */
+  profile?: string;
   socket: string;
   sessionsDir: string;
   sessionsExplicit: boolean;
@@ -107,6 +109,7 @@ export function parseArgs(argv: string[]): CliArgs {
   let http: string | undefined;
   let httpToken: string | undefined;
   let permissionMode: CliArgs["permissionMode"] = "default";
+  let profile: string | undefined;
   const seen = new Set<string>();
 
   const mark = (flag: string): void => {
@@ -133,6 +136,12 @@ export function parseArgs(argv: string[]): CliArgs {
       case "--resume": {
         mark(arg);
         resume = requiredValue(argv, i, arg);
+        i++;
+        break;
+      }
+      case "--profile": {
+        mark(arg);
+        profile = requiredValue(argv, i, arg);
         i++;
         break;
       }
@@ -254,6 +263,7 @@ export function parseArgs(argv: string[]): CliArgs {
       ? { httpToken: httpToken ?? process.env.ANICODE_HTTP_TOKEN! }
       : {}),
     permissionMode,
+    ...(profile ? { profile } : {}),
     socket,
     sessionsDir,
     sessionsExplicit,
@@ -290,6 +300,10 @@ export function helpText(): string {
     t(
       `  --resume <id>             Resume an existing session\n`,
       `  --resume <id>             恢复已有会话\n`,
+    ) +
+    t(
+      `  --profile <name>          Apply a config profile from anicode.json (profiles key)\n`,
+      `  --profile <name>          应用 anicode.json 里的配置档（profiles 键）\n`,
     ) +
     t(
       `  --auto                    Automatically allow edits and commands\n`,
@@ -481,16 +495,24 @@ export function buildManager(
   extras: { config?: AnicodeConfig; extraTools?: Tool[]; deferredTools?: Tool[] } = {},
 ): SessionManager {
   const config = extras.config ?? {};
-  // 配置里的自定义 agents 追加到内置 general 之后（general 兜底通用委派）。
+  // 配置里的自定义 agents + 文件系统发现（.claude/agents/*.md，首次 send 时扫描）；
+  // 程序化（config）定义同名覆盖文件定义，内置 general/explore 始终可用。
   const configAgents = toSubagentDefinitions(config);
-  const subagents = configAgents.length > 0 ? [GENERAL_SUBAGENT, ...configAgents] : true;
+  const subagents = { discover: true, definitions: configAgents };
   const extraTools = extras.extraTools ?? [];
   const deferredTools = extras.deferredTools ?? [];
   const manager = new SessionManager({
     store: new SessionStore(args.sessionsDir),
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
-    permission: { mode: args.permissionMode },
+    permission: {
+      mode: args.permissionMode,
+      // anicode.json / .anicode/settings.local.json 的基础权限规则（deny 永远最先）
+      ...(config.permissions?.allow?.length ? { allowRules: config.permissions.allow } : {}),
+      ...(config.permissions?.deny?.length ? { denyRules: config.permissions.deny } : {}),
+      ...(config.permissions?.ask?.length ? { askRules: config.permissions.ask } : {}),
+    },
+    persistPermissions: true, // allow_always 写回项目 .anicode/settings.local.json
     // 配置里的权限档位：自定义档位表 + 启动即生效的档位名（/profile 运行时可再切）。
     ...(config.permissionProfiles ? { permissionProfiles: config.permissionProfiles } : {}),
     ...(config.permissionProfile ? { permissionProfile: config.permissionProfile } : {}),
@@ -512,6 +534,11 @@ export function buildManager(
         }
       : {}),
     smallModel: config.smallModel ?? true, // 摘要等杂活自动走便宜模型
+    // 模型降级链：主模型限流/过载时按序切换（anicode.json 的 fallbackModels）。
+    ...(config.fallbackModels?.length ? { fallbackModels: config.fallbackModels } : {}),
+    // 命令式 hooks（anicode.json 的 hooks 键）：payload JSON 走 stdin，exit 2=block。
+    ...(config.hooks?.length ? { hooks: commandHooksFromConfig(config.hooks) } : {}),
+    autoTitle: true, // 首轮后用小模型给无标题会话起名（失败静默）
   });
   return manager;
 }
@@ -763,7 +790,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   // 读取 anicode.json（全局+项目合并）；非法配置只提示不致命。
-  const { config, warnings: configWarnings } = await loadConfig({ cwd: args.cwd });
+  const { config, warnings: configWarnings } = await loadConfig({
+    cwd: args.cwd,
+    ...(args.profile ? { profile: args.profile } : {}),
+  });
   for (const w of configWarnings)
     console.error(t(`anicode config warning: ${w}`, `anicode 配置告警: ${w}`));
 
@@ -830,6 +860,71 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // 自定义斜杠命令（.anicode/command/*.md，全局+项目）。
   const commands: CustomCommand[] = args.daemon ? [] : await loadCommands({ cwd: args.cwd });
 
+  // MCP prompts → 斜杠命令 /mcp__<server>__<prompt>（对齐 Claude Code）。
+  // 定位参数按 prompt 声明的 arguments 顺序映射；渲染经 prompts/get 实时取。
+  for (const client of mcpClients) {
+    if (!client.capabilities.prompts) continue;
+    try {
+      for (const p of await client.listPrompts()) {
+        const promptDef = p;
+        commands.push({
+          name: `mcp__${client.name}__${p.name}`,
+          description:
+            p.description ??
+            t(`MCP prompt from ${client.name}`, `来自 ${client.name} 的 MCP 提示模板`),
+          template: "",
+          source: `mcp:${client.name}`,
+          resolve: async (argText: string) => {
+            const parts = argText.trim() ? argText.trim().split(/\s+/) : [];
+            const argMap: Record<string, string> = {};
+            (promptDef.arguments ?? []).forEach((a, i) => {
+              if (parts[i] !== undefined) argMap[a.name] = parts[i]!;
+            });
+            return client.getPrompt(
+              promptDef.name,
+              Object.keys(argMap).length > 0 ? argMap : undefined,
+            );
+          },
+        });
+      }
+    } catch (err) {
+      console.error(
+        t(
+          `anicode: failed to list prompts from MCP server ${client.name}: ${(err as Error).message}`,
+          `anicode: 拉取 MCP 服务器 ${client.name} 的 prompts 失败: ${(err as Error).message}`,
+        ),
+      );
+    }
+  }
+
+  // /mcp 状态概览：server 能力、资源、prompts（延迟查询，命令触发时才拉）。
+  const mcpStatus =
+    mcpClients.length === 0
+      ? undefined
+      : async (): Promise<string> => {
+          const lines: string[] = [];
+          for (const client of mcpClients) {
+            const caps = client.capabilities;
+            const flag = (v: boolean) => (v ? "✓" : "—");
+            lines.push(
+              `▸ ${client.name}  tools:${flag(caps.tools)} resources:${flag(caps.resources)} prompts:${flag(caps.prompts)}`,
+            );
+            try {
+              for (const r of (await client.listResources()).slice(0, 20)) {
+                lines.push(`    ${t("resource", "资源")} ${r.uri}${r.name ? `（${r.name}）` : ""}`);
+              }
+              for (const p of await client.listPrompts()) {
+                lines.push(
+                  `    ${t("prompt", "提示")} /mcp__${client.name}__${p.name}${p.description ? ` — ${p.description}` : ""}`,
+                );
+              }
+            } catch (err) {
+              lines.push(`    ${t("query failed", "查询失败")}: ${(err as Error).message}`);
+            }
+          }
+          return lines.join("\n");
+        };
+
   let host: SessionHost | undefined;
   try {
     const baseHost = await buildHost(args, { config, extraTools, deferredTools }).catch((err) => {
@@ -863,6 +958,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         providers={listProviderDetails()}
         catalog={listModelCatalog()}
         commands={commands}
+        {...(mcpStatus ? { mcpStatus } : {})}
         inspectProviderCredentials={!args.daemon}
         version={CLI_VERSION}
       />,

@@ -15,16 +15,16 @@
  */
 
 import { t } from "./i18n.js";
-import type { ChatMessage, Usage } from "./types.js";
+import type { ChatMessage, Provider, Usage } from "./types.js";
 import { Agent, type AgentEvent, type AgentOptions, type AgentResolvedModel } from "./agent.js";
 import type { ToolRegistry } from "./tools/tool.js";
 import type { HookRegistration } from "./hooks.js";
-import type { SubagentDefinition } from "./subagent.js";
 import type { CompactionConfig } from "./context.js";
 import type { WebSearchBackend } from "./tools/web-search.js";
 import { LspPool, type LspServerConfig } from "./lsp.js";
 import { SessionStore, newSessionId, type SessionMeta } from "./session.js";
 import { defaultSmallModel } from "./provider/registry.js";
+import { appendLocalAllowRules } from "./permission-store.js";
 import type {
   PermissionConfig,
   PermissionDecision,
@@ -40,7 +40,17 @@ export type SessionEvent =
   | { type: "agent"; event: AgentEvent }
   | { type: "permission_request"; permId: string; toolName: string; ruleKey: string }
   | { type: "permission_resolved"; permId: string; decision: PermissionAnswer }
-  | { type: "reverted"; checkpointId: string; restored: number; deleted: number }
+  /** 会话标题变化（自动命名或显式改名），供所有订阅端更新 UI。 */
+  | { type: "title"; title: string }
+  | {
+      type: "reverted";
+      checkpointId: string;
+      restored: number;
+      deleted: number;
+      /** 本次恢复的维度与截掉的对话消息数（mode 含 conversation 时才非 0）。 */
+      mode?: RewindMode;
+      removedMessages?: number;
+    }
   | { type: "state"; running: boolean };
 
 /** 一个可撤销点：某轮用户输入前的工作区快照。 */
@@ -48,14 +58,22 @@ export interface Checkpoint {
   id: string;
   tree: string;
   label: string;
+  /** 该轮用户输入进入历史前的消息数（对话回滚的截断点）。 */
+  messageCount: number;
 }
 
-export type PermissionAnswer = "allow" | "allow_remember" | "deny";
+/** undo/rewind 的恢复维度：仅文件（默认，向后兼容）、仅对话、或两者。 */
+export type RewindMode = "files" | "conversation" | "both";
+
+/** allow_remember=本会话记住；allow_always=写入项目本地设置，跨会话生效。 */
+export type PermissionAnswer = "allow" | "allow_remember" | "allow_always" | "deny";
 
 export interface SessionSnapshot {
   meta: SessionMeta;
   messages: ChatMessage[];
   usage: Usage;
+  /** 会话累计成本估算（美元）；模型无内置价格信息时缺省。 */
+  costUSD?: number;
   running: boolean;
   /** 订阅时仍待裁决的权限请求（重连场景不至于卡死） */
   pendingPermissions: { permId: string; toolName: string; ruleKey: string }[];
@@ -81,10 +99,18 @@ export interface SessionManagerOptions {
   permissionProfiles?: AgentOptions["permissionProfiles"];
   /** 新会话启动时应用的档位名（如配置 permissionProfile: "workspace"）。 */
   permissionProfile?: string;
+  /**
+   * allow_always 授权答复写回 <会话 cwd>/.anicode/settings.local.json，
+   * 下次会话经 loadConfig 自动生效（对齐 Claude Code settings.local.json）。默认关。
+   */
+  persistPermissions?: boolean;
   /** 所有会话共用的 hooks（PreToolUse/PostToolUse/UserPromptSubmit/Stop） */
   hooks?: HookRegistration[];
-  /** 启用 task 工具（子 agent 委派）：true=内置 general；数组=追加自定义类型 */
-  subagents?: boolean | SubagentDefinition[];
+  /**
+   * 启用 task 工具（子 agent 委派）：true=内置 general；数组=追加自定义类型；
+   * 对象形态可开 discover（扫描 .claude/agents/*.md 文件系统 agents）。
+   */
+  subagents?: AgentOptions["subagents"];
   /** 启用 skills 发现与渐进加载。 */
   skills?: AgentOptions["skills"];
   /**
@@ -92,6 +118,13 @@ export interface SessionManagerOptions {
    * 省略/false=用主模型。解析失败会静默回退主模型（见 Agent）。
    */
   smallModel?: boolean | string;
+  /** 模型降级链：主模型重试仍失败时按序切换（对齐 Claude Code fallbackModel）。 */
+  fallbackModels?: string[];
+  /**
+   * 首轮结束后自动为无标题会话起名（小模型总结首条输入，对齐 Codex/Claude Code
+   * 的会话自动命名）。失败静默。默认关。
+   */
+  autoTitle?: boolean;
   /** OS 级 bash 沙箱策略（macOS 第一阶段）；也可由 AGENTX_BASH_SANDBOX 覆盖。 */
   sandbox?: AgentOptions["sandbox"];
   /** 每轮用户输入前记工作区 git 快照，支持 undo 回滚文件改动。默认关。 */
@@ -163,10 +196,12 @@ class ManagedSession {
 
   snapshot(): SessionSnapshot {
     const s = this.agent.snapshot();
+    const costUSD = this.agent.estimatedCostUSD;
     return {
       meta: { ...this.meta },
       messages: s.messages,
       usage: s.usage,
+      ...(costUSD !== undefined ? { costUSD } : {}),
       running: this.running,
       pendingPermissions: [...this.pending.entries()].map(([permId, p]) => ({
         permId,
@@ -220,7 +255,15 @@ class ManagedSession {
     p.resolve(
       decision === "deny"
         ? { behavior: "deny", message: "已拒绝该操作" }
-        : { behavior: "allow", remember: decision === "allow_remember" },
+        : {
+            behavior: "allow",
+            remember:
+              decision === "allow_always"
+                ? "always"
+                : decision === "allow_remember"
+                  ? "session"
+                  : false,
+          },
     );
     // 所有观察者都必须清掉同一个授权提示；仅给请求发起者返回 boolean
     // 无法处理多 TUI/重连观察者的陈旧 UI。
@@ -272,7 +315,12 @@ class ManagedSession {
             next.model ? { model: next.model } : undefined,
           )) {
             if (ev.type === "checkpoint") {
-              this.checkpoints.push({ id: ev.id, tree: ev.tree, label: ev.label });
+              this.checkpoints.push({
+                id: ev.id,
+                tree: ev.tree,
+                label: ev.label,
+                messageCount: ev.messageCount,
+              });
             }
             this.emit({ type: "agent", event: ev });
           }
@@ -330,10 +378,17 @@ class ManagedSession {
   }
 
   /**
-   * 撤销：把工作区文件回滚到某个快照（缺省=最近一个）。回滚后丢弃该快照及其之后的快照，
-   * 使连续 undo 逐步回退。运行中拒绝（避免与工具写入竞争）。仅回滚文件，不改对话历史。
+   * 撤销/回滚：恢复到某个快照（缺省=最近一个）。回滚后丢弃该快照及其之后的快照，
+   * 使连续 undo 逐步回退。运行中拒绝（避免与工具写入竞争）。
+   * mode（对齐 Claude Code /rewind 的三个选项）：
+   *   files（默认，向后兼容）仅回滚工作区文件；
+   *   conversation 仅截断对话历史到该轮之前；
+   *   both 两者一起恢复。
    */
-  async undo(checkpointId?: string): Promise<{ restored: number; deleted: number }> {
+  async undo(
+    checkpointId?: string,
+    mode: RewindMode = "files",
+  ): Promise<{ restored: number; deleted: number; removedMessages: number }> {
     if (this.driving)
       throw new Error(
         t("Session is running; interrupt it before undoing", "会话运行中，请先中断再撤销"),
@@ -351,14 +406,45 @@ class ManagedSession {
     if (idx < 0)
       throw new Error(t(`Snapshot ${checkpointId} not found`, `未找到快照 ${checkpointId}`));
     const target = this.checkpoints[idx]!;
-    const res = await store.restore({ tree: target.tree });
+    const res =
+      mode === "conversation" ? { restored: 0, deleted: 0 } : await store.restore({ tree: target.tree });
+    const removedMessages =
+      mode === "files" ? 0 : await this.agent.rewindConversation(target.messageCount);
     this.checkpoints.splice(idx); // 丢弃目标及其之后的快照
     this.emit({
       type: "reverted",
       checkpointId: target.id,
       restored: res.restored,
       deleted: res.deleted,
+      mode,
+      removedMessages,
     });
+    return { ...res, removedMessages };
+  }
+
+  /** 标题变化广播（自动命名/改名后调用）。 */
+  announceTitle(title: string): void {
+    this.emit({ type: "title", title });
+  }
+
+  /** 手动压缩上下文（/compact）：立即压缩一次并广播 compacted 事件。运行中拒绝。 */
+  async compact(): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
+    if (this.driving)
+      throw new Error(
+        t("Session is running; interrupt it before compacting", "会话运行中，请先中断再压缩"),
+      );
+    const res = await this.agent.compactNow();
+    if (res.compacted) {
+      this.emit({
+        type: "agent",
+        event: {
+          type: "compacted",
+          beforeTokens: res.beforeTokens,
+          afterTokens: res.afterTokens,
+        },
+      });
+    }
+    this.touch();
     return res;
   }
 
@@ -368,6 +454,44 @@ class ManagedSession {
     const next = Number.isFinite(previous) ? Math.max(Date.now(), previous + 1) : Date.now();
     this.meta.updatedAt = new Date(next).toISOString();
   }
+}
+
+/** 调一次模型把首条输入总结成短标题；清洗引号/换行并截断。失败返回 null。 */
+async function generateSessionTitle(
+  provider: Provider,
+  model: string,
+  firstUserText: string,
+): Promise<string | null> {
+  let out = "";
+  try {
+    for await (const ev of provider.stream({
+      model,
+      system: t(
+        "Summarize the user's task as a session title in at most 8 words. Output ONLY the title, no quotes, no punctuation at the end.",
+        "把用户的任务概括成会话标题，不超过 12 个字。只输出标题本身，不要引号，结尾不要标点。",
+      ),
+      messages: [{ role: "user", content: [{ type: "text", text: firstUserText.slice(0, 2000) }] }],
+      maxTokens: 60,
+    })) {
+      if (ev.type === "done") {
+        out = ev.message.content
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map((p) => p.text)
+          .join("");
+      }
+    }
+  } catch {
+    return null;
+  }
+  const title = out
+    .split("\n")
+    .map((l) => l.trim())
+    .find(Boolean)
+    ?.replace(/^["'「『]|["'」』]$/g, "")
+    .replace(/[。.!！]$/g, "")
+    .trim()
+    .slice(0, 40);
+  return title || null;
 }
 
 // ---------- 管理器 ----------
@@ -423,6 +547,36 @@ export class SessionManager {
     return (await this.ensureLive(sessionId)).snapshot();
   }
 
+  /**
+   * fork：把一个会话的对话历史复制成新会话（对齐 Codex `/fork` 与 Claude Code
+   * --fork-session）。原会话不动；新会话从复制点独立演化。
+   * upToMessage 可截断到前 N 条消息（分叉到较早的节点）；截断产生的悬空
+   * tool_call 等由 Agent 载入时的历史自愈处理。
+   */
+  async forkSession(
+    sessionId: string,
+    opts?: { title?: string; upToMessage?: number },
+  ): Promise<SessionSummary> {
+    const source = await this.ensureLive(sessionId);
+    const snap = source.snapshot();
+    const messages =
+      opts?.upToMessage !== undefined ? snap.messages.slice(0, opts.upToMessage) : snap.messages;
+    const resolved = this.opts.resolveProvider(snap.meta.model);
+    const id = newSessionId((this.opts.now ?? Date.now)(), this.opts.rand ?? Math.random);
+    const title =
+      opts?.title ?? (snap.meta.title ? `${snap.meta.title} (fork)` : undefined);
+    const meta = await this.opts.store.create({
+      id,
+      cwd: snap.meta.cwd,
+      model: snap.meta.model,
+      ...(title ? { title } : {}),
+    });
+    // 复制的历史整体落盘（rewrite 原子替换含 meta 头的整份文件）。
+    await this.opts.store.rewrite(meta, messages);
+    this.instantiate(meta, messages, resolved);
+    return { ...meta, running: false };
+  }
+
   private async loadSession(sessionId: string): Promise<ManagedSession> {
     const data = await this.opts.store.load(sessionId);
     const meta: SessionMeta = {
@@ -450,6 +604,43 @@ export class SessionManager {
   async send(sessionId: string, text: string, opts?: { model?: string }): Promise<void> {
     const session = await this.ensureLive(sessionId);
     await session.send(text, opts);
+    // 自动命名：首轮结束且仍无标题时用小模型总结（对齐 Codex/Claude Code）。
+    // 放在 send 收尾而非并行，避免与本轮持久化竞争；失败静默。
+    if (this.opts.autoTitle && !session.meta.title) await this.autoTitle(session);
+  }
+
+  /** 用小模型（未配置则用会话主模型）从首条用户输入总结一个短标题。 */
+  private async autoTitle(session: ManagedSession): Promise<void> {
+    try {
+      const snap = session.snapshot();
+      const firstUser = snap.messages.find((m) => m.role === "user");
+      const text = (firstUser?.content ?? [])
+        .filter((p): p is { type: "text"; text: string } => p.type === "text")
+        .map((p) => p.text)
+        .join(" ")
+        .trim();
+      if (!text) return;
+      const resolved = this.opts.resolveProvider(session.meta.model);
+      let provider = resolved.provider;
+      let model = resolved.model;
+      const smallSpec = this.smallModelSpec(resolved);
+      if (smallSpec) {
+        try {
+          const small = this.opts.resolveProvider(smallSpec);
+          provider = small.provider;
+          model = small.model;
+        } catch {
+          /* 小模型解析失败回退主模型 */
+        }
+      }
+      const title = await generateSessionTitle(provider, model, text);
+      if (!title || session.meta.title) return;
+      session.meta.title = title;
+      await this.opts.store.rewrite(session.meta, session.snapshot().messages);
+      session.announceTitle(title);
+    } catch {
+      /* 起名失败静默——标题只是 UX 加分项 */
+    }
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -461,13 +652,22 @@ export class SessionManager {
     return this.sessions.get(sessionId)?.listCheckpoints() ?? [];
   }
 
-  /** 撤销会话的文件改动到某快照（缺省=最近一个）。仅回滚文件，不改对话历史。 */
+  /** 手动压缩会话上下文（/compact）：立即压缩一次。 */
+  async compact(
+    sessionId: string,
+  ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
+    const session = await this.ensureLive(sessionId);
+    return session.compact();
+  }
+
+  /** 撤销会话到某快照（缺省=最近一个）。mode: files（默认）/conversation/both。 */
   async undo(
     sessionId: string,
     checkpointId?: string,
-  ): Promise<{ restored: number; deleted: number }> {
+    mode: RewindMode = "files",
+  ): Promise<{ restored: number; deleted: number; removedMessages: number }> {
     const session = await this.ensureLive(sessionId);
-    return session.undo(checkpointId);
+    return session.undo(checkpointId, mode);
   }
 
   /** 运行时切换会话的权限模式（如 /plan 进入/退出计划模式）。 */
@@ -573,13 +773,22 @@ export class SessionManager {
         ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
         resolveModel: this.opts.resolveProvider,
         ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
+        ...(this.opts.fallbackModels?.length ? { fallbackModels: this.opts.fallbackModels } : {}),
         ...(this.opts.sandbox ? { sandbox: this.opts.sandbox } : {}),
         ...(this.opts.checkpoints ? { checkpoints: true } : {}),
         ...(this.opts.repoMap !== undefined ? { repoMap: this.opts.repoMap } : {}),
         ...(this.opts.webSearch ? { webSearch: this.opts.webSearch } : {}),
         ...(this.opts.lsp?.length ? { lsp: this.lspPoolFor(meta.cwd) } : {}),
         cwd: meta.cwd,
-        permission: { mode: "default", ...this.opts.permission, confirm },
+        permission: {
+          mode: "default",
+          ...this.opts.permission,
+          confirm,
+          // allow_always 写回会话 cwd 的项目本地设置（.anicode/settings.local.json）
+          ...(this.opts.persistPermissions
+            ? { persistAllowRule: (rule: string) => appendLocalAllowRules(meta.cwd, [rule]) }
+            : {}),
+        },
         ...(this.opts.permissionProfiles
           ? { permissionProfiles: this.opts.permissionProfiles }
           : {}),

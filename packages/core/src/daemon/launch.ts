@@ -143,7 +143,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     compaction: true,
     permission: { mode: args.permissionMode },
     skills: true,
-    subagents: true,
+    subagents: { discover: true },
   });
   const server = new DaemonServer({ manager });
   await server.listen(args.socketPath);

@@ -35,6 +35,11 @@ export type PatchOp =
 /** 一个 hunk = 有序的行操作序列（keep/del/add）。 */
 export interface Hunk {
   lines: { type: " " | "-" | "+"; text: string }[];
+  /**
+   * `@@` 后的定位上下文（如函数签名）。用于消歧：文件里出现多处相同代码块时，
+   * 先定位到该上下文行，再从其后寻找 hunk 的匹配块（对齐 Codex V4A 的 change_context）。
+   */
+  context?: string;
 }
 
 const BEGIN = "*** Begin Patch";
@@ -102,7 +107,8 @@ function parseHunks(raw: string[], start: number): { hunks: Hunk[]; next: number
     const l = raw[i]!;
     if (l.startsWith("@@")) {
       flush();
-      current = { lines: [] };
+      const context = l.slice(2).trim();
+      current = { lines: [], ...(context ? { context } : {}) };
       i++;
       continue;
     }
@@ -133,7 +139,14 @@ export function applyHunks(content: string, hunks: Hunk[]): string {
   for (const hunk of hunks) {
     const oldBlock = hunk.lines.filter((l) => l.type !== "+").map((l) => l.text);
     const newBlock = hunk.lines.filter((l) => l.type !== "-").map((l) => l.text);
-    const at = locateBlock(lines, oldBlock, searchFrom);
+    // @@ 上下文消歧：先找到上下文行，从其后开始匹配；找不到上下文或其后无匹配
+    // 时回退全局顺序匹配（宽松优先于报错——上下文行可能已被本补丁前面的 hunk 改写）。
+    let at = -1;
+    if (hunk.context) {
+      const ctxAt = findLine(lines, hunk.context, searchFrom);
+      if (ctxAt >= 0) at = locateBlock(lines, oldBlock, ctxAt + 1);
+    }
+    if (at < 0) at = locateBlock(lines, oldBlock, searchFrom);
     if (at < 0) {
       const near = oldBlock.slice(0, 3).join("\\n");
       throw new ToolError(
@@ -151,6 +164,18 @@ export function applyHunks(content: string, hunks: Hunk[]): string {
  * 在 lines 中从 from 起定位 block（连续子序列）。先精确，失败按行去空白模糊。
  * 命中返回起始下标；未命中返回 -1。要求唯一性由调用序保证（顺序前进）。
  */
+/** 找到第一行与 target 匹配（先精确后去空白）的下标；未命中返回 -1。 */
+function findLine(lines: string[], target: string, from: number): number {
+  for (let i = Math.max(0, from); i < lines.length; i++) {
+    if (lines[i] === target) return i;
+  }
+  const trimmed = target.trim();
+  for (let i = Math.max(0, from); i < lines.length; i++) {
+    if (lines[i]!.trim() === trimmed) return i;
+  }
+  return -1;
+}
+
 function locateBlock(lines: string[], block: string[], from: number): number {
   if (block.length === 0) return Math.min(from, lines.length);
   const exact = find(lines, block, from, (a, b) => a === b);
@@ -272,13 +297,25 @@ export const applyPatchTool: Tool = {
 
     // 提交阶段：规划已全部成功，按序落盘。此处的 IO 错误（如权限）仍可能半途，
     // 但已排除了「模型逻辑错误导致半应用」这一最常见、最难自纠的情形。
+    // 单文件写入走 tmp+rename：进程中途被杀不会留下写了一半的文件（同目录 rename
+    // 在 POSIX 上是原子替换）。
     if (ctx.signal.aborted) throw new ToolError("会话已中断，补丁未提交");
     for (const p of planned) {
       if ("remove" in p) {
         await fs.rm(p.abs, { force: true });
       } else {
         await fs.mkdir(path.dirname(p.abs), { recursive: true });
-        await fs.writeFile(p.abs, p.write, "utf8");
+        const tmp = path.join(
+          path.dirname(p.abs),
+          `.${path.basename(p.abs)}.anicode-tmp-${process.pid}`,
+        );
+        try {
+          await fs.writeFile(tmp, p.write, "utf8");
+          await fs.rename(tmp, p.abs);
+        } catch (err) {
+          await fs.rm(tmp, { force: true }).catch(() => {});
+          throw err;
+        }
       }
     }
     return `已应用补丁：\n${planned.map((p) => p.summary).join("\n")}`;

@@ -7,7 +7,12 @@
 
 import * as net from "node:net";
 import { t } from "../i18n.js";
-import type { SessionEvent, SessionSnapshot, SessionSummary } from "../session-manager.js";
+import type {
+  RewindMode,
+  SessionEvent,
+  SessionSnapshot,
+  SessionSummary,
+} from "../session-manager.js";
 import type { SessionHost, OpenHandle, PermissionDecisionKind } from "../host.js";
 import {
   decodeLines,
@@ -282,18 +287,47 @@ export class DaemonClient implements SessionHost {
   async undo(
     sessionId: string,
     checkpointId?: string,
-  ): Promise<{ restored: number; deleted: number }> {
+    mode?: RewindMode,
+  ): Promise<{ restored: number; deleted: number; removedMessages: number }> {
     const data = await this.request((id) => ({
       id,
       method: "undo",
       sessionId,
       ...(checkpointId ? { checkpointId } : {}),
+      ...(mode ? { mode } : {}),
     }));
-    const r = (data ?? {}) as { restored?: unknown; deleted?: unknown };
+    const r = (data ?? {}) as { restored?: unknown; deleted?: unknown; removedMessages?: unknown };
     return {
       restored: typeof r.restored === "number" ? r.restored : 0,
       deleted: typeof r.deleted === "number" ? r.deleted : 0,
+      removedMessages: typeof r.removedMessages === "number" ? r.removedMessages : 0,
     };
+  }
+
+  async compact(
+    sessionId: string,
+  ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
+    const data = await this.request((id) => ({ id, method: "compact", sessionId }));
+    const r = (data ?? {}) as Record<string, unknown>;
+    return {
+      compacted: r.compacted === true,
+      beforeTokens: typeof r.beforeTokens === "number" ? r.beforeTokens : 0,
+      afterTokens: typeof r.afterTokens === "number" ? r.afterTokens : 0,
+    };
+  }
+
+  async forkSession(
+    sessionId: string,
+    opts?: { title?: string; upToMessage?: number },
+  ): Promise<SessionSummary> {
+    const data = await this.request((id) => ({
+      id,
+      method: "fork",
+      sessionId,
+      ...(opts?.title !== undefined ? { title: opts.title } : {}),
+      ...(opts?.upToMessage !== undefined ? { upToMessage: opts.upToMessage } : {}),
+    }));
+    return data as SessionSummary;
   }
 
   answerPermission(

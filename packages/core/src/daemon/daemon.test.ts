@@ -497,3 +497,35 @@ test("daemon: 超过单帧上限的长会话 snapshot 可分块恢复", async ()
   await server.close();
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("daemon: fork 复制会话历史成新会话（经 socket 往返）", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-fork-"));
+  const { server, sockPath } = await startDaemon(
+    dir,
+    scriptedProvider([
+      [{ role: "assistant", content: [{ type: "text", text: "第一轮" }] }],
+      [{ role: "assistant", content: [{ type: "text", text: "fork 后" }] }],
+    ]),
+  );
+  const client = await DaemonClient.connect(sockPath);
+  try {
+    const s = await client.createSession({ cwd: dir, model: "scripted", title: "源" });
+    await client.open(s.id, () => {});
+    await client.send(s.id, "你好");
+
+    const fork = await client.forkSession!(s.id, { title: "分叉" });
+    assert.notEqual(fork.id, s.id);
+    assert.equal(fork.title, "分叉");
+    const opened = await client.open(fork.id, () => {});
+    assert.equal(opened.snapshot.messages.length, 2, "fork 应带上完整历史");
+
+    // 截断 fork
+    const early = await client.forkSession!(s.id, { upToMessage: 1 });
+    const openedEarly = await client.open(early.id, () => {});
+    assert.equal(openedEarly.snapshot.messages.length, 1);
+  } finally {
+    client.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

@@ -28,6 +28,8 @@ export {
   listProviderDetails,
   listModelCatalog,
   defaultSmallModel,
+  estimateCostUSD,
+  type ModelCost,
   type ProviderKind,
   type ProviderProtocol,
   type ProviderCapabilities,
@@ -74,6 +76,20 @@ export {
 } from "./subagent.js";
 export { Chan } from "./chan.js";
 export { discoverSkills, skillListPrompt, createSkillTool, type SkillMeta } from "./skills.js";
+export { discoverSubagents, parseSubagentFile } from "./agents-fs.js";
+export {
+  commandHook,
+  commandHooksFromConfig,
+  isHookEventName,
+  type CommandHookConfig,
+} from "./hooks-exec.js";
+export {
+  parseFrontmatter,
+  stripFrontmatter,
+  fmString,
+  fmStringList,
+  type FrontmatterValue,
+} from "./frontmatter.js";
 export {
   SessionManager,
   type SessionManagerOptions,
@@ -82,6 +98,7 @@ export {
   type SessionSummary,
   type SessionListener,
   type Checkpoint,
+  type RewindMode,
 } from "./session-manager.js";
 export { SnapshotStore, type Snapshot, type RestoreResult } from "./snapshot.js";
 export {
@@ -107,7 +124,15 @@ export {
 } from "./host.js";
 export { SessionStore, newSessionId, type SessionMeta, type SessionData } from "./session.js";
 export * from "./daemon/index.js";
-export { McpClient, connectMcpServers, type McpServerConfig } from "./mcp.js";
+export {
+  McpClient,
+  connectMcpServers,
+  type McpServerConfig,
+  type McpResource,
+  type McpPrompt,
+  type McpServerCapabilities,
+  type McpClientHandlers,
+} from "./mcp.js";
 export {
   loadConfig,
   toMcpServerConfigs,
@@ -157,6 +182,7 @@ export {
   type PermissionProfile,
   type ConfirmFn,
 } from "./permission.js";
+export { appendLocalAllowRules, localSettingsPath } from "./permission-store.js";
 export {
   buildRepoMap,
   gatherRepoMap,

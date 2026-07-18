@@ -9,6 +9,7 @@
 
 import type {
   PermissionAnswer,
+  RewindMode,
   SessionEvent,
   SessionSnapshot,
   SessionSummary,
@@ -41,8 +42,27 @@ export interface SessionHost {
     permId: string,
     decision: PermissionDecisionKind,
   ): Promise<boolean | void>;
-  /** 撤销：把工作区文件回滚到某快照（缺省=最近一个）。仅回滚文件，不改对话历史。 */
-  undo(sessionId: string, checkpointId?: string): Promise<{ restored: number; deleted: number }>;
+  /**
+   * 撤销/回滚到某快照（缺省=最近一个）。mode：files（默认）仅文件；
+   * conversation 仅截断对话；both 两者（对齐 Claude Code /rewind）。
+   */
+  undo(
+    sessionId: string,
+    checkpointId?: string,
+    mode?: RewindMode,
+  ): Promise<{ restored: number; deleted: number; removedMessages?: number }>;
+  /**
+   * fork：把会话历史复制成新会话（可截断到前 upToMessage 条）。可选：
+   * 未接线的传输可不实现，前端应在调用前判空。
+   */
+  forkSession?(
+    sessionId: string,
+    opts?: { title?: string; upToMessage?: number },
+  ): Promise<SessionSummary>;
+  /** 手动压缩上下文（/compact）。可选，同 forkSession 的接线边界。 */
+  compact?(
+    sessionId: string,
+  ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }>;
   /**
    * 运行时切换权限模式（如 /plan 计划模式）。可选：不支持的传输（暂未接线的 daemon）
    * 可不实现，前端应在调用前判空。
@@ -85,8 +105,23 @@ export class LocalSessionHost implements SessionHost {
   ): Promise<boolean> {
     return this.manager.answerPermission(sessionId, permId, decision);
   }
-  undo(sessionId: string, checkpointId?: string): Promise<{ restored: number; deleted: number }> {
-    return this.manager.undo(sessionId, checkpointId);
+  undo(
+    sessionId: string,
+    checkpointId?: string,
+    mode?: RewindMode,
+  ): Promise<{ restored: number; deleted: number; removedMessages: number }> {
+    return this.manager.undo(sessionId, checkpointId, mode);
+  }
+  forkSession(
+    sessionId: string,
+    opts?: { title?: string; upToMessage?: number },
+  ): Promise<SessionSummary> {
+    return this.manager.forkSession(sessionId, opts);
+  }
+  compact(
+    sessionId: string,
+  ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
+    return this.manager.compact(sessionId);
   }
   setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
     return this.manager.setPermissionMode(sessionId, mode);

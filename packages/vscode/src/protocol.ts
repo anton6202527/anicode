@@ -31,7 +31,7 @@ export interface PendingPerm {
   ruleKey: string;
 }
 
-export type PermissionDecision = "allow" | "allow_remember" | "deny";
+export type PermissionDecision = "allow" | "allow_remember" | "allow_always" | "deny";
 
 /** 主机 → webview */
 export type HostToWebview =

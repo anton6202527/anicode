@@ -99,7 +99,8 @@ export class ShellRegistry {
       child = spawn(opts.file, opts.args, {
         cwd: opts.cwd,
         env: sanitizedShellEnv(),
-        stdio: ["ignore", "pipe", "pipe"],
+        // stdin 开管道：交互式进程（REPL/向导/等待确认的安装脚本）可经 write_stdin 喂输入。
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
       throw new ToolError(`无法启动后台命令: ${(err as Error)?.message ?? err}`);
@@ -138,6 +139,7 @@ export class ShellRegistry {
     // stdio 管道在运行期是 Socket（有 unref），但静态类型只到 Readable —— 按能力探测调用：
     // 只 unref 子进程而不管管道，事件循环仍会被管道拖住，unref 就白做了。
     child.unref();
+    unrefStream(child.stdin);
     unrefStream(child.stdout);
     unrefStream(child.stderr);
 
@@ -214,6 +216,28 @@ export class ShellRegistry {
         /* 已经死了 */
       }
     }
+    return true;
+  }
+
+  /**
+   * 向运行中 shell 的 stdin 写入（对齐 Codex unified_exec 的 write_stdin）。
+   * end=true 时随后关闭 stdin（很多进程读到 EOF 才继续）。
+   * 返回 false 表示 id 不存在；已结束/无 stdin 的抛 ToolError。
+   */
+  write(id: string, data: string, end = false): boolean {
+    const entry = this.shells.get(id);
+    if (!entry) return false;
+    if (entry.status !== "running") {
+      throw new ToolError(
+        t(`Shell ${id} is not running (${entry.status})`, `shell ${id} 已不在运行（${entry.status}）`),
+      );
+    }
+    const stdin = entry.child.stdin;
+    if (!stdin || stdin.destroyed) {
+      throw new ToolError(t(`Shell ${id} has no writable stdin`, `shell ${id} 的 stdin 不可写`));
+    }
+    stdin.write(data);
+    if (end) stdin.end();
     return true;
   }
 
@@ -356,6 +380,79 @@ export const bashOutputTool: Tool = {
     }
     const body = r.chunk || t("(no new output)", "(无新输出)");
     return [head, ...notes, body].join("\n");
+  },
+};
+
+export const writeStdinTool: Tool = {
+  /**
+   * 非只读：向一个已授权启动的进程喂输入仍可能触发新副作用（如在 REPL 里执行命令），
+   * 走权限门。授权范围仍严格限于本注册表内、agent 自己启动的 shell。
+   */
+  readOnly: false,
+  def: {
+    name: "write_stdin",
+    description: t(
+      "Write input to a running background shell's stdin (for interactive processes: REPLs, prompts, installers waiting for confirmation). Set end=true to close stdin afterwards (EOF).",
+      "向运行中的后台 shell 的 stdin 写入输入（用于交互式进程：REPL、等待确认的向导/安装脚本）。end=true 表示写完后关闭 stdin（发送 EOF）。",
+    ),
+    parameters: {
+      type: "object",
+      properties: {
+        shell_id: { type: "string", description: t("The shell id", "shell id") },
+        input: {
+          type: "string",
+          description: t(
+            "Text to write. Include a trailing \\n if the process reads line-by-line.",
+            "要写入的文本。若进程按行读取，请自带结尾 \\n。",
+          ),
+        },
+        end: {
+          type: "boolean",
+          description: t("Close stdin after writing (EOF)", "写入后关闭 stdin（EOF）"),
+        },
+      },
+      required: ["shell_id", "input"],
+      additionalProperties: false,
+    },
+  },
+  ruleKey: (i) => String(i["shell_id"] ?? ""),
+  async run(input) {
+    const id = String(input["shell_id"] ?? "");
+    if (!id) throw new ToolError("shell_id 不能为空");
+    const data = String(input["input"] ?? "");
+    const end = Boolean(input["end"]);
+    if (!shells.write(id, data, end)) {
+      throw new ToolError(t(`Unknown shell id: ${id}`, `未知的 shell id: ${id}`));
+    }
+    return t(
+      `Wrote ${data.length} chars to ${id}${end ? " and closed stdin" : ""}. Read the process's response with bash_output.`,
+      `已向 ${id} 写入 ${data.length} 字符${end ? "，并已关闭 stdin" : ""}。用 bash_output 读取进程的响应。`,
+    );
+  },
+};
+
+export const listShellsTool: Tool = {
+  // 纯读取：只报告注册表状态。
+  readOnly: true,
+  def: {
+    name: "list_shells",
+    description: t(
+      "List background shells started by bash(run_in_background): id, command, status, exit code.",
+      "列出 bash(run_in_background) 启动的后台 shell：id、命令、状态、退出码。",
+    ),
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+  },
+  ruleKey: () => "list_shells",
+  isConcurrencySafe: () => true,
+  async run() {
+    const all = shells.list();
+    if (all.length === 0) return t("(no background shells)", "（无后台 shell）");
+    return all
+      .map(
+        (s) =>
+          `${s.id} [${s.status}${s.exitCode !== null ? ` exit=${s.exitCode}` : ""}] ${s.command}`,
+      )
+      .join("\n");
   },
 };
 
