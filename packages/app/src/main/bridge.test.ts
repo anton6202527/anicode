@@ -115,6 +115,34 @@ test("Bridge: 模型目录标注凭证就绪状态，debug/demo 免 key 可用",
   }
 });
 
+test("Bridge: 配置 custom/<model> 时可创建首个会话", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-custom-"));
+  const bridge = new Bridge({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile: path.join(dir, "plugins.json"),
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    defaultModel: "custom/my-model",
+  });
+  const { ipcMain, invoke } = fakeIpc();
+  bridge.register(ipcMain);
+  const sender = new FakeSender();
+  try {
+    const info = (await invoke("app:info", sender)) as { defaultModel: string };
+    assert.equal(info.defaultModel, "custom/my-model");
+
+    const session = (await invoke("host:createSession", sender, {
+      cwd: dir,
+      model: info.defaultModel,
+    })) as { model: string };
+    assert.equal(session.model, "custom/my-model");
+  } finally {
+    bridge.dispose();
+  }
+});
+
 test("Bridge: deleteSession 从列表移除会话", async () => {
   const { bridge } = await tempBridge();
   const { ipcMain, invoke } = fakeIpc();

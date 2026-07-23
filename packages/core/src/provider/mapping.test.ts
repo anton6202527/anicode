@@ -1,7 +1,7 @@
 /**
  * 离线测试：验证统一模型在多轮工具调用场景下的关键不变量。
  * （provider 内部映射函数不导出，这里测公共行为：registry 解析 + 消息构造）
- * 注册表已精简为只剩 DeepSeek（唯一云端）+ debug/demo（零网络兜底）。
+ * 注册表包含 DeepSeek、通用 custom 端点与 debug/demo（零网络兜底）。
  */
 
 import { test } from "node:test";
@@ -38,8 +38,8 @@ test("registry: 裸模型名按前缀推断（唯一云端 DeepSeek）", () => {
   assert.equal(createProvider("claude-opus-4-8").provider.name, "deepseek");
 });
 
-test("registry: 内置 provider 只剩 DeepSeek 与 debug/demo，已删除的不再出现", () => {
-  for (const id of ["deepseek", "debug", "demo"])
+test("registry: 内置 provider 包含 DeepSeek、custom 与 debug/demo，已删除的不再出现", () => {
+  for (const id of ["deepseek", "custom", "debug", "demo"])
     assert.ok(listProviders().includes(id), `缺少 ${id}`);
   for (const gone of ["anthropic", "openai", "openrouter", "gemini", "groq", "ollama", "vllm"])
     assert.ok(!listProviders().includes(gone), `${gone} 应已删除`);
@@ -49,6 +49,32 @@ test("registry: 内置 provider 只剩 DeepSeek 与 debug/demo，已删除的不
   assert.equal(routed.model, "vendor/model-name");
   assert.ok(routed.descriptor);
   assert.equal(routed.descriptor.kind, "openai-compatible");
+});
+
+test("registry: custom/<model> 使用环境变量配置 OpenAI-compatible 端点", () => {
+  const oldKey = process.env["CUSTOM_OPENAI_API_KEY"];
+  const oldBase = process.env["CUSTOM_OPENAI_BASE_URL"];
+  process.env["CUSTOM_OPENAI_API_KEY"] = "never-appear-in-diagnostics";
+  process.env["CUSTOM_OPENAI_BASE_URL"] = "http://127.0.0.1:43211/v1";
+  try {
+    const resolved = createProvider("custom/vendor/model-name");
+    assert.equal(resolved.providerId, "custom");
+    assert.equal(resolved.provider.name, "custom");
+    assert.equal(resolved.model, "vendor/model-name");
+    assert.equal(resolved.descriptor.kind, "openai-compatible");
+    assert.equal(resolved.descriptor.local, true);
+    assert.equal(resolved.descriptor.requiresApiKey, false);
+    assert.equal(resolved.diagnostics.baseURL, "http://127.0.0.1:43211/v1");
+    assert.equal(resolved.diagnostics.baseURLSource, "environment");
+    assert.equal(resolved.diagnostics.credentialEnv, "CUSTOM_OPENAI_API_KEY");
+    assert.equal(resolved.diagnostics.hasCredentials, true);
+    assert.equal(JSON.stringify(resolved.diagnostics).includes("never-appear-in-diagnostics"), false);
+  } finally {
+    if (oldKey === undefined) delete process.env["CUSTOM_OPENAI_API_KEY"];
+    else process.env["CUSTOM_OPENAI_API_KEY"] = oldKey;
+    if (oldBase === undefined) delete process.env["CUSTOM_OPENAI_BASE_URL"];
+    else process.env["CUSTOM_OPENAI_BASE_URL"] = oldBase;
+  }
 });
 
 test("registry: 内置模型目录含 DeepSeek 官方模型 + 零网络 debug/demo，spec 可直接解析", () => {

@@ -261,6 +261,24 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
       },
     ],
   }),
+  // 通用 OpenAI Chat Completions 兼容端点。它必须是内置项，因为 anicode.json
+  // 只能选择 provider，无法在启动前调用 registerProvider；缺少此项会让文档中的
+  // `model: "custom/<model>"` 在应用创建首个会话时直接报「未知 provider」。
+  openAI(
+    "custom",
+    "Custom OpenAI-compatible",
+    "http://127.0.0.1:8000/v1",
+    "CUSTOM_OPENAI_API_KEY",
+    {
+      baseURLEnv: "CUSTOM_OPENAI_BASE_URL",
+      requiresApiKey: false,
+      local: true,
+      streamUsage: false,
+      maxTokensField: "max_tokens",
+      reasoningEffort: false,
+      capabilities: cloudDefaults,
+    },
+  ),
 ];
 
 for (const builtin of OPENAI_BUILTINS) registerOpenAICompatibleProvider(builtin);
