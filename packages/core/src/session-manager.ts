@@ -144,6 +144,11 @@ export interface SessionManagerOptions {
    * 建一个 LspPool 并在 dispose 时统一关闭。空数组/省略则不启用。
    */
   lsp?: LspServerConfig[];
+  /**
+   * 内置 browser 工具（前端验证）。默认启用（undefined 视为开启，只读、自动放行）；
+   * 传 false 关闭，传 BrowserToolOptions 自定义浏览器路径/视口。见 browserToolOptions()。
+   */
+  browser?: AgentOptions["browser"];
   /** 生成会话 id 的时钟/随机源（测试可注入） */
   now?: () => number;
   rand?: () => number;
@@ -785,6 +790,8 @@ export class SessionManager {
         ...(this.opts.repoMap !== undefined ? { repoMap: this.opts.repoMap } : {}),
         ...(this.opts.webSearch ? { webSearch: this.opts.webSearch } : {}),
         ...(this.opts.lsp?.length ? { lsp: this.lspPoolFor(meta.cwd) } : {}),
+        // browser 默认开启：仅显式 false 时禁用（undefined→true）。
+        ...(this.opts.browser !== false ? { browser: this.opts.browser ?? true } : {}),
         cwd: meta.cwd,
         permission: {
           mode: "default",

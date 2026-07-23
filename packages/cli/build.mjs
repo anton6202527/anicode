@@ -15,6 +15,9 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const outfile = path.join(here, "dist", "cli.js");
 
+// 版本号单一事实源：从发布包 package.json 注入，避免源码里硬编码版本与之漂移。
+const pkg = JSON.parse(await fs.readFile(path.join(here, "package.json"), "utf8"));
+
 /** 把相对的 ".js" import 解析到实际的 .ts/.tsx 源文件 */
 const tsResolvePlugin = {
   name: "ts-resolve",
@@ -67,6 +70,7 @@ await build({
   target: "node18",
   jsx: "automatic",
   loader: { ".ts": "ts", ".tsx": "tsx" },
+  define: { __ANICODE_VERSION__: JSON.stringify(pkg.version) },
   plugins: [externalizePlugin, tsResolvePlugin],
   logLevel: "info",
 });

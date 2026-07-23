@@ -35,6 +35,7 @@ import {
   toMcpServerConfigs,
   toSubagentDefinitions,
   toLspServers,
+  browserToolOptions,
   connectMcpServers,
   loadCommands,
   defaultTools,
@@ -54,7 +55,10 @@ import {
 import { App } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
 
-const CLI_VERSION = "0.1.2";
+// 版本号由 build.mjs 经 esbuild define 注入（发布包 package.json 单一事实源）；
+// tsx 直跑源码（无 define）时回落到下面的常量。
+declare const __ANICODE_VERSION__: string | undefined;
+const CLI_VERSION = typeof __ANICODE_VERSION__ !== "undefined" ? __ANICODE_VERSION__ : "0.2.0";
 const DISPLAY_NAME = "AniCode Zen";
 // 默认走 DeepSeek 开放模型；真正生效值由 resolveDefaultModel 在运行时按凭证/本地服务挑选
 // （无 DeepSeek key 时优雅回退，见 resolveDefaultModel）。
@@ -524,6 +528,8 @@ export function buildManager(
     subagents,
     checkpoints: true, // 每轮前记工作区 git 快照，支持 /undo 回滚文件改动
     repoMap: true, // 会话开始注入代码骨架（repo map），帮模型少盲 grep、首次定位更准
+    // 内置 browser 工具：写完前端自动开页验证。默认开启，config.browser=false 可关。
+    browser: browserToolOptions(config),
 
     // MCP / diagnostics 等附加工具与内置工具合流；无附加工具时沿用默认工具集。
     // deferredTools（大量 MCP）延迟暴露：schema 不进请求，模型经 tool_search 按需激活。

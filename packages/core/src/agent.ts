@@ -31,6 +31,7 @@ import { createWebSearchTool, type WebSearchBackend } from "./tools/web-search.j
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
 import { createLspNavTools } from "./tools/lsp-nav.js";
 import { createToolSearchTool } from "./tools/tool-search.js";
+import { createBrowserTool, type BrowserToolOptions } from "./tools/browser.js";
 import type { LspPool } from "./lsp.js";
 import { Chan } from "./chan.js";
 import { HookRunner, type HookRegistration } from "./hooks.js";
@@ -179,6 +180,12 @@ export interface AgentOptions {
    * 不传则不注册这些工具。
    */
   lsp?: LspPool;
+  /**
+   * 启用 browser 工具：headless 打开 URL 做前端验证（console 错误/异常/失败请求/截图）。
+   * 传入 BrowserToolOptions（可指定浏览器路径/视口）即注册；true 表示用默认自动探测。
+   * 不传则不注册该工具。只读，注册后自动放行、无需逐次授权。
+   */
+  browser?: BrowserToolOptions | boolean;
   /** 上下文压缩配置。传入即启用；summarizer 缺省用当前 provider 自摘要 */
   compaction?: Partial<CompactionConfig> | boolean;
   /** 会话持久化 */
@@ -426,6 +433,11 @@ export class Agent {
     if (opts.lsp) {
       this.tools.register(createDiagnosticsTool(opts.lsp));
       for (const navTool of createLspNavTools(opts.lsp)) this.tools.register(navTool);
+    }
+    // browser：只读的前端验证工具，同样在 perm 引擎构建前注册即自动放行；
+    // 子 agent 一并继承（写完代码的验证子 agent 正需要它）。
+    if (opts.browser) {
+      this.tools.register(createBrowserTool(opts.browser === true ? {} : opts.browser));
     }
     // 有 deferred 工具（大量 MCP 场景）时自动挂上 tool_search 检索入口；
     // 只读，在 perm 引擎构建前注册即自动放行。
@@ -1424,6 +1436,15 @@ export class Agent {
         this.perm.addReadOnlyTools([skillTool.def.name]);
         sections.push(skillListPrompt(skills));
       }
+    }
+    // browser 工具已注册时，注入「写完前端就开页验证」的用法指引（对齐 Codex 内置浏览器习惯）。
+    if (this.tools.get("browser")) {
+      sections.push(
+        t(
+          "# Verifying frontend changes\n- After writing or changing frontend/UI code, verify it actually renders and runs by opening it in the browser tool — point it at the running dev server (e.g. http://localhost:3000) or an HTML file. It reports console errors, uncaught exceptions and failed requests, and returns a screenshot. Prefer this over guessing.\n- If no dev server is running, start one with bash run_in_background first, then open the URL.\n- Treat console errors, uncaught exceptions, or a blank/error screenshot as a failure to fix, not a done state.",
+          "# 验证前端改动\n- 写完或改完前端/UI 代码后，用 browser 工具打开页面确认它真的能渲染、能跑 —— 指向正在跑的 dev server（如 http://localhost:3000）或某个 HTML 文件。它会报告 console 错误、未捕获异常与失败请求，并回传一张截图。别靠猜。\n- 若没有 dev server 在跑，先用 bash 的 run_in_background 起一个，再打开 URL。\n- 把 console 错误、未捕获异常或白屏/报错截图当成待修的失败，而不是完成态。",
+        ),
+      );
     }
     // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
     // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。

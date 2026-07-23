@@ -41,10 +41,16 @@ async function toolsOffered(opts: Record<string, unknown> = {}) {
   return sink.toolNames;
 }
 
-test("默认不含 web_search / diagnostics", async () => {
+test("默认不含 web_search / diagnostics / browser（Agent 层为 opt-in）", async () => {
   const names = await toolsOffered();
   assert.ok(!names.includes("web_search"));
   assert.ok(!names.includes("diagnostics"));
+  assert.ok(!names.includes("browser"));
+});
+
+test("browser: true → 注册 browser 工具（只读、自动放行、随请求发给模型）", async () => {
+  const names = await toolsOffered({ browser: true });
+  assert.ok(names.includes("browser"), `实际工具: ${names.join(",")}`);
 });
 
 test("传入 webSearch 后端 → 注册 web_search 工具", async () => {

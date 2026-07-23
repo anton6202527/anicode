@@ -55,6 +55,7 @@ export {
   buildSeatbeltProfile,
   resolveSandboxPolicy,
 } from "./sandbox.js";
+export { createBrowserTool, formatReport, type BrowserToolOptions } from "./browser.js";
 
 /**
  * 默认工具集：Read/Write/Edit/ApplyPatch/Glob/Grep/Bash/BashOutput/KillShell/WebFetch/TodoWrite

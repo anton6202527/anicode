@@ -16,6 +16,7 @@ import * as path from "node:path";
 import type { McpServerConfig } from "./mcp.js";
 import type { SubagentDefinition } from "./subagent.js";
 import type { LspServerConfig } from "./lsp.js";
+import type { BrowserToolOptions } from "./tools/browser.js";
 import type { PermissionProfile } from "./permission.js";
 
 /** 配置里的单个 agent 定义（比 SubagentDefinition 更贴近用户书写习惯）。 */
@@ -52,6 +53,20 @@ export interface AnicodeConfig {
   agents?: Record<string, ConfigAgent>;
   /** 语言服务器：name → 配置（命令 + 负责扩展名）。 */
   lsp?: Record<string, LspServerConfig>;
+  /**
+   * 内置 browser 工具（headless 前端验证：开页、抓 console 错误/异常/失败请求、截图）。
+   * 默认启用——只注册工具，Chrome 懒启动，首次调用才拉起。false 或 { enabled: false } 关闭；
+   * 可指定浏览器二进制路径与默认视口。
+   */
+  browser?:
+    | boolean
+    | {
+        enabled?: boolean;
+        executablePath?: string;
+        headless?: boolean;
+        viewport?: { width: number; height: number };
+        launchTimeoutMs?: number;
+      };
   /** 额外注入 system 的规则文件路径（相对 cwd 或绝对）。 */
   instructions?: string[];
   /**
@@ -151,6 +166,7 @@ const KNOWN_KEYS = new Set([
   "mcp",
   "agents",
   "lsp",
+  "browser",
   "hooks",
   "instructions",
   "permissions",
@@ -317,6 +333,23 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
 export function toLspServers(config: AnicodeConfig): LspServerConfig[] {
   if (!config.lsp) return [];
   return Object.values(config.lsp);
+}
+
+/**
+ * config.browser → BrowserToolOptions（默认启用）。返回 false 表示显式禁用；
+ * 返回对象（可能为空）表示启用并附带可选的浏览器路径/视口等。
+ */
+export function browserToolOptions(config: AnicodeConfig): BrowserToolOptions | false {
+  const b = config.browser;
+  if (b === false) return false;
+  if (b === undefined || b === true) return {};
+  if (b.enabled === false) return false;
+  const opts: BrowserToolOptions = {};
+  if (b.executablePath) opts.executablePath = b.executablePath;
+  if (b.headless !== undefined) opts.headless = b.headless;
+  if (b.viewport) opts.viewport = b.viewport;
+  if (b.launchTimeoutMs) opts.launchTimeoutMs = b.launchTimeoutMs;
+  return opts;
 }
 
 /** 把配置里的 agents 映射转成 SubagentDefinition[]（prompt→system）。 */

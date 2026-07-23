@@ -611,8 +611,8 @@ export function buildCommandMenuOverlay(
   termRows: number,
   termCols: number,
 ): Sprite {
-  // 命令菜单宽度封顶 72、随窄屏缩小；不超过屏宽故无需横向滚动（放不下的描述按列截断）。
-  const width = Math.max(1, Math.min(72, termCols));
+  // 命令菜单平铺整屏宽（对齐输入框左右缘）；放不下的描述按列截断，故无需横向滚动。
+  const width = Math.max(1, termCols);
   const inner = Math.max(1, width - 2 * PADX);
   const blank = () => line(width, []);
   const bodyL = (spans: Span[], baseBg: string = DLG.bg) => line(width, [PAD, ...spans], baseBg);

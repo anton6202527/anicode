@@ -23,6 +23,7 @@ import type {
   ChatMessage,
   CustomCommand,
   ModelCatalogEntry,
+  PermissionMode,
   ProviderDescriptor,
   SessionEvent,
   SessionHost,
@@ -322,6 +323,58 @@ export function matchCommands(all: readonly CommandMenuRow[], text: string): Com
   return all.filter((c) => c.name.toLowerCase().includes(q));
 }
 
+/**
+ * shift+tab 权限模式轮盘（对齐 Claude Code 的循环切换）：
+ * default 逐项确认 → acceptEdits 自动放行编辑 → plan 只读计划 → bypass 全自动跳过授权 → 回到 default。
+ * 切到 default 之外任一档都免去逐次授权；bypass 最危险，只跳过授权但压不过显式 deny/ask 规则。
+ */
+export const PERM_CYCLE: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"];
+
+/** 当前权限模式的状态行提示（default 无提示，返回 null）。i18n 双语。 */
+export function permModeHint(mode: PermissionMode): string | null {
+  switch (mode) {
+    case "acceptEdits":
+      return t("⏵⏵ accept edits on (shift+tab to cycle)", "⏵⏵ 自动接受编辑（shift+tab 切换）");
+    case "plan":
+      return t("⏸ plan mode · read-only (shift+tab to cycle)", "⏸ 计划模式 · 只读（shift+tab 切换）");
+    case "auto":
+    case "bypass":
+      return t(
+        "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "⏵⏵ 跳过所有授权（shift+tab 切换）",
+      );
+    default:
+      return null;
+  }
+}
+
+/** 切模式时给会话流的一句反馈（default 也给，说明回到逐项确认）。i18n 双语。 */
+export function permModeNotice(mode: PermissionMode): string {
+  switch (mode) {
+    case "acceptEdits":
+      return t(
+        "Permission mode: accept edits — auto-approve file edits; bash still asks",
+        "权限模式：自动接受编辑 —— 文件编辑自动放行，bash 等仍会询问",
+      );
+    case "plan":
+      return t(
+        "Permission mode: plan — read-only, no writes or exec",
+        "权限模式：计划模式 —— 只读，不写盘不执行",
+      );
+    case "auto":
+    case "bypass":
+      return t(
+        "Permission mode: bypass — auto-approve everything except deny/ask rules",
+        "权限模式：跳过授权 —— 除 deny/ask 规则外一律自动放行",
+      );
+    default:
+      return t(
+        "Permission mode: normal — confirm each side-effecting action",
+        "权限模式：普通 —— 逐项确认有副作用的动作",
+      );
+  }
+}
+
 /** 会话选择器的本地即时筛选；标题优先，同时支持 id / model / cwd。 */
 export function filterSessionRows(
   rows: readonly SessionSummary[],
@@ -571,7 +624,8 @@ export function App({
   const [leaderPending, setLeaderPending] = useState(false);
   const leaderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 计划模式：/plan 切换；只读规划，退出后执行。会话切换时回到默认。
-  const [planMode, setPlanMode] = useState(false);
+  // 权限模式为单一真源（shift+tab 轮盘 / /plan / /profile 都改它）。
+  const [permMode, setPermMode] = useState<PermissionMode>("default");
   // per-prompt 模型覆盖：仅下一条消息生效（/model <spec> once 或选择器里 Tab 设定）。
   const [nextModel, setNextModel] = useState<string | null>(null);
   // 超窄终端下弹框横向滚动偏移（列）；仅当弹框比屏还宽时生效，切换弹框时归零。
@@ -712,7 +766,7 @@ export function App({
     closeRef.current?.();
     closeRef.current = null;
     setPendings([]);
-    setPlanMode(false); // 新会话回到默认模式
+    setPermMode("default"); // 新会话回到默认模式
     dispatch({ t: "opening", v: true });
     // 事件合流：流式 token 高频到达时，把一帧内的事件攒成一批，
     // 用 ~16ms 定时器统一 flush（React18 会自动 batch 这些 dispatch），
@@ -968,10 +1022,10 @@ export function App({
           return true;
         }
         const arg = (rest[0] ?? "").toLowerCase();
-        const next = arg === "on" ? true : arg === "off" ? false : !planMode;
+        const next = arg === "on" ? true : arg === "off" ? false : permMode !== "plan";
         try {
           await host.setPermissionMode(sessionId, next ? "plan" : "default");
-          setPlanMode(next);
+          setPermMode(next ? "plan" : "default");
           dispatch({
             t: "push",
             item: {
@@ -1023,7 +1077,7 @@ export function App({
             return true;
           }
           const mode = await host.setPermissionProfile(sessionId, name);
-          setPlanMode(mode === "plan"); // 只读指示与档位保持一致
+          setPermMode(mode); // 权限指示与档位保持一致
           dispatch({
             t: "push",
             item: {
@@ -1186,7 +1240,7 @@ export function App({
       commands,
       mcpStatus,
       sessionId,
-      planMode,
+      permMode,
     ],
   );
 
@@ -1250,6 +1304,31 @@ export function App({
     },
     [host, runSlash, sessionId, state.meta.cwd, nextModel],
   );
+
+  // shift+tab 轮盘：在 default → acceptEdits → plan → bypass 间循环，一次切换免去逐次授权。
+  const cyclePermMode = useCallback((): void => {
+    if (!host.setPermissionMode) {
+      dispatch({
+        t: "push",
+        item: {
+          kind: "error",
+          text: t(
+            "This transport doesn't support runtime permission modes.",
+            "当前传输不支持运行时权限模式切换。",
+          ),
+        },
+      });
+      return;
+    }
+    const cur = PERM_CYCLE.indexOf(permMode);
+    const next = PERM_CYCLE[(cur + 1) % PERM_CYCLE.length]!;
+    setPermMode(next);
+    void host.setPermissionMode(sessionId, next).catch((err) => {
+      setPermMode(permMode); // 回滚 UI 到切换前，避免与后端不一致
+      dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+    });
+    dispatch({ t: "push", item: { kind: "info", text: permModeNotice(next) } });
+  }, [host, sessionId, permMode]);
 
   useInput((ch, key) => {
     const mouse = parseMouseInput(ch);
@@ -1568,6 +1647,11 @@ export function App({
       void host.interrupt(sessionId);
       return;
     }
+    // shift+tab：切换权限模式轮盘（对齐 Claude Code）。先于命令菜单的 Tab 补全拦截，故菜单开着也能切。
+    if (key.tab && key.shift) {
+      cyclePermMode();
+      return;
+    }
     // 斜杠命令补全菜单（输入框正上方、方向朝上）：正在敲命令名时接管方向键/Tab/Enter/Esc。
     if (menuOpen) {
       const n = menuRows.length;
@@ -1801,7 +1885,7 @@ export function App({
     : state.running
       ? [t("esc interrupt", "esc 中断"), t("enter append", "enter 追加")]
       : [
-          ...(planMode ? [t("◆ plan mode (read-only)", "◆ 计划模式（只读）")] : []),
+          ...(permModeHint(permMode) ? [permModeHint(permMode)!] : []),
           ...(nextModel
             ? [t(`↳ next: ${nextModel} (once)`, `↳ 下一条: ${nextModel}（仅一次）`)]
             : []),
@@ -2224,6 +2308,10 @@ function helpText(): string {
     t(
       "Ctrl+P command palette · Ctrl+X then n/l/m/s/c/u/q for common actions",
       "Ctrl+P 命令面板 · Ctrl+X 后按 n/l/m/s/c/u/q 执行常用操作",
+    ),
+    t(
+      "Shift+Tab             Cycle permission mode: default → accept-edits → plan → bypass",
+      "Shift+Tab             轮换权限模式：默认 → 自动接受编辑 → 计划 → 跳过授权",
     ),
     t(
       "/undo [mode]          Rewind the last turn; mode: files (default) / conversation / both",

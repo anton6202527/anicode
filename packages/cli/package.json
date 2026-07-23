@@ -1,6 +1,6 @@
 {
   "name": "anicode",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "anicode —— 前端无关的 AI coding agent CLI（TUI）。多 provider、工具、权限、会话与守护进程。",
   "type": "module",
   "license": "MIT",

@@ -150,6 +150,7 @@ export {
   toMcpServerConfigs,
   toSubagentDefinitions,
   toLspServers,
+  browserToolOptions,
   type AnicodeConfig,
   type ConfigAgent,
   type LoadedConfig,
@@ -234,7 +235,17 @@ export {
   wrapWithSandbox,
   buildSeatbeltProfile,
   resolveSandboxPolicy,
+  createBrowserTool,
+  type BrowserToolOptions,
 } from "./tools/index.js";
+export {
+  Browser,
+  Page,
+  resolveChromePath,
+  closeAllBrowsers,
+  type NavigateResult,
+  type ConsoleEntry,
+} from "./browser/cdp.js";
 export { createId, deterministicId, type IdPrefix } from "./id.js";
 export {
   messagesToParts,
