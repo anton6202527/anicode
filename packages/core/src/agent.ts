@@ -14,8 +14,8 @@
  */
 
 import { t } from "./i18n.js";
-import type { ChatMessage, ImagePart, Provider, ToolResultPart, Usage } from "./types.js";
-import { emptyUsage, toolCallsOf } from "./types.js";
+import type { ChatMessage, Provider, Usage } from "./types.js";
+import { toolCallsOf } from "./types.js";
 import {
   BUILTIN_PROFILES,
   PermissionEngine,
@@ -25,7 +25,10 @@ import {
   type PermissionMode,
   type PermissionProfile,
 } from "./permission.js";
-import { ToolRegistry, ToolError, type Tool } from "./tools/tool.js";
+import { ToolRegistry, type Tool } from "./tools/tool.js";
+import { ToolExecutor } from "./tool-executor.js";
+import { TurnRunner } from "./turn-runner.js";
+import { SteeringInbox } from "./steering.js";
 import { defaultTools } from "./tools/index.js";
 import { createWebSearchTool, type WebSearchBackend } from "./tools/web-search.js";
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
@@ -33,7 +36,6 @@ import { createLspNavTools } from "./tools/lsp-nav.js";
 import { createToolSearchTool } from "./tools/tool-search.js";
 import { createBrowserTool, type BrowserToolOptions } from "./tools/browser.js";
 import type { LspPool } from "./lsp.js";
-import { Chan } from "./chan.js";
 import { HookRunner, type HookRegistration } from "./hooks.js";
 import {
   createTaskTools,
@@ -41,20 +43,26 @@ import {
   type SubagentDefinition,
   type TaskRecord,
 } from "./subagent.js";
-import { discoverSkills, skillListPrompt, createSkillTool } from "./skills.js";
 import { discoverSubagents } from "./agents-fs.js";
 import {
-  loadProjectMemory,
   composeSystem,
   maybeCompact,
   compactionPending,
   providerSummarizer,
   type CompactionConfig,
 } from "./context.js";
-import { gatherEnv } from "./env.js";
-import { gatherRepoMap, type RepoMapOptions } from "./repomap.js";
+import type { RepoMapOptions } from "./repomap.js";
+import {
+  ContextAssembler,
+  envProvider,
+  projectMemoryProvider,
+  repoMapProvider,
+  skillsProvider,
+  browserUsageProvider,
+  sessionStartHookProvider,
+} from "./context-assembler.js";
 import { SnapshotStore } from "./snapshot.js";
-import type { ISessionStore, SessionMeta } from "./session.js";
+import { Conversation, reminder, type PersistenceConfig } from "./conversation.js";
 
 // ---------- 对外事件 ----------
 
@@ -205,44 +213,13 @@ export interface AgentOptions {
   persistence?: PersistenceConfig;
 }
 
-export interface PersistenceConfig {
-  store: ISessionStore;
-  /** 会话 meta（含 id）。resume 时传已有会话的 meta。 */
-  meta: SessionMeta;
-  /** resume：预填历史（跳过再次写 meta，只在此后 append） */
-  resumeMessages?: ChatMessage[];
-}
+// 历史值对象及其伴生类型迁至 conversation.ts（架构 v2）；此处 re-export 保持既有 import 路径。
+export { repairHistory, type PersistenceConfig } from "./conversation.js";
 
 /** Agent 的可序列化状态快照 —— 供晚加入的订阅者 / resume 渲染重建界面 */
 export interface AgentSnapshot {
   messages: ChatMessage[];
   usage: Usage;
-}
-
-/**
- * 历史自愈：若历史以「含 tool_call 但缺配对 tool_result 的 assistant 消息」结尾
- * （进程崩溃 / 强杀留下的悬空状态），补上合成错误结果 —— 否则下一次
- * provider 回放必 400（tool_use 无配对 tool_result）。
- * 返回新数组；无需修复时原样返回（引用相等，调用方可据此判断是否发生了修复）。
- */
-export function repairHistory(messages: ChatMessage[]): ChatMessage[] {
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "assistant") return messages;
-  const calls = toolCallsOf(last);
-  if (calls.length === 0) return messages;
-  return [
-    ...messages,
-    {
-      role: "user",
-      content: calls.map((c) => ({
-        type: "tool_result" as const,
-        toolCallId: c.id,
-        toolName: c.name,
-        content: "（会话在该工具执行完成前中断，结果不可用）",
-        isError: true,
-      })),
-    },
-  ];
 }
 
 /** 默认系统提示词，按当前界面语言取词（在 Agent 构造时求值，故 /lang 后新建会话即生效）。 */
@@ -317,16 +294,9 @@ const MAX_STOP_CONTINUATIONS = 3;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 500;
 
-type ToolCall = { id: string; name: string; args: Record<string, unknown> };
-
-type TurnOutcome =
-  | { type: "ok"; message: ChatMessage; stopReason: string; usage: Usage }
-  | { type: "error"; message: string; cause?: unknown; partial: boolean };
-
 export class Agent {
-  // 非 readonly：per-prompt 模型覆盖会在单次 drive 内临时换掉、结束即还原（send 不可重入保证安全）。
-  private provider: Provider;
-  private model: string;
+  /** 模型轮执行（架构 v2：provider 流 + 重试 + 降级链 + active 模型状态）。 */
+  private readonly runner: TurnRunner;
   private readonly resolveModelFn?: (spec: string) => AgentResolvedModel;
   private readonly cwd: string;
   private readonly baseSystem: string;
@@ -336,18 +306,12 @@ export class Agent {
   private readonly hooks: HookRunner;
   private readonly maxTurns: number;
   private readonly maxTokens: number | undefined;
-  private readonly effort: AgentOptions["effort"];
-  private supportsTools: boolean;
-  /** 模型是否支持视觉；未知能力按 false（宁可降级为文本，也不要整轮请求被拒）。 */
-  private supportsImages: boolean;
-  private readonly maxToolResultChars: number;
-  private readonly retry: Required<RetryConfig> | null;
-  private readonly useProjectMemory: boolean;
-  private readonly injectEnv: boolean;
-  private readonly repoMapOpt: boolean | RepoMapOptions;
   private readonly snapshots: SnapshotStore | null;
   private readonly sandbox: AgentOptions["sandbox"];
-  private readonly skillsOpt: AgentOptions["skills"];
+  /** 静态上下文装配管线（架构 v2）：env / 项目记忆 / repo map / skills / browser 指引。 */
+  private readonly assembler: ContextAssembler;
+  /** SessionStart hook 段 —— 装配的最后一步（在 subagent 发现之后跑）。 */
+  private readonly postAssembler: ContextAssembler;
   /** 归一化后的 subagents 选项；discover=true 时 task 工具推迟到首次 send 注册。 */
   private subagentsOpt: {
     definitions: SubagentDefinition[];
@@ -357,36 +321,21 @@ export class Agent {
   private readonly modelInfoOpt: AgentModelInfo | undefined;
   private readonly permissionOpt: PermissionConfig | undefined;
   private readonly hooksOpt: HookRegistration[];
-  /** 配置的降级链（不可变）；每次 drive 复制一份消耗。 */
-  private readonly fallbackModels: string[];
-  private fallbackQueue: string[] = [];
   private readonly compaction: CompactionConfig | null;
-  private readonly persist: PersistenceConfig | null;
-  /** 摘要等杂活用的小模型；未配置或解析失败时等于主 provider/model。 */
-  private readonly smallProvider: Provider;
-  private readonly smallModelId: string;
 
   private system: string;
   private memoryLoaded = false;
-  private history: ChatMessage[] = [];
-  private cumulative: Usage = emptyUsage();
-  private lastInputTokens = 0; // 上一次 provider 调用的真实输入 token，驱动压缩触发
-  private persistedCount = 0; // 已 append 进会话文件的消息数；compaction 后重置
+  /** 会话历史 + 持久化 + 记账（架构 v2：唯一能改写历史的对象）。 */
+  private readonly conv: Conversation;
   private running = false; // 并发护栏：send 不可重入
-  private acceptingQueuedInput = false; // done/error 已决定后关闭，避免收尾窗口吞消息
-  private queued: string[] = []; // steering：运行中追加的用户输入，turn 边界注入
-  private readonly parallelInputsStable: boolean;
+  /** steering 输入 + 任务通知的接收窗口与队列（架构 v2：显式状态机）。 */
+  private readonly inbox: SteeringInbox;
+  /** 工具执行调度（架构 v2：并行批 + 权限门 + Pre/PostToolUse hook）。 */
+  private readonly executor: ToolExecutor;
   /** 后台子 agent 任务注册表（启用 subagents 后由 registerTaskTool 填充）。 */
   private taskRegistry: TaskRegistry | null = null;
-  /** drive 运行中到达的任务完成通知：turn 边界作为 internal user 注入。 */
-  private noticeQueue: string[] = [];
-  /** 空闲时到达且无 onTaskNotice 出口的通知：下一次 send 开始时注入。 */
-  private pendingTaskNotices: string[] = [];
-  private readonly onTaskNoticeCb?: (text: string) => void;
 
   constructor(opts: AgentOptions) {
-    this.provider = opts.provider;
-    this.model = opts.model;
     if (opts.resolveModel) this.resolveModelFn = opts.resolveModel;
     // 小模型：解析失败（拼写/缺凭证）就静默回退主模型，绝不因杂活模型而拖垮主流程。
     let smallProvider = opts.provider;
@@ -400,8 +349,6 @@ export class Agent {
         /* 回退主模型 */
       }
     }
-    this.smallProvider = smallProvider;
-    this.smallModelId = smallModelId;
     this.cwd = opts.cwd;
     this.baseSystem = opts.system ?? defaultSystem();
     this.system = this.baseSystem;
@@ -411,21 +358,37 @@ export class Agent {
     this.hooks = new HookRunner(opts.hooks ?? []);
     this.maxTurns = opts.maxTurns ?? 50;
     this.maxTokens = resolveMaxTokens(opts.maxTokens, opts.modelInfo);
-    this.supportsTools = opts.modelInfo?.capabilities.tools ?? true;
-    this.supportsImages = opts.modelInfo?.capabilities.images ?? false;
-    this.effort = opts.modelInfo?.capabilities.reasoning === false ? undefined : opts.effort;
+    const effort = opts.modelInfo?.capabilities.reasoning === false ? undefined : opts.effort;
     const maxResult = opts.maxToolResultChars ?? 30_000;
-    this.maxToolResultChars = Number.isFinite(maxResult) ? Math.max(256, maxResult) : 30_000;
-    this.retry =
+    const maxToolResultChars = Number.isFinite(maxResult) ? Math.max(256, maxResult) : 30_000;
+    const retry =
       opts.retry === false
         ? null
         : {
             maxRetries: Math.max(0, Math.floor(opts.retry?.maxRetries ?? DEFAULT_MAX_RETRIES)),
             baseDelayMs: Math.max(0, opts.retry?.baseDelayMs ?? DEFAULT_RETRY_BASE_MS),
           };
-    this.useProjectMemory = opts.projectMemory ?? true;
-    this.injectEnv = opts.injectEnv ?? true;
-    this.repoMapOpt = opts.repoMap ?? false;
+    // 模型轮执行器（架构 v2）：provider 流 + 重试 + 降级链 + active 模型状态。
+    this.runner = new TurnRunner({
+      provider: opts.provider,
+      model: opts.model,
+      ...(opts.modelInfo ? { modelInfo: opts.modelInfo } : {}),
+      ...(opts.resolveModel ? { resolveModel: opts.resolveModel } : {}),
+      ...(opts.fallbackModels?.length ? { fallbackModels: opts.fallbackModels } : {}),
+      retry,
+      ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
+      ...(effort ? { effort } : {}),
+      small: { provider: smallProvider, model: smallModelId },
+    });
+    // 静态上下文装配（架构 v2）：provider 顺序 = v1 的 sections.push 顺序（字节稳定）。
+    this.assembler = new ContextAssembler([
+      ...((opts.injectEnv ?? true) ? [envProvider()] : []),
+      ...((opts.projectMemory ?? true) ? [projectMemoryProvider()] : []),
+      ...(opts.repoMap ? [repoMapProvider(opts.repoMap)] : []),
+      ...(opts.skills ? [skillsProvider(opts.skills)] : []),
+      browserUsageProvider(),
+    ]);
+    this.postAssembler = new ContextAssembler([sessionStartHookProvider(this.hooks)]);
     this.snapshots =
       opts.checkpoints instanceof SnapshotStore
         ? opts.checkpoints
@@ -433,20 +396,12 @@ export class Agent {
           ? new SnapshotStore(this.cwd)
           : null;
     this.sandbox = opts.sandbox;
-    this.skillsOpt = opts.skills;
     this.modelInfoOpt = opts.modelInfo;
     this.permissionOpt = opts.permission;
     this.hooksOpt = opts.hooks ?? [];
-    if (opts.onTaskNotice) this.onTaskNoticeCb = opts.onTaskNotice;
-    this.fallbackModels = opts.fallbackModels ?? [];
+    this.inbox = new SteeringInbox(opts.onTaskNotice);
     this.compaction = this.resolveCompaction(opts.compaction, opts.modelInfo);
-    this.persist = opts.persistence ?? null;
-    if (this.persist?.resumeMessages) {
-      const resumed = [...this.persist.resumeMessages];
-      // 这些已在文件里，勿重复写；自愈补上的合成结果会在下次 flush 时落盘
-      this.persistedCount = resumed.length;
-      this.history = repairHistory(resumed);
-    }
+    this.conv = new Conversation(opts.persistence);
     // web_search / diagnostics：都是只读工具，在 perm 引擎构建前注册即可自动放行；
     // 也在 task 工具之前注册，好让子 agent（含只读的 explore）一并继承 —— 调研子 agent
     // 能搜网、能自查诊断，正是它们该有的能力。
@@ -519,11 +474,21 @@ export class Agent {
       editTools: [...(opts.permission?.editTools ?? []), ...this.tools.editNames()],
     });
     this.permissionProfiles = { ...BUILTIN_PROFILES, ...opts.permissionProfiles };
-    // 并发分组发生在执行前。只要 PreToolUse 或只读 ask-confirm 可能改写入参，
-    // 就保守串行，避免按旧参数判成安全、最终却执行写操作。
-    this.parallelInputsStable =
-      !this.hooks.has("PreToolUse") &&
-      !(opts.permission?.confirm && (opts.permission.askRules?.length ?? 0) > 0);
+    // 工具执行调度（架构 v2）。并发分组发生在执行前：只要 PreToolUse 或只读
+    // ask-confirm 可能改写入参，就保守串行，避免按旧参数判成安全、最终却执行写操作。
+    this.executor = new ToolExecutor({
+      tools: this.tools,
+      perm: this.perm,
+      hooks: this.hooks,
+      cwd: this.cwd,
+      ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+      maxToolResultChars,
+      parallelInputsStable:
+        !this.hooks.has("PreToolUse") &&
+        !(opts.permission?.confirm && (opts.permission.askRules?.length ?? 0) > 0),
+      supportsImages: () => this.runner.supportsImages,
+      addUsage: (usage) => this.conv.accumulate(usage),
+    });
   }
 
   /** 把 task 工具注册进本 agent 的工具集（构造期或首次 send 前调用）。 */
@@ -537,8 +502,8 @@ export class Agent {
     this.taskRegistry = registry;
     const taskTools = createTaskTools({
       makeAgent: (o) => new Agent(o),
-      provider: this.provider,
-      model: this.model,
+      provider: this.runner.provider,
+      model: this.runner.model,
       ...(this.modelInfoOpt ? { modelInfo: this.modelInfoOpt } : {}),
       ...(this.resolveModelFn ? { resolveModel: this.resolveModelFn } : {}),
       cwd: this.cwd,
@@ -555,22 +520,9 @@ export class Agent {
     for (const tool of taskTools.all) this.tools.register(tool);
   }
 
-  /**
-   * 后台任务完成通知的三级投递：
-   *   1) drive 运行中 → noticeQueue，最近的 turn 边界注入（模型当轮即可处理）；
-   *   2) 空闲且宿主给了出口 → onTaskNotice（SessionManager 用它自动发起新 drive）；
-   *   3) 兜底 → pendingTaskNotices，下一次 send 开始时注入。
-   */
+  /** 后台任务完成通知的三级投递（策略见 SteeringInbox.deliverNotice）。 */
   private deliverTaskNotice(text: string): void {
-    if (this.running && this.acceptingQueuedInput) {
-      this.noticeQueue.push(text);
-      return;
-    }
-    if (this.onTaskNoticeCb) {
-      this.onTaskNoticeCb(text);
-      return;
-    }
-    this.pendingTaskNotices.push(text);
+    this.inbox.deliverNotice(text, this.running);
   }
 
   /** 后台子 agent 任务一览（UI/宿主观测用）。 */
@@ -589,39 +541,29 @@ export class Agent {
     return this.running;
   }
   get totalUsage(): Usage {
-    return this.cumulative;
+    return this.conv.cumulative;
   }
   /**
    * 会话累计成本估算（美元）。基于主模型单价的近似值：per-prompt 覆盖 / 小模型 /
    * 降级链期间的用量也按主模型价折算。主模型无价格信息时返回 undefined。
    */
   get estimatedCostUSD(): number | undefined {
-    const cost = this.modelInfoOpt?.cost;
-    if (!cost) return undefined;
-    const per = 1 / 1_000_000;
-    const cacheRead = cost.cacheRead ?? cost.input * 0.1;
-    const cacheWrite = cost.cacheWrite ?? cost.input * 1.25;
-    return (
-      this.cumulative.inputTokens * cost.input * per +
-      this.cumulative.outputTokens * cost.output * per +
-      this.cumulative.cacheReadTokens * cacheRead * per +
-      this.cumulative.cacheWriteTokens * cacheWrite * per
-    );
+    return this.conv.estimatedCostUSD(this.modelInfoOpt?.cost);
   }
   get messages(): readonly ChatMessage[] {
-    return this.history;
+    return this.conv.messages;
   }
   /**
    * 当前上下文占用：最近一次 provider 调用的真实输入 token（含 system+tools+缓存），
    * 以及模型上下文窗口（有 modelInfo 时）。未跑过任何轮次时为 null。
    */
   get contextUsage(): { tokens: number; window?: number } | null {
-    if (!this.lastInputTokens) return null;
+    if (!this.conv.lastInputTokens) return null;
     const window = this.modelInfoOpt?.limits.contextWindow;
-    return { tokens: this.lastInputTokens, ...(window ? { window } : {}) };
+    return { tokens: this.conv.lastInputTokens, ...(window ? { window } : {}) };
   }
   snapshot(): AgentSnapshot {
-    return { messages: [...this.history], usage: this.cumulative };
+    return { messages: [...this.conv.messages], usage: this.conv.cumulative };
   }
   /** 工作区快照存储（供上层实现 undo）；未启用 checkpoints 时为 null。 */
   get snapshotStore(): SnapshotStore | null {
@@ -640,14 +582,17 @@ export class Agent {
     if (!this.compaction)
       throw new Error(t("Compaction is not enabled for this session", "该会话未启用上下文压缩"));
     if (this.hooks.has("PreCompact")) {
-      await this.hooks.run({ event: "PreCompact", cwd: this.cwd, tokens: this.lastInputTokens });
+      await this.hooks.run({
+        event: "PreCompact",
+        cwd: this.cwd,
+        tokens: this.conv.lastInputTokens,
+      });
     }
-    const res = await maybeCompact(this.history, this.compaction, this.lastInputTokens, {
+    const res = await maybeCompact(this.conv.raw(), this.compaction, this.conv.lastInputTokens, {
       force: true,
     });
     if (res.compacted) {
-      this.history = res.messages;
-      await this.rewritePersist();
+      await this.conv.replaceAll(res.messages);
       if (this.hooks.has("PostCompact")) {
         await this.hooks.run({
           event: "PostCompact",
@@ -675,12 +620,7 @@ export class Agent {
       throw new Error(
         t("Session is running; interrupt it before rewinding", "会话运行中，请先中断再回滚"),
       );
-    const target = Math.max(0, messageCount);
-    const removed = this.history.length - target;
-    if (removed <= 0) return 0;
-    this.history = this.history.slice(0, target);
-    await this.rewritePersist();
-    return removed;
+    return this.conv.rewind(messageCount);
   }
 
   /** 运行时切换权限模式（如 /plan 进入/退出计划模式）；下一轮工具授权即按新模式判定。 */
@@ -740,20 +680,14 @@ export class Agent {
     this.running = true;
     // 主输入尚在加载记忆 / 跑 UserPromptSubmit hook 时不接 steering；否则主输入
     // 被 block 时，准备期间到达的消息会跟着它的 queue 一起被清掉。
-    this.acceptingQueuedInput = false;
-    // per-prompt 模型覆盖：本次 drive 全程（含工具后的后续 turn）用覆盖模型，结束还原。
-    // send 不可重入（running 护栏），临时换字段是安全的。
-    const saved = {
-      provider: this.provider,
-      model: this.model,
-      supportsTools: this.supportsTools,
-      supportsImages: this.supportsImages,
-    };
+    this.inbox.close();
     // 降级链每次 drive 重置：上一轮的降级不该让本轮少一个候选。
-    this.fallbackQueue = [...this.fallbackModels];
+    this.runner.resetFallbacks();
     try {
+      // per-prompt 模型覆盖：本次 drive 全程（含工具后的后续 turn）用覆盖模型，
+      // 结束由 finally 的 restore() 还原。send 不可重入（running 护栏），是安全的。
       if (opts?.model) {
-        if (!this.resolveModelFn) {
+        if (!this.runner.canResolve) {
           yield {
             type: "error",
             message: t(
@@ -763,9 +697,8 @@ export class Agent {
           };
           return;
         }
-        let resolved: AgentResolvedModel;
         try {
-          resolved = this.resolveModelFn(opts.model);
+          this.runner.override(opts.model);
         } catch (err) {
           yield {
             type: "error",
@@ -776,24 +709,15 @@ export class Agent {
           };
           return;
         }
-        this.provider = resolved.provider;
-        this.model = resolved.model;
-        this.supportsTools = resolved.modelInfo?.capabilities.tools ?? true;
-        this.supportsImages = resolved.modelInfo?.capabilities.images ?? false;
       }
       yield* this.drive(userText, signal ?? new AbortController().signal);
     } finally {
-      this.provider = saved.provider;
-      this.model = saved.model;
-      this.supportsTools = saved.supportsTools;
-      this.supportsImages = saved.supportsImages;
-      this.acceptingQueuedInput = false;
-      this.queued = [];
+      // per-prompt 覆盖与降级都是 drive 局部的：结束还原主模型。
+      this.runner.restore();
+      this.inbox.clear();
       this.running = false;
       // drive 收尾窗口到达、没赶上 turn 边界的任务通知：改走空闲投递（回调或积压）。
-      const leftover = this.noticeQueue;
-      this.noticeQueue = [];
-      for (const text of leftover) this.deliverTaskNotice(text);
+      this.inbox.flushLeftover();
     }
   }
 
@@ -803,45 +727,38 @@ export class Agent {
    * 调用方应把消息排到下一次 send。
    */
   queue(text: string): boolean {
-    if (!this.running || !this.acceptingQueuedInput) return false;
-    this.queued.push(text);
-    return true;
+    if (!this.running) return false;
+    return this.inbox.enqueue(text);
   }
 
   /** 中断时丢弃尚未注入历史的 steering 输入。返回被清掉的数量。 */
   clearQueue(): number {
-    // 先同步关门，再清队列。interrupt 随后的 abort 可能同步触发外部回调；
-    // 回调中新到的消息必须进入下一 drive，不能重新塞进即将终止的本轮。
-    this.acceptingQueuedInput = false;
-    const count = this.queued.length;
-    this.queued = [];
-    return count;
+    // 「先同步关窗、再清队列」的时序不变量在 SteeringInbox.clear 内部保证。
+    return this.inbox.clear();
   }
 
   private async *drive(userText: string, signal: AbortSignal): AsyncGenerator<AgentEvent> {
     await this.ensureMemory();
 
     // rewind 需要「本轮开始前」的消息数；必须在 pushUser 之前取。
-    const preTurnCount = this.history.length;
+    const preTurnCount = this.conv.length;
 
     // UserPromptSubmit hook：可拦截输入，或注入 UI 不展示的内部上下文。
     const prepared = await this.prepareUserInput(userText);
     if (prepared.blocked) {
-      this.acceptingQueuedInput = false;
+      this.inbox.close();
       yield { type: "error", message: `输入被 hook 拦截: ${prepared.reason}` };
       return;
     }
     yield* this.pushUser(userText, false, prepared.additionalContext);
     // 上一轮空闲期积压的后台任务完成通知：随本轮主输入一并交给模型。
-    if (this.pendingTaskNotices.length > 0) {
-      this.noticeQueue.unshift(...this.pendingTaskNotices);
-      this.pendingTaskNotices = [];
+    if (this.inbox.promotePending()) {
       yield* this.drainNotices();
     }
-    await this.flushPersist();
+    await this.conv.flush();
     // 主输入已经正式进入历史，从这里开始同一 drive 才可接受 steering。
     // interrupt 可能发生在异步 hook / 持久化期间；closing 不得重新回到 active。
-    this.acceptingQueuedInput = !signal.aborted;
+    this.inbox.open(!signal.aborted);
 
     // 工作区快照：在模型动手前记一份，供用户 undo 回滚本轮的文件改动。尽力而为，失败不影响主流程。
     if (this.snapshots) {
@@ -864,18 +781,17 @@ export class Agent {
         // PreCompact：达到触发线才响（与 maybeCompact 同一判定），观察性 hook。
         if (
           this.hooks.has("PreCompact") &&
-          compactionPending(this.history, this.compaction, this.lastInputTokens)
+          compactionPending(this.conv.raw(), this.compaction, this.conv.lastInputTokens)
         ) {
           await this.hooks.run({
             event: "PreCompact",
             cwd: this.cwd,
-            tokens: this.lastInputTokens,
+            tokens: this.conv.lastInputTokens,
           });
         }
-        const res = await maybeCompact(this.history, this.compaction, this.lastInputTokens);
+        const res = await maybeCompact(this.conv.raw(), this.compaction, this.conv.lastInputTokens);
         if (res.compacted) {
-          this.history = res.messages;
-          await this.rewritePersist(); // 历史被改写，整文件重写
+          await this.conv.replaceAll(res.messages); // 历史被改写，整文件重写
           yield { type: "compacted", beforeTokens: res.beforeTokens, afterTokens: res.afterTokens };
           if (this.hooks.has("PostCompact")) {
             await this.hooks.run({
@@ -888,52 +804,54 @@ export class Agent {
         }
       }
 
-      const outcome = yield* this.runModelTurn(signal);
+      const outcome = yield* this.runner.runTurn({
+        system: this.system,
+        messages: this.conv.raw(),
+        toolDefs: this.tools.definitions(),
+        signal,
+      });
       if (outcome.type === "error") {
         // 已经接受的 steering 不可留到下一次 send 后乱序；先按原顺序入历史，
         // 再结束本轮。它们会在下一次显式 send 时与历史一同交给模型。
-        while (this.queued.length > 0) {
+        while (this.inbox.hasQueued()) {
           yield* this.drainQueued();
-          await this.flushPersist();
+          await this.conv.flush();
         }
-        this.acceptingQueuedInput = false;
+        this.inbox.close();
         yield { type: "error", message: outcome.message };
         return;
       }
       // Provider 实现可能忽略 AbortSignal 并在退出后仍返回工具调用。此处是
       // Agent 自己的最后一道副作用闸门：被中断的响应绝不能进入 history/执行工具。
       if (signal.aborted) {
-        this.acceptingQueuedInput = false;
+        this.inbox.close();
         yield { type: "turn_reset" };
         yield { type: "error", message: "会话已中断" };
         return;
       }
 
-      this.history.push(outcome.message);
-      await this.flushPersist();
-      this.accumulate(outcome.usage);
-      // 真实上下文规模 = 非缓存输入 + 缓存读 + 缓存写（三者都属本轮 prompt token）。
-      // 含 system+tools，是压缩触发最准的依据；比 char/4 估算靠谱。
-      const realInput =
-        outcome.usage.inputTokens + outcome.usage.cacheReadTokens + outcome.usage.cacheWriteTokens;
-      if (realInput > 0) this.lastInputTokens = realInput;
+      this.conv.pushAssistant(outcome.message);
+      await this.conv.flush();
+      this.conv.accumulate(outcome.usage);
+      // 真实上下文规模（压缩触发依据）的口径见 Conversation.noteRealInput。
+      this.conv.noteRealInput(outcome.usage);
       yield { type: "turn_end", usage: outcome.usage };
 
       const calls = toolCallsOf(outcome.message);
       if (outcome.stopReason !== "tool_use" || calls.length === 0) {
         // 后台任务在模型收尾前完成 → 通知注入并继续 loop（模型当轮消化结果）
-        if (this.noticeQueue.length > 0) {
+        if (this.inbox.hasNotices()) {
           const n = yield* this.drainNotices();
           if (n > 0) {
-            await this.flushPersist();
+            await this.conv.flush();
             continue;
           }
         }
         // steering 队列非空 → 注入并继续 loop（模型收尾了但用户还有话说）
-        if (this.queued.length > 0) {
+        if (this.inbox.hasQueued()) {
           const added = yield* this.drainQueued();
           if (added > 0) {
-            await this.flushPersist();
+            await this.conv.flush();
             continue;
           }
         }
@@ -943,33 +861,33 @@ export class Agent {
           if (h.blocked && stopContinuations < MAX_STOP_CONTINUATIONS) {
             stopContinuations++;
             this.pushInternalUser(reminder(`Stop hook 要求继续: ${h.reason}`).trim());
-            await this.flushPersist();
+            await this.conv.flush();
             continue;
           }
         }
         // Stop hook await 期间也可能收到 steering；必须在决定 done 前再检查一次。
-        if (this.queued.length > 0) {
+        if (this.inbox.hasQueued()) {
           const added = yield* this.drainQueued();
           if (added > 0) {
-            await this.flushPersist();
+            await this.conv.flush();
             continue;
           }
         }
-        this.acceptingQueuedInput = false;
+        this.inbox.close();
         // Notification（观察性）：一次 drive 收尾，供外接桌面通知/提示音。
         if (this.hooks.has("Notification")) {
           await this.hooks.run({
             event: "Notification",
             cwd: this.cwd,
             notificationType: "turn_done",
-            message: lastAssistantHead(this.history),
+            message: lastAssistantHead(this.conv.raw()),
           });
         }
         {
           const costUSD = this.estimatedCostUSD;
           yield {
             type: "done",
-            usage: this.cumulative,
+            usage: this.conv.cumulative,
             turns: turn,
             ...(costUSD !== undefined ? { costUSD } : {}),
           };
@@ -977,31 +895,31 @@ export class Agent {
         return;
       }
 
-      const { results, images } = yield* this.runTools(calls, signal);
+      const { results, images } = yield* this.executor.run(calls, signal);
       // tool_result 必须在前（Anthropic 的硬性要求），工具附带的图片紧随其后。
-      this.history.push({ role: "user", content: [...results, ...images] });
-      await this.flushPersist();
+      this.conv.pushToolRound(results, images);
+      await this.conv.flush();
       if (signal.aborted) {
-        this.acceptingQueuedInput = false;
+        this.inbox.close();
         yield { type: "error", message: "会话已中断" };
         return;
       }
       // 工具轮之后是注入 steering / 任务通知的天然边界
-      if (this.noticeQueue.length > 0) {
+      if (this.inbox.hasNotices()) {
         const n = yield* this.drainNotices();
-        if (n > 0) await this.flushPersist();
+        if (n > 0) await this.conv.flush();
       }
-      if (this.queued.length > 0) {
+      if (this.inbox.hasQueued()) {
         const added = yield* this.drainQueued();
-        if (added > 0) await this.flushPersist();
+        if (added > 0) await this.conv.flush();
       }
     }
 
-    while (this.queued.length > 0) {
+    while (this.inbox.hasQueued()) {
       yield* this.drainQueued();
-      await this.flushPersist();
+      await this.conv.flush();
     }
-    this.acceptingQueuedInput = false;
+    this.inbox.close();
     yield { type: "error", message: `达到最大轮数 ${this.maxTurns}，已停止` };
   }
 
@@ -1010,20 +928,12 @@ export class Agent {
     queued: boolean,
     additionalContext?: string,
   ): Generator<AgentEvent> {
-    this.history.push({
-      role: "user",
-      content: [
-        { type: "text", text },
-        ...(additionalContext
-          ? [{ type: "text" as const, text: reminder(additionalContext).trim(), internal: true }]
-          : []),
-      ],
-    });
+    this.conv.pushUser(text, additionalContext);
     yield { type: "user_message", text, queued };
   }
 
   private pushInternalUser(text: string): void {
-    this.history.push({ role: "user", content: [{ type: "text", text, internal: true }] });
+    this.conv.pushInternal(text);
   }
 
   private async prepareUserInput(
@@ -1041,8 +951,8 @@ export class Agent {
   /** 把积压的后台任务完成通知注入历史（internal user，不过 UserPromptSubmit hook）。 */
   private *drainNotices(): Generator<AgentEvent, number> {
     let added = 0;
-    while (this.noticeQueue.length > 0) {
-      const text = this.noticeQueue.shift()!;
+    while (this.inbox.hasNotices()) {
+      const text = this.inbox.shiftNotice()!;
       this.pushInternalUser(text);
       yield { type: "task_notice", text };
       added++;
@@ -1052,8 +962,8 @@ export class Agent {
 
   private async *drainQueued(): AsyncGenerator<AgentEvent, number> {
     let added = 0;
-    while (this.queued.length > 0) {
-      const text = this.queued.shift()!;
+    while (this.inbox.hasQueued()) {
+      const text = this.inbox.shiftQueued()!;
       const prepared = await this.prepareUserInput(text);
       if (prepared.blocked) {
         yield { type: "error", message: `排队输入被 hook 拦截: ${prepared.reason}` };
@@ -1065,391 +975,8 @@ export class Agent {
     return added;
   }
 
-  // ---------- 模型轮（含瞬时错误重试） ----------
-
-  private async *runModelTurn(signal: AbortSignal): AsyncGenerator<AgentEvent, TurnOutcome> {
-    for (let attempt = 0; ; attempt++) {
-      const res = yield* this.streamOnce(signal);
-      if (res.type === "ok") return res;
-      const retriable =
-        this.retry !== null &&
-        attempt < this.retry.maxRetries &&
-        !signal.aborted &&
-        isTransientError(res.cause);
-      if (!retriable) {
-        // 即使不再重试，消费者也必须清掉未进入 Agent history 的流式残影。
-        if (res.partial) yield { type: "turn_reset" };
-        // 降级链：主模型确定失败（非用户中断）时切到下一个可解析的 fallback 模型，
-        // 从头重试本轮。切换是 drive 局部的——send 的 finally 会还原主模型。
-        const switched = signal.aborted ? null : this.nextFallback();
-        if (switched) {
-          yield {
-            type: "model_fallback",
-            from: switched.from,
-            to: switched.to,
-            reason: res.message,
-          };
-          attempt = -1; // for 递增后归 0：新模型享有完整的重试预算
-          continue;
-        }
-        return res;
-      }
-      if (res.partial) yield { type: "turn_reset" };
-      const backoff = Math.round(
-        this.retry!.baseDelayMs * 2 ** attempt * (1 + Math.random() * 0.25),
-      );
-      // 服务端给了 Retry-After 就尊重它（取与退避的较大值，封顶 60s 防呆滞）。
-      const serverHint = retryAfterMs(res.cause);
-      const delayMs =
-        serverHint !== null ? Math.min(60_000, Math.max(backoff, serverHint)) : backoff;
-      yield { type: "retry", attempt: attempt + 1, delayMs, reason: res.message };
-      try {
-        await sleep(delayMs, signal);
-      } catch {
-        return res; // 等待期间被中断
-      }
-    }
-  }
-
-  /** 消耗降级链：切到下一个能解析的 fallback 模型；链空/无 resolver 返回 null。 */
-  private nextFallback(): { from: string; to: string } | null {
-    if (!this.resolveModelFn) return null;
-    while (this.fallbackQueue.length > 0) {
-      const spec = this.fallbackQueue.shift()!;
-      try {
-        const resolved = this.resolveModelFn(spec);
-        const from = this.model;
-        this.provider = resolved.provider;
-        this.model = resolved.model;
-        this.supportsTools = resolved.modelInfo?.capabilities.tools ?? true;
-        this.supportsImages = resolved.modelInfo?.capabilities.images ?? false;
-        return { from, to: resolved.model };
-      } catch {
-        /* 该 fallback 解析失败（拼写/缺凭证），试下一个 */
-      }
-    }
-    return null;
-  }
-
-  /** 跑一次模型补全，把流式增量转成 AgentEvent，聚合出最终消息 */
-  private async *streamOnce(signal: AbortSignal): AsyncGenerator<AgentEvent, TurnOutcome> {
-    let finalMessage: ChatMessage | null = null;
-    let stopReason = "";
-    let usage: Usage = emptyUsage();
-    let partial = false;
-    const toolNames = new Map<string, string>(); // 流式期间 id → 工具名
-
-    try {
-      for await (const ev of this.provider.stream({
-        model: this.model,
-        system: this.system,
-        messages: this.history,
-        ...(this.supportsTools ? { tools: this.tools.definitions() } : {}),
-        ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
-        ...(this.effort ? { effort: this.effort } : {}),
-        signal,
-      })) {
-        if (ev.type === "text_delta") {
-          partial = true;
-          yield { type: "text", text: ev.text };
-        } else if (ev.type === "thinking_delta") {
-          partial = true;
-          yield { type: "thinking", text: ev.text };
-        } else if (ev.type === "tool_call_start") {
-          partial = true;
-          toolNames.set(ev.id, ev.name);
-        } else if (ev.type === "tool_call_delta") {
-          partial = true;
-          yield {
-            type: "tool_input_delta",
-            id: ev.id,
-            name: toolNames.get(ev.id) ?? "",
-            delta: ev.argsText,
-          };
-        } else if (ev.type === "done") {
-          finalMessage = ev.message;
-          stopReason = ev.stopReason;
-          usage = ev.usage;
-        }
-      }
-    } catch (err) {
-      return { type: "error", message: errText(err), cause: err, partial };
-    }
-    if (!finalMessage) {
-      return { type: "error", message: "provider 未产出 done 事件", partial };
-    }
-    return { type: "ok", message: finalMessage, stopReason, usage };
-  }
-
-  // ---------- 工具执行 ----------
-
-  /**
-   * 执行一轮工具调用：连续的只读调用组成一批并行执行（互不阻塞），
-   * 副作用调用按序串行（保证写操作的可预测顺序）。
-   * results 始终按 calls 原顺序排列 —— 与模型发起顺序一致。
-   */
-  private async *runTools(
-    calls: ToolCall[],
-    signal: AbortSignal,
-  ): AsyncGenerator<AgentEvent, { results: ToolResultPart[]; images: ImagePart[] }> {
-    const results: ToolResultPart[] = [];
-    // 工具附带的图片单独收集：它们必须排在本轮全部 tool_result 之后
-    // （Anthropic 要求 tool_result 块位于 user 消息开头）。
-    const images: ImagePart[] = [];
-    let i = 0;
-    while (i < calls.length) {
-      if (!this.isParallelSafe(calls[i]!)) {
-        yield* this.runToolSafe(calls[i]!, signal, results, images);
-        i++;
-        continue;
-      }
-      const batch: ToolCall[] = [calls[i]!];
-      while (i + batch.length < calls.length && this.isParallelSafe(calls[i + batch.length]!)) {
-        batch.push(calls[i + batch.length]!);
-      }
-      i += batch.length;
-      if (batch.length === 1) yield* this.runToolSafe(batch[0]!, signal, results, images);
-      else yield* this.runToolBatch(batch, signal, results, images);
-    }
-    return { results, images };
-  }
-
-  /**
-   * 并发资格按调用判定。前提：入参不会在准备阶段被改写（无 PreToolUse / 无 ask-confirm）。
-   * 满足后：有 isConcurrencySafe 的以它为准（如 task 只对只读子 agent 类型返回 true，
-   * 从而让多个只读调研子 agent 并行 fan-out）；否则回落到静态 readOnly 契约。
-   */
-  private isParallelSafe(call: ToolCall): boolean {
-    const tool = this.tools.get(call.name);
-    if (!tool || !this.parallelInputsStable) return false;
-    if (tool.isConcurrencySafe) {
-      try {
-        return tool.isConcurrencySafe(call.args);
-      } catch {
-        return false;
-      }
-    }
-    return tool.readOnly;
-  }
-
-  /** 并行批：各调用独立产生事件（经 Chan 汇成单流），结果按原调用顺序落位 */
-  private async *runToolBatch(
-    batch: ToolCall[],
-    signal: AbortSignal,
-    results: ToolResultPart[],
-    images: ImagePart[],
-  ): AsyncGenerator<AgentEvent> {
-    const chan = new Chan<AgentEvent>();
-    const slots: (ToolResultPart | null)[] = new Array(batch.length).fill(null);
-    // 图片也按调用顺序落位，避免并行完成顺序带来的不确定性。
-    const imageSlots: ImagePart[][] = batch.map(() => []);
-    const runs = batch.map(async (call, idx) => {
-      const local: ToolResultPart[] = [];
-      try {
-        for await (const ev of this.runToolSafe(call, signal, local, imageSlots[idx]!)) {
-          chan.push(ev);
-        }
-      } catch (err) {
-        // runToolSafe 已是兜底；这里再守一层，确保任何未来改动都不会漏配对结果。
-        const msg = `工具执行异常: ${errText(err)}`;
-        local.push(errResult(call.id, call.name, msg));
-        chan.push({
-          type: "tool_result",
-          id: call.id,
-          name: call.name,
-          content: msg,
-          isError: true,
-        });
-      }
-      if (!local[0]) {
-        const msg = "工具未返回结果";
-        local.push(errResult(call.id, call.name, msg));
-        chan.push({
-          type: "tool_result",
-          id: call.id,
-          name: call.name,
-          content: msg,
-          isError: true,
-        });
-      }
-      slots[idx] = local[0]!;
-    });
-    void Promise.allSettled(runs).then(() => chan.close());
-    for await (const ev of chan) yield ev;
-    for (const slot of slots) results.push(slot!);
-    for (const slot of imageSlots) images.push(...slot);
-  }
-
-  /** 无论自定义 ruleKey/权限回调/工具实现怎样抛错，都合成合法的 tool_result。 */
-  private async *runToolSafe(
-    call: ToolCall,
-    signal: AbortSignal,
-    results: ToolResultPart[],
-    images: ImagePart[],
-  ): AsyncGenerator<AgentEvent> {
-    const before = results.length;
-    try {
-      yield* this.runTool(call, signal, results, images);
-    } catch (err) {
-      if (results.length !== before) return;
-      const msg = `工具执行异常: ${errText(err)}`;
-      results.push(errResult(call.id, call.name, msg));
-      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
-    }
-  }
-
-  /** 单个工具：PreToolUse hook → 权限门 → 执行（进度回流）→ PostToolUse hook → 收集结果 */
-  private async *runTool(
-    call: ToolCall,
-    signal: AbortSignal,
-    results: ToolResultPart[],
-    images: ImagePart[],
-  ): AsyncGenerator<AgentEvent> {
-    if (signal.aborted) {
-      const msg = "会话已中断，工具未执行";
-      results.push(errResult(call.id, call.name, msg));
-      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
-      return;
-    }
-    const tool = this.tools.get(call.name);
-    // 宽容语义：直接调用未激活的 deferred 工具时自动激活（模型可能记得名字径直调用）。
-    if (tool && this.tools.isDeferred(call.name)) this.tools.activate(call.name);
-    if (!tool) {
-      const msg = `未知工具: ${call.name}`;
-      results.push(errResult(call.id, call.name, msg));
-      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
-      return;
-    }
-
-    // PreToolUse hook：可拦截 / 改写入参 / 显式放行（跳过权限门）
-    let args = call.args;
-    let hookAllowed = false;
-    let blockedReason: string | null = null;
-    let preContext: string | undefined;
-    if (this.hooks.has("PreToolUse")) {
-      const h = await this.hooks.run({
-        event: "PreToolUse",
-        cwd: this.cwd,
-        toolName: call.name,
-        toolInput: args,
-      });
-      if (h.blocked) blockedReason = h.reason ?? "被 PreToolUse hook 拦截";
-      if (h.updatedInput) args = h.updatedInput;
-      hookAllowed = h.allowed;
-      preContext = h.additionalContext;
-    }
-
-    const ruleKey = tool.ruleKey(args);
-    yield { type: "tool_start", id: call.id, name: call.name, ruleKey };
-
-    if (blockedReason) {
-      const msg = `PreToolUse hook 拦截: ${blockedReason}`;
-      yield { type: "tool_permission", id: call.id, name: call.name, decision: "deny" };
-      results.push(errResult(call.id, call.name, msg));
-      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
-      return;
-    }
-
-    // hook 的 allow 也进权限门 —— 它跳过 mode/confirm，但压不过 deny/ask 规则
-    let decision: PermissionDecision = await this.perm.check({
-      toolName: call.name,
-      input: args,
-      ruleKey,
-      ...(tool.ruleParts ? { ruleParts: tool.ruleParts(args) } : {}),
-      ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(args) } : {}),
-      ...(hookAllowed ? { hookAllowed } : {}),
-      toolCallId: call.id,
-      signal,
-    });
-
-    // confirm 可以收窄/改写参数，但确认针对的是原动作。最终动作必须重新经过
-    // deny/ask 不可绕过层，不能借 updatedInput 把安全请求换成被禁请求。
-    if (decision.behavior === "allow" && decision.updatedInput) {
-      const updated = decision.updatedInput;
-      const updatedRuleKey = tool.ruleKey(updated);
-      decision = this.perm.validateUpdatedInput({
-        toolName: call.name,
-        input: updated,
-        ruleKey: updatedRuleKey,
-        ...(tool.ruleParts ? { ruleParts: tool.ruleParts(updated) } : {}),
-        ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(updated) } : {}),
-        toolCallId: call.id,
-        signal,
-      });
-      if (decision.behavior === "allow") decision = { ...decision, updatedInput: updated };
-    }
-    yield { type: "tool_permission", id: call.id, name: call.name, decision: decision.behavior };
-
-    if (decision.behavior === "deny") {
-      const msg = decision.message ?? "用户拒绝了该操作";
-      results.push(errResult(call.id, call.name, msg));
-      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
-      return;
-    }
-
-    if (signal.aborted) {
-      const msg = "会话已中断，工具未执行";
-      results.push(errResult(call.id, call.name, msg));
-      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
-      return;
-    }
-
-    // 执行：进度经 Chan 实时回流（子 agent 事件、长任务心跳）
-    const input = decision.updatedInput ?? args;
-    const chan = new Chan<AgentEvent>();
-    // 工具经 attachImage 附带的图片先收在本地；只有工具成功时才并入历史。
-    const localImages: ImagePart[] = [];
-    const settled = tool
-      .run(input, {
-        cwd: this.cwd,
-        signal,
-        ...(this.sandbox ? { sandbox: this.sandbox } : {}),
-        modelSupportsImages: this.supportsImages,
-        attachImage: (img) => localImages.push(img),
-        emit: (progress) =>
-          chan.push({ type: "tool_progress", id: call.id, name: call.name, event: progress }),
-        addUsage: (usage) => this.accumulate(usage),
-      })
-      .then(
-        (content) => ({ ok: true as const, content }),
-        (err: unknown) => ({ ok: false as const, err }),
-      )
-      .finally(() => chan.close());
-    for await (const ev of chan) yield ev;
-    const r = await settled;
-
-    const isError = !r.ok;
-    let content = truncateToolResult(
-      r.ok ? r.content : r.err instanceof ToolError ? r.err.message : errText(r.err),
-      this.maxToolResultChars,
-    );
-    if (preContext) content += reminder(preContext);
-    // PostToolUse 对成功和失败都执行；反馈（含 block reason）回传给模型。
-    if (this.hooks.has("PostToolUse")) {
-      const h = await this.hooks.run({
-        event: "PostToolUse",
-        cwd: this.cwd,
-        toolName: call.name,
-        toolInput: input,
-        toolResult: content,
-        isError,
-      });
-      const feedback = h.blocked ? h.reason : h.additionalContext;
-      if (feedback) content += reminder(feedback);
-    }
-    const result: ToolResultPart = {
-      type: "tool_result",
-      toolCallId: call.id,
-      toolName: call.name,
-      content,
-      ...(isError ? { isError: true } : {}),
-    };
-    results.push(result);
-    // 图片附在本轮 tool_result 之后进入同一条 user 消息（由 runTools 汇总后排序）。
-    // 工具失败时丢弃：错误结果配一堆图片只会白烧上下文。
-    if (!isError && localImages.length) images.push(...localImages);
-    yield { type: "tool_result", id: call.id, name: call.name, content, isError };
-  }
+  // 模型轮执行已迁至 TurnRunner（turn-runner.ts）；工具执行调度已迁至
+  // ToolExecutor（tool-executor.ts）。（架构 v2）
 
   // ---------- 内部工具方法 ----------
 
@@ -1459,7 +986,7 @@ export class Agent {
   ): CompactionConfig | null {
     if (!cfg) return null;
     const defaultSummarizer = providerSummarizer((messages, system) =>
-      this.streamText(messages, system),
+      this.runner.streamText(messages, system),
     );
     const safeTrigger = compactionTrigger(modelInfo, this.maxTokens);
     if (cfg === true) {
@@ -1482,85 +1009,20 @@ export class Agent {
     };
   }
 
-  /** 供默认 summarizer 用：优先小模型跑一次纯文本流，小模型出错则回退主模型。 */
-  private async *streamText(
-    messages: ChatMessage[],
-    system: string,
-  ): AsyncIterable<{ type: string; text?: string }> {
-    const maxTokens = Math.min(2000, this.maxTokens ?? 2000);
-    const usingSmall = this.smallProvider !== this.provider || this.smallModelId !== this.model;
-    try {
-      for await (const ev of this.smallProvider.stream({
-        model: this.smallModelId,
-        system,
-        messages,
-        maxTokens,
-      })) {
-        if (ev.type === "text_delta") yield { type: "text", text: ev.text };
-      }
-    } catch (err) {
-      if (!usingSmall) throw err;
-      // 小模型失败（如额度/网络）→ 用主模型重来一次，保证压缩不因杂活模型而失败。
-      for await (const ev of this.provider.stream({
-        model: this.model,
-        system,
-        messages,
-        maxTokens,
-      })) {
-        if (ev.type === "text_delta") yield { type: "text", text: ev.text };
-      }
-    }
-  }
-
-  /** 首次 send 前装配静态上下文（项目记忆 + skills 清单）；此后 system 不再变（缓存友好） */
+  /**
+   * 首次 send 前装配静态上下文；此后 system 不再变（缓存友好）。
+   * 段落顺序由 assembler 的 provider 顺序决定（env → 记忆 → repo map → skills →
+   * browser 指引），subagent 发现夹在中间（不贡献段落），SessionStart hook 收尾。
+   */
   private async ensureMemory(): Promise<void> {
     if (this.memoryLoaded) return;
     this.memoryLoaded = true;
-    const sections: string[] = [];
-    // 环境接地：会话开始时快照一次（cwd/OS/日期/git），缓存友好，对齐 Claude Code/Codex。
-    if (this.injectEnv) {
-      try {
-        sections.push(await gatherEnv(this.cwd));
-      } catch {
-        /* 采集失败不影响主流程 */
-      }
-    }
-    if (this.useProjectMemory) {
-      const memory = await loadProjectMemory(this.cwd);
-      if (memory) sections.push(memory);
-    }
-    // Repo map：会话开始时快照一次代码骨架，帮模型少盲 grep（对齐 Aider）。
-    if (this.repoMapOpt) {
-      try {
-        const opts = typeof this.repoMapOpt === "object" ? this.repoMapOpt : {};
-        const map = await gatherRepoMap(this.cwd, opts);
-        if (map) sections.push(map);
-      } catch {
-        /* 采集失败不影响主流程 */
-      }
-    }
-    if (this.skillsOpt) {
-      const opt = typeof this.skillsOpt === "object" ? this.skillsOpt : {};
-      const extraDirs = opt.dirs ?? [];
-      const disabled = new Set(opt.disabled ?? []);
-      const discovered = await discoverSkills(this.cwd, extraDirs);
-      const skills = disabled.size ? discovered.filter((s) => !disabled.has(s.name)) : discovered;
-      if (skills.length > 0) {
-        const skillTool = createSkillTool(skills);
-        this.tools.register(skillTool);
-        this.perm.addReadOnlyTools([skillTool.def.name]);
-        sections.push(skillListPrompt(skills));
-      }
-    }
-    // browser 工具已注册时，注入「写完前端就开页验证」的用法指引（对齐 Codex 内置浏览器习惯）。
-    if (this.tools.get("browser")) {
-      sections.push(
-        t(
-          "# Verifying frontend changes\n- After writing or changing frontend/UI code, verify it actually renders and runs by opening it in the browser tool — point it at the running dev server (e.g. http://localhost:3000) or an HTML file. It reports console errors, uncaught exceptions and failed requests, and returns a screenshot. Prefer this over guessing.\n- If no dev server is running, start one with bash run_in_background first, then open the URL.\n- Treat console errors, uncaught exceptions, or a blank/error screenshot as a failure to fix, not a done state.",
-          "# 验证前端改动\n- 写完或改完前端/UI 代码后，用 browser 工具打开页面确认它真的能渲染、能跑 —— 指向正在跑的 dev server（如 http://localhost:3000）或某个 HTML 文件。它会报告 console 错误、未捕获异常与失败请求，并回传一张截图。别靠猜。\n- 若没有 dev server 在跑，先用 bash 的 run_in_background 起一个，再打开 URL。\n- 把 console 错误、未捕获异常或白屏/报错截图当成待修的失败，而不是完成态。",
-        ),
-      );
-    }
+    const ctx = {
+      cwd: this.cwd,
+      tools: this.tools,
+      markReadOnly: (names: string[]) => this.perm.addReadOnlyTools(names),
+    };
+    const sections = await this.assembler.collect(ctx);
     // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
     // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。
     if (this.subagentsOpt?.discover) {
@@ -1572,50 +1034,15 @@ export class Agent {
       }
       this.registerTaskTool([...discovered, ...this.subagentsOpt.definitions]);
     }
-    // SessionStart hook：会话装配的最后一步，additionalContext 注入 system
-    //（对齐 Codex/Claude Code 的 SessionStart 注入上下文能力）。
-    if (this.hooks.has("SessionStart")) {
-      const h = await this.hooks.run({ event: "SessionStart", cwd: this.cwd });
-      if (h.additionalContext) sections.push(h.additionalContext);
-    }
+    // SessionStart hook：会话装配的最后一步，additionalContext 注入 system。
+    sections.push(...(await this.postAssembler.collect(ctx)));
     if (sections.length > 0) {
       this.system = composeSystem(this.baseSystem, sections.join("\n\n"));
     }
   }
-
-  private async flushPersist(): Promise<void> {
-    if (!this.persist) return;
-    for (let i = this.persistedCount; i < this.history.length; i++) {
-      await this.persist.store.append(this.persist.meta.id, this.history[i]!);
-    }
-    this.persistedCount = this.history.length;
-  }
-
-  private async rewritePersist(): Promise<void> {
-    if (!this.persist) return;
-    await this.persist.store.rewrite(this.persist.meta, this.history);
-    this.persistedCount = this.history.length;
-  }
-
-  private accumulate(u: Usage): void {
-    this.cumulative = {
-      inputTokens: this.cumulative.inputTokens + u.inputTokens,
-      outputTokens: this.cumulative.outputTokens + u.outputTokens,
-      cacheReadTokens: this.cumulative.cacheReadTokens + u.cacheReadTokens,
-      cacheWriteTokens: this.cumulative.cacheWriteTokens + u.cacheWriteTokens,
-    };
-  }
 }
 
 // ---------- 模块级辅助 ----------
-
-function errResult(id: string, name: string, msg: string): ToolResultPart {
-  return { type: "tool_result", toolCallId: id, toolName: name, content: msg, isError: true };
-}
-
-function errText(err: unknown): string {
-  return String((err as { message?: unknown })?.message ?? err);
-}
 
 function resolveMaxTokens(
   requested: number | undefined,
@@ -1658,40 +1085,6 @@ function compactionTrigger(
   return Math.min(120_000, Math.max(1_024, Math.floor(contextWindow * 0.8) - outputReserve));
 }
 
-/** 包一段注入上下文（对齐 Claude Code 的 system-reminder 惯例，模型学过这个记号） */
-function reminder(text: string): string {
-  return `\n\n<system-reminder>\n${text}\n</system-reminder>`;
-}
-
-/** 超长工具结果截中段（保头 80% + 尾 20%，头尾往往比中段信息密度高） */
-function truncateToolResult(content: string, max: number): string {
-  if (content.length <= max) return content;
-  const head = Math.floor(max * 0.8);
-  const tail = max - head;
-  return (
-    content.slice(0, head) +
-    `\n\n…（工具输出共 ${content.length} 字符，超过 ${max} 上限，中段已截断）…\n\n` +
-    content.slice(content.length - tail)
-  );
-}
-
-/** 判定 provider 错误是否值得重试（限流/服务端/网络层；4xx 业务错误不重试） */
-function isTransientError(err: unknown): boolean {
-  if (err == null) return false;
-  const status = (err as { status?: unknown }).status;
-  if (typeof status === "number") {
-    return status === 408 || status === 429 || status >= 500;
-  }
-  const msg = String((err as { message?: unknown }).message ?? err);
-  return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EPIPE|EAI_AGAIN|fetch failed|network|socket hang up|overloaded|connection error/i.test(
-    msg,
-  );
-}
-
-/**
- * 从 provider 错误里解析 Retry-After（秒数或 HTTP 日期），返回毫秒；无则 null。
- * SDK 错误通常带 headers（Headers 实例或普通对象）。
- */
 /** 最后一条 assistant 文本的首行（Notification hook 的 message，截 120 字符）。 */
 function lastAssistantHead(messages: ChatMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -1706,39 +1099,7 @@ function lastAssistantHead(messages: ChatMessage[]): string {
   return "";
 }
 
-export function retryAfterMs(err: unknown, now: number = Date.now()): number | null {
-  const headers = (err as { headers?: unknown })?.headers;
-  if (!headers) return null;
-  let raw: string | null = null;
-  if (typeof (headers as Headers).get === "function") {
-    raw = (headers as Headers).get("retry-after");
-  } else if (typeof headers === "object") {
-    const rec = headers as Record<string, unknown>;
-    const v = rec["retry-after"] ?? rec["Retry-After"];
-    if (typeof v === "string") raw = v;
-    else if (Array.isArray(v) && typeof v[0] === "string") raw = v[0];
-  }
-  if (!raw) return null;
-  const secs = Number(raw);
-  if (Number.isFinite(secs)) return secs >= 0 ? Math.round(secs * 1000) : null;
-  const when = Date.parse(raw);
-  if (Number.isFinite(when)) return Math.max(0, when - now);
-  return null;
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) return reject(new Error("aborted"));
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error("aborted"));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}
+// Retry-After 解析随模型轮执行迁至 turn-runner.ts；re-export 保持既有 import 路径。
+export { retryAfterMs } from "./turn-runner.js";
 
 export type { Tool };
