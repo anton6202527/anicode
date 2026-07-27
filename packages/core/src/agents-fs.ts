@@ -64,9 +64,7 @@ export function parseSubagentFile(filename: string, text: string): SubagentDefin
   const disallowedTools = fmStringList(fm["disallowed-tools"] ?? fm["disallowedTools"]);
   const model = fmString(fm["model"]);
   const effortRaw = fmString(fm["effort"] ?? fm["model-reasoning-effort"]);
-  const effort = (["low", "medium", "high", "xhigh", "max"] as const).find(
-    (e) => e === effortRaw,
-  );
+  const effort = (["low", "medium", "high", "xhigh", "max"] as const).find((e) => e === effortRaw);
   const maxTurnsRaw = fmString(fm["maxTurns"] ?? fm["max-turns"]);
   const maxTurns = maxTurnsRaw !== undefined ? Number(maxTurnsRaw) : undefined;
   const readOnly = fmString(fm["readonly"] ?? fm["readOnly"]) === "true";

@@ -50,7 +50,9 @@ export function resolveChromePath(explicit?: string): string {
     return existsSync(p) ? p : undefined;
   };
   const found =
-    push(explicit) ?? push(process.env["ANICODE_BROWSER_PATH"]) ?? chromeCandidates().find(existsSync);
+    push(explicit) ??
+    push(process.env["ANICODE_BROWSER_PATH"]) ??
+    chromeCandidates().find(existsSync);
   if (!found) {
     throw new Error(
       `No Chrome/Chromium/Edge found. Set ANICODE_BROWSER_PATH or config browser.executablePath. Tried: ${[
@@ -404,7 +406,10 @@ export class Page {
 
   /** 截图，返回 PNG 的 base64。fullPage 时截整页。 */
   async screenshot(opts: { fullPage?: boolean } = {}): Promise<string> {
-    const params: Record<string, unknown> = { format: "png", captureBeyondViewport: !!opts.fullPage };
+    const params: Record<string, unknown> = {
+      format: "png",
+      captureBeyondViewport: !!opts.fullPage,
+    };
     const res = await this.cmd("Page.captureScreenshot", params);
     return String(res.data ?? "");
   }
@@ -426,7 +431,8 @@ export class Page {
 /** CDP Runtime.RemoteObject → 简短文本（console 参数预览）。 */
 function previewArg(arg: any): string {
   if (arg == null) return "null";
-  if (arg.value !== undefined) return typeof arg.value === "string" ? arg.value : JSON.stringify(arg.value);
+  if (arg.value !== undefined)
+    return typeof arg.value === "string" ? arg.value : JSON.stringify(arg.value);
   if (arg.description) return String(arg.description);
   if (arg.preview?.properties) {
     return JSON.stringify(

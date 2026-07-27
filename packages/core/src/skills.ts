@@ -67,7 +67,9 @@ async function isExecutableOnPath(bin: string, cache: Map<string, boolean>): Pro
       : [""];
   const dirs = (process.env["PATH"] ?? "").split(path.delimiter).filter(Boolean);
   // 含路径分隔符：当作直接路径校验；否则逐个 PATH 目录探测。
-  const candidates = bin.includes(path.sep) ? [path.resolve(bin)] : dirs.map((d) => path.join(d, bin));
+  const candidates = bin.includes(path.sep)
+    ? [path.resolve(bin)]
+    : dirs.map((d) => path.join(d, bin));
   let ok = false;
   outer: for (const base of candidates) {
     for (const ext of exts) {

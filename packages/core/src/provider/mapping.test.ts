@@ -68,7 +68,10 @@ test("registry: custom/<model> 使用环境变量配置 OpenAI-compatible 端点
     assert.equal(resolved.diagnostics.baseURLSource, "environment");
     assert.equal(resolved.diagnostics.credentialEnv, "CUSTOM_OPENAI_API_KEY");
     assert.equal(resolved.diagnostics.hasCredentials, true);
-    assert.equal(JSON.stringify(resolved.diagnostics).includes("never-appear-in-diagnostics"), false);
+    assert.equal(
+      JSON.stringify(resolved.diagnostics).includes("never-appear-in-diagnostics"),
+      false,
+    );
   } finally {
     if (oldKey === undefined) delete process.env["CUSTOM_OPENAI_API_KEY"];
     else process.env["CUSTOM_OPENAI_API_KEY"] = oldKey;

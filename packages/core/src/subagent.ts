@@ -518,7 +518,10 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
         });
       }
       if (errorMsg) throw new ToolError(`子 agent 失败: ${errorMsg}`);
-      return (answer || t("(subagent produced no text conclusion)", "（子 agent 未产出文本结论）")) + worktreeNote;
+      return (
+        (answer || t("(subagent produced no text conclusion)", "（子 agent 未产出文本结论）")) +
+        worktreeNote
+      );
     };
 
     if (!background) {
@@ -606,7 +609,10 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
       if (!message) throw new ToolError("message 不能为空");
       const record = registry!.get(id);
       if (!record) {
-        const ids = registry!.list().map((r) => `${r.id}(${r.status})`).join(", ");
+        const ids = registry!
+          .list()
+          .map((r) => `${r.id}(${r.status})`)
+          .join(", ");
         throw new ToolError(`任务 ${id} 不存在（可能已被逐出）。在册任务: ${ids || "无"}`);
       }
       if (record.status === "running")
@@ -640,7 +646,10 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
     async run(input): Promise<string> {
       const record = registry!.get(String(input["id"] ?? ""));
       if (!record) {
-        const ids = registry!.list().map((r) => `${r.id}(${r.status})`).join(", ");
+        const ids = registry!
+          .list()
+          .map((r) => `${r.id}(${r.status})`)
+          .join(", ");
         throw new ToolError(`任务不存在。在册任务: ${ids || "无"}`);
       }
       const u = record.agent.totalUsage;
@@ -649,7 +658,9 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
         `description: ${record.description}`,
         `usage: in=${u.inputTokens} out=${u.outputTokens}`,
         ...(record.worktree
-          ? [`worktree: ${record.worktree}${record.worktreeRemoved ? t(" (removed)", "（已清理）") : ""}`]
+          ? [
+              `worktree: ${record.worktree}${record.worktreeRemoved ? t(" (removed)", "（已清理）") : ""}`,
+            ]
           : []),
         ...(record.status === "running" && record.activity
           ? [t(`activity: ${record.activity}`, `当前活动: ${record.activity}`)]
@@ -684,7 +695,10 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
       const record = registry!.get(String(input["id"] ?? ""));
       if (!record) throw new ToolError("任务不存在");
       if (record.status !== "running" || !record.abort)
-        return t(`Task ${record.id} is not running (status: ${record.status})`, `任务 ${record.id} 未在运行（状态: ${record.status}）`);
+        return t(
+          `Task ${record.id} is not running (status: ${record.status})`,
+          `任务 ${record.id} 未在运行（状态: ${record.status}）`,
+        );
       record.abort.abort();
       record.status = "stopped";
       return t(`Task ${record.id} stopped`, `任务 ${record.id} 已终止`);
@@ -706,7 +720,9 @@ function taskNotification(record: TaskRecord, errorMsg: string | null, result: s
     ? t(`failed: ${errorMsg}`, `失败: ${errorMsg}`)
     : result || record.result || "";
   if (body.length > MAX)
-    body = body.slice(0, MAX) + t("\n…(truncated; task_output for full text)", "\n…（已截断，task_output 看全文）");
+    body =
+      body.slice(0, MAX) +
+      t("\n…(truncated; task_output for full text)", "\n…（已截断，task_output 看全文）");
   return [
     `<task-notification id="${record.id}">`,
     t(

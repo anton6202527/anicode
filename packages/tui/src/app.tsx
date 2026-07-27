@@ -351,7 +351,10 @@ export function permModeHint(mode: PermissionMode): string | null {
     case "acceptEdits":
       return t("⏵⏵ accept edits on (shift+tab to cycle)", "⏵⏵ 自动接受编辑（shift+tab 切换）");
     case "plan":
-      return t("⏸ plan mode · read-only (shift+tab to cycle)", "⏸ 计划模式 · 只读（shift+tab 切换）");
+      return t(
+        "⏸ plan mode · read-only (shift+tab to cycle)",
+        "⏸ 计划模式 · 只读（shift+tab 切换）",
+      );
     case "auto":
     case "bypass":
       return t(

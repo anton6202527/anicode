@@ -143,7 +143,8 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
         return;
       }
       default:
-        if (id !== undefined && id !== null) replyError(id, -32601, `unknown method: ${msg.method}`);
+        if (id !== undefined && id !== null)
+          replyError(id, -32601, `unknown method: ${msg.method}`);
     }
   }
 

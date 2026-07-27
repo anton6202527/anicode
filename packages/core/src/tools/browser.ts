@@ -92,7 +92,10 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
           },
           timeoutMs: {
             type: "number",
-            description: t("Navigation timeout in ms (default 30000).", "导航超时（毫秒，默认 30000）。"),
+            description: t(
+              "Navigation timeout in ms (default 30000).",
+              "导航超时（毫秒，默认 30000）。",
+            ),
           },
         },
         required: ["url"],
@@ -116,10 +119,7 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
         b = await ensureBrowser();
       } catch (e: any) {
         throw new ToolError(
-          t(
-            `Could not start a browser: ${e?.message ?? e}`,
-            `无法启动浏览器：${e?.message ?? e}`,
-          ),
+          t(`Could not start a browser: ${e?.message ?? e}`, `无法启动浏览器：${e?.message ?? e}`),
         );
       }
 
@@ -228,7 +228,10 @@ export function formatReport(
   const ok = errors.length === 0 && r.failedRequests.length === 0;
   lines.push(
     ok
-      ? t("✓ Loaded with no console errors or failed requests.", "✓ 加载完成，无 console 错误、无失败请求。")
+      ? t(
+          "✓ Loaded with no console errors or failed requests.",
+          "✓ 加载完成，无 console 错误、无失败请求。",
+        )
       : t(
           `✗ ${errors.length} console error(s), ${r.failedRequests.length} failed request(s).`,
           `✗ ${errors.length} 个 console 错误，${r.failedRequests.length} 个失败请求。`,
@@ -261,7 +264,10 @@ export function formatReport(
     lines.push(t(`Script error: ${extra.scriptError}`, `脚本报错：${extra.scriptError}`));
   } else if (extra.scriptValue !== undefined) {
     lines.push(
-      t(`Script result: ${previewValue(extra.scriptValue)}`, `脚本返回：${previewValue(extra.scriptValue)}`),
+      t(
+        `Script result: ${previewValue(extra.scriptValue)}`,
+        `脚本返回：${previewValue(extra.scriptValue)}`,
+      ),
     );
   }
   return lines.join("\n");

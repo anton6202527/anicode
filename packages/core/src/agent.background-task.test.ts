@@ -60,7 +60,16 @@ test("后台任务空闲期完成：通知积压，下一次 send 注入并广�
     },
   };
 
-  const agent = new Agent({ provider, model: "m", cwd: "/x", system: "PARENT", subagents: true, injectEnv: false, projectMemory: false, permission: { mode: "auto" } });
+  const agent = new Agent({
+    provider,
+    model: "m",
+    cwd: "/x",
+    system: "PARENT",
+    subagents: true,
+    injectEnv: false,
+    projectMemory: false,
+    permission: { mode: "auto" },
+  });
   for await (const _ of agent.send("开始")) {
     /* drive 1 */
   }
@@ -130,7 +139,16 @@ test("后台任务 drive 中完成：turn 边界注入，loop 续跑让模型当
     },
   };
 
-  const agent = new Agent({ provider, model: "m", cwd: "/x", system: "PARENT", subagents: true, injectEnv: false, projectMemory: false, permission: { mode: "auto" } });
+  const agent = new Agent({
+    provider,
+    model: "m",
+    cwd: "/x",
+    system: "PARENT",
+    subagents: true,
+    injectEnv: false,
+    projectMemory: false,
+    permission: { mode: "auto" },
+  });
   const events: string[] = [];
   for await (const ev of agent.send("开始")) {
     events.push(ev.type);

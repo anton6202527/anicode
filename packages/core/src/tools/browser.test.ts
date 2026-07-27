@@ -36,7 +36,11 @@ test("formatReport: 有 console 错误与失败请求 → ✗ 并逐条列出", 
       "http://localhost:3000/",
       base({
         console: [
-          { level: "error", text: "Uncaught TypeError: x is not a function", location: "app.js:12" },
+          {
+            level: "error",
+            text: "Uncaught TypeError: x is not a function",
+            location: "app.js:12",
+          },
           { level: "warning", text: "deprecated API" },
         ],
         failedRequests: [{ url: "http://localhost:3000/missing.js", error: "404" }],
