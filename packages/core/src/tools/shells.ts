@@ -78,7 +78,13 @@ export class ShellRegistry {
   private shells = new Map<string, ShellEntry>();
 
   /** 启动一个后台 shell，立即返回 id。 */
-  start(opts: { command: string; cwd: string; file: string; args: string[] }): string {
+  start(opts: {
+    command: string;
+    cwd: string;
+    file: string;
+    args: string[];
+    env?: NodeJS.ProcessEnv;
+  }): string {
     this.reap();
     // 仍然满员就按结束时间淘汰已结束的（宽限期让位于可用性）。少了这一步，
     // 20 个秒退的 shell 会把注册表堵死 5 分钟 —— 而 kill_shell 并不删除条目，
@@ -98,7 +104,7 @@ export class ShellRegistry {
     try {
       child = spawn(opts.file, opts.args, {
         cwd: opts.cwd,
-        env: sanitizedShellEnv(),
+        env: opts.env ?? sanitizedShellEnv(),
         // stdin 开管道：交互式进程（REPL/向导/等待确认的安装脚本）可经 write_stdin 喂输入。
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -307,10 +313,29 @@ function installExitHook(): void {
 // ---------- 工具 ----------
 
 /** 供 bash 工具在 run_in_background=true 时调用。 */
-export function startBackgroundShell(command: string, ctx: ToolContext): string {
+export function startBackgroundShell(
+  command: string,
+  ctx: ToolContext,
+  options: { network?: boolean } = {},
+): string {
   installExitHook();
-  const { file, args } = buildShellSpawn(command, ctx.sandbox, ctx.cwd);
-  const id = shells.start({ command, cwd: ctx.cwd, file, args });
+  if (ctx.isolatedRuntime && !ctx.isolatedRuntime.prepare) {
+    throw new ToolError("当前 Remote Runtime 不支持交互式后台 shell；请使用前台 bash");
+  }
+  const prepared = ctx.isolatedRuntime?.prepare?.({
+    command,
+    cwd: ctx.cwd,
+    ...(ctx.sandbox ? { policy: ctx.sandbox } : {}),
+    network: options.network ?? false,
+  });
+  const spawnSpec = prepared ?? buildShellSpawn(command, ctx.sandbox, ctx.cwd);
+  const id = shells.start({
+    command,
+    cwd: ctx.cwd,
+    file: spawnSpec.file,
+    args: spawnSpec.args,
+    ...(prepared ? { env: prepared.env } : {}),
+  });
   return t(
     `Started in background. shell id: ${id}\nRead new output with bash_output({ bash_id: "${id}" }); stop it with kill_shell({ shell_id: "${id}" }).`,
     `已在后台启动。shell id: ${id}\n用 bash_output({ bash_id: "${id}" }) 读取新输出；用 kill_shell({ shell_id: "${id}" }) 停止。`,

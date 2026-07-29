@@ -27,8 +27,15 @@ export type SkillsOption = boolean | { dirs?: string[]; disabled?: string[] };
 export interface ContextProviderCtx {
   cwd: string;
   tools: ToolRegistry;
+  /** 首轮用户请求，供 repo map / retrieval 做相关性排序。 */
+  query?: string;
   /** 把工具名并入权限引擎的只读集合（自动放行）。 */
   markReadOnly: (names: string[]) => void;
+}
+
+export interface ContextContribution {
+  id: string;
+  content: string;
 }
 
 export interface ContextProvider {
@@ -40,14 +47,19 @@ export interface ContextProvider {
 export class ContextAssembler {
   constructor(private readonly providers: ContextProvider[]) {}
 
+  /** 保留 provider 身份，供 Context Compiler 做来源追踪、预算与去重。 */
+  async collectContributions(ctx: ContextProviderCtx): Promise<ContextContribution[]> {
+    const contributions: ContextContribution[] = [];
+    for (const p of this.providers) {
+      const content = await p.contribute(ctx);
+      if (content) contributions.push({ id: p.id, content });
+    }
+    return contributions;
+  }
+
   /** 按注册顺序执行全部 provider，收集非空贡献段。 */
   async collect(ctx: ContextProviderCtx): Promise<string[]> {
-    const sections: string[] = [];
-    for (const p of this.providers) {
-      const s = await p.contribute(ctx);
-      if (s) sections.push(s);
-    }
-    return sections;
+    return (await this.collectContributions(ctx)).map((item) => item.content);
   }
 }
 
@@ -82,10 +94,10 @@ export function projectMemoryProvider(): ContextProvider {
 export function repoMapProvider(opt: boolean | RepoMapOptions): ContextProvider {
   return {
     id: "repo-map",
-    async contribute({ cwd }) {
+    async contribute({ cwd, query }) {
       try {
         const opts = typeof opt === "object" ? opt : {};
-        const map = await gatherRepoMap(cwd, opts);
+        const map = await gatherRepoMap(cwd, { ...opts, ...(query ? { query } : {}) });
         return map || null;
       } catch {
         return null;

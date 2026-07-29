@@ -544,12 +544,15 @@ export function buildPermissionOverlay(
   pendings: readonly PermissionLike[],
   termRows: number,
   termCols: number,
+  selected = 0,
+  anchorTop?: number,
 ): Sprite {
-  const width = dialogWidth(termCols);
+  // 与输入面板同宽同左缘；不再居中挡住正在看的上下文。
+  const width = Math.max(1, termCols);
   const inner = width - 2 * PADX;
   const p = pendings[0]!;
   const blank = () => line(width, []);
-  const bodyL = (spans: Span[]) => line(width, [PAD, ...spans]);
+  const bodyL = (spans: Span[], baseBg: string = DLG.bg) => line(width, [PAD, ...spans], baseBg);
   const bodyLR = (l: Span[], r: Span[]) => lineLR(width, [PAD, ...l], [...r, PAD]);
 
   const L: string[] = [];
@@ -576,21 +579,47 @@ export function buildPermissionOverlay(
   );
   L.push(bodyL([{ text: truncWidth(p.ruleKey, inner), fg: DLG.dim }]));
   L.push(blank());
+  const options = [
+    { key: "y", label: t("Allow once", "允许一次"), color: DLG.ok },
+    { key: "a", label: t("Allow for this session", "本会话允许并记住"), color: DLG.accent },
+    {
+      key: "p",
+      label: t("Always allow in this project", "永久允许（写入项目）"),
+      color: DLG.section,
+    },
+    { key: "n", label: t("Deny", "拒绝"), color: DLG.err },
+  ];
+  const index = Math.max(0, Math.min(selected, options.length - 1));
+  options.forEach((option, optionIndex) => {
+    const active = optionIndex === index;
+    L.push(
+      bodyL(
+        [
+          { text: active ? "› " : "  ", fg: active ? DLG.hlFg : DLG.dim, bold: active },
+          { text: `[${option.key}] `, fg: active ? DLG.hlFg : option.color, bold: true },
+          {
+            text: truncWidth(option.label, Math.max(1, inner - 8)),
+            fg: active ? DLG.hlFg : DLG.text,
+          },
+        ],
+        active ? DLG.hlBg : DLG.bg,
+      ),
+    );
+  });
+  L.push(blank());
   L.push(
-    bodyL([
-      { text: "[", fg: DLG.dim },
-      { text: "y", fg: DLG.ok, bold: true },
-      { text: t("] allow   [", "] 允许   ["), fg: DLG.dim },
-      { text: "a", fg: DLG.accent, bold: true },
-      { text: t("] allow and remember   [", "] 允许并记住   ["), fg: DLG.dim },
-      { text: "n", fg: DLG.err, bold: true },
-      { text: t("] deny", "] 拒绝"), fg: DLG.dim },
-    ]),
+    bodyLR(
+      [{ text: t("esc interrupt", "esc 中断"), fg: DLG.dim }],
+      [{ text: t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认"), fg: DLG.dim }],
+    ),
   );
   L.push(blank());
-  L.push(bodyLR([{ text: t("esc interrupt", "esc 中断"), fg: DLG.dim }], []));
-  L.push(blank());
-  return place(L, width, termRows, termCols);
+  return {
+    ...(anchorTop === undefined
+      ? place(L, width, termRows, termCols)
+      : placeAbove(L, width, anchorTop, 0)),
+    hitRows: [null, null, null, null, null, null, 0, 1, 2, 3, null, null, null],
+  };
 }
 
 /** 斜杠命令菜单行（名字不含前导 `/`）。 */

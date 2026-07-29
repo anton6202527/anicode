@@ -21,6 +21,10 @@ const host = {
   format: "cjs",
   target: "node18",
   external: ["vscode"],
+  // VSIX is built per target platform. Copy the installed N-API artifacts next to the host
+  // bundle and let esbuild rewrite the generated binding loader to those concrete files.
+  loader: { ".node": "file" },
+  assetNames: "native/[name]-[hash]",
 };
 
 const webview = {

@@ -15,6 +15,8 @@
  */
 
 import { t } from "./i18n.js";
+import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import type { ChatMessage, Provider, Usage } from "./types.js";
 import { Agent, type AgentEvent, type AgentOptions, type AgentResolvedModel } from "./agent.js";
 import type { ToolRegistry } from "./tools/tool.js";
@@ -32,6 +34,42 @@ import type {
   PermissionMode,
   PermissionProfile,
 } from "./permission.js";
+import {
+  MemoryArtifactStore,
+  type Artifact,
+  type ArtifactInput,
+  type ArtifactRecord,
+  type ArtifactStore,
+} from "./runtime/artifacts.js";
+import {
+  DurableRuntime,
+  MemoryRuntimeEventStore,
+  type RecoveredRuntimeState,
+  type RuntimeEvent,
+} from "./runtime/durable.js";
+import {
+  CommandInbox,
+  DurableOutbox,
+  MemoryCommandInboxStore,
+  MemoryOutboxStore,
+  type DurableCommand,
+} from "./runtime/commands.js";
+import type { ContextCompiler } from "./runtime/context-compiler.js";
+import type { Verifier } from "./runtime/verifier.js";
+import type { SpanContext, Telemetry } from "./runtime/telemetry.js";
+import { noTelemetry, parseTraceparent, traceparent } from "./runtime/telemetry.js";
+import type { SecurityPolicyEngine } from "./security/policy.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import type { WorktreeOwnership } from "./runtime/worker.js";
+import type { NetworkProxy } from "./runtime/network-proxy.js";
+import {
+  PatchSetService,
+  type PatchSet,
+  type PatchSetApproval,
+  type PatchSetChangeInput,
+  type PatchSetRebaseResult,
+  type PatchSetServiceOptions,
+} from "./runtime/patchset.js";
 
 // ---------- 对外事件与快照 ----------
 
@@ -166,6 +204,24 @@ export interface SessionManagerOptions {
   /** 生成会话 id 的时钟/随机源（测试可注入） */
   now?: () => number;
   rand?: () => number;
+  /** Durable Runtime 事件事实源；缺省用内存实现，生产宿主应传 FileRuntimeEventStore。 */
+  runtime?: DurableRuntime;
+  /** Artifact 资源存储；缺省内存，生产宿主应传 FileArtifactStore。 */
+  artifacts?: ArtifactStore;
+  contextCompiler?: ContextCompiler;
+  verifier?: Verifier;
+  verificationMaxAttempts?: number;
+  securityPolicy?: SecurityPolicyEngine;
+  telemetry?: Telemetry;
+  isolatedRuntime?: ExecutionRuntime;
+  worktreeOwnership?: WorktreeOwnership;
+  networkProxy?: NetworkProxy;
+  /** prompt 正文与状态的耐久 inbox；缺省内存，生产宿主应传文件实现。 */
+  commandInbox?: CommandInbox;
+  /** Runtime Event 的 transactional outbox；缺省内存实现。 */
+  outbox?: DurableOutbox;
+  /** 冷会话载入时自动恢复未完成 command。默认 true。 */
+  recoverCommands?: boolean;
 }
 
 interface PendingPerm {
@@ -175,15 +231,23 @@ interface PendingPerm {
 }
 
 interface SendWaiter {
-  resolve: () => void;
+  resolve: (outcome: SendOutcome) => void;
   reject: (err: Error) => void;
   steering: boolean;
+}
+
+interface SendOutcome {
+  /** AgentEvent.error 属于正常可观察终态，不改变既有 send Promise 的兼容语义。 */
+  error?: Error;
 }
 
 interface PendingSend extends SendWaiter {
   text: string;
   /** per-prompt 模型覆盖：仅这一次 drive 用该模型。 */
   model?: string;
+  /** 崩溃恢复：输入是内部续跑指令，不重复原始用户 prompt。 */
+  resume?: boolean;
+  traceParent?: SpanContext;
 }
 
 type ResolvedProvider = ReturnType<SessionManagerOptions["resolveProvider"]>;
@@ -207,6 +271,7 @@ class ManagedSession {
   constructor(
     meta: SessionMeta,
     makeAgent: (confirm: (r: PermissionRequest) => Promise<PermissionDecision>) => Agent,
+    private readonly onEvent?: (event: SessionEvent) => void,
   ) {
     this.meta = meta;
     this.agent = makeAgent((r) => this.onConfirm(r));
@@ -260,6 +325,7 @@ class ManagedSession {
       // 观察者都先看到 request、再看到 resolved，不会因重入留下陈旧 prompt。
       while (this.eventQueue.length > 0) {
         const next = this.eventQueue.shift()!;
+        this.onEvent?.(next);
         for (const l of this.listeners) {
           try {
             l(next);
@@ -312,7 +378,10 @@ class ManagedSession {
    * 对应的 user_message(queued) 事件由 Agent 在注入时广播；Promise 在该 drive
    * 真正收尾后才 resolve，避免持久化尚未完成就向调用方报告成功。
    */
-  send(text: string, opts?: { model?: string }): Promise<void> {
+  send(
+    text: string,
+    opts?: { model?: string; resume?: boolean; traceParent?: SpanContext },
+  ): Promise<SendOutcome> {
     this.touch();
     return new Promise((resolve, reject) => {
       if (this.agent.queue(text)) {
@@ -329,6 +398,8 @@ class ManagedSession {
         reject,
         steering: false,
         ...(opts?.model ? { model: opts.model } : {}),
+        ...(opts?.resume ? { resume: true } : {}),
+        ...(opts?.traceParent ? { traceParent: opts.traceParent } : {}),
       });
       if (!this.driving) void this.pump();
     });
@@ -344,10 +415,17 @@ class ManagedSession {
         this.currentWaiters = [next];
         this.abort = new AbortController();
         try {
+          let agentError: Error | undefined;
           for await (const ev of this.agent.send(
             next.text,
             this.abort.signal,
-            next.model ? { model: next.model } : undefined,
+            next.model || next.resume || next.traceParent
+              ? {
+                  ...(next.model ? { model: next.model } : {}),
+                  ...(next.resume ? { resume: true } : {}),
+                  ...(next.traceParent ? { parent: next.traceParent } : {}),
+                }
+              : undefined,
           )) {
             if (ev.type === "checkpoint") {
               this.checkpoints.push({
@@ -357,9 +435,11 @@ class ManagedSession {
                 messageCount: ev.messageCount,
               });
             }
+            if (ev.type === "error") agentError = new Error(ev.message);
             this.emit({ type: "agent", event: ev });
           }
-          for (const waiter of this.currentWaiters) waiter.resolve();
+          const outcome: SendOutcome = agentError ? { error: agentError } : {};
+          for (const waiter of this.currentWaiters) waiter.resolve(outcome);
         } catch (err) {
           const error = err instanceof Error ? err : new Error(String(err));
           for (const waiter of this.currentWaiters) waiter.reject(error);
@@ -547,9 +627,30 @@ export class SessionManager {
   private lspPools = new Set<LspPool>();
   /** firehose 订阅者：收所有 live 会话的事件（见 subscribeAll）。 */
   private globalListeners = new Set<GlobalListener>();
+  readonly runtime: DurableRuntime;
+  readonly artifacts: ArtifactStore;
+  readonly commandInbox: CommandInbox;
+  readonly outbox: DurableOutbox;
+  private readonly telemetry: Telemetry;
+  private readonly workerId = `runtime_${process.pid}_${randomUUID().slice(0, 8)}`;
+  private readonly activeCommands = new Map<string, Map<string, DurableCommand>>();
+  private readonly recoveringCommands = new Map<string, Promise<number>>();
+  /** 同一工作区并发 create/resume 只执行一次 PatchSet journal 恢复。 */
+  private readonly recoveringPatchSets = new Map<string, Promise<PatchSet[]>>();
+  /** UI→runtime 的投影是异步的；command 进入终态前必须把此前事实冲刷干净。 */
+  private readonly runtimeWrites = new Set<Promise<unknown>>();
 
   constructor(opts: SessionManagerOptions) {
     this.opts = opts;
+    this.runtime = opts.runtime ?? new DurableRuntime(new MemoryRuntimeEventStore());
+    this.artifacts = opts.artifacts ?? new MemoryArtifactStore();
+    this.commandInbox = opts.commandInbox ?? new CommandInbox(new MemoryCommandInboxStore());
+    this.outbox = opts.outbox ?? new DurableOutbox(new MemoryOutboxStore(), this.runtime);
+    this.telemetry = opts.telemetry ?? noTelemetry;
+    if (opts.recoverCommands !== false) {
+      // 宿主启动即扫描 inbox，不依赖用户先打开旧会话才恢复。
+      queueMicrotask(() => void this.recoverAllCommands().catch(() => 0));
+    }
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -575,6 +676,7 @@ export class SessionManager {
     // provider 解析可能因未知配置失败；必须在落盘前完成，避免留下一个永远
     // 无法 open/resume 的孤儿 JSONL。解析结果直接交给 instantiate，勿重复创建。
     const resolved = this.opts.resolveProvider(input.model);
+    const recoveredPatchSets = await this.recoverWorkspacePatchSets(input.cwd);
     const id = newSessionId((this.opts.now ?? Date.now)(), this.opts.rand ?? Math.random);
     const meta = await this.opts.store.create({
       id,
@@ -583,6 +685,20 @@ export class SessionManager {
       ...(input.title ? { title: input.title } : {}),
     });
     this.instantiate(meta, [], resolved);
+    await this.runtime.record({
+      streamId: meta.id,
+      type: "session.created",
+      data: { cwd: meta.cwd, model: meta.model },
+      idempotencyKey: `session.created:${meta.id}`,
+    });
+    for (const patchset of recoveredPatchSets) {
+      await this.runtime.record({
+        streamId: meta.id,
+        type: "patchset.recovered",
+        data: { id: patchset.id, status: patchset.status, error: patchset.error ?? "" },
+        idempotencyKey: `patchset.recovered:${patchset.id}`,
+      });
+    }
     return { ...meta, running: false };
   }
 
@@ -630,8 +746,18 @@ export class SessionManager {
       model: data.model,
       ...(data.title ? { title: data.title } : {}),
     };
+    const recoveredPatchSets = await this.recoverWorkspacePatchSets(meta.cwd);
+    for (const patchset of recoveredPatchSets) {
+      await this.runtime.record({
+        streamId: meta.id,
+        type: "patchset.recovered",
+        data: { id: patchset.id, status: patchset.status, error: patchset.error ?? "" },
+        idempotencyKey: `patchset.recovered:${patchset.id}`,
+      });
+    }
     const resolved = this.opts.resolveProvider(meta.model);
-    return this.instantiate(meta, data.messages, resolved);
+    const session = this.instantiate(meta, data.messages, resolved);
+    return session;
   }
 
   /** 订阅：立即回放 snapshot，之后实时收事件。返回 unsubscribe。 */
@@ -644,12 +770,121 @@ export class SessionManager {
     return { snapshot: session.snapshot(), close };
   }
 
-  async send(sessionId: string, text: string, opts?: { model?: string }): Promise<void> {
-    const session = await this.ensureLive(sessionId);
-    await session.send(text, opts);
+  async send(
+    sessionId: string,
+    text: string,
+    opts?: { model?: string; idempotencyKey?: string; traceparent?: string },
+  ): Promise<void> {
+    // live 会话走同步快路，保持 steering/interrupt 的既有微任务时序；冷会话才 await 载入。
+    const session = this.sessions.get(sessionId) ?? (await this.ensureLive(sessionId));
+    const span = this.telemetry.startSpan(
+      "anicode.session.prompt",
+      {
+        "anicode.session.id": sessionId,
+        "gen_ai.request.model": opts?.model ?? session.meta.model,
+        "anicode.prompt.chars": text.length,
+      },
+      parseTraceparent(opts?.traceparent),
+    );
+    const context = span.context();
+    const sendOptions = {
+      ...(opts?.model ? { model: opts.model } : {}),
+      ...(context ? { traceParent: context } : {}),
+    };
+    // 运行中输入必须同步进入 Agent steering 队列，保持 interrupt 同 tick 的既有语义。
+    // 首条 command 仍严格遵循 inbox accepted/claimed 后才开始执行。
+    const steering = session.running ? session.send(text, sendOptions) : undefined;
+    const command = await this.commandInbox.accept({
+      sessionId,
+      text,
+      ...(opts?.model ? { model: opts.model } : {}),
+      ...(context ? { traceparent: traceparent(context) } : {}),
+      ...(opts?.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+      messageCountBefore: session.snapshot().messages.length,
+    });
+    if (command.status === "completed") {
+      span.setStatus({ code: "ok" }).end();
+      return;
+    }
+    const claimed = await this.commandInbox.claim(sessionId, command.id, this.workerId);
+    this.activateCommand(claimed);
+    const stopHeartbeat = this.startCommandHeartbeat(claimed);
+    const accepted = await this.outbox.publish({
+      streamId: sessionId,
+      type: "prompt.accepted",
+      data: {
+        commandId: command.id,
+        chars: text.length,
+        model: opts?.model ?? session.meta.model,
+      },
+      idempotencyKey: `command:${command.id}:accepted`,
+      ...(context ? { traceId: context.traceId, spanId: context.spanId } : {}),
+    });
+    let commandCompleted = false;
+    try {
+      const outcome = await (steering ?? session.send(text, sendOptions));
+      await this.flushRuntimeWrites();
+      const latest = await this.commandInbox.get(sessionId, command.id);
+      if (latest?.status === "cancelled") {
+        span.setStatus({ code: "error", message: latest.error ?? "cancelled" });
+      } else if (outcome.error) {
+        await this.commandInbox.finish(sessionId, command.id, "failed", outcome.error.message, {
+          owner: this.workerId,
+          fencingToken: claimed.fencingToken ?? 0,
+        });
+        await this.outbox.publish({
+          streamId: sessionId,
+          type: "prompt.failed",
+          data: { commandId: command.id, error: outcome.error.message },
+          causationId: accepted.id,
+          idempotencyKey: `command:${command.id}:failed`,
+        });
+        span.recordException(outcome.error).setStatus({ code: "error" });
+      } else {
+        await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
+          owner: this.workerId,
+          fencingToken: claimed.fencingToken ?? 0,
+        });
+        await this.outbox.publish({
+          streamId: sessionId,
+          type: "prompt.completed",
+          data: { commandId: command.id },
+          causationId: accepted.id,
+          idempotencyKey: `command:${command.id}:completed`,
+        });
+        span.setStatus({ code: "ok" });
+        commandCompleted = true;
+      }
+    } catch (error) {
+      const cancelled = error instanceof Error && /interrupt|中断/i.test(error.message);
+      await this.commandInbox.finish(
+        sessionId,
+        command.id,
+        cancelled ? "cancelled" : "failed",
+        error instanceof Error ? error.message : String(error),
+        { owner: this.workerId, fencingToken: claimed.fencingToken ?? 0 },
+      );
+      await this.outbox.publish({
+        streamId: sessionId,
+        type: cancelled ? "prompt.cancelled" : "prompt.failed",
+        data: {
+          commandId: command.id,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        causationId: accepted.id,
+        idempotencyKey: `command:${command.id}:${cancelled ? "cancelled" : "failed"}`,
+      });
+      span.recordException(error).setStatus({ code: "error" });
+      throw error;
+    } finally {
+      stopHeartbeat();
+      this.deactivateCommand(sessionId, command.id);
+      span.end();
+    }
     // 自动命名：首轮结束且仍无标题时用小模型总结（对齐 Codex/Claude Code）。
     // 放在 send 收尾而非并行，避免与本轮持久化竞争；失败静默。
-    if (this.opts.autoTitle && !session.meta.title) await this.autoTitle(session);
+    if (commandCompleted && this.opts.autoTitle && !session.meta.title)
+      await this.autoTitle(session);
   }
 
   /** 用小模型（未配置则用会话主模型）从首条用户输入总结一个短标题。 */
@@ -688,6 +923,46 @@ export class SessionManager {
 
   async interrupt(sessionId: string): Promise<void> {
     this.sessions.get(sessionId)?.interrupt();
+    const commands = [...(this.activeCommands.get(sessionId)?.values() ?? [])];
+    this.activeCommands.delete(sessionId);
+    for (const command of commands) {
+      await this.commandInbox.finish(sessionId, command.id, "cancelled", "user interrupted", {
+        owner: this.workerId,
+        fencingToken: command.fencingToken ?? 0,
+      });
+      await this.outbox.publish({
+        streamId: sessionId,
+        type: "prompt.cancelled",
+        data: { commandId: command.id, reason: "user interrupted" },
+        idempotencyKey: `command:${command.id}:cancelled`,
+      });
+    }
+  }
+
+  /** 显式触发未完成 command 的恢复；同一会话并发调用共享一次恢复。 */
+  recoverCommands(sessionId: string): Promise<number> {
+    const current = this.recoveringCommands.get(sessionId);
+    if (current) return current;
+    const work = this.ensureLive(sessionId).then((session) => this.recoverSessionCommands(session));
+    this.recoveringCommands.set(sessionId, work);
+    const cleanup = () => {
+      if (this.recoveringCommands.get(sessionId) === work)
+        this.recoveringCommands.delete(sessionId);
+    };
+    void work.then(cleanup, cleanup);
+    return work;
+  }
+
+  /** 启动恢复扫描：让无客户端连接的守护进程也能继续崩溃前已接收的命令。 */
+  async recoverAllCommands(): Promise<number> {
+    const sessionIds = await this.commandInbox.store.listSessions();
+    const results = await Promise.allSettled(
+      sessionIds.map((sessionId) => this.recoverCommands(sessionId)),
+    );
+    return results.reduce(
+      (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+      0,
+    );
   }
 
   /** 列出会话的可撤销点（最近的在末尾）。未加载/未启用快照时返回空数组。 */
@@ -746,6 +1021,125 @@ export class SessionManager {
     }
     this.loading.delete(sessionId);
     await this.opts.store.delete(sessionId);
+    await this.runtime.record({ streamId: sessionId, type: "session.deleted", data: {} });
+  }
+
+  putArtifact(input: ArtifactInput): Promise<Artifact> {
+    return this.artifacts.put(input);
+  }
+
+  listArtifacts(sessionId: string): Promise<Artifact[]> {
+    return this.artifacts.list(sessionId);
+  }
+
+  getArtifact(sessionId: string, artifactId: string): Promise<ArtifactRecord | undefined> {
+    return this.artifacts.get(sessionId, artifactId);
+  }
+
+  deleteArtifact(sessionId: string, artifactId: string): Promise<boolean> {
+    return this.artifacts.delete(sessionId, artifactId);
+  }
+
+  /** 准备一个可预览/审批的事务，不在此步写工作区。 */
+  async preparePatchSet(
+    sessionId: string,
+    changes: PatchSetChangeInput[],
+    options: Pick<PatchSetServiceOptions, "requiredApprovals" | "requiredRoles"> = {},
+  ): Promise<{ patchset: PatchSet; preview: string; artifact: Artifact }> {
+    const { service } = await this.patchSetContext(sessionId, true, options);
+    const patchset = await service.prepare(changes);
+    const preview = service.preview(patchset);
+    const artifact = await this.persistPatchSetArtifact(sessionId, patchset, preview);
+    await this.outbox.publish({
+      streamId: sessionId,
+      type: "patchset.prepared",
+      data: { id: patchset.id, status: patchset.status, artifactId: artifact.id },
+      idempotencyKey: `patchset:${patchset.id}:prepared`,
+    });
+    return { patchset, preview, artifact };
+  }
+
+  async getPatchSet(
+    sessionId: string,
+    patchsetId: string,
+  ): Promise<{ patchset: PatchSet; preview: string } | undefined> {
+    const { service } = await this.patchSetContext(sessionId, false);
+    const patchset = await service.load(patchsetId);
+    return patchset ? { patchset, preview: service.preview(patchset) } : undefined;
+  }
+
+  async approvePatchSet(
+    sessionId: string,
+    patchsetId: string,
+    approval: Omit<PatchSetApproval, "timestamp">,
+  ): Promise<PatchSet> {
+    const { service } = await this.patchSetContext(sessionId, false);
+    const patchset = await service.approve(patchsetId, approval);
+    await this.outbox.publish({
+      streamId: sessionId,
+      type: "patchset.approval",
+      data: {
+        id: patchset.id,
+        actor: approval.actor,
+        role: approval.role,
+        decision: approval.decision,
+        status: patchset.status,
+      },
+    });
+    return patchset;
+  }
+
+  async applyPatchSet(sessionId: string, patchsetId: string): Promise<PatchSet> {
+    const { service } = await this.patchSetContext(sessionId, true);
+    const current = await service.load(patchsetId);
+    if (!current) throw new Error(`Unknown PatchSet: ${patchsetId}`);
+    const patchset = await service.apply(current);
+    await this.outbox.publish({
+      streamId: sessionId,
+      type: "patchset.applied",
+      data: { id: patchset.id, changes: patchset.changes.length },
+      idempotencyKey: `patchset:${patchset.id}:applied`,
+    });
+    return patchset;
+  }
+
+  async rollbackPatchSet(sessionId: string, patchsetId: string, force = false): Promise<PatchSet> {
+    const { service } = await this.patchSetContext(sessionId, true);
+    const patchset = await service.rollback(patchsetId, force);
+    await this.outbox.publish({
+      streamId: sessionId,
+      type: "patchset.rolled_back",
+      data: { id: patchset.id, force },
+      idempotencyKey: `patchset:${patchset.id}:rolled_back`,
+    });
+    return patchset;
+  }
+
+  async rebasePatchSet(sessionId: string, patchsetId: string): Promise<PatchSetRebaseResult> {
+    const { service } = await this.patchSetContext(sessionId, true);
+    const result = await service.rebase(patchsetId);
+    const preview = service.preview(result.patchset);
+    const artifact = await this.persistPatchSetArtifact(sessionId, result.patchset, preview);
+    await this.outbox.publish({
+      streamId: sessionId,
+      type: "patchset.rebased",
+      data: {
+        sourceId: patchsetId,
+        id: result.patchset.id,
+        conflictedPaths: result.conflictedPaths,
+        artifactId: artifact.id,
+      },
+      idempotencyKey: `patchset:${patchsetId}:rebased:${result.patchset.id}`,
+    });
+    return result;
+  }
+
+  runtimeEvents(sessionId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
+    return this.runtime.events(sessionId, afterSequence);
+  }
+
+  recoverRuntime(sessionId: string): Promise<RecoveredRuntimeState> {
+    return this.runtime.recover(sessionId);
   }
 
   /** 重命名会话标题并持久化。应在会话空闲（无进行中回合）时调用以避免与消息落盘竞争。 */
@@ -774,6 +1168,8 @@ export class SessionManager {
     }
     for (const pool of this.lspPools) pool.closeAll();
     this.lspPools.clear();
+    // dispose 保持同步契约；生产宿主还会在真正退出前显式 await，同步调用方则至少触发发送。
+    void this.telemetry.forceFlush?.();
   }
 
   /** 为某会话 cwd 建一个 LSP 池并登记，供 dispose 统一关闭。 */
@@ -800,6 +1196,49 @@ export class SessionManager {
     }
   }
 
+  private recoverWorkspacePatchSets(cwd: string): Promise<PatchSet[]> {
+    const root = path.resolve(cwd);
+    const active = this.recoveringPatchSets.get(root);
+    if (active) return active;
+    const recovery = new PatchSetService(root).recoverIncomplete();
+    this.recoveringPatchSets.set(root, recovery);
+    void recovery
+      .finally(() => {
+        if (this.recoveringPatchSets.get(root) === recovery) this.recoveringPatchSets.delete(root);
+      })
+      .catch(() => undefined);
+    return recovery;
+  }
+
+  private async patchSetContext(
+    sessionId: string,
+    requireIdle: boolean,
+    options: Pick<PatchSetServiceOptions, "requiredApprovals" | "requiredRoles"> = {},
+  ): Promise<{ service: PatchSetService; session: ManagedSession }> {
+    const session = await this.ensureLive(sessionId);
+    if (requireIdle && session.running) {
+      throw new Error(
+        `Session ${sessionId} is running; PatchSet transaction requires an idle session`,
+      );
+    }
+    return { service: new PatchSetService(session.meta.cwd, options), session };
+  }
+
+  private persistPatchSetArtifact(
+    sessionId: string,
+    patchset: PatchSet,
+    preview: string,
+  ): Promise<Artifact> {
+    return this.artifacts.put({
+      sessionId,
+      kind: "patch",
+      name: `${patchset.id}.json`,
+      mediaType: "application/vnd.anicode.patchset+json",
+      data: JSON.stringify({ patchset, preview }, null, 2),
+      metadata: { patchsetId: patchset.id, status: patchset.status },
+    });
+  }
+
   /** 解析本会话该用的小模型 spec：true→按 provider 推导，字符串→原样，否则无。 */
   private smallModelSpec(resolved: ResolvedProvider): string | undefined {
     const cfg = this.opts.smallModel;
@@ -813,57 +1252,73 @@ export class SessionManager {
     resumeMessages: ChatMessage[],
     resolved: ResolvedProvider,
   ): ManagedSession {
-    const session = new ManagedSession(meta, (confirm) => {
-      const agent = new Agent({
-        provider: resolved.provider,
-        model: resolved.model,
-        // 后台子 agent 在会话空闲时完成 → 自动发起一次 drive 让模型消化通知
-        // （运行中完成的通知由 Agent 在 turn 边界注入，不经此回调）。
-        onTaskNotice: (text) => {
-          void session.send(text).catch(() => {});
-        },
-        ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
-        resolveModel: this.opts.resolveProvider,
-        ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
-        ...(this.opts.fallbackModels?.length ? { fallbackModels: this.opts.fallbackModels } : {}),
-        ...(this.opts.sandbox ? { sandbox: this.opts.sandbox } : {}),
-        ...(this.opts.checkpoints ? { checkpoints: true } : {}),
-        ...(this.opts.repoMap !== undefined ? { repoMap: this.opts.repoMap } : {}),
-        ...(this.opts.webSearch ? { webSearch: this.opts.webSearch } : {}),
-        ...(this.opts.lsp?.length ? { lsp: this.lspPoolFor(meta.cwd) } : {}),
-        // browser 默认开启：仅显式 false 时禁用（undefined→true）。
-        ...(this.opts.browser !== false ? { browser: this.opts.browser ?? true } : {}),
-        cwd: meta.cwd,
-        permission: {
-          mode: "default",
-          ...this.opts.permission,
-          confirm,
-          // allow_always 写回会话 cwd 的项目本地设置（.anicode/settings.local.json）
-          ...(this.opts.persistPermissions
-            ? {
-                persistAllowRule: async (rule: string) => {
-                  await appendLocalAllowRules(meta.cwd, [rule]);
-                },
-              }
+    const session = new ManagedSession(
+      meta,
+      (confirm) => {
+        const agent = new Agent({
+          provider: resolved.provider,
+          model: resolved.model,
+          // 后台子 agent 在会话空闲时完成 → 自动发起一次 drive 让模型消化通知
+          // （运行中完成的通知由 Agent 在 turn 边界注入，不经此回调）。
+          onTaskNotice: (text) => {
+            void this.send(meta.id, text).catch(() => {});
+          },
+          ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
+          resolveModel: this.opts.resolveProvider,
+          ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
+          ...(this.opts.fallbackModels?.length ? { fallbackModels: this.opts.fallbackModels } : {}),
+          ...(this.opts.sandbox ? { sandbox: this.opts.sandbox } : {}),
+          ...(this.opts.checkpoints ? { checkpoints: true } : {}),
+          ...(this.opts.repoMap !== undefined ? { repoMap: this.opts.repoMap } : {}),
+          ...(this.opts.worktreeOwnership
+            ? { worktreeOwnership: this.opts.worktreeOwnership }
             : {}),
-        },
-        ...(this.opts.permissionProfiles
-          ? { permissionProfiles: this.opts.permissionProfiles }
-          : {}),
-        ...(this.opts.tools ? { tools: this.opts.tools() } : {}),
-        ...(this.opts.hooks ? { hooks: this.opts.hooks } : {}),
-        ...(this.opts.subagents !== undefined ? { subagents: this.opts.subagents } : {}),
-        ...(this.opts.skills !== undefined ? { skills: this.opts.skills } : {}),
-        ...(this.opts.compaction !== undefined ? { compaction: this.opts.compaction } : {}),
-        persistence: {
-          store: this.opts.store,
-          meta,
-          ...(resumeMessages.length ? { resumeMessages } : {}),
-        },
-      });
-      if (this.opts.permissionProfile) agent.setPermissionProfile(this.opts.permissionProfile);
-      return agent;
-    });
+          ...(this.opts.networkProxy ? { networkProxy: this.opts.networkProxy } : {}),
+          ...(this.opts.webSearch ? { webSearch: this.opts.webSearch } : {}),
+          ...(this.opts.lsp?.length ? { lsp: this.lspPoolFor(meta.cwd) } : {}),
+          // browser 默认开启：仅显式 false 时禁用（undefined→true）。
+          ...(this.opts.browser !== false ? { browser: this.opts.browser ?? true } : {}),
+          cwd: meta.cwd,
+          permission: {
+            mode: "default",
+            ...this.opts.permission,
+            confirm,
+            // allow_always 写回会话 cwd 的项目本地设置（.anicode/settings.local.json）
+            ...(this.opts.persistPermissions
+              ? {
+                  persistAllowRule: async (rule: string) => {
+                    await appendLocalAllowRules(meta.cwd, [rule]);
+                  },
+                }
+              : {}),
+          },
+          ...(this.opts.permissionProfiles
+            ? { permissionProfiles: this.opts.permissionProfiles }
+            : {}),
+          ...(this.opts.tools ? { tools: this.opts.tools() } : {}),
+          ...(this.opts.hooks ? { hooks: this.opts.hooks } : {}),
+          ...(this.opts.subagents !== undefined ? { subagents: this.opts.subagents } : {}),
+          ...(this.opts.skills !== undefined ? { skills: this.opts.skills } : {}),
+          ...(this.opts.compaction !== undefined ? { compaction: this.opts.compaction } : {}),
+          ...(this.opts.contextCompiler ? { contextCompiler: this.opts.contextCompiler } : {}),
+          ...(this.opts.verifier ? { verifier: this.opts.verifier } : {}),
+          ...(this.opts.verificationMaxAttempts !== undefined
+            ? { verificationMaxAttempts: this.opts.verificationMaxAttempts }
+            : {}),
+          ...(this.opts.securityPolicy ? { securityPolicy: this.opts.securityPolicy } : {}),
+          ...(this.opts.telemetry ? { telemetry: this.opts.telemetry } : {}),
+          ...(this.opts.isolatedRuntime ? { isolatedRuntime: this.opts.isolatedRuntime } : {}),
+          persistence: {
+            store: this.opts.store,
+            meta,
+            ...(resumeMessages.length ? { resumeMessages } : {}),
+          },
+        });
+        if (this.opts.permissionProfile) agent.setPermissionProfile(this.opts.permissionProfile);
+        return agent;
+      },
+      (event) => this.recordSessionEvent(meta.id, event),
+    );
     this.sessions.set(meta.id, session);
     // 全局订阅：每个 live 会话的事件都转发给 subscribeAll 的监听者（firehose 用），
     // 与是否有人 open 该会话无关。会话生命周期内常驻，dispose/delete 时随会话释放。
@@ -888,5 +1343,190 @@ export class SessionManager {
         /* 单个 firehose 订阅者异常不影响其他订阅者 */
       }
     }
+  }
+
+  /** 把 UI 事件投影成不含正文/密钥的持久运行时事实，并把验证报告落为 Artifact。 */
+  private recordSessionEvent(sessionId: string, event: SessionEvent): void {
+    let type: string;
+    let data: Record<string, unknown>;
+    if (event.type === "state") {
+      type = "session.state";
+      data = { running: event.running };
+    } else if (event.type === "permission_request") {
+      type = "permission.requested";
+      data = { permId: event.permId, toolName: event.toolName };
+    } else if (event.type === "permission_resolved") {
+      type = "permission.resolved";
+      data = { permId: event.permId, decision: event.decision };
+    } else if (event.type === "title") {
+      type = "session.title_changed";
+      data = { title: event.title };
+    } else if (event.type === "reverted") {
+      type = "session.reverted";
+      data = {
+        checkpointId: event.checkpointId,
+        restored: event.restored,
+        deleted: event.deleted,
+        mode: event.mode ?? "files",
+      };
+    } else {
+      const agent = event.event;
+      if (agent.type === "tool_start") {
+        type = "tool.started";
+        data = { id: agent.id, name: agent.name };
+      } else if (agent.type === "tool_result") {
+        type = "tool.completed";
+        data = { id: agent.id, name: agent.name, isError: agent.isError };
+      } else if (agent.type === "verification") {
+        type = "verification.completed";
+        data = { id: agent.report.id, status: agent.report.status, summary: agent.report.summary };
+        void this.artifacts.put({
+          sessionId,
+          kind: "verification",
+          name: `${agent.report.id}.json`,
+          mediaType: "application/json",
+          data: JSON.stringify(agent.report, null, 2),
+          metadata: { status: agent.report.status },
+        });
+      } else if (agent.type === "done") {
+        type = "agent.completed";
+        data = { turns: agent.turns, usage: agent.usage, costUSD: agent.costUSD };
+      } else if (agent.type === "error") {
+        type = "agent.failed";
+        data = { error: agent.message };
+      } else if (agent.type === "checkpoint") {
+        type = "checkpoint.created";
+        data = { id: agent.id, messageCount: agent.messageCount };
+      } else {
+        return;
+      }
+    }
+    this.trackRuntimeWrite(this.outbox.publish({ streamId: sessionId, type, data }));
+  }
+
+  private trackRuntimeWrite<T>(promise: Promise<T>): void {
+    this.runtimeWrites.add(promise);
+    void promise.finally(() => this.runtimeWrites.delete(promise)).catch(() => undefined);
+  }
+
+  private async flushRuntimeWrites(): Promise<void> {
+    // 完成一个批次时，listener 可能又排入后续事件，因此循环到真正清空。
+    while (this.runtimeWrites.size > 0) {
+      await Promise.allSettled([...this.runtimeWrites]);
+    }
+  }
+
+  private async recoverSessionCommands(session: ManagedSession): Promise<number> {
+    const sessionId = session.meta.id;
+    await this.outbox.flush();
+    await this.runtime.reconcileInterrupted(sessionId);
+    const commands = await this.commandInbox.recoverable(sessionId);
+    let recovered = 0;
+    for (const command of commands) {
+      if (session.running) break;
+      let claimed: DurableCommand;
+      try {
+        claimed = await this.commandInbox.claim(sessionId, command.id, this.workerId);
+      } catch {
+        continue;
+      }
+      this.activateCommand(claimed);
+      const stopHeartbeat = this.startCommandHeartbeat(claimed);
+      const historyAdvanced = session.snapshot().messages.length > command.messageCountBefore;
+      await this.outbox.publish({
+        streamId: sessionId,
+        type: "prompt.recovered",
+        data: { commandId: command.id, attempt: claimed.attempts, historyAdvanced },
+        idempotencyKey: `command:${command.id}:recovered:${claimed.attempts}`,
+      });
+      try {
+        const recoveredTraceParent = parseTraceparent(command.traceparent);
+        const outcome = await session.send(
+          historyAdvanced
+            ? t(
+                "Continue the interrupted command from the durable history. Inspect prior tool results, do not repeat completed side effects, finish the remaining work, and verify it.",
+                "从耐久历史继续刚才中断的命令。检查已有工具结果，不要重复已完成的副作用，完成剩余工作并验证。",
+              )
+            : command.text,
+          {
+            ...(command.model ? { model: command.model } : {}),
+            ...(historyAdvanced ? { resume: true } : {}),
+            ...(recoveredTraceParent ? { traceParent: recoveredTraceParent } : {}),
+          },
+        );
+        await this.flushRuntimeWrites();
+        if (outcome.error) {
+          await this.commandInbox.finish(sessionId, command.id, "failed", outcome.error.message, {
+            owner: this.workerId,
+            fencingToken: claimed.fencingToken ?? 0,
+          });
+          await this.outbox.publish({
+            streamId: sessionId,
+            type: "prompt.failed",
+            data: { commandId: command.id, recovered: true, error: outcome.error.message },
+            idempotencyKey: `command:${command.id}:failed`,
+          });
+        } else {
+          await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
+            owner: this.workerId,
+            fencingToken: claimed.fencingToken ?? 0,
+          });
+          await this.outbox.publish({
+            streamId: sessionId,
+            type: "prompt.completed",
+            data: { commandId: command.id, recovered: true },
+            idempotencyKey: `command:${command.id}:completed`,
+          });
+          recovered++;
+        }
+      } catch (error) {
+        await this.commandInbox.finish(
+          sessionId,
+          command.id,
+          "failed",
+          error instanceof Error ? error.message : String(error),
+          { owner: this.workerId, fencingToken: claimed.fencingToken ?? 0 },
+        );
+        await this.outbox.publish({
+          streamId: sessionId,
+          type: "prompt.failed",
+          data: {
+            commandId: command.id,
+            recovered: true,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          idempotencyKey: `command:${command.id}:failed`,
+        });
+      } finally {
+        stopHeartbeat();
+        this.deactivateCommand(sessionId, command.id);
+      }
+    }
+    return recovered;
+  }
+
+  private startCommandHeartbeat(command: DurableCommand): () => void {
+    const timer = setInterval(
+      () =>
+        void this.commandInbox
+          .heartbeat(command.sessionId, command.id, this.workerId, 60_000, command.fencingToken)
+          .catch(() => undefined),
+      20_000,
+    );
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  private activateCommand(command: DurableCommand): void {
+    const active = this.activeCommands.get(command.sessionId) ?? new Map<string, DurableCommand>();
+    active.set(command.id, command);
+    this.activeCommands.set(command.sessionId, active);
+  }
+
+  private deactivateCommand(sessionId: string, commandId: string): void {
+    const active = this.activeCommands.get(sessionId);
+    if (!active) return;
+    active.delete(commandId);
+    if (active.size === 0) this.activeCommands.delete(sessionId);
   }
 }

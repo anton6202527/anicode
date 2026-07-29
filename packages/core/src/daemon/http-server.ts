@@ -31,6 +31,7 @@ import type { PermissionDecisionKind } from "../host.js";
 import type { PermissionMode } from "../permission.js";
 import { PartsProjector, messagesToParts } from "../parts.js";
 import { createId } from "../id.js";
+import { PatchSetConflictError, type PatchSetChangeInput } from "../runtime/patchset.js";
 import { generateOpenApi, PROTOCOL_VERSION, type EventEnvelope } from "./api.js";
 
 export interface HttpDaemonOptions {
@@ -51,6 +52,8 @@ export interface HttpDaemonOptions {
    * 让单客户端断线重连仍能在窗口内增量补发；窗口外回落整份快照。默认 15000。
    */
   feedLingerMs?: number;
+  /** 监听关闭后的宿主资源清理（数据库、worker 等）。 */
+  onClose?: () => void | Promise<void>;
 }
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -87,6 +90,16 @@ function noContent(res: http.ServerResponse): void {
   res.end();
 }
 
+function strictBase64(value: string): Uint8Array {
+  if (
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
+  ) {
+    throw new Error("invalid dataBase64");
+  }
+  return Buffer.from(value, "base64");
+}
+
 function envelope(type: string, properties: Record<string, unknown>): EventEnvelope {
   return { id: createId("evt"), type, properties };
 }
@@ -109,9 +122,19 @@ function deriveNamedEvents(
 ): EventEnvelope[] {
   switch (event.type) {
     case "agent":
-      return projector
-        .handle(event.event)
-        .map((p) => envelope(p.type, p.properties as unknown as Record<string, unknown>));
+      return [
+        ...projector
+          .handle(event.event)
+          .map((p) => envelope(p.type, p.properties as unknown as Record<string, unknown>)),
+        ...(event.event.type === "verification"
+          ? [
+              envelope("verification.completed", {
+                sessionId,
+                report: event.event.report,
+              }),
+            ]
+          : []),
+      ];
     case "permission_request":
       return [
         envelope("permission.asked", {
@@ -188,6 +211,7 @@ export class HttpDaemonServer {
   private resolveInstance?: (directory: string) => SessionManager | Promise<SessionManager>;
   private replayBufferSize: number;
   private feedLingerMs: number;
+  private onClose?: () => void | Promise<void>;
   /** 活跃 SSE 连接的清理器，close 时逐个断开。 */
   private sseCleanups = new Set<() => void>();
   /** 目录 → 实例的 memo（并发 boot 去重）。 */
@@ -201,6 +225,7 @@ export class HttpDaemonServer {
     if (opts.resolveInstance) this.resolveInstance = opts.resolveInstance;
     this.replayBufferSize = opts.replayBufferSize ?? 1024;
     this.feedLingerMs = opts.feedLingerMs ?? 15_000;
+    if (opts.onClose) this.onClose = opts.onClose;
     this.server = http.createServer((req, res) => {
       void this.route(req, res).catch((err) => {
         if (!res.headersSent)
@@ -224,7 +249,7 @@ export class HttpDaemonServer {
     return typeof addr === "object" && addr ? addr.port : 0;
   }
 
-  close(): Promise<void> {
+  async close(): Promise<void> {
     for (const cleanup of this.sseCleanups) cleanup();
     this.sseCleanups.clear();
     for (const inst of this.streams.values()) {
@@ -235,7 +260,8 @@ export class HttpDaemonServer {
       inst.firehose?.close();
     }
     this.streams.clear();
-    return new Promise((res) => this.server.close(() => res()));
+    await new Promise<void>((res) => this.server.close(() => res()));
+    await this.onClose?.();
   }
 
   private authorized(req: http.IncomingMessage, url: URL): boolean {
@@ -314,6 +340,234 @@ export class HttpDaemonServer {
       return json(res, 200, meta);
     }
 
+    // Artifact 子资源（必须先于 /sessions/:id/:action 的两段匹配）。
+    const artifactCollection = /^\/sessions\/([^/]+)\/artifacts$/.exec(url.pathname);
+    if (artifactCollection) {
+      const sessionId = decodeURIComponent(artifactCollection[1]!);
+      if (!(await this.snapshotOf(manager, sessionId))) {
+        return json(res, 404, { error: "not found" });
+      }
+      if (req.method === "GET") return json(res, 200, await manager.listArtifacts(sessionId));
+      if (req.method === "POST") {
+        const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+        if (
+          !body.kind ||
+          !body.name ||
+          (body.text === undefined && body.dataBase64 === undefined)
+        ) {
+          return json(res, 400, { error: "kind, name and text or dataBase64 are required" });
+        }
+        let data: string | Uint8Array;
+        if (typeof body.dataBase64 === "string") {
+          try {
+            data = Buffer.from(body.dataBase64, "base64");
+          } catch {
+            return json(res, 400, { error: "invalid dataBase64" });
+          }
+        } else {
+          data = String(body.text ?? "");
+        }
+        return json(
+          res,
+          200,
+          await manager.putArtifact({
+            sessionId,
+            kind: String(body.kind) as import("../runtime/artifacts.js").ArtifactKind,
+            name: String(body.name),
+            ...(typeof body.mediaType === "string" ? { mediaType: body.mediaType } : {}),
+            data,
+            ...(body.metadata && typeof body.metadata === "object"
+              ? { metadata: body.metadata as Record<string, unknown> }
+              : {}),
+          }),
+        );
+      }
+      return json(res, 405, { error: "method not allowed" });
+    }
+
+    const artifactItem = /^\/sessions\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
+    if (artifactItem) {
+      const sessionId = decodeURIComponent(artifactItem[1]!);
+      const artifactId = decodeURIComponent(artifactItem[2]!);
+      if (req.method === "GET") {
+        const record = await manager.getArtifact(sessionId, artifactId);
+        return record
+          ? json(res, 200, {
+              artifact: record.artifact,
+              dataBase64: Buffer.from(record.data).toString("base64"),
+            })
+          : json(res, 404, { error: "not found" });
+      }
+      if (req.method === "DELETE") {
+        const deleted = await manager.deleteArtifact(sessionId, artifactId);
+        return deleted ? noContent(res) : json(res, 404, { error: "not found" });
+      }
+      return json(res, 405, { error: "method not allowed" });
+    }
+
+    const patchsetCollection = /^\/sessions\/([^/]+)\/patchsets$/.exec(url.pathname);
+    if (patchsetCollection) {
+      if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+      const sessionId = decodeURIComponent(patchsetCollection[1]!);
+      if (!(await this.snapshotOf(manager, sessionId))) {
+        return json(res, 404, { error: "not found" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+      if (!Array.isArray(body.changes) || body.changes.length === 0) {
+        return json(res, 400, { error: "changes must be a non-empty array" });
+      }
+      let changes: PatchSetChangeInput[];
+      try {
+        changes = body.changes.map((raw, index) => {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            throw new Error(`changes[${index}] must be an object`);
+          }
+          const change = raw as Record<string, unknown>;
+          if (typeof change.path !== "string" || !change.path) {
+            throw new Error(`changes[${index}].path is required`);
+          }
+          const hasText = typeof change.text === "string";
+          const hasBinary = typeof change.dataBase64 === "string";
+          const deleting = change.delete === true;
+          const renameFrom =
+            typeof change.renameFrom === "string" && change.renameFrom
+              ? change.renameFrom
+              : undefined;
+          if (Number(hasText) + Number(hasBinary) + Number(deleting) > 1) {
+            throw new Error(
+              `changes[${index}] must choose only one of text, dataBase64, or delete`,
+            );
+          }
+          if (!hasText && !hasBinary && !deleting && !renameFrom) {
+            throw new Error(`changes[${index}] requires content, delete, or renameFrom`);
+          }
+          if (deleting && renameFrom) {
+            throw new Error(`changes[${index}] cannot combine delete and renameFrom`);
+          }
+          return {
+            path: change.path,
+            ...(renameFrom ? { renameFrom } : {}),
+            ...(hasText
+              ? { content: change.text as string }
+              : hasBinary
+                ? { content: strictBase64(change.dataBase64 as string) }
+                : deleting
+                  ? { content: null }
+                  : {}),
+          };
+        });
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      const requiredApprovals = Number(body.requiredApprovals ?? 0);
+      if (!Number.isInteger(requiredApprovals) || requiredApprovals < 0) {
+        return json(res, 400, { error: "requiredApprovals must be a non-negative integer" });
+      }
+      const requiredRoles = body.requiredRoles ?? [];
+      if (
+        !Array.isArray(requiredRoles) ||
+        requiredRoles.some((role) => typeof role !== "string" || !role.trim())
+      ) {
+        return json(res, 400, { error: "requiredRoles must contain non-empty strings" });
+      }
+      return json(
+        res,
+        200,
+        await manager.preparePatchSet(sessionId, changes, {
+          requiredApprovals,
+          requiredRoles: requiredRoles as string[],
+        }),
+      );
+    }
+
+    const patchsetItem = /^\/sessions\/([^/]+)\/patchsets\/([^/]+)$/.exec(url.pathname);
+    if (patchsetItem) {
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      const value = await manager.getPatchSet(
+        decodeURIComponent(patchsetItem[1]!),
+        decodeURIComponent(patchsetItem[2]!),
+      );
+      return value ? json(res, 200, value) : json(res, 404, { error: "not found" });
+    }
+
+    const patchsetAction =
+      /^\/sessions\/([^/]+)\/patchsets\/([^/]+)\/(approve|apply|rebase|rollback)$/.exec(
+        url.pathname,
+      );
+    if (patchsetAction) {
+      if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+      const sessionId = decodeURIComponent(patchsetAction[1]!);
+      const patchsetId = decodeURIComponent(patchsetAction[2]!);
+      const action = patchsetAction[3]!;
+      if (!(await manager.getPatchSet(sessionId, patchsetId))) {
+        return json(res, 404, { error: "not found" });
+      }
+      const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+      try {
+        if (action === "approve") {
+          if (
+            typeof body.actor !== "string" ||
+            !body.actor.trim() ||
+            typeof body.role !== "string" ||
+            !body.role.trim() ||
+            (body.decision !== "approve" && body.decision !== "reject")
+          ) {
+            return json(res, 400, {
+              error: "actor, role and approve|reject decision are required",
+            });
+          }
+          return json(
+            res,
+            200,
+            await manager.approvePatchSet(sessionId, patchsetId, {
+              actor: body.actor,
+              role: body.role,
+              decision: body.decision,
+              ...(typeof body.comment === "string" ? { comment: body.comment } : {}),
+            }),
+          );
+        }
+        if (action === "apply") {
+          return json(res, 200, await manager.applyPatchSet(sessionId, patchsetId));
+        }
+        if (action === "rebase") {
+          return json(res, 200, await manager.rebasePatchSet(sessionId, patchsetId));
+        }
+        return json(
+          res,
+          200,
+          await manager.rollbackPatchSet(sessionId, patchsetId, body.force === true),
+        );
+      } catch (error) {
+        if (error instanceof PatchSetConflictError) {
+          return json(res, 409, { error: error.message, paths: error.paths });
+        }
+        if (
+          error instanceof Error &&
+          /lacks required approvals| is (?:conflict|failed)/.test(error.message)
+        ) {
+          return json(res, 409, { error: error.message });
+        }
+        throw error;
+      }
+    }
+
+    const runtimeResource = /^\/sessions\/([^/]+)\/(runtime-events|runtime-state)$/.exec(
+      url.pathname,
+    );
+    if (runtimeResource) {
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      const sessionId = decodeURIComponent(runtimeResource[1]!);
+      if (!(await this.snapshotOf(manager, sessionId))) {
+        return json(res, 404, { error: "not found" });
+      }
+      if (runtimeResource[2] === "runtime-state") {
+        return json(res, 200, await manager.recoverRuntime(sessionId));
+      }
+      const after = Math.max(0, Number(url.searchParams.get("afterSequence") ?? 0) || 0);
+      return json(res, 200, await manager.runtimeEvents(sessionId, after));
+    }
+
     // /sessions/:id —— 会话资源本体
     const mSelf = /^\/sessions\/([^/]+)$/.exec(url.pathname);
     if (mSelf) {
@@ -360,7 +614,20 @@ export class HttpDaemonServer {
         await manager.send(
           sessionId,
           String(body.text ?? ""),
-          typeof body.model === "string" && body.model ? { model: body.model } : undefined,
+          (typeof body.model === "string" && body.model) ||
+            (typeof body.idempotencyKey === "string" && body.idempotencyKey)
+            ? {
+                ...(typeof body.model === "string" && body.model ? { model: body.model } : {}),
+                ...(typeof body.idempotencyKey === "string" && body.idempotencyKey
+                  ? { idempotencyKey: body.idempotencyKey }
+                  : {}),
+                ...(typeof req.headers.traceparent === "string"
+                  ? { traceparent: req.headers.traceparent }
+                  : {}),
+              }
+            : typeof req.headers.traceparent === "string"
+              ? { traceparent: req.headers.traceparent }
+              : undefined,
         );
         return noContent(res);
       case "interrupt":

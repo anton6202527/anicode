@@ -1,0 +1,9 @@
+.git
+.anicode*
+node_modules
+packages/*/node_modules
+packages/*/dist
+packages/app/out
+packages/app/release
+coverage
+*.log

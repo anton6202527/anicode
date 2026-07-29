@@ -20,6 +20,8 @@ import {
   type SkillMeta,
   type Tool,
   type ToolRegistry,
+  type CredentialBroker,
+  isCredentialEnvironmentName,
 } from "@anicode/core";
 import {
   mergePluginState,
@@ -30,6 +32,7 @@ import {
 
 export type McpConnector = (
   configs: McpServerConfig[],
+  handlers?: NonNullable<Parameters<typeof connectMcpServers>[1]>,
 ) => Promise<{ tools: Tool[]; clients: McpClient[] }>;
 
 interface Connection {
@@ -46,6 +49,8 @@ export class PluginRuntime {
   constructor(
     private readonly connect: McpConnector = connectMcpServers,
     private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly broker?: CredentialBroker,
+    private readonly connectHandlers?: NonNullable<Parameters<typeof connectMcpServers>[1]>,
   ) {}
 
   /** 扫描文件系统技能（全局 + 项目级），供市场展示与开关；失败静默保持空表。 */
@@ -91,7 +96,11 @@ export class PluginRuntime {
     // 连接新启用的 MCP（凭证就绪才连）。
     for (const entry of enabledMcp) {
       if (this.connections.has(entry.id)) continue;
-      const missing = (entry.requiresEnv ?? []).filter((name) => !this.env[name]?.trim());
+      const missing = (entry.requiresEnv ?? []).filter((name) =>
+        isCredentialEnvironmentName(name)
+          ? !this.broker?.has(`env:${name}`)
+          : !this.env[name]?.trim(),
+      );
       if (missing.length > 0) {
         this.status.set(entry.id, {
           connected: false,
@@ -104,9 +113,25 @@ export class PluginRuntime {
       }
       const spec = entry.mcpServer!;
       try {
-        const { tools, clients } = await this.connect([
-          { name: spec.name, command: spec.command, args: [...spec.args] },
-        ]);
+        const scopedEnv: Record<string, string> = {};
+        const credentialEnv: Record<string, string> = {};
+        for (const name of entry.requiresEnv ?? []) {
+          if (isCredentialEnvironmentName(name)) credentialEnv[name] = `env:${name}`;
+          else scopedEnv[name] = this.env[name] ?? "";
+        }
+        const { tools, clients } = await this.connect(
+          [
+            {
+              name: spec.name,
+              command: spec.command,
+              args: [...spec.args],
+              ...(Object.keys(scopedEnv).length ? { env: scopedEnv } : {}),
+              ...(Object.keys(credentialEnv).length ? { credentialEnv } : {}),
+              ...(spec.network ? { network: true } : {}),
+            },
+          ],
+          this.connectHandlers,
+        );
         this.connections.set(entry.id, { clients, tools });
         this.status.set(entry.id, { connected: true, toolCount: tools.length });
       } catch (err) {

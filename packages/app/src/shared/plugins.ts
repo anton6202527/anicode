@@ -17,6 +17,8 @@ export interface McpServerSpec {
   name: string;
   command: string;
   args: readonly string[];
+  /** 需要联网时必须由隔离运行时强制经过 AniCode Network Proxy。 */
+  network?: boolean;
 }
 
 export interface PluginManifest {
@@ -120,6 +122,7 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
       name: "websearch",
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-web-search"],
+      network: true,
     },
     requiresEnv: ["BRAVE_API_KEY"],
     homepage: "https://modelcontextprotocol.io",
@@ -139,6 +142,7 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
       name: "github",
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-github"],
+      network: true,
     },
     requiresEnv: ["GITHUB_TOKEN"],
     homepage: "https://github.com/github/github-mcp-server",
@@ -154,7 +158,12 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
     author: "microsoft",
     icon: "🎭",
     version: "0.2.0",
-    mcpServer: { name: "playwright", command: "npx", args: ["-y", "@playwright/mcp"] },
+    mcpServer: {
+      name: "playwright",
+      command: "npx",
+      args: ["-y", "@playwright/mcp"],
+      network: true,
+    },
     homepage: "https://github.com/microsoft/playwright-mcp",
   },
   {

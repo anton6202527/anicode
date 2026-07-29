@@ -60,7 +60,7 @@ test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
     assert.equal(health.name, "anicode");
 
     const doc = await client.global.doc();
-    assert.equal((doc as { openapi: string }).openapi, "3.1.0");
+    assert.equal((doc as { openapi: string }).openapi, "3.1.1");
 
     const meta = await client.session.create({ cwd: dir, model: "scripted", title: "sdk 会话" });
     assert.ok((await client.session.list()).some((s) => s.id === meta.id));
@@ -82,6 +82,84 @@ test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
     assert.equal((await client.session.list()).find((s) => s.id === meta.id)?.title, "改名了");
 
     assert.deepEqual(await client.session.checkpoints(meta.id), []);
+
+    const artifact = await client.artifact.create(meta.id, {
+      kind: "report",
+      name: "report.txt",
+      mediaType: "text/plain",
+      text: "SDK artifact",
+    });
+    assert.equal((await client.artifact.list(meta.id))[0]?.id, artifact.id);
+    const artifactBody = await client.artifact.get(meta.id, artifact.id);
+    assert.equal(Buffer.from(artifactBody.dataBase64, "base64").toString(), "SDK artifact");
+
+    const runtimeEvents = await client.runtime.events(meta.id);
+    assert.ok(runtimeEvents.some((event) => event.type === "prompt.accepted"));
+    assert.equal((await client.runtime.state(meta.id)).streamId, meta.id);
+    await client.artifact.delete(meta.id, artifact.id);
+    assert.deepEqual(await client.artifact.list(meta.id), []);
+
+    await fs.writeFile(path.join(dir, "old.txt"), "source\n");
+    await fs.writeFile(path.join(dir, "image.bin"), Buffer.from([0, 1, 2]));
+    const prepared = await client.patchset.prepare(meta.id, {
+      changes: [
+        { path: "new.txt", renameFrom: "old.txt" },
+        { path: "image.bin", dataBase64: Buffer.from([0, 9, 8, 7]).toString("base64") },
+      ],
+      requiredApprovals: 2,
+      requiredRoles: ["reviewer", "security"],
+    });
+    assert.equal(prepared.patchset.status, "pending_approval");
+    assert.match(prepared.preview, /rename-target new\.txt/);
+    assert.equal(
+      (await client.patchset.get(meta.id, prepared.patchset.id)).patchset.id,
+      prepared.patchset.id,
+    );
+    await client.patchset.approve(meta.id, prepared.patchset.id, {
+      actor: "alice",
+      role: "reviewer",
+      decision: "approve",
+    });
+    await assert.rejects(
+      () => client.patchset.apply(meta.id, prepared.patchset.id),
+      (error: unknown) => error instanceof AnicodeApiError && error.status === 409,
+    );
+    await client.patchset.approve(meta.id, prepared.patchset.id, {
+      actor: "security-bot",
+      role: "security",
+      decision: "approve",
+    });
+    assert.equal((await client.patchset.apply(meta.id, prepared.patchset.id)).status, "applied");
+    assert.equal(await fs.readFile(path.join(dir, "new.txt"), "utf8"), "source\n");
+    assert.deepEqual([...(await fs.readFile(path.join(dir, "image.bin")))], [0, 9, 8, 7]);
+    assert.equal(
+      (await client.patchset.rollback(meta.id, prepared.patchset.id)).status,
+      "rolled_back",
+    );
+    assert.equal(await fs.readFile(path.join(dir, "old.txt"), "utf8"), "source\n");
+    await assert.rejects(() => fs.access(path.join(dir, "new.txt")));
+
+    await fs.writeFile(path.join(dir, "merge.txt"), "one\ntwo\nthree");
+    const stale = await client.patchset.prepare(meta.id, {
+      changes: [{ path: "merge.txt", text: "ONE\ntwo\nthree" }],
+    });
+    await fs.writeFile(path.join(dir, "merge.txt"), "one\ntwo\nTHREE");
+    await assert.rejects(
+      () => client.patchset.apply(meta.id, stale.patchset.id),
+      (error: unknown) => error instanceof AnicodeApiError && error.status === 409,
+    );
+    const rebased = await client.patchset.rebase(meta.id, stale.patchset.id);
+    assert.deepEqual(rebased.conflictedPaths, []);
+    await client.patchset.apply(meta.id, rebased.patchset.id);
+    assert.equal(await fs.readFile(path.join(dir, "merge.txt"), "utf8"), "ONE\ntwo\nTHREE");
+
+    await assert.rejects(
+      () =>
+        client.patchset.prepare(meta.id, {
+          changes: [{ path: "bad.bin", dataBase64: "not-base64" }],
+        }),
+      (error: unknown) => error instanceof AnicodeApiError && error.status === 400,
+    );
 
     const fork = await client.session.fork(meta.id, { title: "分叉" });
     assert.notEqual(fork.id, meta.id);

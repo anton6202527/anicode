@@ -105,8 +105,8 @@ test("sandbox: resolveSandboxPolicy 显式优先，其次环境变量，默认�
   assert.equal(resolveSandboxPolicy("none", { AGENTX_BASH_SANDBOX: "read-only" }), "read-only");
 });
 
-test("sandbox: resolveSandboxNetwork 默认放行，AGENTX_SANDBOX_NETWORK=off 断网", () => {
-  assert.equal(resolveSandboxNetwork({}), true);
+test("sandbox: resolveSandboxNetwork 默认拒绝，仅显式 on 放行", () => {
+  assert.equal(resolveSandboxNetwork({}), false);
   assert.equal(resolveSandboxNetwork({ AGENTX_SANDBOX_NETWORK: "off" }), false);
   assert.equal(resolveSandboxNetwork({ AGENTX_SANDBOX_NETWORK: "0" }), false);
   assert.equal(resolveSandboxNetwork({ AGENTX_SANDBOX_NETWORK: "on" }), true);

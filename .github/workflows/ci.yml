@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Merge queue 创建临时 merge group；同一组 required checks 必须在该 SHA 上重跑。
+  merge_group:
+    types: [checks_requested]
 
 # 同一分支的旧运行取消，节省 CI 时间。
 concurrency:
@@ -37,6 +40,9 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Generated API contract is current
+        run: npm run codegen:check
 
       - name: Test
         run: npm test

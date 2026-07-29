@@ -10,5 +10,12 @@ import { JS_TASKS } from "./js.js";
 import { TS_TASKS } from "./ts.js";
 import { PY_TASKS } from "./python.js";
 import { GO_TASKS } from "./go.js";
+import { SCALED_TASKS } from "./scaled.js";
 
-export const BUILTIN_TASKS: EvalTask[] = [...JS_TASKS, ...TS_TASKS, ...PY_TASKS, ...GO_TASKS];
+export const BUILTIN_TASKS: EvalTask[] = [
+  ...JS_TASKS,
+  ...TS_TASKS,
+  ...PY_TASKS,
+  ...GO_TASKS,
+  ...SCALED_TASKS,
+];

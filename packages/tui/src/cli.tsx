@@ -24,6 +24,7 @@ import {
   listModelCatalog,
   SessionManager,
   SessionStore,
+  MigratingSessionStore,
   LocalSessionHost,
   DaemonClient,
   HttpSessionHost,
@@ -45,6 +46,13 @@ import {
   createDiagnosticsTool,
   LspPool,
   AuthStore,
+  createLocalRuntimeStack,
+  createConfiguredLocalRuntimeStack,
+  ContextCompiler,
+  Verifier,
+  SecurityPolicyEngine,
+  telemetryFromEnv,
+  telemetryForLocalStack,
   buildAuthUrl,
   exchangeCode,
   parseCallbackCode,
@@ -54,6 +62,8 @@ import {
   type CustomCommand,
   type Tool,
   type McpClient,
+  type LocalRuntimeStack,
+  type Telemetry,
 } from "@anicode/core";
 import { App } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
@@ -491,6 +501,8 @@ export async function buildHost(
     extraTools?: Tool[];
     deferredTools?: Tool[];
     plugins?: PluginDirs;
+    runtimeStack?: LocalRuntimeStack;
+    telemetry?: Telemetry;
   } = {},
 ): Promise<SessionHost> {
   if (args.daemon) {
@@ -512,6 +524,8 @@ export function buildManager(
     config?: AnicodeConfig;
     extraTools?: Tool[];
     deferredTools?: Tool[];
+    runtimeStack?: LocalRuntimeStack;
+    telemetry?: Telemetry;
     /** 插件目录（discoverPlugins 的产物）：agents/skills 子目录并入既有发现器。 */
     plugins?: PluginDirs;
   } = {},
@@ -528,8 +542,32 @@ export function buildManager(
   const skills = extras.plugins?.skills.length ? { dirs: extras.plugins.skills } : true;
   const extraTools = extras.extraTools ?? [];
   const deferredTools = extras.deferredTools ?? [];
+  const runtimeStack =
+    extras.runtimeStack ?? createLocalRuntimeStack(path.dirname(args.sessionsDir));
+  const configuredBrowser = browserToolOptions(config);
+  const securedBrowser =
+    configuredBrowser === false
+      ? false
+      : {
+          ...configuredBrowser,
+          ...(process.env.ANICODE_NETWORK_PROXY_URL
+            ? { proxyUrl: process.env.ANICODE_NETWORK_PROXY_URL }
+            : {}),
+          requireProxy: true,
+        };
   const manager = new SessionManager({
-    store: new SessionStore(args.sessionsDir),
+    store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(args.sessionsDir)),
+    runtime: runtimeStack.runtime,
+    artifacts: runtimeStack.artifacts,
+    commandInbox: runtimeStack.commandInbox,
+    outbox: runtimeStack.outbox,
+    networkProxy: runtimeStack.networkProxy,
+    worktreeOwnership: runtimeStack.worktreeOwnership,
+    contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
+    verifier: new Verifier({ autoDiscover: true }),
+    securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
+    telemetry: extras.telemetry ?? telemetryForLocalStack(runtimeStack),
+    isolatedRuntime: runtimeStack.isolatedRuntime,
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: {
@@ -548,7 +586,7 @@ export function buildManager(
     checkpoints: true, // 每轮前记工作区 git 快照，支持 /undo 回滚文件改动
     repoMap: true, // 会话开始注入代码骨架（repo map），帮模型少盲 grep、首次定位更准
     // 内置 browser 工具：写完前端自动开页验证。默认开启，config.browser=false 可关。
-    browser: browserToolOptions(config),
+    browser: securedBrowser,
 
     // MCP / diagnostics 等附加工具与内置工具合流；无附加工具时沿用默认工具集。
     // deferredTools（大量 MCP）延迟暴露：schema 不进请求，模型经 tool_search 按需激活。
@@ -614,8 +652,20 @@ export async function runServeCommand(
     );
   }
   const { config } = await loadConfig();
-  const manager = buildManager({ sessionsDir, permissionMode: "default" }, { config });
-  const server = new HttpDaemonServer({ manager, ...(token ? { token } : {}) });
+  const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
+  const manager = buildManager(
+    { sessionsDir, permissionMode: "default" },
+    { config, runtimeStack },
+  );
+  const server = new HttpDaemonServer({
+    manager,
+    ...(token ? { token } : {}),
+    onClose: async () => {
+      manager.dispose();
+      await runtimeStack.networkProxy.close();
+      await runtimeStack.database.close();
+    },
+  });
   await server.listen(port, hostAddr);
   out.write(
     t(
@@ -671,8 +721,9 @@ export async function runMcpCommand(
     }
   }
   const { config } = await loadConfig({ cwd });
-  const manager = buildManager({ sessionsDir, permissionMode }, { config });
-  return serveMcp({
+  const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
+  const manager = buildManager({ sessionsDir, permissionMode }, { config, runtimeStack });
+  const server = serveMcp({
     manager,
     model: model ?? config.model ?? resolveDefaultModel(),
     cwd,
@@ -680,6 +731,13 @@ export async function runMcpCommand(
     ...(io.output ? { output: io.output } : {}),
     serverInfo: { name: "anicode", version: CLI_VERSION },
   });
+  return {
+    close() {
+      server.close();
+      manager.dispose();
+      void runtimeStack.networkProxy.close().then(() => runtimeStack.database.close());
+    },
+  };
 }
 
 export async function runAuthCommand(
@@ -809,23 +867,25 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   if (argv[0] === "mcp") {
     await loadProjectEnv({ cwd: process.cwd() });
-    await runMcpCommand(argv.slice(1));
+    const server = await runMcpCommand(argv.slice(1));
     // stdio server 常驻直到 stdin 关闭（客户端断开）或收到信号。
     await new Promise<void>((resolve) => {
       process.stdin.once("end", resolve);
       process.once("SIGINT", resolve);
       process.once("SIGTERM", resolve);
     });
+    server.close();
     return;
   }
   if (argv[0] === "serve") {
     await loadProjectEnv({ cwd: process.cwd() });
-    await runServeCommand(argv.slice(1));
+    const server = await runServeCommand(argv.slice(1));
     // 前台常驻直到 SIGINT/SIGTERM。
     await new Promise<void>((resolve) => {
       process.once("SIGINT", resolve);
       process.once("SIGTERM", resolve);
     });
+    await server.close();
     return;
   }
 
@@ -882,6 +942,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const w of configWarnings)
     console.error(t(`${DISPLAY_NAME} config warning: ${w}`, `${DISPLAY_NAME} 配置告警: ${w}`));
 
+  // 安全栈必须先于 provider/MCP 创建：环境密钥此时迁入 Broker 并从进程环境删除，
+  // provider、HTTP MCP 与后续工具共用同一个策略出口和 trace exporter。
+  const localRuntimeStack =
+    !args.daemon && !args.http
+      ? await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir))
+      : undefined;
+  const telemetry = localRuntimeStack
+    ? telemetryForLocalStack(localRuntimeStack)
+    : telemetryFromEnv();
+
   // 未显式指定模型时挑默认：配置 model → 已配置凭证的 DeepSeek → 零网络 debug/demo。
   // 绝不因缺 DEEPSEEK_API_KEY 报错退出。
   if (!args.modelExplicit && !args.demo) {
@@ -906,11 +976,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // 连接配置里的 MCP 服务器（本地进程内模式才需要；daemon 由其自身进程负责）。
   let mcpClients: McpClient[] = [];
   let mcpTools: Tool[] = [];
-  if (!args.daemon) {
+  if (!args.daemon && !args.http) {
     const mcpConfigs = toMcpServerConfigs(config);
     if (mcpConfigs.length > 0) {
       try {
-        const connected = await connectMcpServers(mcpConfigs);
+        const connected = await connectMcpServers(mcpConfigs, {
+          telemetry,
+          networkProxy: localRuntimeStack!.networkProxy,
+          credentialBroker: localRuntimeStack!.broker,
+          executionRuntime: localRuntimeStack!.isolatedRuntime,
+        });
         mcpTools = connected.tools;
         mcpClients = connected.clients;
         console.error(
@@ -1026,6 +1101,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       extraTools,
       deferredTools,
       ...(plugins ? { plugins } : {}),
+      ...(localRuntimeStack ? { runtimeStack: localRuntimeStack } : {}),
+      telemetry,
     }).catch((err) => {
       throw new Error(
         t(
@@ -1085,6 +1162,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         // 关闭 MCP 子进程失败不影响退出
       }
     }
+    await localRuntimeStack?.networkProxy.close().catch(() => undefined);
+    await localRuntimeStack?.database.close().catch(() => undefined);
   }
 }
 

@@ -14,8 +14,15 @@ import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DaemonServer } from "./server.js";
 import { SessionManager } from "../session-manager.js";
-import { SessionStore } from "../session.js";
+import { MigratingSessionStore, SessionStore } from "../session.js";
 import { createProvider, diagnoseProvider } from "../provider/registry.js";
+import {
+  createConfiguredLocalRuntimeStack,
+  telemetryForLocalStack,
+} from "../runtime/local-stack.js";
+import { ContextCompiler } from "../runtime/context-compiler.js";
+import { Verifier } from "../runtime/verifier.js";
+import { SecurityPolicyEngine } from "../security/policy.js";
 
 export function defaultSocketPath(): string {
   return path.join(os.tmpdir(), "anicode.sock");
@@ -137,8 +144,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   await removeStaleSocket(args.socketPath);
 
+  const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir));
   const manager = new SessionManager({
-    store: new SessionStore(args.sessionsDir),
+    store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(args.sessionsDir)),
+    runtime: runtimeStack.runtime,
+    artifacts: runtimeStack.artifacts,
+    commandInbox: runtimeStack.commandInbox,
+    outbox: runtimeStack.outbox,
+    networkProxy: runtimeStack.networkProxy,
+    worktreeOwnership: runtimeStack.worktreeOwnership,
+    contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
+    verifier: new Verifier({ autoDiscover: true }),
+    securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
+    telemetry: telemetryForLocalStack(runtimeStack),
+    isolatedRuntime: runtimeStack.isolatedRuntime,
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: { mode: args.permissionMode },
@@ -154,6 +173,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const shutdown = async () => {
     await server.close();
+    await runtimeStack.networkProxy.close();
+    await runtimeStack.database.close();
     await fs.rm(args.socketPath, { force: true });
     process.exit(0);
   };

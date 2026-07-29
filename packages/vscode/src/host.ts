@@ -8,11 +8,17 @@ import * as path from "node:path";
 import {
   SessionManager,
   SessionStore,
+  MigratingSessionStore,
   createProvider,
   diagnoseProvider,
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
+  createLocalRuntimeStack,
+  ContextCompiler,
+  Verifier,
+  SecurityPolicyEngine,
+  telemetryForLocalStack,
   t,
 } from "@anicode/core";
 
@@ -32,8 +38,20 @@ export function resolveConfiguredProvider(model: string) {
 
 export function buildManager(sessionsDir?: string): SessionManager {
   const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
+  const runtimeStack = createLocalRuntimeStack(path.dirname(dir));
   return new SessionManager({
-    store: new SessionStore(dir),
+    store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(dir)),
+    runtime: runtimeStack.runtime,
+    artifacts: runtimeStack.artifacts,
+    commandInbox: runtimeStack.commandInbox,
+    outbox: runtimeStack.outbox,
+    networkProxy: runtimeStack.networkProxy,
+    worktreeOwnership: runtimeStack.worktreeOwnership,
+    contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
+    verifier: new Verifier({ autoDiscover: true }),
+    securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
+    telemetry: telemetryForLocalStack(runtimeStack),
+    isolatedRuntime: runtimeStack.isolatedRuntime,
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: { mode: "default" },

@@ -78,6 +78,7 @@ function offlineHost(
     onInterrupt?: () => void;
     onSend?: (text: string) => void;
     onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
+    onPermission?: (decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
   } = {},
 ): SessionHost {
   const id = options.id ?? "s_offline";
@@ -141,7 +142,8 @@ function offlineHost(
     async undo() {
       return { restored: 0, deleted: 0 };
     },
-    async answerPermission() {
+    async answerPermission(_sessionId, _permId, decision) {
+      options.onPermission?.(decision);
       return true;
     },
     dispose() {},
@@ -498,6 +500,28 @@ test("TUI: 权限弹窗期间 Escape 可中断会话", async () => {
   await tick(80);
 
   assert.equal(interrupts, 1);
+  assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+  view.unmount();
+});
+
+test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认", async () => {
+  const decisions: string[] = [];
+  const host = offlineHost({
+    pendingPermissions: [{ permId: "p-arrow", toolName: "edit", ruleKey: "src/app.ts" }],
+    onPermission: (decision) => decisions.push(decision),
+  });
+  const view = render(<App host={host} cwd="/fallback" model="fallback" sessionId="s_offline" />);
+  await tick(80);
+  const frame = view.lastFrame() ?? "";
+  assert.match(frame, /授权请求/);
+  assert.match(frame, /输入需求/);
+  assert.match(frame, /↑↓ 选择 · Enter 确认/);
+
+  view.stdin.write("\u001b[B");
+  view.stdin.write("\u001b[B");
+  view.stdin.write("\r");
+  await tick(80);
+  assert.deepEqual(decisions, ["allow_always"]);
   assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
   view.unmount();
 });
@@ -938,13 +962,18 @@ function panelRows(props: { text: string; cursor: number; width: number }): stri
         cursor={props.cursor}
         width={props.width}
         model="anthropic/claude-opus-4-8"
-        cwd="/Users/someone/work/a-rather-long-project-name"
         running={false}
         spinner="●"
       />,
     ).lastFrame() ?? "";
   return frame.replace(SGR, "").split("\n");
 }
+
+test("TUI: 输入面板只显示去掉 provider 的模型标识", () => {
+  const rows = panelRows({ text: "", cursor: 0, width: 80 });
+  assert.match(rows[3]!, /claude-opus-4-8/);
+  assert.doesNotMatch(rows[3]!, /anthropic|project| · /);
+});
 
 test("TUI: 窄屏输入面板不折行，占位与模型行按宽度截断", () => {
   for (const width of [60, 30, 20, 12]) {

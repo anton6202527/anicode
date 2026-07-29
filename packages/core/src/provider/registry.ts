@@ -7,6 +7,8 @@
  */
 
 import { t } from "../i18n.js";
+import type { NetworkProxy } from "../runtime/network-proxy.js";
+import type { CredentialBroker } from "../security/credentials.js";
 import type { Provider } from "../types.js";
 import { AuthStore } from "../auth/store.js";
 import { DebugProvider } from "./debug.js";
@@ -196,6 +198,18 @@ export interface OpenAICompatibleProviderRegistration {
 
 const providers = new Map<string, RegisteredProvider>();
 const canonical = new Map<string, RegisteredProvider>();
+let providerCredentialBroker: CredentialBroker | undefined;
+let providerNetworkProxy: NetworkProxy | undefined;
+
+/** 宿主把环境/Keychain/Vault 密钥导入 Broker 后调用；provider adapter 优先从 Broker 取。 */
+export function configureProviderCredentialBroker(broker: CredentialBroker | undefined): void {
+  providerCredentialBroker = broker;
+}
+
+/** 生产宿主把 provider SDK 的 fetch 也收口到同一策略化出口。 */
+export function configureProviderNetworkProxy(proxy: NetworkProxy | undefined): void {
+  providerNetworkProxy = proxy;
+}
 
 /** 进程内共享的凭证存储（OAuth 等）；路径可由 ANICODE_AUTH_FILE 覆盖。 */
 let sharedAuthStore: AuthStore | null = null;
@@ -261,6 +275,56 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
       },
     ],
   }),
+  openAI(
+    "gemini",
+    "Gemini",
+    "https://generativelanguage.googleapis.com/v1beta/openai/",
+    ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    {
+      baseURLEnv: "GEMINI_BASE_URL",
+      streamUsage: false,
+      maxTokensField: "max_tokens",
+      reasoningEffort: false,
+      capabilities: { ...cloudDefaults, images: true },
+      limits: { contextWindow: 1_048_576, maxOutputTokens: 8_192 },
+      models: [
+        {
+          pattern: "gemini-2.5-flash*",
+          limits: { maxOutputTokens: 8_192 },
+          cost: { input: 0.075, output: 0.3, cacheRead: 0.0025 },
+        },
+        {
+          pattern: "gemini-2.5-pro*",
+          capabilities: { reasoning: true },
+          limits: { maxOutputTokens: 65_536 },
+          cost: { input: 1.25, output: 10.0, cacheRead: 0.0425 },
+        },
+        {
+          pattern: "gemini-2.0-flash*",
+          limits: { maxOutputTokens: 8_192 },
+          cost: { input: 0.1, output: 0.4, cacheRead: 0.0025 },
+        },
+      ],
+      catalog: [
+        {
+          model: "gemini-2.5-flash",
+          label: "Gemini 2.5 Flash",
+          recommended: true,
+          note: "快速模型，Google Gemini",
+        },
+        {
+          model: "gemini-2.5-pro",
+          label: "Gemini 2.5 Pro",
+          note: "强推理模型，Google Gemini",
+        },
+        {
+          model: "gemini-2.0-flash",
+          label: "Gemini 2.0 Flash",
+          note: "上一代快速模型",
+        },
+      ],
+    },
+  ),
   // 通用 OpenAI Chat Completions 兼容端点。它必须是内置项，因为 anicode.json
   // 只能选择 provider，无法在启动前调用 registerProvider；缺少此项会让文档中的
   // `model: "custom/<model>"` 在应用创建首个会话时直接报「未知 provider」。
@@ -367,6 +431,15 @@ export function registerOpenAICompatibleProvider(
         // 始终显式传入（包括空串），禁止 SDK 回退到 OPENAI_API_KEY。
         apiKey: runtime.apiKey,
         maxRetries: 0,
+        ...(!d.local && providerNetworkProxy
+          ? {
+              fetch: ((input: string | URL | Request, init?: RequestInit) =>
+                providerNetworkProxy!.fetch(
+                  typeof input === "string" || input instanceof URL ? input : input.url,
+                  init,
+                )) as typeof fetch,
+            }
+          : {}),
         ...(input.defaultHeaders ? { defaultHeaders: input.defaultHeaders } : {}),
         ...(input.streamUsage !== undefined ? { streamUsage: input.streamUsage } : {}),
         ...(input.maxTokensField !== undefined ? { maxTokensField: input.maxTokensField } : {}),
@@ -383,10 +456,14 @@ export function registerOpenAICompatibleProvider(
  */
 const SMALL_MODELS: Record<string, string> = {
   deepseek: "deepseek/deepseek-v4-flash",
+  gemini: "gemini/gemini-2.5-flash",
 };
 
 /** 未显式指定模型时，按凭证就绪状态挑选云端默认模型。 */
-const DEFAULT_MODEL_PREFERENCES = ["deepseek/deepseek-v4-flash"] as const;
+const DEFAULT_MODEL_PREFERENCES = [
+  "deepseek/deepseek-v4-flash",
+  "gemini/gemini-2.5-flash",
+] as const;
 
 export function resolveDefaultModel(): string {
   for (const spec of DEFAULT_MODEL_PREFERENCES) {
@@ -522,7 +599,8 @@ function runtimeConfig(
   directApiKey?: string,
 ): { baseURL?: string; apiKey: string } {
   const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv) : undefined;
-  const credential = directApiKey ?? findCredential(d.apiKeyEnv)?.value;
+  const credential =
+    directApiKey ?? findCredential(d.apiKeyEnv, `provider:${d.id}`, envBase ?? d.baseURL)?.value;
   return {
     ...((envBase ?? d.baseURL) ? { baseURL: envBase ?? d.baseURL } : {}),
     // 本地匿名服务仍给 SDK 一个无敏感性的占位 key；云端缺 key 用空串尽早失败。
@@ -533,8 +611,8 @@ function runtimeConfig(
 function diagnosticsFor(entry: RegisteredProvider, model: string): ProviderDiagnostics {
   const d = entry.descriptor;
   const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv) : undefined;
-  const credential = findCredential(d.apiKeyEnv);
   const baseURL = envBase ?? d.baseURL;
+  const credential = findCredential(d.apiKeyEnv, `provider:${d.id}`, baseURL);
   const warnings: string[] = [];
   // OAuth 订阅登录也算有凭证（无需 API key）。
   const hasOAuth = defaultAuthStore().getSync(d.id)?.type === "oauth";
@@ -565,8 +643,32 @@ function diagnosticsFor(entry: RegisteredProvider, model: string): ProviderDiagn
   };
 }
 
-function findCredential(names: readonly string[]): { name: string; value: string } | undefined {
+function findCredential(
+  names: readonly string[],
+  audience?: string,
+  baseURL?: string,
+): { name: string; value: string } | undefined {
   for (const name of names) {
+    const brokerId = `env:${name}`;
+    if (providerCredentialBroker?.has(brokerId) && audience) {
+      let host: string | undefined;
+      try {
+        host = baseURL ? new URL(baseURL).hostname : undefined;
+      } catch {
+        /* 非法 URL 由 provider 自身诊断；scope 保守按无 host 处理。 */
+      }
+      try {
+        return {
+          name,
+          value: providerCredentialBroker.trustedValue(brokerId, {
+            audience,
+            ...(host ? { host } : {}),
+          }),
+        };
+      } catch {
+        continue;
+      }
+    }
     const value = nonEmptyEnv(name);
     if (value !== undefined) return { name, value };
   }

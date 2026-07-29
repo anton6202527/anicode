@@ -9,6 +9,7 @@ import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
 import { ripgrepAvailable, runRipgrep } from "./ripgrep.js";
 import { t } from "../i18n.js";
+import { PatchSetService } from "../runtime/patchset.js";
 
 const MAX_RESULTS = 200;
 
@@ -240,10 +241,11 @@ export const writeTool: Tool = {
     const abs = await resolveInside(ctx.cwd, input["path"]);
     const content = String(input["content"] ?? "");
     ensureActive(ctx);
-    await fs.mkdir(path.dirname(abs), { recursive: true });
+    const service = new PatchSetService(ctx.cwd);
+    const patchset = await service.prepare([{ path: abs, content }]);
     ensureActive(ctx);
-    await fs.writeFile(abs, content, "utf8");
-    return `已写入 ${rel(ctx.cwd, abs)}（${content.length} 字符）`;
+    await service.apply(patchset);
+    return `已写入 ${rel(ctx.cwd, abs)}（${content.length} 字符，PatchSet ${patchset.id}）`;
   },
 };
 
@@ -295,10 +297,15 @@ export const editTool: Tool = {
 
     const { updated, replaced, mode } = applyEdit(content, oldStr, newStr, replaceAll);
     ensureActive(ctx);
-    await fs.writeFile(abs, updated, "utf8");
+    const service = new PatchSetService(ctx.cwd);
+    const patchset = await service.prepare([{ path: abs, content: updated }]);
+    ensureActive(ctx);
+    await service.apply(patchset);
     // mode=fuzzy 时提示模型这次靠空白容差匹配上了，下次可给更精确的 old_string。
     const note = mode === "fuzzy" ? "（按空白容差匹配）" : "";
-    return `已修改 ${rel(ctx.cwd, abs)}（替换 ${replaced} 处${note ? " " + note : ""}）`;
+    return `已修改 ${rel(ctx.cwd, abs)}（替换 ${replaced} 处${
+      note ? " " + note : ""
+    }，PatchSet ${patchset.id}）`;
   },
 };
 

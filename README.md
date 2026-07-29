@@ -16,7 +16,7 @@ packages/
 Electron IPC、VSCode webview postMessage 只是同一契约的不同「传输」实现，可互换。transcript / Markdown /
 diff 等前端无关的纯逻辑集中在 `@anicode/shared`，三端共用、单独测试。
 
-当前全仓类型检查通过，离线测试 **core 241 + eval 4 + shared 6 + TUI 50 + app 16 + vscode 8，共 325 个**。测试不需要真实 API key。
+当前全仓类型检查通过，离线测试 **core 470 + eval 9 + SDK 5 + shared 6 + TUI 74 + app 19 + vscode 8，共 591 个**。默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，昂贵的真实模型运行留给显式 nightly job。
 
 ## 先本地调试 TUI
 
@@ -33,7 +33,8 @@ npm run dev:tui
 
 ```text
 .anicode-dev/
-  sessions/       调试会话
+  sessions/       旧 JSONL 会话迁移源/备份
+  runtime.db      SQLite WAL 会话与运行时事实主库
   tui.jsonl       调试日志
 ```
 
@@ -51,6 +52,19 @@ npm run dev:tui
 ```bash
 npm run dev:tui:demo
 ```
+
+高安全联网模式先启动本地出口，再把 browser/联网命令绑定到它；provider 与 HTTP MCP 本身会直接复用同一策略代理：
+
+```bash
+# 终端 1
+HOST=127.0.0.1 PORT=8787 ANICODE_NETWORK_ALLOW_DOMAINS=api.github.com,github.com \
+  npm run network-proxy --workspace @anicode/core
+
+# 终端 2
+ANICODE_NETWORK_PROXY_URL=http://127.0.0.1:8787 npm run dev:tui
+```
+
+默认长期凭证后端是 OS Keychain；也可设置 `ANICODE_CREDENTIAL_BACKEND=vault|kms`，通过 OIDC/workload identity 读取后端中的 `env:NAME`。完整配置、Remote Runtime 与验收边界见[第三轮生产化归档](docs/architecture/2026-07-29-runtime-hardening-round-3.md)。
 
 TUI 内可用命令：
 
@@ -96,7 +110,7 @@ npm run build:app    # 打包 main/preload/renderer 到 packages/app/out
 
 - **对话与流式渲染**：气泡式界面，助手消息经内置轻量 Markdown 渲染（围栏代码块带复制按钮、
   行内代码 / 粗体 / 链接 / 列表 / 标题），且绝不注入原始 HTML（无 XSS）。
-- **自动标题**：新会话发出首条消息后，用首句自动命名（离线、无需额外模型调用），持久化到会话文件。
+- **自动标题**：新会话发出首条消息后，用首句自动命名（离线、无需额外模型调用），事务写入会话数据库。
 - **模型选择器**：复用内置免费 / 开源目录，主进程算好凭证就绪状态；可用的排前并标 ✔。
 - **自定义模型**：设置页可为任意已有 provider 追加模型（持久化到 `userData/models.json`），
   立即出现在选择器里——回答了「模型是否只能写死在代码里」。
@@ -104,7 +118,7 @@ npm run build:app    # 打包 main/preload/renderer 到 packages/app/out
 
 **插件市场 → 真实工具链**：插件统一抽象为可挂到 agent 的能力来源——内建工具（文件 / Bash / 任务清单）、
 MCP 服务（Web 搜索 / GitHub / Playwright）、技能。开关会真正改变 agent 拿到的工具集：停用内建工具组会
-从工具集移除对应工具；启用 MCP 且凭证就绪时连接 server 并注入其工具（`<name>__<tool>`），市场卡片显示连接
+从工具集移除对应工具；启用 MCP 且 Broker 凭证就绪时连接 server 并注入其工具（`<name>__<tool>`），stdio 插件进程由隔离运行时启动，联网插件强制复用策略代理，市场卡片显示连接
 状态。改动对新建会话生效，状态持久化到 `userData/plugins.json`。
 
 **打包分发**（electron-builder，主进程已把 core 与 SDK 依赖打进 bundle，产物自包含）：
@@ -130,6 +144,8 @@ agent 的 cwd**，状态栏显示当前模型，首条消息后自动命名会�
 npm run build:vscode                       # esbuild 打包 out/extension.js 与 out/webview.js
 npm run package --workspace anicode-vscode  # 产出可安装的 anicode.vsix
 ```
+
+Tree-sitter 与 OS Keychain 含原生 N-API 模块，本地 `.vsix` 对应当前 OS/CPU；Release workflow 会分别产出 Linux x64/arm64、macOS arm64/x64 与 Windows x64 安装包。
 
 在 VSCode 里以该目录为「扩展开发宿主」按 F5 即可调试。
 
@@ -247,8 +263,8 @@ registerOpenAICompatibleProvider({
   - 硬性上限（防失控）：嵌套深度、单会话 spawn 总量、后台并发；子 agent 结论过滤通知信封标记（防伪装宿主控制信息）。agent 间 peer 通信刻意不做（对齐 opencode not-planned / Claude Code 实验 flag 的取舍）。
 - **后台长时命令**：`bash(run_in_background)` 立即返回 shell id 不阻塞，`bash_output` 增量读取新输出（可选正则 filter），`kill_shell` 停止 —— dev server / watch 构建 / 日志跟随不再被 120s 超时打死。增量读取（读过即清）、有界缓冲、自动回收、宿主退出收尸，且**不主动往上下文塞提醒**，规避 Claude Code 后台任务刷爆上下文的已知坑。后台与前台共用同一套 OS 沙箱，绝非绕过通道。见 `tools/shells.ts`。
 - **多模态 read**：`read` 可读图片（png/jpg/gif/webp），模型支持视觉时经 `ctx.attachImage` 把图片本体附在本轮 tool_result 之后送入同一条 user 消息；不支持视觉/超 3.7MB 时如实降级为文本说明。两端 provider 映射（Anthropic `image` 块 / OpenAI `image_url`）已实测通过，无需改 provider。见 `tools/fs.ts`、`tools/tool.ts` 的 `ToolContext.attachImage`。
-- **repo map**：会话开始时按 token 预算注入关键文件与顶层符号签名，基于跨文件引用词频排序，减少首次定位时的盲目检索。
-- **结构化补丁**：`apply_patch` 支持一次增/改/删多个文件，带精确定位、空白容差与最接近片段错误提示。
+- **类型化 repo map**：Tree-sitter/ast-grep 覆盖 JS/TS/Python/Go/Rust/Java，可选 LSP enrich，维护增量 symbol/reference graph，并以 lexical + graph + SQLite/pgvector 混合检索减少盲目定位。
+- **事务化 PatchSet**：`write` / `edit` / `apply_patch` 统一走预览、base hash 冲突检测、审批、原子 journal、崩溃恢复与回滚；支持 rename、binary 和三方 merge。
 - **ripgrep 后端检索**：检测到 `rg` 时 grep/glob 走 ripgrep（尊重 .gitignore、跳过二进制、按 mtime 排序），无 rg 自动回退纯 JS。grep 支持 `output_mode`（content/files_with_matches/count）、`ignore_case`、`context` 前后行、`path`/`glob` 限定。
 - **read 加固**：NUL 字节识别二进制（不返回乱码）、超长单行截断（防炸上下文）。
 - **重试尊重 `Retry-After`**：429/503 带该头时按服务端节流等待（与指数退避取较大值，封顶 60s）。
@@ -256,9 +272,9 @@ registerOpenAICompatibleProvider({
 - 每轮可创建 git 工作区快照，TUI 用 `/undo` 恢复文件；macOS Seatbelt 与 Linux bubblewrap 可为 Bash 提供 OS 级沙箱。
 - 项目记忆：向上发现 `AGENTS.md` / `CLAUDE.md`，止于 `.git` 边界。
 - 两级 compaction：先清理旧工具输出，再在安全边界生成摘要，保持 tool call/result 配对。
-- JSONL 会话持久化、resume、最近活跃排序、悬空工具调用自愈。
+- SQLite WAL 会话持久化、resume、最近活跃排序、悬空工具调用自愈；旧 JSONL 首次访问时幂等迁移，数据库较新时不回灌。
 - `SessionHost` 抽象与 daemon pub/sub：本地 TUI 和远程客户端使用同一接口，多客户端可观察、接管和裁决权限。
-- MCP：stdio（规范的换行分隔 JSON-RPC）+ Streamable HTTP 客户端；`anicode mcp` 把自身暴露为 MCP server（`anicode` 跑新会话 / `anicode_reply` 续会话，对齐 `codex mcp-server`），任意 MCP 客户端可嵌入。
+- MCP：stdio（规范的换行分隔 JSON-RPC）+ Streamable HTTP 客户端；HTTP 强制受控出口，敏感 header/env 只能由 Credential Broker 短租约注入；stdio 可由同一 OS 隔离运行时启动。`anicode mcp` 也可把自身暴露为 MCP server。
 - Notification hook（turn_done / permission_request）+ TUI 授权响铃：配合 anicode.json 命令 hook 可外接桌面通知（对齐 Codex notify）。
 - 插件目录：`~/.anicode/plugins/<name>/` 与项目 `.anicode/plugins/<name>/` 下的 agents/skills/commands 子目录自动并入发现器（Claude Code plugins 的精简形态）。
 - TUI：`/diff`（工作区改动）、`/review`（uncommitted/branch/commit/自定义 四模式审查）、`/tasks`（后台任务一览）、`/status` 显示上下文占用（tokens/窗口/百分比）。
@@ -312,7 +328,7 @@ npm run build:app
 npm run build:vscode
 ```
 
-当前覆盖 325 个离线测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、repo map、结构化补丁、检查点回滚、macOS/Linux 沙箱、环境接地渲染、ripgrep/JS 双后端检索、后台 shell 生命周期（增量读取/容量淘汰/filter 计数/收尸）、多模态 read（魔数校验/降级/图片在 tool_result 之后的排序不变量）、私有会话权限、会话竞态、daemon 多客户端与大快照，以及三端 UI 交互。
+当前覆盖 591 个离线测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端 UI 交互。
 
 `@anicode/eval` 还提供带自校验的真实编辑任务，可汇总通过率、轮数、token 与编辑失败率：
 

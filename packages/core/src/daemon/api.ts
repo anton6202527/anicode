@@ -20,7 +20,17 @@ export interface RouteDef {
   request?: Record<string, unknown>;
   /** 成功响应：204 表示无 body；schema 表示 200 JSON；"sse" 表示事件流 */
   response: Record<string, unknown> | 204 | "sse";
-  tag: "global" | "session" | "message" | "permission";
+  tag: "global" | "session" | "message" | "permission" | "artifact" | "runtime" | "patchset";
+}
+
+/** 稳定 operationId：同时供 OpenAPI 与 SDK codegen 使用。 */
+export function operationIdFor(route: Pick<RouteDef, "method" | "path">): string {
+  const words = route.path
+    .split("/")
+    .filter(Boolean)
+    .map((part) => part.replace(/[{}]/g, ""))
+    .flatMap((part) => part.split(/[^A-Za-z0-9]+/).filter(Boolean));
+  return `${route.method}${words.map((word) => word[0]!.toUpperCase() + word.slice(1)).join("")}`;
 }
 
 const SESSION_SUMMARY = { $ref: "#/components/schemas/SessionSummary" };
@@ -125,13 +135,177 @@ export const ROUTES: RouteDef[] = [
     tag: "session",
   },
   {
+    method: "get",
+    path: "/sessions/{id}/artifacts",
+    summary: "列出会话 Artifacts",
+    response: { type: "array", items: { $ref: "#/components/schemas/Artifact" } },
+    tag: "artifact",
+  },
+  {
+    method: "post",
+    path: "/sessions/{id}/artifacts",
+    summary: "创建 Artifact（text 或 dataBase64 二选一）",
+    request: {
+      type: "object",
+      required: ["kind", "name"],
+      properties: {
+        kind: { type: "string" },
+        name: { type: "string" },
+        mediaType: { type: "string" },
+        text: { type: "string" },
+        dataBase64: { type: "string" },
+        metadata: { type: "object" },
+      },
+    },
+    response: { $ref: "#/components/schemas/Artifact" },
+    tag: "artifact",
+  },
+  {
+    method: "get",
+    path: "/sessions/{id}/artifacts/{artifactId}",
+    summary: "读取 Artifact 元数据与 base64 内容",
+    response: {
+      type: "object",
+      properties: {
+        artifact: { $ref: "#/components/schemas/Artifact" },
+        dataBase64: { type: "string" },
+      },
+    },
+    tag: "artifact",
+  },
+  {
+    method: "delete",
+    path: "/sessions/{id}/artifacts/{artifactId}",
+    summary: "删除会话对 Artifact 的引用",
+    response: 204,
+    tag: "artifact",
+  },
+  {
+    method: "post",
+    path: "/sessions/{id}/patchsets",
+    summary: "准备事务 PatchSet（text/binary/delete/rename），返回预览与 Artifact；不立即写盘",
+    request: {
+      type: "object",
+      required: ["changes"],
+      properties: {
+        changes: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            required: ["path"],
+            properties: {
+              path: { type: "string" },
+              text: { type: "string" },
+              dataBase64: { type: "string" },
+              delete: { type: "boolean" },
+              renameFrom: { type: "string" },
+            },
+          },
+        },
+        requiredApprovals: { type: "integer", minimum: 0 },
+        requiredRoles: { type: "array", items: { type: "string" } },
+      },
+    },
+    response: {
+      type: "object",
+      properties: {
+        patchset: { $ref: "#/components/schemas/PatchSet" },
+        preview: { type: "string" },
+        artifact: { $ref: "#/components/schemas/Artifact" },
+      },
+    },
+    tag: "patchset",
+  },
+  {
+    method: "get",
+    path: "/sessions/{id}/patchsets/{patchsetId}",
+    summary: "读取 PatchSet journal 与预览",
+    response: {
+      type: "object",
+      properties: {
+        patchset: { $ref: "#/components/schemas/PatchSet" },
+        preview: { type: "string" },
+      },
+    },
+    tag: "patchset",
+  },
+  {
+    method: "post",
+    path: "/sessions/{id}/patchsets/{patchsetId}/approve",
+    summary: "记录 PatchSet 角色审批或拒绝",
+    request: {
+      type: "object",
+      required: ["actor", "role", "decision"],
+      properties: {
+        actor: { type: "string" },
+        role: { type: "string" },
+        decision: { type: "string", enum: ["approve", "reject"] },
+        comment: { type: "string" },
+      },
+    },
+    response: { $ref: "#/components/schemas/PatchSet" },
+    tag: "patchset",
+  },
+  {
+    method: "post",
+    path: "/sessions/{id}/patchsets/{patchsetId}/apply",
+    summary: "校验 base hash 与审批链后原子提交 PatchSet",
+    request: { type: "object" },
+    response: { $ref: "#/components/schemas/PatchSet" },
+    tag: "patchset",
+  },
+  {
+    method: "post",
+    path: "/sessions/{id}/patchsets/{patchsetId}/rebase",
+    summary: "把 stale 文本 PatchSet 三方合并到当前工作区并生成新事务",
+    request: { type: "object" },
+    response: {
+      type: "object",
+      properties: {
+        patchset: { $ref: "#/components/schemas/PatchSet" },
+        conflictedPaths: { type: "array", items: { type: "string" } },
+      },
+    },
+    tag: "patchset",
+  },
+  {
+    method: "post",
+    path: "/sessions/{id}/patchsets/{patchsetId}/rollback",
+    summary: "回滚已提交 PatchSet；默认拒绝覆盖提交后的外部改动",
+    request: {
+      type: "object",
+      properties: { force: { type: "boolean" } },
+    },
+    response: { $ref: "#/components/schemas/PatchSet" },
+    tag: "patchset",
+  },
+  {
+    method: "get",
+    path: "/sessions/{id}/runtime-events",
+    summary: "读取 Durable Runtime v2 事件；?afterSequence=N 增量读取",
+    response: { type: "array", items: { $ref: "#/components/schemas/RuntimeEvent" } },
+    tag: "runtime",
+  },
+  {
+    method: "get",
+    path: "/sessions/{id}/runtime-state",
+    summary: "从事件事实源恢复运行态投影",
+    response: { type: "object" },
+    tag: "runtime",
+  },
+  {
     method: "post",
     path: "/sessions/{id}/send",
     summary: "发消息驱动 agent loop（drive 收尾后返回）",
     request: {
       type: "object",
       required: ["text"],
-      properties: { text: { type: "string" }, model: { type: "string" } },
+      properties: {
+        text: { type: "string" },
+        model: { type: "string" },
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
+      },
     },
     response: 204,
     tag: "message",
@@ -253,6 +427,7 @@ export const EVENTS: Record<string, string> = {
   "message.updated": "消息元数据创建/完成：{ info: MessageInfo }",
   "message.part.updated": "part 创建或到达终态：{ part: MessagePart }",
   "message.part.delta": "流式增量：{ sessionId, messageId, partId, field: text|input, delta }",
+  "verification.completed": "确定性验证完成：{ sessionId, report }",
 };
 
 /** 协议版本：信封或路由的不兼容变更时 +1。 */
@@ -326,6 +501,87 @@ const COMPONENT_SCHEMAS: Record<string, Record<string, unknown>> = {
       properties: { type: "object" },
     },
   },
+  Artifact: {
+    type: "object",
+    required: [
+      "id",
+      "sessionId",
+      "kind",
+      "name",
+      "mediaType",
+      "sizeBytes",
+      "sha256",
+      "createdAt",
+      "uri",
+    ],
+    properties: {
+      id: { type: "string" },
+      sessionId: { type: "string" },
+      kind: { type: "string" },
+      name: { type: "string" },
+      mediaType: { type: "string" },
+      sizeBytes: { type: "integer" },
+      sha256: { type: "string" },
+      createdAt: { type: "string", format: "date-time" },
+      uri: { type: "string" },
+      metadata: { type: "object" },
+    },
+  },
+  RuntimeEvent: {
+    type: "object",
+    required: ["id", "version", "streamId", "sequence", "timestamp", "type", "data"],
+    properties: {
+      id: { type: "string" },
+      version: { type: "integer", const: 2 },
+      streamId: { type: "string" },
+      sequence: { type: "integer" },
+      timestamp: { type: "string", format: "date-time" },
+      type: { type: "string" },
+      data: {},
+    },
+  },
+  PatchSet: {
+    type: "object",
+    required: [
+      "version",
+      "id",
+      "root",
+      "status",
+      "createdAt",
+      "updatedAt",
+      "changes",
+      "requiredApprovals",
+      "requiredRoles",
+      "approvals",
+      "appliedCount",
+    ],
+    properties: {
+      version: { type: "integer", const: 2 },
+      id: { type: "string" },
+      root: { type: "string" },
+      status: {
+        type: "string",
+        enum: [
+          "planned",
+          "pending_approval",
+          "approved",
+          "applying",
+          "applied",
+          "conflict",
+          "rolled_back",
+          "failed",
+        ],
+      },
+      createdAt: { type: "string", format: "date-time" },
+      updatedAt: { type: "string", format: "date-time" },
+      changes: { type: "array", items: { type: "object" } },
+      requiredApprovals: { type: "integer" },
+      requiredRoles: { type: "array", items: { type: "string" } },
+      approvals: { type: "array", items: { type: "object" } },
+      appliedCount: { type: "integer" },
+      error: { type: "string" },
+    },
+  },
 };
 
 /** 生成 OpenAPI 3.1 文档（`GET /doc`）。 */
@@ -333,11 +589,17 @@ export function generateOpenApi(): Record<string, unknown> {
   const paths: Record<string, Record<string, unknown>> = {};
   for (const route of ROUTES) {
     const op: Record<string, unknown> = {
+      operationId: operationIdFor(route),
       summary: route.summary,
       tags: [route.tag],
-      ...(route.path.includes("{id}")
+      ...([...route.path.matchAll(/\{([^}]+)\}/g)].length
         ? {
-            parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+            parameters: [...route.path.matchAll(/\{([^}]+)\}/g)].map((match) => ({
+              name: match[1],
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            })),
           }
         : {}),
       ...(route.request
@@ -367,7 +629,7 @@ export function generateOpenApi(): Record<string, unknown> {
     (paths[route.path] ??= {})[route.method] = op;
   }
   return {
-    openapi: "3.1.0",
+    openapi: "3.1.1",
     info: {
       title: "anicode server",
       version: `${PROTOCOL_VERSION}.0.0`,
@@ -380,4 +642,37 @@ export function generateOpenApi(): Record<string, unknown> {
     components: { schemas: COMPONENT_SCHEMAS },
     "x-events": EVENTS,
   };
+}
+
+/** 轻量契约校验：codegen/CI 在不引入大型 validator 的情况下阻止漂移。 */
+export function validateOpenApiDocument(document = generateOpenApi()): string[] {
+  const errors: string[] = [];
+  const paths = document["paths"] as Record<string, Record<string, unknown>> | undefined;
+  const operationIds = new Set<string>();
+  if (!paths) return ["document.paths is missing"];
+  for (const route of ROUTES) {
+    const operation = paths[route.path]?.[route.method] as Record<string, unknown> | undefined;
+    if (!operation) {
+      errors.push(`missing operation: ${route.method.toUpperCase()} ${route.path}`);
+      continue;
+    }
+    const operationId = operation["operationId"];
+    if (typeof operationId !== "string" || !operationId)
+      errors.push(`missing operationId: ${route.path}`);
+    else if (operationIds.has(operationId)) errors.push(`duplicate operationId: ${operationId}`);
+    else operationIds.add(operationId);
+    const declared = new Set(
+      ((operation["parameters"] as { name?: string; in?: string; required?: boolean }[]) ?? [])
+        .filter((parameter) => parameter.in === "path" && parameter.required)
+        .map((parameter) => parameter.name),
+    );
+    for (const match of route.path.matchAll(/\{([^}]+)\}/g)) {
+      if (!declared.has(match[1]))
+        errors.push(`missing required path parameter ${match[1]}: ${route.path}`);
+    }
+    const responses = operation["responses"] as Record<string, unknown> | undefined;
+    if (!responses || Object.keys(responses).length === 0)
+      errors.push(`missing response: ${route.path}`);
+  }
+  return errors;
 }

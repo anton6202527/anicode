@@ -23,6 +23,7 @@ import type {
   ChatMessage,
   CustomCommand,
   ModelCatalogEntry,
+  PermissionAnswer,
   PermissionMode,
   ProviderDescriptor,
   SessionEvent,
@@ -613,7 +614,18 @@ export function App({
   const pasteSubmitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 权限请求队列：并行只读工具可能同时产生多个 ask（如 askRules 命中），逐个裁决
   const [pendings, setPendings] = useState<PendingPerm[]>([]);
+  const [permissionIndex, setPermissionIndex] = useState(0);
+  const permissionIndexRef = useRef(0);
+  const setPermissionSelection = useCallback((index: number) => {
+    const value = ((index % 4) + 4) % 4;
+    permissionIndexRef.current = value;
+    setPermissionIndex(value);
+  }, []);
   const [sessions, setSessions] = useState<SessionPickerState | null>(null);
+  const activePermissionId = pendings[0]?.permId;
+  useEffect(() => {
+    setPermissionSelection(0);
+  }, [activePermissionId, setPermissionSelection]);
   // /model 选择器：非空即打开，index 为高亮项，filter 为搜索词。
   const [picker, setPicker] = useState<{ rows: PickerRow[]; index: number; filter: string } | null>(
     null,
@@ -1703,17 +1715,51 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         });
         return;
       }
-      const kind =
-        ch === "y" || ch === "Y"
-          ? "allow"
-          : ch === "a" || ch === "A"
-            ? "allow_remember"
-            : ch === "p" || ch === "P"
-              ? "allow_always"
-              : ch === "n" || ch === "N"
-                ? "deny"
-                : null;
+      const options: PermissionAnswer[] = ["allow", "allow_remember", "allow_always", "deny"];
+      let selectedByMouse: PermissionAnswer | null = null;
+      if (mouse !== null) {
+        if (mouse.wheelDelta !== 0) {
+          setPermissionSelection(permissionIndexRef.current + mouse.wheelDelta);
+        } else if (mouse.leftClick) {
+          const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
+          const sprite = buildPermissionOverlay(
+            pendings,
+            termRows,
+            termCols,
+            permissionIndexRef.current,
+            anchor,
+          );
+          const clicked = hitTestSprite(sprite, mouse.leftClick.column, mouse.leftClick.row);
+          if (clicked !== null) {
+            setPermissionSelection(clicked);
+            selectedByMouse = options[clicked] ?? null;
+          }
+        }
+        if (!selectedByMouse) return;
+      }
+      if (key.upArrow || key.leftArrow) {
+        setPermissionSelection(permissionIndexRef.current - 1);
+        return;
+      }
+      if (key.downArrow || key.rightArrow) {
+        setPermissionSelection(permissionIndexRef.current + 1);
+        return;
+      }
+      const kind: PermissionAnswer | null = selectedByMouse
+        ? selectedByMouse
+        : key.return
+          ? options[permissionIndexRef.current]!
+          : ch === "y" || ch === "Y"
+            ? "allow"
+            : ch === "a" || ch === "A"
+              ? "allow_remember"
+              : ch === "p" || ch === "P"
+                ? "allow_always"
+                : ch === "n" || ch === "N"
+                  ? "deny"
+                  : null;
       if (!kind) return; // 方向键/误触等不应被当成拒绝
+      setPermissionSelection(0);
       setPendings((q) => q.slice(1));
       void host
         .answerPermission(sessionId, pending.permId, kind)
@@ -1929,7 +1975,10 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         buildModelPickerOverlay(visible, picker.index, picker.filter, termRows, termCols),
       );
     }
-    if (pendings[0]) return show(buildPermissionOverlay(pendings, termRows, termCols));
+    if (pendings[0]) {
+      const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
+      return show(buildPermissionOverlay(pendings, termRows, termCols, permissionIndex, anchor));
+    }
     if (sessions) {
       const visible = filterSessionRows(sessions.rows, sessions.filter);
       return show(
@@ -1953,6 +2002,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     overlayMode,
     picker,
     pendings,
+    permissionIndex,
     sessions,
     sessionId,
     input,
@@ -2003,7 +2053,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
 
   // 浮层模式下背景常驻可见（对齐 opencode），故弹框打开时仍渲染输入框；
   // 非浮层模式沿用旧行为：被授权弹窗/选择器接管时不渲染输入框。
-  const showInput = overlayMode || (!pendings[0] && !picker && !sessions);
+  const showInput = overlayMode || (!picker && !sessions);
   // 非浮层模式（测试）下命令菜单改由 in-tree 渲染在输入框上方；浮层模式由写入层合成盖屏。
   const inTreeMenu = !overlayMode ? matchCommands(allCommands, input) : [];
   // 提示行仅在需要时出现（对齐 opencode 的极简）：运行中显示中断/追加；
@@ -2031,8 +2081,6 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         text={input}
         cursor={cursor}
         model={state.meta.model}
-        cwd={state.meta.cwd}
-        {...(state.meta.title ? { title: state.meta.title } : {})}
         running={state.running}
         spinner={spinner}
         width={termCols}
@@ -2073,6 +2121,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           <Text color="yellow">
             {t("⚠ Permission request: ", "⚠ 授权请求: ")}
             <Text bold>{pendings[0].toolName}</Text>
+            <Text dimColor>{` · ${truncate(pendings[0].ruleKey, 72)}`}</Text>
             {pendings.length > 1 ? (
               <Text dimColor>
                 {t(
@@ -2082,17 +2131,30 @@ Requirements: read the actual diff and surrounding code before judging; verify e
               </Text>
             ) : null}
           </Text>
-          <Text dimColor>{truncate(pendings[0].ruleKey, 100)}</Text>
-          <Text>
-            [<Text color="green">y</Text>
-            {t("] allow [", "] 允许 [")}
-            <Text color="cyan">a</Text>
-            {t("] allow and remember [", "] 允许并记住 [")}
-            <Text color="magenta">p</Text>
-            {t("] always allow (persist) [", "] 永久允许（写入项目）[")}
-            <Text color="red">n</Text>
-            {t("] deny", "] 拒绝")}
-          </Text>
+          {[
+            { keyName: "y", label: t("Allow once", "允许一次"), color: "green" },
+            {
+              keyName: "a",
+              label: t("Allow for this session", "本会话允许并记住"),
+              color: "cyan",
+            },
+            {
+              keyName: "p",
+              label: t("Always allow in this project", "永久允许（写入项目）"),
+              color: "magenta",
+            },
+            { keyName: "n", label: t("Deny", "拒绝"), color: "red" },
+          ].map(({ keyName, label, color }, index) => (
+            <Text
+              key={keyName}
+              inverse={index === permissionIndex}
+              bold={index === permissionIndex}
+            >
+              {index === permissionIndex ? "› " : "  "}[<Text color={color}>{keyName}</Text>]{" "}
+              {label}
+            </Text>
+          ))}
+          <Text dimColor>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
         </Box>
       ) : null}
       {inputCluster}
@@ -2226,11 +2288,6 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       </Box>
     </Box>
   );
-}
-
-function basename(p: string): string {
-  const parts = p.replace(/\/+$/, "").split("/");
-  return parts[parts.length - 1] || p;
 }
 
 /** 用 ~ 缩写 home 目录，其余原样（状态栏展示路径用）。 */
@@ -3161,8 +3218,6 @@ export function InputPanel({
   text,
   cursor,
   model,
-  cwd,
-  title,
   running,
   spinner,
   width,
@@ -3171,8 +3226,6 @@ export function InputPanel({
   text: string;
   cursor: number;
   model: string;
-  cwd: string;
-  title?: string;
   running: boolean;
   spinner: string;
   width: number;
@@ -3214,16 +3267,14 @@ export function InputPanel({
     inputW = 1 + 1 + dispWidth(ph);
   }
 
-  // 模型行：前导空格 +（运行中才画的 spinner）+ 各段按剩余列预算依次裁掉。
+  // 模型行只显示 provider 后面的模型标识；项目名与会话标题已在其他界面提供。
+  // 例如 deepseek/deepseek-v4-flash → deepseek-v4-flash；OpenRouter 的嵌套 model id 保留。
+  const slash = model.indexOf("/");
+  const modelLabel = slash >= 0 ? model.slice(slash + 1) : model;
+
+  // 前导空格 +（运行中才画的 spinner）+ 模型名按剩余列预算裁掉。
   // 空闲态不再显示 ● 点（对齐 opencode）；spinner 仅在生成时作为活动指示出现。
-  const metaSegs = fitSegments(
-    [
-      { t: model, color: "white" },
-      { t: ` · ${basename(cwd)}`, color: PANEL_DIM },
-      ...(title ? [{ t: ` · ${truncate(title, 20)}`, color: PANEL_DIM }] : []),
-    ],
-    Math.max(0, width - 4),
-  );
+  const metaSegs = fitSegments([{ t: modelLabel, color: "white" }], Math.max(0, width - 4));
   // 前导 1 列空格；运行时再加 spinner + 空格（共 3 列），空闲时只占 1 列。
   const metaUsed = (running ? 3 : 1) + metaSegs.reduce((w, s) => w + dispWidth(s.t), 0);
 

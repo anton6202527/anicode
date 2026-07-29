@@ -15,6 +15,9 @@ export interface BrowserToolOptions {
   headless?: boolean;
   launchTimeoutMs?: number;
   viewport?: { width: number; height: number };
+  /** Chrome 的唯一 HTTP(S) 出口；生产宿主同时启用 requireProxy。 */
+  proxyUrl?: string;
+  requireProxy?: boolean;
 }
 
 const MAX_SHOT_BYTES = 5 * 1024 * 1024; // 截图超 5MB 不附（避免撑爆请求）。
@@ -28,11 +31,26 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
   const ensureBrowser = async (): Promise<Browser> => {
     if (browser) return browser;
     if (!launching) {
+      if (opts.requireProxy && !opts.proxyUrl) {
+        throw new Error("Browser network access requires the configured AniCode proxy");
+      }
+      const proxy = opts.proxyUrl ? new URL(opts.proxyUrl) : undefined;
       // 进程退出时的收尸由 cdp 模块的全局 LIVE 集合统一处理（见 closeAllBrowsers）。
       launching = Browser.launch({
         ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
         ...(opts.headless !== undefined ? { headless: opts.headless } : {}),
         ...(opts.launchTimeoutMs ? { launchTimeoutMs: opts.launchTimeoutMs } : {}),
+        ...(proxy
+          ? {
+              args: [
+                `--proxy-server=${proxy.toString()}`,
+                // Chrome 默认绕过 loopback；显式撤销，localhost 同样必须过策略出口。
+                "--proxy-bypass-list=<-loopback>",
+                `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE ${proxy.hostname}`,
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+              ],
+            }
+          : {}),
       })
         .then((b) => {
           browser = b;

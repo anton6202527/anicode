@@ -21,11 +21,11 @@
  */
 
 import { promises as fs } from "node:fs";
-import * as path from "node:path";
 import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
 import { resolveInside } from "./fs.js";
 import { t } from "../i18n.js";
+import { PatchSetService } from "../runtime/patchset.js";
 
 export type PatchOp =
   | { kind: "add"; path: string; lines: string[] }
@@ -295,30 +295,19 @@ export const applyPatchTool: Tool = {
       }
     }
 
-    // 提交阶段：规划已全部成功，按序落盘。此处的 IO 错误（如权限）仍可能半途，
-    // 但已排除了「模型逻辑错误导致半应用」这一最常见、最难自纠的情形。
-    // 单文件写入走 tmp+rename：进程中途被杀不会留下写了一半的文件（同目录 rename
-    // 在 POSIX 上是原子替换）。
+    // 提交阶段交给 PatchSet：preview 的 before hash 是乐观锁；journal 先落盘，
+    // 跨文件提交中任一 IO 失败会恢复所有已写文件，之后也可按 patchset id 显式回滚。
     if (ctx.signal.aborted) throw new ToolError("会话已中断，补丁未提交");
-    for (const p of planned) {
-      if ("remove" in p) {
-        await fs.rm(p.abs, { force: true });
-      } else {
-        await fs.mkdir(path.dirname(p.abs), { recursive: true });
-        const tmp = path.join(
-          path.dirname(p.abs),
-          `.${path.basename(p.abs)}.anicode-tmp-${process.pid}`,
-        );
-        try {
-          await fs.writeFile(tmp, p.write, "utf8");
-          await fs.rename(tmp, p.abs);
-        } catch (err) {
-          await fs.rm(tmp, { force: true }).catch(() => {});
-          throw err;
-        }
-      }
-    }
-    return `已应用补丁：\n${planned.map((p) => p.summary).join("\n")}`;
+    const service = new PatchSetService(ctx.cwd);
+    const changes = [...overlay.entries()].map(([abs, content]) => ({
+      path: abs,
+      content,
+    }));
+    const patchset = await service.prepare(changes);
+    await service.apply(patchset);
+    return `已应用补丁（PatchSet ${patchset.id}）：\n${planned
+      .map((p) => p.summary)
+      .join("\n")}\n预览：\n${service.preview(patchset)}`;
   },
 };
 

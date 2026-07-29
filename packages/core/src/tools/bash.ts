@@ -333,6 +333,13 @@ export const bashTool: Tool = {
             "在后台运行并立即返回 shell id，不阻塞。适合 dev server、watch 构建、日志跟随，以及任何长时间运行或不会自己结束的命令。之后用 bash_output 读输出、kill_shell 停止。",
           ),
         },
+        network: {
+          type: "boolean",
+          description: t(
+            "Request network access through the configured AniCode proxy (default false).",
+            "申请通过 AniCode 代理访问网络（默认 false）。",
+          ),
+        },
       },
       required: ["command"],
       additionalProperties: false,
@@ -352,13 +359,33 @@ export const bashTool: Tool = {
     // 后台模式：立即返回 shell id，不阻塞、不受 timeout 约束（这正是它存在的意义）。
     // 沙箱与前台完全一致（共用 buildShellSpawn），权限门也已在此之前走过。
     if (input["run_in_background"]) {
-      return Promise.resolve(startBackgroundShell(command, ctx));
+      return Promise.resolve(
+        startBackgroundShell(command, ctx, { network: input["network"] === true }),
+      );
     }
 
     const requestedTimeout = Number(input["timeout_ms"] ?? DEFAULT_TIMEOUT_MS);
     const timeout = Number.isFinite(requestedTimeout)
       ? Math.max(1000, requestedTimeout)
       : DEFAULT_TIMEOUT_MS;
+
+    if (ctx.isolatedRuntime) {
+      return ctx.isolatedRuntime
+        .run({
+          command,
+          cwd: ctx.cwd,
+          ...(ctx.sandbox ? { policy: ctx.sandbox } : {}),
+          timeoutMs: timeout,
+          signal: ctx.signal,
+          network: input["network"] === true,
+          ...(ctx.traceContext ? { traceContext: ctx.traceContext } : {}),
+        })
+        .then((result) =>
+          result.timedOut
+            ? `[timeout ${timeout}ms]\n${result.output}`
+            : `[exit ${result.exitCode ?? "?"}]\n${result.output || t("(no output)", "（无输出）")}`,
+        );
+    }
 
     const { file: spawnFile, args: spawnArgs } = buildShellSpawn(command, ctx.sandbox, ctx.cwd);
 

@@ -12,12 +12,18 @@ import type { IpcMain, WebContents } from "electron";
 import {
   SessionManager,
   SessionStore,
+  MigratingSessionStore,
   createProvider,
   diagnoseProvider,
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
   resolveDefaultModel,
+  createLocalRuntimeStack,
+  ContextCompiler,
+  Verifier,
+  SecurityPolicyEngine,
+  telemetryForLocalStack,
   t,
   type OpenHandle,
   type PermissionDecisionKind,
@@ -69,9 +75,33 @@ export class Bridge {
   private readonly subscriptions = new Map<string, { handle: OpenHandle; sender: WebContents }>();
 
   constructor(private readonly options: BridgeOptions) {
-    this.plugins = new PluginRuntime(options.mcpConnector, options.env);
+    const runtimeStack = createLocalRuntimeStack(
+      path.dirname(options.sessionsDir),
+      options.env ?? process.env,
+    );
+    const telemetry = telemetryForLocalStack(runtimeStack, options.env ?? process.env);
+    this.plugins = new PluginRuntime(options.mcpConnector, options.env, runtimeStack.broker, {
+      telemetry,
+      networkProxy: runtimeStack.networkProxy,
+      credentialBroker: runtimeStack.broker,
+      executionRuntime: runtimeStack.isolatedRuntime,
+    });
     this.manager = new SessionManager({
-      store: new SessionStore(options.sessionsDir),
+      store: new MigratingSessionStore(
+        runtimeStack.sessions,
+        new SessionStore(options.sessionsDir),
+      ),
+      runtime: runtimeStack.runtime,
+      artifacts: runtimeStack.artifacts,
+      commandInbox: runtimeStack.commandInbox,
+      outbox: runtimeStack.outbox,
+      networkProxy: runtimeStack.networkProxy,
+      worktreeOwnership: runtimeStack.worktreeOwnership,
+      contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
+      verifier: new Verifier({ autoDiscover: true }),
+      securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
+      telemetry,
+      isolatedRuntime: runtimeStack.isolatedRuntime,
       resolveProvider: resolveConfiguredProvider,
       compaction: true,
       permission: { mode: "default" },

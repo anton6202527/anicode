@@ -246,7 +246,13 @@ export class DaemonServer {
         await this.manager.send(
           req.sessionId,
           req.text,
-          req.model ? { model: req.model } : undefined,
+          req.model || req.idempotencyKey || req.traceparent
+            ? {
+                ...(req.model ? { model: req.model } : {}),
+                ...(req.idempotencyKey ? { idempotencyKey: req.idempotencyKey } : {}),
+                ...(req.traceparent ? { traceparent: req.traceparent } : {}),
+              }
+            : undefined,
         );
         return null;
       case "interrupt":

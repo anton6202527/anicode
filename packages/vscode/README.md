@@ -15,15 +15,17 @@
 ## 开发
 
 ```bash
-npm run build --workspace @anicode/vscode    # 用 esbuild 打包 out/extension.js 与 out/webview.js
-npm run watch --workspace @anicode/vscode    # 监听重建
+npm run build --workspace anicode-vscode    # 用 esbuild 打包 out/extension.js 与 out/webview.js
+npm run watch --workspace anicode-vscode    # 监听重建
 ```
 
 在 VSCode 里按 F5（以本目录为扩展开发宿主）即可调试。打包为 `.vsix`：
 
 ```bash
-npm run package --workspace @anicode/vscode
+npm run package --workspace anicode-vscode
 ```
+
+Tree-sitter 与 OS Keychain 使用 N-API，因此本地命令生成的是当前平台 VSIX。Release workflow 会在 Linux x64/arm64、macOS arm64/x64 和 Windows x64 runner 上分别执行 `vsce --target`，产出带平台后缀的安装包，避免把某一平台的 `.node` 文件误发给全部用户。
 
 默认使用项目配置或已就绪凭证对应的模型，并自动读取工作区根目录的 `.env.local` / `.env`；
 没有可用云端凭证时回退到零网络的 `debug/demo`。

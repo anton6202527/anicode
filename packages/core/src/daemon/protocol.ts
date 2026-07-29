@@ -29,7 +29,15 @@ export type ClientRequest =
   | { id: number; method: "open"; sessionId: string }
   /** 取消订阅 */
   | { id: number; method: "close"; sessionId: string }
-  | { id: number; method: "send"; sessionId: string; text: string; model?: string }
+  | {
+      id: number;
+      method: "send";
+      sessionId: string;
+      text: string;
+      model?: string;
+      idempotencyKey?: string;
+      traceparent?: string;
+    }
   | { id: number; method: "interrupt"; sessionId: string }
   | { id: number; method: "undo"; sessionId: string; checkpointId?: string; mode?: RewindMode }
   /** fork：复制会话历史成新会话（可截断到前 upToMessage 条）。 */
@@ -161,7 +169,11 @@ export function isClientRequest(value: unknown): value is ClientRequest {
           (typeof frame.upToMessage === "number" && Number.isSafeInteger(frame.upToMessage)))
       );
     case "send":
-      return typeof frame.sessionId === "string" && typeof frame.text === "string";
+      return (
+        typeof frame.sessionId === "string" &&
+        typeof frame.text === "string" &&
+        (frame.traceparent === undefined || typeof frame.traceparent === "string")
+      );
     case "answerPermission":
       return (
         typeof frame.sessionId === "string" &&

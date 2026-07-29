@@ -112,6 +112,18 @@ test("overlay: 会话列表与授权弹框定宽且含关键信息", () => {
   assert.match(pt, /授权请求/);
   assert.match(pt, /bash/);
   assert.match(pt, /允许并记住/);
+
+  const anchored = buildPermissionOverlay(
+    [{ toolName: "bash", ruleKey: "npm test" }],
+    30,
+    80,
+    2,
+    24,
+  );
+  assert.equal(anchored.left, 0);
+  assert.equal(anchored.width, 80);
+  assert.equal(anchored.top + anchored.lines.length, 24, "授权层末行应贴住输入框上缘");
+  assert.ok(anchored.lines[8]!.includes("48;2;246;177;122"), "第三项应为方向键高亮项");
 });
 
 test("overlay: 命令菜单钉在锚点上方、定宽、含命令与描述与高亮", () => {

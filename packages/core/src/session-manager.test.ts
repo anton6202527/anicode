@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager, type SessionEvent } from "./session-manager.js";
 import { SessionStore } from "./session.js";
+import { PatchSetService } from "./runtime/patchset.js";
 import type { Provider, StreamEvent, ChatMessage } from "./types.js";
 
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
@@ -74,6 +75,35 @@ test("SessionManager: 多订阅者都收到同一批事件", async () => {
 
   subA.close();
   subB.close();
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: 会话启动前恢复崩溃中断的 PatchSet", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-patch-recovery-"));
+  const workspace = path.join(dir, "workspace");
+  await fs.mkdir(workspace);
+  await fs.writeFile(path.join(workspace, "a.txt"), "before");
+  const service = new PatchSetService(workspace);
+  const patchset = await service.prepare([{ path: "a.txt", content: "after" }]);
+  // 模拟进程在第一项落盘、journal 标记 applying 后被 SIGKILL。
+  await fs.writeFile(path.join(workspace, "a.txt"), "after");
+  patchset.status = "applying";
+  patchset.appliedCount = 1;
+  await fs.writeFile(
+    path.join(workspace, ".anicode", "patchsets", `${patchset.id}.json`),
+    JSON.stringify(patchset),
+  );
+
+  const manager = await mgr(
+    dir,
+    scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "ok" }] }]]),
+  );
+  const session = await manager.createSession({ cwd: workspace, model: "scripted" });
+  assert.equal(await fs.readFile(path.join(workspace, "a.txt"), "utf8"), "before");
+  assert.equal((await service.load(patchset.id))?.status, "rolled_back");
+  assert.ok(
+    (await manager.runtimeEvents(session.id)).some((event) => event.type === "patchset.recovered"),
+  );
   await fs.rm(dir, { recursive: true, force: true });
 });
 

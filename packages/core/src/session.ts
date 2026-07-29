@@ -44,6 +44,92 @@ export interface ISessionStore {
   delete(id: string): Promise<void>;
 }
 
+/**
+ * 生产迁移门：首次访问时把旧 JSONL 会话幂等导入数据库，之后所有读写只走 primary。
+ * 旧文件保留为可恢复备份；primary 已更新得更晚时不会被旧数据覆盖。
+ */
+export class MigratingSessionStore implements ISessionStore {
+  private ready: Promise<void> | undefined;
+
+  constructor(
+    readonly primary: ISessionStore,
+    readonly legacy: ISessionStore,
+  ) {}
+
+  private ensureMigrated(): Promise<void> {
+    if (this.ready) return this.ready;
+    const migration = this.migrate();
+    this.ready = migration;
+    void migration.catch(() => {
+      if (this.ready === migration) this.ready = undefined;
+    });
+    return migration;
+  }
+
+  private async migrate(): Promise<void> {
+    const primaryIds = new Set((await this.primary.list()).map((meta) => meta.id));
+    for (const legacyMeta of await this.legacy.list()) {
+      const legacyData = await this.legacy.load(legacyMeta.id);
+      let current: SessionData | undefined;
+      let created = false;
+      if (primaryIds.has(legacyMeta.id)) {
+        current = await this.primary.load(legacyMeta.id);
+      } else {
+        try {
+          await this.primary.create({
+            id: legacyMeta.id,
+            cwd: legacyMeta.cwd,
+            model: legacyMeta.model,
+            ...(legacyMeta.title ? { title: legacyMeta.title } : {}),
+          });
+          created = true;
+          primaryIds.add(legacyMeta.id);
+        } catch {
+          // 另一进程可能刚完成相同迁移；以数据库中的提交为准继续比较。
+        }
+        current = await this.primary.load(legacyMeta.id);
+      }
+      const legacyNewer = Date.parse(legacyMeta.updatedAt) > Date.parse(current.updatedAt);
+      const interruptedImport = current.messages.length === 0 && legacyData.messages.length > 0;
+      if (created || legacyNewer || interruptedImport) {
+        await this.primary.rewrite({ ...legacyMeta }, legacyData.messages);
+      }
+    }
+  }
+
+  async create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
+    await this.ensureMigrated();
+    return this.primary.create(meta);
+  }
+
+  async append(id: string, message: ChatMessage): Promise<void> {
+    await this.ensureMigrated();
+    return this.primary.append(id, message);
+  }
+
+  async rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
+    await this.ensureMigrated();
+    return this.primary.rewrite(meta, messages);
+  }
+
+  async load(id: string): Promise<SessionData> {
+    await this.ensureMigrated();
+    return this.primary.load(id);
+  }
+
+  async list(): Promise<SessionMeta[]> {
+    await this.ensureMigrated();
+    return this.primary.list();
+  }
+
+  async delete(id: string): Promise<void> {
+    await this.ensureMigrated();
+    await this.primary.delete(id);
+    // 删除语义必须同时清理迁移源，否则下次进程启动会把已删除会话重新导入。
+    await this.legacy.delete(id);
+  }
+}
+
 function defaultDir(): string {
   return path.join(os.homedir(), ".anicode", "sessions");
 }

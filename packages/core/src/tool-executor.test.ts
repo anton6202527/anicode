@@ -5,6 +5,7 @@ import { ToolRegistry, type Tool } from "./tools/tool.js";
 import { PermissionEngine } from "./permission.js";
 import { HookRunner } from "./hooks.js";
 import type { AgentEvent } from "./agent.js";
+import { SecurityPolicyEngine } from "./security/policy.js";
 
 function makeTool(
   name: string,
@@ -115,4 +116,51 @@ test("ToolExecutor: 未知工具合成配对的错误 tool_result（不抛、不
   );
   assert.equal(results.length, 1);
   assert.equal(results[0]!.isError, true);
+});
+
+test("ToolExecutor: 用户确认改写参数后仍重新经过硬安全策略", async () => {
+  const log: string[] = [];
+  const tool: Tool = {
+    def: { name: "change", description: "change", parameters: { type: "object" } },
+    readOnly: false,
+    mutatesFiles: true,
+    ruleKey: (input) => String(input["path"] ?? ""),
+    async run(input) {
+      log.push(String(input["path"]));
+      return "changed";
+    },
+  };
+  const tools = new ToolRegistry().register(tool);
+  const exec = new ToolExecutor({
+    tools,
+    perm: new PermissionEngine({
+      mode: "default",
+      confirm: async () => ({ behavior: "allow", updatedInput: { path: ".env" } }),
+    }),
+    hooks: new HookRunner([]),
+    cwd: "/tmp",
+    maxToolResultChars: 1000,
+    parallelInputsStable: false,
+    supportsImages: () => false,
+    addUsage: () => {},
+    securityPolicy: new SecurityPolicyEngine({
+      rules: [
+        {
+          id: "deny-env",
+          effect: "deny",
+          actions: ["tool:change"],
+          resources: [".env"],
+          reason: "credential files are protected",
+        },
+      ],
+    }),
+  });
+  const results = await drain(
+    exec.run(
+      [{ id: "10", name: "change", args: { path: "safe.txt" } }],
+      new AbortController().signal,
+    ),
+  );
+  assert.deepEqual(log, []);
+  assert.equal(results[0]?.isError, true);
 });

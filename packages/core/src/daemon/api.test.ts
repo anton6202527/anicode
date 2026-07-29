@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ROUTES, EVENTS, generateOpenApi, PROTOCOL_VERSION } from "./api.js";
+import {
+  ROUTES,
+  EVENTS,
+  generateOpenApi,
+  PROTOCOL_VERSION,
+  validateOpenApiDocument,
+} from "./api.js";
 
 test("generateOpenApi: 每条路由都有对应 path+method 条目", () => {
   const doc = generateOpenApi() as {
@@ -9,7 +15,7 @@ test("generateOpenApi: 每条路由都有对应 path+method 条目", () => {
     paths: Record<string, Record<string, unknown>>;
     "x-events": Record<string, string>;
   };
-  assert.equal(doc.openapi, "3.1.0");
+  assert.equal(doc.openapi, "3.1.1");
   assert.ok(doc.info.version.startsWith(`${PROTOCOL_VERSION}.`));
   for (const route of ROUTES) {
     const entry = doc.paths[route.path];
@@ -19,11 +25,17 @@ test("generateOpenApi: 每条路由都有对应 path+method 条目", () => {
   assert.deepEqual(Object.keys(doc["x-events"]).sort(), Object.keys(EVENTS).sort());
 });
 
-test("ROUTES: 路径参数统一为 {id}，method 合法", () => {
+test("OpenAPI 3.1.1 conformance: operationId/path params/responses 完整且唯一", () => {
+  const document = generateOpenApi() as { openapi: string };
+  assert.equal(document.openapi, "3.1.1");
+  assert.deepEqual(validateOpenApiDocument(document as Record<string, unknown>), []);
+});
+
+test("ROUTES: 路径参数命名合法，method 合法", () => {
   for (const route of ROUTES) {
     assert.match(route.path, /^\//);
     const params = route.path.match(/\{[^}]+\}/g) ?? [];
-    for (const p of params) assert.equal(p, "{id}");
+    for (const p of params) assert.match(p, /^\{(?:id|artifactId|patchsetId)\}$/);
     assert.ok(["get", "post", "delete", "patch"].includes(route.method));
   }
 });

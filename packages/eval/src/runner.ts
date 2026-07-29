@@ -9,7 +9,15 @@ import { spawn, spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, defaultTools, type AgentModelInfo, type Provider } from "@anicode/core";
+import {
+  Agent,
+  defaultTools,
+  type AgentModelInfo,
+  type ExecutionRuntime,
+  type NetworkProxy,
+  type Provider,
+  type Telemetry,
+} from "@anicode/core";
 import { EDIT_TOOLS, verifyFilesOf, type EvalTask } from "./task.js";
 
 export interface RunOptions {
@@ -22,6 +30,11 @@ export interface RunOptions {
   timeoutMs?: number;
   /** 给 Agent 开 repo map（system 注入代码地图）——用于 A/B 对比 scaffolding 效果。 */
   repomap?: boolean;
+  /** 与生产宿主相同的 OS/OCI 执行边界；模型发起的 Bash 不得裸 spawn。 */
+  isolatedRuntime?: ExecutionRuntime;
+  /** 内建 HTTP 工具与 provider 使用的策略出口。 */
+  networkProxy?: NetworkProxy;
+  telemetry?: Telemetry;
 }
 
 const binCache = new Map<string, boolean>();
@@ -127,6 +140,9 @@ export async function runTask(task: EvalTask, opts: RunOptions): Promise<TaskRes
       projectMemory: false,
       injectEnv: false,
       maxTurns: opts.maxTurns ?? 30,
+      ...(opts.isolatedRuntime ? { isolatedRuntime: opts.isolatedRuntime } : {}),
+      ...(opts.networkProxy ? { networkProxy: opts.networkProxy } : {}),
+      ...(opts.telemetry ? { telemetry: opts.telemetry } : {}),
       ...(opts.repomap ? { repoMap: true } : {}),
     });
 

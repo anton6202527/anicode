@@ -5,7 +5,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { McpClient, McpServerConfig, Tool } from "@anicode/core";
+import {
+  credentialBrokerFromEnv,
+  type McpClient,
+  type McpServerConfig,
+  type Tool,
+} from "@anicode/core";
 import { PluginRuntime, type McpConnector } from "./plugin-runtime.js";
 
 function fakeTool(name: string): Tool {
@@ -85,12 +90,31 @@ test("PluginRuntime: 缺环境变量的 MCP 不连接，状态标记缺失凭证
   assert.match(status?.error ?? "", /BRAVE_API_KEY/);
 });
 
-test("PluginRuntime: 凭证就绪时 MCP 连接成功", async () => {
+test("PluginRuntime: 凭证只以 Broker 引用交给 MCP 连接器", async () => {
+  const fake = fakeConnector();
+  const env = { BRAVE_API_KEY: "x" };
+  const broker = credentialBrokerFromEnv(env, { remove: true });
+  const rt = new PluginRuntime(fake.connect, env, broker);
+  await rt.setState(["mcp.websearch"]);
+  assert.equal(fake.calls.length, 1);
+  const config = fake.calls[0]![0]! as Extract<McpServerConfig, { command: string }>;
+  assert.deepEqual(config.credentialEnv, {
+    BRAVE_API_KEY: "env:BRAVE_API_KEY",
+  });
+  assert.equal(config.env, undefined);
+  assert.equal(config.network, true);
+  assert.ok(rt.buildToolRegistry().names().includes("websearch__do"));
+});
+
+test("PluginRuntime: 原始进程密钥不能绕过 Credential Broker", async () => {
   const fake = fakeConnector();
   const rt = new PluginRuntime(fake.connect, { BRAVE_API_KEY: "x" });
   await rt.setState(["mcp.websearch"]);
-  assert.equal(fake.calls.length, 1);
-  assert.ok(rt.buildToolRegistry().names().includes("websearch__do"));
+  assert.equal(fake.calls.length, 0);
+  assert.match(
+    rt.entriesWithStatus().find((entry) => entry.id === "mcp.websearch")?.runtime?.error ?? "",
+    /BRAVE_API_KEY/,
+  );
 });
 
 test("PluginRuntime: 停用已连接的 MCP 会断开并移除其工具", async () => {

@@ -21,6 +21,8 @@ export {
 export { DebugProvider, type DebugProviderOptions } from "./provider/debug.js";
 export {
   createProvider,
+  configureProviderCredentialBroker,
+  configureProviderNetworkProxy,
   diagnoseProvider,
   registerProvider,
   registerOpenAICompatibleProvider,
@@ -134,6 +136,7 @@ export {
 } from "./host.js";
 export {
   SessionStore,
+  MigratingSessionStore,
   newSessionId,
   assertSessionId,
   type ISessionStore,
@@ -143,6 +146,19 @@ export {
 export { SqliteSessionStore, sqliteAvailable } from "./session-sqlite.js";
 export * from "./daemon/index.js";
 export { serveMcp, type McpServeOptions } from "./mcp-server.js";
+export {
+  AcpAgentAdapter,
+  ACP_V1_METHODS,
+  validateAcpV1Request,
+  serveAcpStdio,
+  type AcpAdapterOptions,
+  type AcpPeer,
+  type AcpStdioOptions,
+  type JsonRpcId,
+  type JsonRpcRequest,
+  type JsonRpcNotification,
+  type JsonRpcResponse,
+} from "./acp.js";
 export {
   McpClient,
   connectMcpServers,
@@ -213,6 +229,263 @@ export {
   type SourceFile,
 } from "./repomap.js";
 export { ToolRegistry, ToolError, type Tool, type ToolContext } from "./tools/tool.js";
+export {
+  PatchSetService,
+  PatchSetConflictError,
+  threeWayMerge,
+  type PatchSet,
+  type PatchSetStatus,
+  type PatchSetChange,
+  type PatchSetChangeInput,
+  type PatchSetApproval,
+  type PatchSetRebaseResult,
+  type PatchSetServiceOptions,
+  type ThreeWayMergeResult,
+} from "./runtime/patchset.js";
+export {
+  IncrementalCodeIndex,
+  type IndexedCodeFile,
+  type IndexedSymbol,
+  type CodeIndexSnapshot,
+  type HybridSearchHit,
+  type CodeEmbedding,
+  type IncrementalCodeIndexOptions,
+} from "./runtime/code-index.js";
+export {
+  DurableWorkerQueue,
+  MemoryWorkerQueueStore,
+  FileWorkerQueueStore,
+  PersistentWorker,
+  WorktreeOwnership,
+  type WorkerJob,
+  type WorkerJobStatus,
+  type WorkerQueueStore,
+  type WorkerHandler,
+  type WorktreeLease,
+} from "./runtime/worker.js";
+export { RemoteRuntime, type RemoteRuntimeOptions } from "./runtime/remote.js";
+export {
+  GitHubDelivery,
+  buildSlsaProvenance,
+  type GitHubDeliveryOptions,
+  type GitHubDeliveryInput,
+  type GitHubDeliveryResult,
+  type GitHubCheckOutput,
+  type GitHubCheckConclusion,
+  type GitHubCheckRun,
+  type GitHubAuditEvent,
+  type SlsaProvenanceInput,
+} from "./runtime/github-delivery.js";
+export {
+  GitHubWebhookController,
+  GitHubWebhookServer,
+  verifyGitHubWebhookSignature,
+  createGitHubRepairWorker,
+  type GitHubWebhookControllerOptions,
+  type GitHubWebhookResult,
+  type GitHubRepairJob,
+  type GitHubRepairWorkerOptions,
+} from "./runtime/github-webhook.js";
+export {
+  MemoryArtifactStore,
+  FileArtifactStore,
+  type Artifact,
+  type ArtifactKind,
+  type ArtifactInput,
+  type ArtifactRecord,
+  type ArtifactStore,
+} from "./runtime/artifacts.js";
+export {
+  DurableRuntime,
+  MemoryRuntimeEventStore,
+  FileRuntimeEventStore,
+  type RuntimeEvent,
+  type AppendRuntimeEvent,
+  type RuntimeEventStore,
+  type RecoveredRuntimeState,
+  MemoryRuntimeSnapshotStore,
+  FileRuntimeSnapshotStore,
+  type RuntimeSnapshot,
+  type RuntimeSnapshotStore,
+} from "./runtime/durable.js";
+export {
+  CommandInbox,
+  MemoryCommandInboxStore,
+  FileCommandInboxStore,
+  DurableOutbox,
+  MemoryOutboxStore,
+  FileOutboxStore,
+  type DurableCommand,
+  type CommandStatus,
+  type AcceptCommandInput,
+  type CommandInboxStore,
+  type OutboxMessage,
+  type OutboxStatus,
+  type OutboxStore,
+} from "./runtime/commands.js";
+export {
+  ContextCompiler,
+  type ContextCompilerOptions,
+  type ContextSource,
+  type ContextKind,
+  type CompiledContext,
+} from "./runtime/context-compiler.js";
+export {
+  TaskScheduler,
+  type ScheduledTask,
+  type TaskExecution,
+  type TaskSchedulerOptions,
+  type TaskResource,
+  type SchedulerEvent,
+} from "./runtime/scheduler.js";
+export {
+  Verifier,
+  renderVerificationReport,
+  type VerificationPolicy,
+  type VerificationCheck,
+  type VerificationReport,
+  type VerificationCheckResult,
+} from "./runtime/verifier.js";
+export {
+  noTelemetry,
+  fromOpenTelemetry,
+  InMemoryTelemetry,
+  OtlpHttpTelemetry,
+  telemetryFromEnv,
+  traceparent,
+  parseTraceparent,
+  type Telemetry,
+  type TelemetrySpan,
+  type TelemetryAttribute,
+  type SpanContext,
+  type OpenTelemetryTracerLike,
+  type RecordedSpan,
+  type OtlpHttpTelemetryOptions,
+  type TelemetryFromEnvOptions,
+} from "./runtime/telemetry.js";
+export {
+  IsolatedRuntime,
+  type ExecutionRuntime,
+  type IsolatedRuntimeOptions,
+  type IsolatedRunRequest,
+  type IsolatedRunResult,
+  type PreparedIsolatedCommand,
+} from "./runtime/isolated-runtime.js";
+export {
+  ContainerIsolatedRuntime,
+  type ContainerIsolatedRuntimeOptions,
+} from "./runtime/container-runtime.js";
+export {
+  KubernetesJobRuntime,
+  type KubernetesJobRuntimeOptions,
+} from "./runtime/kubernetes-runtime.js";
+export {
+  RemoteRuntimeHttpServer,
+  RemoteExecutionService,
+  type RemoteRuntimeServerOptions,
+  type RemoteExecutionRequest,
+  type RemoteExecutionView,
+} from "./runtime/remote-server.js";
+export {
+  createRemoteOidcAuthenticator,
+  type RemoteOidcAuthenticatorOptions,
+} from "./runtime/remote-auth.js";
+export {
+  NetworkProxy,
+  NetworkProxyServer,
+  isPrivateAddress,
+  type NetworkPolicy,
+  type NetworkProxyOptions,
+  type NetworkAuditEvent,
+  type NetworkProxyServerOptions,
+} from "./runtime/network-proxy.js";
+export {
+  SecurityPolicyEngine,
+  CapabilityAuthority,
+  type SecurityRule,
+  type SecurityRequest,
+  type SecurityDecision,
+  type SecurityEffect,
+  type SecurityPolicyOptions,
+  type CapabilityGrant,
+} from "./security/policy.js";
+export {
+  CredentialBroker,
+  credentialBrokerFromEnv,
+  credentialBrokerFromBackend,
+  credentialScopesForEnvironment,
+  isCredentialEnvironmentName,
+  type CredentialScope,
+  type CredentialRegistration,
+  type CredentialLeaseRequest,
+} from "./security/credentials.js";
+export {
+  OsKeychainSecretBackend,
+  VaultKvV2SecretBackend,
+  VaultJwtTokenProvider,
+  StaticVaultTokenProvider,
+  AwsKmsSecretBackend,
+  githubActionsOidcProvider,
+  oidcTokenFileProvider,
+  configuredSecretBackendFromEnv,
+  type SecretBackend,
+  type SyncSecretBackend,
+  type OidcTokenProvider,
+  type VaultTokenProvider,
+  type AwsKmsSecretBackendOptions,
+} from "./security/secret-backends.js";
+export {
+  CredentialRotationManager,
+  type CredentialRotationPolicy,
+  type CredentialRotationEvent,
+} from "./security/rotation.js";
+export {
+  SqliteRuntimeDatabase,
+  SqliteRuntimeEventStore,
+  SqliteRuntimeSnapshotStore,
+  SqliteRuntimeSessionStore,
+  SqliteCommandInboxStore,
+  SqliteOutboxStore,
+  SqliteWorkerQueueStore,
+  SqliteArtifactStore,
+  type RuntimeAuditRecord,
+} from "./runtime/sqlite.js";
+export {
+  PostgresRuntimeDatabase,
+  PostgresRuntimeEventStore,
+  PostgresRuntimeSnapshotStore,
+  PostgresSessionStore,
+  PostgresCommandInboxStore,
+  PostgresOutboxStore,
+  PostgresWorkerQueueStore,
+  PostgresArtifactStore,
+} from "./runtime/postgres.js";
+export {
+  TypedCodeGraph,
+  extractTreeSitterSymbols,
+  type TypedCodeGraphOptions,
+  type TypedCodeGraphSnapshot,
+  type TypedCodeFile,
+  type TypedCodeSymbol,
+  type TypedCodeReference,
+  type TypedGraphSearchHit,
+  type CodeLanguage,
+  type CodeRange,
+} from "./runtime/typed-code-graph.js";
+export {
+  SqliteVectorStore,
+  PostgresVectorStore,
+  localCodeEmbedding,
+  type VectorStore,
+  type VectorRecord,
+  type VectorSearchHit,
+} from "./runtime/vector-store.js";
+export {
+  createLocalRuntimeStack,
+  createConfiguredLocalRuntimeStack,
+  telemetryForLocalStack,
+  type LocalRuntimeStack,
+} from "./runtime/local-stack.js";
 export {
   defaultTools,
   readTool,

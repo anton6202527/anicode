@@ -20,6 +20,10 @@ import type { PermissionDecision, PermissionEngine } from "./permission.js";
 import type { HookRunner } from "./hooks.js";
 import { Chan } from "./chan.js";
 import { reminder } from "./conversation.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import type { NetworkProxy } from "./runtime/network-proxy.js";
+import { noTelemetry, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
+import type { SecurityPolicyEngine } from "./security/policy.js";
 
 export type ToolCall = { id: string; name: string; args: Record<string, unknown> };
 
@@ -41,6 +45,13 @@ export interface ToolExecutorOptions {
   supportsImages: () => boolean;
   /** 工具内部产生的模型用量汇入会话记账。 */
   addUsage: (usage: Usage) => void;
+  isolatedRuntime?: ExecutionRuntime;
+  networkProxy?: NetworkProxy;
+  securityPolicy?: SecurityPolicyEngine;
+  telemetry?: Telemetry;
+  traceParent?: () => SpanContext | undefined;
+  /** 成功写入后通知 Verifier 收集变更路径。 */
+  onFilesChanged?: (paths: string[]) => void;
 }
 
 export class ToolExecutor {
@@ -204,6 +215,23 @@ export class ToolExecutor {
     const ruleKey = tool.ruleKey(args);
     yield { type: "tool_start", id: call.id, name: call.name, ruleKey };
 
+    const securityDecision = this.o.securityPolicy?.authorize({
+      principal: "agent",
+      action: `tool:${call.name}`,
+      resource: ruleKey,
+      attributes: {
+        readOnly: tool.readOnly,
+        mutatesFiles: tool.mutatesFiles ?? false,
+      },
+    });
+    if (securityDecision?.effect === "deny") {
+      const msg = `安全策略拒绝: ${securityDecision.reason}`;
+      yield { type: "tool_permission", id: call.id, name: call.name, decision: "deny" };
+      results.push(errResult(call.id, call.name, msg));
+      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
+      return;
+    }
+
     if (blockedReason) {
       const msg = `PreToolUse hook 拦截: ${blockedReason}`;
       yield { type: "tool_permission", id: call.id, name: call.name, decision: "deny" };
@@ -238,7 +266,24 @@ export class ToolExecutor {
         toolCallId: call.id,
         signal,
       });
-      if (decision.behavior === "allow") decision = { ...decision, updatedInput: updated };
+      if (decision.behavior === "allow") {
+        const updatedSecurityDecision = this.o.securityPolicy?.authorize({
+          principal: "agent",
+          action: `tool:${call.name}`,
+          resource: updatedRuleKey,
+          attributes: {
+            readOnly: tool.readOnly,
+            mutatesFiles: tool.mutatesFiles ?? false,
+          },
+        });
+        decision =
+          updatedSecurityDecision?.effect === "deny"
+            ? {
+                behavior: "deny",
+                message: `安全策略拒绝: ${updatedSecurityDecision.reason}`,
+              }
+            : { ...decision, updatedInput: updated };
+      }
     }
     yield { type: "tool_permission", id: call.id, name: call.name, decision: decision.behavior };
 
@@ -261,11 +306,25 @@ export class ToolExecutor {
     const chan = new Chan<AgentEvent>();
     // 工具经 attachImage 附带的图片先收在本地；只有工具成功时才并入历史。
     const localImages: ImagePart[] = [];
+    const toolSpan = (this.o.telemetry ?? noTelemetry).startSpan(
+      "anicode.tool.execute",
+      {
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": call.name,
+        "anicode.tool.read_only": tool.readOnly,
+        "anicode.tool.mutates_files": tool.mutatesFiles ?? false,
+      },
+      this.o.traceParent?.(),
+    );
+    const toolContext = toolSpan.context();
     const settled = tool
       .run(input, {
         cwd: this.o.cwd,
         signal,
         ...(this.o.sandbox ? { sandbox: this.o.sandbox } : {}),
+        ...(this.o.isolatedRuntime ? { isolatedRuntime: this.o.isolatedRuntime } : {}),
+        ...(this.o.networkProxy ? { networkProxy: this.o.networkProxy } : {}),
+        ...(toolContext ? { traceContext: toolContext } : {}),
         modelSupportsImages: this.o.supportsImages(),
         attachImage: (img) => localImages.push(img),
         emit: (progress) =>
@@ -273,10 +332,19 @@ export class ToolExecutor {
         addUsage: (usage) => this.o.addUsage(usage),
       })
       .then(
-        (content) => ({ ok: true as const, content }),
-        (err: unknown) => ({ ok: false as const, err }),
+        (content) => {
+          toolSpan.setStatus({ code: "ok" });
+          return { ok: true as const, content };
+        },
+        (err: unknown) => {
+          toolSpan.recordException(err).setStatus({ code: "error" });
+          return { ok: false as const, err };
+        },
       )
-      .finally(() => chan.close());
+      .finally(() => {
+        toolSpan.end();
+        chan.close();
+      });
     for await (const ev of chan) yield ev;
     const r = await settled;
 
@@ -307,6 +375,12 @@ export class ToolExecutor {
       ...(isError ? { isError: true } : {}),
     };
     results.push(result);
+    if (!isError && tool.mutatesFiles) {
+      const paths = ["path", "file", "file_path"]
+        .map((key) => input[key])
+        .filter((value): value is string => typeof value === "string" && value.length > 0);
+      this.o.onFilesChanged?.(paths);
+    }
     // 图片附在本轮 tool_result 之后进入同一条 user 消息（由 run 汇总后排序）。
     // 工具失败时丢弃：错误结果配一堆图片只会白烧上下文。
     if (!isError && localImages.length) images.push(...localImages);

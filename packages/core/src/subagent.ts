@@ -36,6 +36,8 @@ import type {
   AgentModelInfo,
   AgentResolvedModel,
 } from "./agent.js";
+import type { WorktreeOwnership } from "./runtime/worker.js";
+import type { NetworkProxy } from "./runtime/network-proxy.js";
 
 const execFileP = promisify(execFile);
 
@@ -221,6 +223,14 @@ export interface TaskToolOptions {
   defaultMaxTurns?: number;
   /** 继承父级 OS 沙箱策略，避免子 agent 的 bash 成为绕过沙箱的通道。 */
   sandbox?: AgentOptions["sandbox"];
+  isolatedRuntime?: AgentOptions["isolatedRuntime"];
+  securityPolicy?: AgentOptions["securityPolicy"];
+  telemetry?: AgentOptions["telemetry"];
+  verifier?: AgentOptions["verifier"];
+  contextCompiler?: AgentOptions["contextCompiler"];
+  /** 跨 worker 的 worktree 独占租约。 */
+  worktreeOwnership?: WorktreeOwnership;
+  networkProxy?: NetworkProxy;
   /** 当前委派层级（根 task 工具为 0，每下派一层编排型子 agent +1）。内部用，勿手填。 */
   depth?: number;
   /** 嵌套委派深度上限；缺省 MAX_SUBAGENT_DEPTH。 */
@@ -365,6 +375,12 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
         if (!backgroundEnabled)
           throw new ToolError("isolation=worktree 仅根 agent 的 task 工具支持");
         worktree = await addWorktree(opts.cwd);
+        try {
+          await opts.worktreeOwnership?.acquire(worktree, taskId, 5 * 60_000);
+        } catch (error) {
+          await cleanupWorktree(opts.cwd, worktree).catch(() => undefined);
+          throw error;
+        }
       }
 
       const child = buildChildAgent(def, worktree ?? opts.cwd);
@@ -459,6 +475,12 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
       ...(opts.resolveModel ? { resolveModel: opts.resolveModel } : {}),
       cwd,
       ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
+      ...(opts.isolatedRuntime ? { isolatedRuntime: opts.isolatedRuntime } : {}),
+      ...(opts.networkProxy ? { networkProxy: opts.networkProxy } : {}),
+      ...(opts.securityPolicy ? { securityPolicy: opts.securityPolicy } : {}),
+      ...(opts.telemetry ? { telemetry: opts.telemetry } : {}),
+      ...(opts.verifier ? { verifier: opts.verifier } : {}),
+      ...(opts.contextCompiler ? { contextCompiler: opts.contextCompiler } : {}),
       system: def.system ?? subagentSystem(),
       ...(def.effort ? { effort: def.effort } : {}),
       // 子 agent 不重复采集环境（每次都 spawn git，量大时拖慢）；父会话已接地。
@@ -486,8 +508,19 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
     record.background = background;
     const child = record.agent;
     const usageBefore = { ...child.totalUsage };
+    const ownershipHeartbeat =
+      record.worktree && opts.worktreeOwnership
+        ? setInterval(
+            () =>
+              void opts
+                .worktreeOwnership!.heartbeat(record.worktree!, record.id, 5 * 60_000)
+                .catch(() => undefined),
+            60_000,
+          )
+        : undefined;
 
     const finish = async (errorMsg: string | null, aborted: boolean): Promise<string> => {
+      if (ownershipHeartbeat) clearInterval(ownershipHeartbeat);
       // task_send 续话会多轮累计，用量按本轮增量计入父会话，避免重复记账。
       ctx.addUsage?.(usageDelta(child.totalUsage, usageBefore));
       // 防伪：剥掉子 agent 输出里的通知信封标记，子输出不能伪装成宿主的控制信息。
@@ -504,6 +537,9 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
             `\n[changes kept in worktree: ${record.worktree} — merge or discard them]`,
             `\n[改动保留在 worktree: ${record.worktree} —— 请合并或丢弃]`,
           );
+      }
+      if (record.worktree && opts.worktreeOwnership) {
+        await opts.worktreeOwnership.release(record.worktree, record.id).catch(() => undefined);
       }
       // SubagentStop：观察性，成功/失败都触发（审计/统计用）。
       if (opts.parentHooks?.has("SubagentStop")) {
@@ -527,9 +563,15 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
     if (!background) {
       return (async () => {
         let errorMsg: string | null = null;
-        for await (const ev of child.send(prompt, ctx.signal)) {
-          ctx.emit?.(ev satisfies AgentEvent);
-          if (ev.type === "error") errorMsg = ev.message;
+        try {
+          for await (const ev of child.send(prompt, ctx.signal, {
+            ...(ctx.traceContext ? { parent: ctx.traceContext } : {}),
+          })) {
+            ctx.emit?.(ev satisfies AgentEvent);
+            if (ev.type === "error") errorMsg = ev.message;
+          }
+        } catch (error) {
+          errorMsg = error instanceof Error ? error.message : String(error);
         }
         const out = await finish(errorMsg, ctx.signal.aborted);
         if (!backgroundEnabled) return out; // 嵌套（前台-only）task 无 task_send，不提任务 id
@@ -544,7 +586,9 @@ export function createTaskTools(opts: TaskToolOptions): TaskTools {
       let errorMsg: string | null = null;
       let out = "";
       try {
-        for await (const ev of child.send(prompt, abort.signal)) {
+        for await (const ev of child.send(prompt, abort.signal, {
+          ...(ctx.traceContext ? { parent: ctx.traceContext } : {}),
+        })) {
           // 不再经 ctx.emit 回流（该工具调用已返回，通道已关）；留一条活动行供 task_output。
           if (ev.type === "tool_start") record.activity = `${ev.name}: ${ev.ruleKey}`;
           if (ev.type === "error") errorMsg = ev.message;

@@ -35,6 +35,8 @@ export interface OpenAICompatOptions {
   reasoningEffort?: boolean;
   /** 随每个请求发送的非敏感/调用方管理的自定义 header。 */
   defaultHeaders?: Record<string, string>;
+  /** 宿主注入的受控网络出口；生产宿主不得使用全局直连 fetch。 */
+  fetch?: typeof fetch;
 }
 
 export type MaxTokensField = "max_completion_tokens" | "max_tokens" | false;
@@ -64,6 +66,7 @@ export class OpenAICompatProvider implements Provider {
         ...(this.options.baseURL !== undefined ? { baseURL: this.options.baseURL } : {}),
         maxRetries: this.options.maxRetries ?? 0,
         ...(this.options.defaultHeaders ? { defaultHeaders: this.options.defaultHeaders } : {}),
+        ...(this.options.fetch ? { fetch: this.options.fetch } : {}),
       };
 
       // OPENAI_CUSTOM_HEADERS 没有对应的 SDK 关闭选项，并且会在构造器中与

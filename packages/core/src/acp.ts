@@ -1,0 +1,474 @@
+/**
+ * ACP v1 adapter：把稳定的 Agent Client Protocol 边界映射到 SessionHost。
+ * 内部事件模型不泄漏给编辑器；未来 v2 只需替换本文件。
+ */
+
+import { createInterface } from "node:readline";
+import * as path from "node:path";
+import { createId } from "./id.js";
+import type { OpenHandle, SessionHost } from "./host.js";
+import type { AgentEvent } from "./agent.js";
+import type { ContentPart } from "./types.js";
+import type { SessionEvent, SessionSnapshot, SessionSummary } from "./session-manager.js";
+import {
+  noTelemetry,
+  parseTraceparent,
+  traceparent,
+  type SpanContext,
+  type Telemetry,
+} from "./runtime/telemetry.js";
+
+export type JsonRpcId = string | number;
+
+export interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  id: JsonRpcId;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export interface JsonRpcNotification {
+  jsonrpc: "2.0";
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: JsonRpcId;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+export interface AcpPeer {
+  notify(message: JsonRpcNotification): void | Promise<void>;
+  request(method: string, params: Record<string, unknown>): Promise<unknown>;
+}
+
+export interface AcpAdapterOptions {
+  host: SessionHost;
+  peer: AcpPeer;
+  defaultModel: string;
+  agentInfo?: { name: string; title?: string; version: string };
+  deleteSession?: (sessionId: string) => Promise<void>;
+  telemetry?: Telemetry;
+}
+
+export const ACP_V1_METHODS = [
+  "initialize",
+  "session/new",
+  "session/load",
+  "session/prompt",
+  "session/cancel",
+  "session/resume",
+  "session/list",
+  "session/close",
+  "session/delete",
+] as const;
+
+/** ACP v1 JSON-RPC 边界的确定性校验；dispatch 前执行，返回标准 Invalid Params。 */
+export function validateAcpV1Request(request: JsonRpcRequest | JsonRpcNotification): string[] {
+  const errors: string[] = [];
+  if (!request || request.jsonrpc !== "2.0") errors.push('jsonrpc must be "2.0"');
+  if (typeof request.method !== "string" || !request.method)
+    errors.push("method must be non-empty");
+  if ("id" in request && typeof request.id !== "string" && typeof request.id !== "number")
+    errors.push("id must be a string or number");
+  const params = request.params;
+  if (params !== undefined && (!params || typeof params !== "object" || Array.isArray(params)))
+    errors.push("params must be an object");
+  if (request.method === "initialize") {
+    if (!Number.isInteger(params?.["protocolVersion"]))
+      errors.push("protocolVersion must be integer");
+  } else if (
+    request.method.startsWith("session/") &&
+    request.method !== "session/new" &&
+    request.method !== "session/list"
+  ) {
+    if (typeof params?.["sessionId"] !== "string" || !params["sessionId"])
+      errors.push("sessionId must be non-empty");
+  }
+  if (request.method === "session/new" || request.method === "session/load") {
+    if (typeof params?.["cwd"] !== "string" || !path.isAbsolute(params["cwd"]))
+      errors.push("cwd must be absolute");
+    if (!Array.isArray(params?.["mcpServers"])) errors.push("mcpServers must be an array");
+  }
+  if (request.method === "session/prompt") {
+    try {
+      textOfPrompt(params?.["prompt"]);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return errors;
+}
+
+function textOfPrompt(prompt: unknown): string {
+  if (!Array.isArray(prompt)) throw new Error("prompt must be an array");
+  const chunks: string[] = [];
+  for (const block of prompt) {
+    if (!block || typeof block !== "object") continue;
+    const value = block as Record<string, unknown>;
+    if (value["type"] === "text" && typeof value["text"] === "string") {
+      chunks.push(value["text"]);
+    } else if (value["type"] === "resource") {
+      const resource = value["resource"] as Record<string, unknown> | undefined;
+      if (resource && typeof resource["text"] === "string") {
+        chunks.push(
+          `<resource uri=${JSON.stringify(String(resource["uri"] ?? ""))}>\n${resource["text"]}\n</resource>`,
+        );
+      }
+    } else if (value["type"] === "resource_link") {
+      chunks.push(`[resource: ${String(value["uri"] ?? "")}]`);
+    }
+  }
+  const text = chunks.join("\n\n").trim();
+  if (!text) throw new Error("prompt contains no supported content");
+  return text;
+}
+
+function contentBlock(part: ContentPart): Record<string, unknown> | undefined {
+  if (part.type === "text") return { type: "text", text: part.text };
+  if (part.type === "image") {
+    return { type: "image", mimeType: part.mediaType, data: part.data };
+  }
+  return undefined;
+}
+
+export class AcpAgentAdapter {
+  private readonly host: SessionHost;
+  private readonly peer: AcpPeer;
+  private readonly defaultModel: string;
+  private readonly agentInfo: NonNullable<AcpAdapterOptions["agentInfo"]>;
+  private readonly deleteSession?: AcpAdapterOptions["deleteSession"];
+  private readonly telemetry: Telemetry;
+  private readonly handles = new Map<string, OpenHandle>();
+  private readonly messageSequences = new Map<string, number>();
+  private initialized = false;
+
+  constructor(options: AcpAdapterOptions) {
+    this.host = options.host;
+    this.peer = options.peer;
+    this.defaultModel = options.defaultModel;
+    this.agentInfo = options.agentInfo ?? { name: "anicode", title: "AniCode", version: "0.1.0" };
+    this.telemetry = options.telemetry ?? noTelemetry;
+    if (options.deleteSession) this.deleteSession = options.deleteSession;
+  }
+
+  async handle(
+    request: JsonRpcRequest | JsonRpcNotification,
+  ): Promise<JsonRpcResponse | undefined> {
+    const id = "id" in request ? request.id : undefined;
+    const meta = request.params?.["_meta"];
+    const parent =
+      meta && typeof meta === "object"
+        ? parseTraceparent(String((meta as Record<string, unknown>)["traceparent"] ?? ""))
+        : undefined;
+    const span = this.telemetry.startSpan(
+      "anicode.acp.request",
+      {
+        "rpc.system": "jsonrpc",
+        "rpc.method": request.method,
+        "anicode.acp.protocol_version": Number(request.params?.["protocolVersion"] ?? 1),
+      },
+      parent,
+    );
+    try {
+      const validation = validateAcpV1Request(request);
+      if (validation.length) throw new AcpError(-32602, validation.join("; "));
+      const result = await this.dispatch(request.method, request.params ?? {}, span.context());
+      span.setStatus({ code: "ok" });
+      return id === undefined ? undefined : { jsonrpc: "2.0", id, result };
+    } catch (error) {
+      span.recordException(error).setStatus({ code: "error" });
+      if (id === undefined) return undefined;
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: error instanceof AcpError ? error.code : -32603,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+    } finally {
+      span.end();
+    }
+  }
+
+  private async dispatch(
+    method: string,
+    params: Record<string, unknown>,
+    context?: SpanContext,
+  ): Promise<unknown> {
+    if (method === "initialize") {
+      const requested = Number(params["protocolVersion"] ?? 1);
+      this.initialized = true;
+      return {
+        protocolVersion: requested === 1 ? 1 : 1,
+        agentCapabilities: {
+          loadSession: true,
+          promptCapabilities: { image: false, audio: false, embeddedContext: true },
+          mcpCapabilities: { http: false, sse: false },
+          sessionCapabilities: {
+            resume: {},
+            close: {},
+            list: {},
+            ...(this.deleteSession ? { delete: {} } : {}),
+          },
+        },
+        agentInfo: this.agentInfo,
+        authMethods: [],
+      };
+    }
+    if (!this.initialized) throw new AcpError(-32002, "connection is not initialized");
+
+    if (method === "session/new") {
+      const cwd = String(params["cwd"] ?? "");
+      const created = await this.host.createSession({ cwd, model: this.defaultModel });
+      await this.attach(created.id);
+      return { sessionId: created.id };
+    }
+    if (method === "session/load") {
+      const sessionId = String(params["sessionId"] ?? "");
+      const handle = await this.attach(sessionId);
+      await this.replay(sessionId, handle.snapshot);
+      return null;
+    }
+    if (method === "session/resume") {
+      const sessionId = String(params["sessionId"] ?? "");
+      await this.attach(sessionId);
+      return {};
+    }
+    if (method === "session/list") {
+      const sessions = await this.host.listSessions();
+      return { sessions: sessions.map(acpSessionInfo) };
+    }
+    if (method === "session/delete") {
+      if (!this.deleteSession) throw new AcpError(-32601, "session/delete is not supported");
+      const sessionId = String(params["sessionId"] ?? "");
+      this.handles.get(sessionId)?.close();
+      this.handles.delete(sessionId);
+      await this.deleteSession(sessionId);
+      return {};
+    }
+    if (method === "session/close") {
+      const sessionId = String(params["sessionId"] ?? "");
+      await this.host.interrupt(sessionId);
+      this.handles.get(sessionId)?.close();
+      this.handles.delete(sessionId);
+      return {};
+    }
+    if (method === "session/cancel") {
+      await this.host.interrupt(String(params["sessionId"] ?? ""));
+      return null;
+    }
+    if (method === "session/prompt") {
+      const sessionId = String(params["sessionId"] ?? "");
+      await this.attach(sessionId);
+      await this.host.send(sessionId, textOfPrompt(params["prompt"]), {
+        ...(context ? { traceparent: traceparent(context) } : {}),
+      });
+      return { stopReason: "end_turn" };
+    }
+    throw new AcpError(-32601, `method not found: ${method}`);
+  }
+
+  private async attach(sessionId: string): Promise<OpenHandle> {
+    const existing = this.handles.get(sessionId);
+    if (existing) return existing;
+    const handle = await this.host.open(sessionId, (event) => {
+      void this.forward(sessionId, event);
+    });
+    this.handles.set(sessionId, handle);
+    return handle;
+  }
+
+  private update(sessionId: string, update: Record<string, unknown>): void | Promise<void> {
+    return this.peer.notify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId, update },
+    });
+  }
+
+  private async forward(sessionId: string, event: SessionEvent): Promise<void> {
+    if (event.type === "permission_request") {
+      const result = (await this.peer.request("session/request_permission", {
+        sessionId,
+        toolCall: { toolCallId: event.permId, title: event.ruleKey, kind: "other" },
+        options: [
+          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+          { optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+          { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+        ],
+      })) as { outcome?: { optionId?: string } };
+      const option = result?.outcome?.optionId;
+      await this.host.answerPermission(
+        sessionId,
+        event.permId,
+        option === "allow_always" ? "allow_always" : option === "allow_once" ? "allow" : "deny",
+      );
+      return;
+    }
+    if (event.type === "state") return;
+    if (event.type !== "agent") return;
+    await this.forwardAgent(sessionId, event.event);
+  }
+
+  private async forwardAgent(sessionId: string, event: AgentEvent): Promise<void> {
+    if (event.type === "text") {
+      await this.update(sessionId, {
+        sessionUpdate: "agent_message_chunk",
+        messageId: `msg_${sessionId}_${this.messageSequences.get(sessionId) ?? 0}`,
+        content: { type: "text", text: event.text },
+      });
+    } else if (event.type === "thinking") {
+      await this.update(sessionId, {
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text: event.text },
+      });
+    } else if (event.type === "tool_start") {
+      await this.update(sessionId, {
+        sessionUpdate: "tool_call",
+        toolCallId: event.id,
+        title: `${event.name}: ${event.ruleKey}`,
+        kind: "other",
+        status: "pending",
+      });
+    } else if (event.type === "tool_permission" && event.decision === "allow") {
+      await this.update(sessionId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: event.id,
+        status: "in_progress",
+      });
+    } else if (event.type === "tool_result") {
+      await this.update(sessionId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: event.id,
+        status: event.isError ? "failed" : "completed",
+        content: [{ type: "content", content: { type: "text", text: event.content } }],
+      });
+    } else if (event.type === "verification") {
+      const id = `verify_${event.report.id}`;
+      await this.update(sessionId, {
+        sessionUpdate: "tool_call",
+        toolCallId: id,
+        title: "Deterministic verification",
+        kind: "other",
+        status: event.report.status === "failed" ? "failed" : "completed",
+        content: [{ type: "content", content: { type: "text", text: event.report.summary } }],
+      });
+    } else if (event.type === "turn_end") {
+      const used = event.usage.inputTokens + event.usage.outputTokens;
+      await this.update(sessionId, { sessionUpdate: "usage_update", used, size: used });
+    } else if (event.type === "done") {
+      this.messageSequences.set(sessionId, (this.messageSequences.get(sessionId) ?? 0) + 1);
+    } else if (event.type === "error") {
+      await this.update(sessionId, {
+        sessionUpdate: "agent_message_chunk",
+        messageId: `msg_${sessionId}_${this.messageSequences.get(sessionId) ?? 0}`,
+        content: { type: "text", text: `\n[Agent error] ${event.message}` },
+      });
+    }
+  }
+
+  private async replay(sessionId: string, snapshot: SessionSnapshot): Promise<void> {
+    let sequence = 0;
+    for (const message of snapshot.messages) {
+      const messageId = `msg_replay_${sequence++}`;
+      for (const part of message.content) {
+        const content = contentBlock(part);
+        if (!content) continue;
+        await this.update(sessionId, {
+          sessionUpdate: message.role === "user" ? "user_message_chunk" : "agent_message_chunk",
+          messageId,
+          content,
+        });
+      }
+    }
+  }
+
+  close(): void {
+    for (const handle of this.handles.values()) handle.close();
+    this.handles.clear();
+  }
+}
+
+function acpSessionInfo(session: SessionSummary): Record<string, unknown> {
+  return {
+    sessionId: session.id,
+    cwd: session.cwd,
+    title: session.title ?? session.id,
+    updatedAt: session.updatedAt,
+    _meta: { model: session.model, running: session.running },
+  };
+}
+
+class AcpError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export interface AcpStdioOptions extends Omit<AcpAdapterOptions, "peer"> {
+  input?: NodeJS.ReadableStream;
+  output?: NodeJS.WritableStream;
+}
+
+/** ACP stdio 传输：每行一条 JSON-RPC 消息，支持 agent→client 双向请求。 */
+export function serveAcpStdio(options: AcpStdioOptions): { close(): void } {
+  const input = options.input ?? process.stdin;
+  const output = options.output ?? process.stdout;
+  const pending = new Map<
+    JsonRpcId,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  const write = (message: unknown) => output.write(JSON.stringify(message) + "\n");
+  const adapter = new AcpAgentAdapter({
+    ...options,
+    peer: {
+      notify(message) {
+        write(message);
+      },
+      request(method, params) {
+        const id = createId("evt");
+        write({ jsonrpc: "2.0", id, method, params });
+        return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+      },
+    },
+  });
+  const lines = createInterface({ input });
+  lines.on("line", (line) => {
+    if (!line.trim()) return;
+    void (async () => {
+      let message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
+      try {
+        message = JSON.parse(line) as typeof message;
+      } catch {
+        write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+        return;
+      }
+      if ("id" in message && !("method" in message)) {
+        const waiter = pending.get(message.id);
+        if (!waiter) return;
+        pending.delete(message.id);
+        if (message.error) waiter.reject(new Error(message.error.message));
+        else waiter.resolve(message.result);
+        return;
+      }
+      const response = await adapter.handle(message as JsonRpcRequest | JsonRpcNotification);
+      if (response) write(response);
+    })();
+  });
+  return {
+    close() {
+      lines.close();
+      adapter.close();
+      for (const waiter of pending.values()) waiter.reject(new Error("ACP connection closed"));
+      pending.clear();
+    },
+  };
+}

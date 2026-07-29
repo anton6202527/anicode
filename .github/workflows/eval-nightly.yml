@@ -2,7 +2,7 @@ name: Eval (nightly)
 
 # 每晚用真实模型跑完整 eval 矩阵，输出 JSON 工件并与提交在库的基线比较；
 # 通过率跌超容忍度（默认 6 个百分点 ≈ 16 任务容 1 个偶发）则失败告警。
-# 仓库没配 ANTHROPIC_API_KEY 时静默跳过——fork/无凭证环境不报红。
+# 模型凭证只通过 GitHub OIDC 换取 Vault 短期身份；fork/未启用环境不运行。
 on:
   schedule:
     - cron: "0 18 * * *" # 02:00 Asia/Shanghai
@@ -10,7 +10,11 @@ on:
 
 jobs:
   eval:
+    if: ${{ vars.ANICODE_EVAL_ENABLED == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -22,22 +26,27 @@ jobs:
       # ubuntu-latest 自带 python3 与 go；缺了对应任务会被 harness 跳过而非失败。
 
       - name: Install
-        run: npm ci
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          npm ci
 
       - name: Run eval
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANICODE_CREDENTIAL_BACKEND: vault
+          VAULT_ADDR: ${{ vars.ANICODE_VAULT_ADDR }}
+          VAULT_NAMESPACE: ${{ vars.ANICODE_VAULT_NAMESPACE }}
+          ANICODE_VAULT_ROLE: ${{ vars.ANICODE_VAULT_ROLE }}
+          ANICODE_VAULT_PREFIX: ${{ vars.ANICODE_VAULT_PREFIX || 'anicode' }}
+          ANICODE_CREDENTIAL_KEYS: ${{ vars.ANICODE_CREDENTIAL_KEYS }}
+          ANICODE_NETWORK_ALLOW_DOMAINS: ${{ vars.ANICODE_EVAL_NETWORK_ALLOW_DOMAINS }}
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "ANTHROPIC_API_KEY 未配置，跳过 nightly eval"
-            exit 0
-          fi
           BASELINE_ARGS=""
           if [ -f packages/eval/baseline.json ]; then
             BASELINE_ARGS="--baseline packages/eval/baseline.json"
           fi
           npm run eval --workspace @anicode/eval -- \
-            --model anthropic/claude-opus-4-8 \
+            --model "${{ vars.ANICODE_EVAL_MODEL }}" \
             --json eval-result.json $BASELINE_ARGS
 
       - name: Upload result

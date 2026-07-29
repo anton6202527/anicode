@@ -69,10 +69,18 @@ export class HttpSessionHost implements SessionHost {
     };
   }
 
-  private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
-      headers: this.headers(body !== undefined ? { "content-type": "application/json" } : {}),
+      headers: this.headers({
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        ...extraHeaders,
+      }),
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     if (!res.ok) {
@@ -166,11 +174,21 @@ export class HttpSessionHost implements SessionHost {
     };
   }
 
-  send(sessionId: string, text: string, opts?: { model?: string }): Promise<void> {
-    return this.call("POST", `/sessions/${encodeURIComponent(sessionId)}/send`, {
-      text,
-      ...(opts?.model ? { model: opts.model } : {}),
-    });
+  send(
+    sessionId: string,
+    text: string,
+    opts?: { model?: string; idempotencyKey?: string; traceparent?: string },
+  ): Promise<void> {
+    return this.call(
+      "POST",
+      `/sessions/${encodeURIComponent(sessionId)}/send`,
+      {
+        text,
+        ...(opts?.model ? { model: opts.model } : {}),
+        ...(opts?.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+      },
+      opts?.traceparent ? { traceparent: opts.traceparent } : {},
+    );
   }
 
   interrupt(sessionId: string): Promise<void> {

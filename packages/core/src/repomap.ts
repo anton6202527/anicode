@@ -12,6 +12,10 @@
 
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import type { LspPool } from "./lsp.js";
+import { type CodeEmbedding } from "./runtime/code-index.js";
+import { TypedCodeGraph } from "./runtime/typed-code-graph.js";
+import type { VectorStore } from "./runtime/vector-store.js";
 
 export interface RepoMapOptions {
   /** 注入预算（token 近似，1 token≈4 char）。默认 1500。 */
@@ -20,6 +24,14 @@ export interface RepoMapOptions {
   maxFiles?: number;
   /** 单文件读取上限（字节），超出跳过。默认 256KB。 */
   maxFileBytes?: number;
+  /** 首轮用户请求，用于 lexical + symbol graph + embedding 混合排序。 */
+  query?: string;
+  /** 默认 true；关闭时使用旧的一次性扫描排序。 */
+  incremental?: boolean;
+  indexFile?: string;
+  embed?: CodeEmbedding;
+  lspPool?: LspPool;
+  vectorStore?: VectorStore;
 }
 
 export interface SourceFile {
@@ -201,6 +213,18 @@ async function walk(dir: string, root: string, out: string[], maxFiles: number):
 
 /** 采集工作区源文件并渲染 repo map。任何一步失败静默降级为空串。 */
 export async function gatherRepoMap(cwd: string, opts: RepoMapOptions = {}): Promise<string> {
+  if (opts.incremental !== false) {
+    const index = new TypedCodeGraph(cwd, {
+      ...(opts.indexFile ? { indexFile: opts.indexFile } : {}),
+      ...(opts.maxFiles ? { maxFiles: opts.maxFiles } : {}),
+      ...(opts.maxFileBytes ? { maxFileBytes: opts.maxFileBytes } : {}),
+      ...(opts.embed ? { embedding: opts.embed } : {}),
+      ...(opts.lspPool ? { lspPool: opts.lspPool } : {}),
+      ...(opts.vectorStore ? { vectorStore: opts.vectorStore } : {}),
+    });
+    await index.refresh();
+    return index.render(opts.query ?? "", opts.tokenBudget ?? 1500);
+  }
   const maxFiles = opts.maxFiles ?? 2000;
   const maxBytes = opts.maxFileBytes ?? 256 * 1024;
   const abs: string[] = [];

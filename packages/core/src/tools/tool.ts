@@ -6,6 +6,9 @@
  */
 
 import type { ImagePart, ToolDefinition, Usage } from "../types.js";
+import type { ExecutionRuntime } from "../runtime/isolated-runtime.js";
+import type { NetworkProxy } from "../runtime/network-proxy.js";
+import type { SpanContext } from "../runtime/telemetry.js";
 
 export interface ToolContext {
   /** 工作目录（所有相对路径的根，也是沙箱边界） */
@@ -28,6 +31,12 @@ export interface ToolContext {
   attachImage?: (image: ImagePart) => void;
   /** OS 级命令沙箱策略（bash 工具据此包一层 sandbox-exec）；缺省 none / 读环境变量。 */
   sandbox?: "none" | "read-only" | "workspace-write";
+  /** 统一隔离执行后端；有值时前后台 shell 都不得走旧的裸 spawn 旁路。 */
+  isolatedRuntime?: ExecutionRuntime;
+  /** 所有内置 HTTP 工具统一走此策略化出口；生产宿主必须注入。 */
+  networkProxy?: NetworkProxy;
+  /** 当前工具 span；MCP/Remote Runtime/子 agent 用它延续同一 W3C trace。 */
+  traceContext?: SpanContext;
   /**
    * 长任务进度上报通道（可选）。工具执行中调用它，事件会被 Agent 包成
    * tool_progress 实时转发给订阅者 —— 子 agent（task 工具）靠它回流内部事件流。

@@ -58,7 +58,7 @@ async function checkTask(task: EvalTask): Promise<string | null> {
 }
 
 test("任务矩阵规模与元数据", () => {
-  assert.ok(BUILTIN_TASKS.length >= 15, `任务应 ≥15，现 ${BUILTIN_TASKS.length}`);
+  assert.ok(BUILTIN_TASKS.length >= 100, `任务应 ≥100，现 ${BUILTIN_TASKS.length}`);
   const ids = new Set(BUILTIN_TASKS.map((t) => t.id));
   assert.equal(ids.size, BUILTIN_TASKS.length, "任务 id 不应重复");
   const langs = new Set(BUILTIN_TASKS.map((t) => t.lang));

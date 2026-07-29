@@ -168,7 +168,7 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
       openapi: string;
       paths: Record<string, unknown>;
     };
-    assert.equal(doc.openapi, "3.1.0");
+    assert.equal(doc.openapi, "3.1.1");
     assert.ok(doc.paths["/sessions/{id}/messages"]);
 
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
@@ -412,6 +412,10 @@ test("http SSE: 全局 firehose GET /events 跨会话广播，不发快照", asy
 
 test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= 隔离会话", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-"));
+  const projectA = path.join(dir, "project-a");
+  const projectB = path.join(dir, "project-b");
+  await fs.mkdir(projectA, { recursive: true });
+  await fs.mkdir(projectB, { recursive: true });
   const provider = scriptedProvider([]);
   const mk = (sub: string) =>
     new SessionManager({
@@ -419,8 +423,8 @@ test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= �
       resolveProvider: () => ({ provider, model: "scripted" }),
     });
   const managers = new Map([
-    ["/proj/a", mk("a")],
-    ["/proj/b", mk("b")],
+    [projectA, mk("a")],
+    [projectB, mk("b")],
   ]);
   const fallback = mk("default");
   const server = new HttpDaemonServer({
@@ -434,19 +438,23 @@ test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= �
     const created = (await (
       await fetch(`${baseUrl}/sessions`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-anicode-directory": "/proj/a" },
-        body: JSON.stringify({ cwd: "/proj/a", model: "scripted" }),
+        headers: { "content-type": "application/json", "x-anicode-directory": projectA },
+        body: JSON.stringify({ cwd: projectA, model: "scripted" }),
       })
     ).json()) as { id: string };
 
     // 实例 A 列表可见（经 query）
-    const listA = (await (await fetch(`${baseUrl}/sessions?directory=/proj/a`)).json()) as {
+    const listA = (await (
+      await fetch(`${baseUrl}/sessions?directory=${encodeURIComponent(projectA)}`)
+    ).json()) as {
       id: string;
     }[];
     assert.ok(listA.some((s) => s.id === created.id));
 
     // 实例 B 与默认实例都看不到 A 的会话
-    const listB = (await (await fetch(`${baseUrl}/sessions?directory=/proj/b`)).json()) as {
+    const listB = (await (
+      await fetch(`${baseUrl}/sessions?directory=${encodeURIComponent(projectB)}`)
+    ).json()) as {
       id: string;
     }[];
     assert.ok(!listB.some((s) => s.id === created.id));

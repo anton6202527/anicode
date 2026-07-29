@@ -15,6 +15,7 @@
 import type { ChatMessage, Effort, Provider, ToolDefinition, Usage } from "./types.js";
 import { emptyUsage } from "./types.js";
 import type { AgentEvent, AgentModelInfo, AgentResolvedModel, RetryConfig } from "./agent.js";
+import { noTelemetry, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
 
 export type TurnOutcome =
   | { type: "ok"; message: ChatMessage; stopReason: string; usage: Usage }
@@ -42,6 +43,9 @@ export interface TurnRunnerOptions {
   effort?: Effort;
   /** 摘要等杂活用的小模型；未配置或解析失败时等于主 provider/model。 */
   small: { provider: Provider; model: string };
+  telemetry?: Telemetry;
+  /** 当前 drive 的上游 trace；用 getter 读取以支持 per-send parent。 */
+  parent?: () => SpanContext | undefined;
 }
 
 export class TurnRunner {
@@ -54,6 +58,8 @@ export class TurnRunner {
   private readonly maxTokens: number | undefined;
   private readonly effort: Effort | undefined;
   private readonly small: { provider: Provider; model: string };
+  private readonly telemetry: Telemetry;
+  private readonly parent: (() => SpanContext | undefined) | undefined;
 
   constructor(opts: TurnRunnerOptions) {
     this.base = {
@@ -69,6 +75,8 @@ export class TurnRunner {
     this.maxTokens = opts.maxTokens;
     this.effort = opts.effort;
     this.small = opts.small;
+    this.telemetry = opts.telemetry ?? noTelemetry;
+    this.parent = opts.parent;
   }
 
   // ---------- active 模型状态 ----------
@@ -191,6 +199,15 @@ export class TurnRunner {
     toolDefs: ToolDefinition[];
     signal: AbortSignal;
   }): AsyncGenerator<AgentEvent, TurnOutcome> {
+    const span = this.telemetry.startSpan(
+      "anicode.model.stream",
+      {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": this.active.model,
+        "gen_ai.provider.name": this.active.provider.name,
+      },
+      this.parent?.(),
+    );
     let finalMessage: ChatMessage | null = null;
     let stopReason = "";
     let usage: Usage = emptyUsage();
@@ -228,10 +245,18 @@ export class TurnRunner {
           finalMessage = ev.message;
           stopReason = ev.stopReason;
           usage = ev.usage;
+          span
+            .setAttribute("gen_ai.response.finish_reasons", [ev.stopReason])
+            .setAttribute("gen_ai.usage.input_tokens", ev.usage.inputTokens)
+            .setAttribute("gen_ai.usage.output_tokens", ev.usage.outputTokens)
+            .setStatus({ code: "ok" });
         }
       }
     } catch (err) {
+      span.recordException(err).setStatus({ code: "error", message: errText(err) });
       return { type: "error", message: errText(err), cause: err, partial };
+    } finally {
+      span.end();
     }
     if (!finalMessage) {
       return { type: "error", message: "provider 未产出 done 事件", partial };

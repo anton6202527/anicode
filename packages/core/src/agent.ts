@@ -63,6 +63,13 @@ import {
 } from "./context-assembler.js";
 import { SnapshotStore } from "./snapshot.js";
 import { Conversation, reminder, type PersistenceConfig } from "./conversation.js";
+import type { WorktreeOwnership } from "./runtime/worker.js";
+import type { NetworkProxy } from "./runtime/network-proxy.js";
+import { ContextCompiler, type ContextSource } from "./runtime/context-compiler.js";
+import { Verifier, renderVerificationReport, type VerificationReport } from "./runtime/verifier.js";
+import { noTelemetry, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
+import type { SecurityPolicyEngine } from "./security/policy.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
 // ---------- 对外事件 ----------
 
@@ -83,6 +90,7 @@ export type AgentEvent =
   | { type: "compacted"; beforeTokens: number; afterTokens: number } // 上下文被压缩
   // 本轮开始前的工作区快照（供 undo/rewind）；messageCount = 本轮用户输入进入历史前的消息数
   | { type: "checkpoint"; id: string; tree: string; label: string; messageCount: number }
+  | { type: "verification"; report: VerificationReport }
   // 后台子 agent 任务完成通知已注入历史（模型将在下一轮看到并处理）
   | { type: "task_notice"; text: string }
   // 整个 loop 结束，等待下一条用户输入；costUSD 为会话累计成本估算（模型无价格信息时缺省）
@@ -183,6 +191,9 @@ export interface AgentOptions {
    * 让模型少盲 grep、首次定位更准。true=默认预算；对象可调预算/限量。默认关。
    */
   repoMap?: boolean | RepoMapOptions;
+  /** 子 agent worktree 的跨 worker 独占租约。 */
+  worktreeOwnership?: WorktreeOwnership;
+  networkProxy?: NetworkProxy;
   /**
    * 工作区快照/撤销：每轮用户输入前记一个 git 快照（不动 HEAD/index），供 undo 回滚
    * 本轮的文件改动。true=按 cwd 自建 SnapshotStore；也可直接传入共享的 store。默认关。
@@ -211,6 +222,17 @@ export interface AgentOptions {
   compaction?: Partial<CompactionConfig> | boolean;
   /** 会话持久化 */
   persistence?: PersistenceConfig;
+  /** 有预算、可追溯的上下文装配器；默认 12k token 静态上下文预算。 */
+  contextCompiler?: ContextCompiler;
+  /** 代码改动后、宣告完成前运行确定性检查；失败结果回灌模型继续修复。 */
+  verifier?: Verifier;
+  /** 单次 drive 最多自动验证/返修次数，默认 2。 */
+  verificationMaxAttempts?: number;
+  /** 权限确认之上的确定性硬策略；deny 不能被 hook/bypass/用户确认覆盖。 */
+  securityPolicy?: SecurityPolicyEngine;
+  /** 可注入真实 OpenTelemetry tracer 的窄接口。 */
+  telemetry?: Telemetry;
+  isolatedRuntime?: ExecutionRuntime;
 }
 
 // 历史值对象及其伴生类型迁至 conversation.ts（架构 v2）；此处 re-export 保持既有 import 路径。
@@ -306,6 +328,8 @@ export class Agent {
   private readonly hooks: HookRunner;
   private readonly maxTurns: number;
   private readonly maxTokens: number | undefined;
+  private readonly worktreeOwnership?: WorktreeOwnership;
+  private readonly networkProxy?: NetworkProxy;
   private readonly snapshots: SnapshotStore | null;
   private readonly sandbox: AgentOptions["sandbox"];
   /** 静态上下文装配管线（架构 v2）：env / 项目记忆 / repo map / skills / browser 指引。 */
@@ -322,6 +346,14 @@ export class Agent {
   private readonly permissionOpt: PermissionConfig | undefined;
   private readonly hooksOpt: HookRegistration[];
   private readonly compaction: CompactionConfig | null;
+  private readonly contextCompiler: ContextCompiler;
+  private readonly verifier: Verifier | null;
+  private readonly verificationMaxAttempts: number;
+  private readonly securityPolicy?: SecurityPolicyEngine;
+  private readonly telemetry: Telemetry;
+  private readonly isolatedRuntime?: ExecutionRuntime;
+  /** 当前 drive 的父上下文；工具/MCP/Remote/子 agent 从此继续同一 trace。 */
+  private traceParent: SpanContext | undefined;
 
   private system: string;
   private memoryLoaded = false;
@@ -334,6 +366,8 @@ export class Agent {
   private readonly executor: ToolExecutor;
   /** 后台子 agent 任务注册表（启用 subagents 后由 registerTaskTool 填充）。 */
   private taskRegistry: TaskRegistry | null = null;
+  private changedSinceVerification = false;
+  private readonly changedFiles = new Set<string>();
 
   constructor(opts: AgentOptions) {
     if (opts.resolveModel) this.resolveModelFn = opts.resolveModel;
@@ -368,6 +402,7 @@ export class Agent {
             maxRetries: Math.max(0, Math.floor(opts.retry?.maxRetries ?? DEFAULT_MAX_RETRIES)),
             baseDelayMs: Math.max(0, opts.retry?.baseDelayMs ?? DEFAULT_RETRY_BASE_MS),
           };
+    this.telemetry = opts.telemetry ?? noTelemetry;
     // 模型轮执行器（架构 v2）：provider 流 + 重试 + 降级链 + active 模型状态。
     this.runner = new TurnRunner({
       provider: opts.provider,
@@ -379,16 +414,25 @@ export class Agent {
       ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
       ...(effort ? { effort } : {}),
       small: { provider: smallProvider, model: smallModelId },
+      telemetry: this.telemetry,
+      parent: () => this.traceParent,
     });
+    const repoMap = opts.repoMap ?? false;
+    const repoMapOpt =
+      repoMap && opts.lsp
+        ? { ...(typeof repoMap === "object" ? repoMap : {}), lspPool: opts.lsp }
+        : repoMap;
     // 静态上下文装配（架构 v2）：provider 顺序 = v1 的 sections.push 顺序（字节稳定）。
     this.assembler = new ContextAssembler([
       ...((opts.injectEnv ?? true) ? [envProvider()] : []),
       ...((opts.projectMemory ?? true) ? [projectMemoryProvider()] : []),
-      ...(opts.repoMap ? [repoMapProvider(opts.repoMap)] : []),
+      ...(repoMapOpt ? [repoMapProvider(repoMapOpt)] : []),
       ...(opts.skills ? [skillsProvider(opts.skills)] : []),
       browserUsageProvider(),
     ]);
     this.postAssembler = new ContextAssembler([sessionStartHookProvider(this.hooks)]);
+    if (opts.worktreeOwnership) this.worktreeOwnership = opts.worktreeOwnership;
+    if (opts.networkProxy) this.networkProxy = opts.networkProxy;
     this.snapshots =
       opts.checkpoints instanceof SnapshotStore
         ? opts.checkpoints
@@ -402,6 +446,11 @@ export class Agent {
     this.inbox = new SteeringInbox(opts.onTaskNotice);
     this.compaction = this.resolveCompaction(opts.compaction, opts.modelInfo);
     this.conv = new Conversation(opts.persistence);
+    this.contextCompiler = opts.contextCompiler ?? new ContextCompiler();
+    this.verifier = opts.verifier ?? null;
+    this.verificationMaxAttempts = Math.max(1, Math.floor(opts.verificationMaxAttempts ?? 2));
+    if (opts.securityPolicy) this.securityPolicy = opts.securityPolicy;
+    if (opts.isolatedRuntime) this.isolatedRuntime = opts.isolatedRuntime;
     // web_search / diagnostics：都是只读工具，在 perm 引擎构建前注册即可自动放行；
     // 也在 task 工具之前注册，好让子 agent（含只读的 explore）一并继承 —— 调研子 agent
     // 能搜网、能自查诊断，正是它们该有的能力。
@@ -488,6 +537,15 @@ export class Agent {
         !(opts.permission?.confirm && (opts.permission.askRules?.length ?? 0) > 0),
       supportsImages: () => this.runner.supportsImages,
       addUsage: (usage) => this.conv.accumulate(usage),
+      ...(this.isolatedRuntime ? { isolatedRuntime: this.isolatedRuntime } : {}),
+      ...(this.networkProxy ? { networkProxy: this.networkProxy } : {}),
+      ...(this.securityPolicy ? { securityPolicy: this.securityPolicy } : {}),
+      telemetry: this.telemetry,
+      traceParent: () => this.traceParent,
+      onFilesChanged: (paths) => {
+        this.changedSinceVerification = true;
+        for (const changedPath of paths) this.changedFiles.add(changedPath);
+      },
     });
   }
 
@@ -509,6 +567,13 @@ export class Agent {
       cwd: this.cwd,
       tools: this.tools,
       ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+      ...(this.isolatedRuntime ? { isolatedRuntime: this.isolatedRuntime } : {}),
+      ...(this.securityPolicy ? { securityPolicy: this.securityPolicy } : {}),
+      telemetry: this.telemetry,
+      ...(this.verifier ? { verifier: this.verifier } : {}),
+      contextCompiler: this.contextCompiler,
+      ...(this.worktreeOwnership ? { worktreeOwnership: this.worktreeOwnership } : {}),
+      ...(this.networkProxy ? { networkProxy: this.networkProxy } : {}),
       ...(this.permissionOpt ? { permission: this.permissionOpt } : {}),
       ...(childHooks.length > 0 ? { hooks: childHooks } : {}),
       // SubagentStart/Stop 属父级生命周期事件，经父 HookRunner 触发（不下发给子 agent）。
@@ -668,7 +733,7 @@ export class Agent {
   async *send(
     userText: string,
     signal?: AbortSignal,
-    opts?: { model?: string },
+    opts?: { model?: string; resume?: boolean; parent?: SpanContext },
   ): AsyncGenerator<AgentEvent> {
     if (this.running)
       throw new Error(
@@ -681,6 +746,8 @@ export class Agent {
     // 主输入尚在加载记忆 / 跑 UserPromptSubmit hook 时不接 steering；否则主输入
     // 被 block 时，准备期间到达的消息会跟着它的 queue 一起被清掉。
     this.inbox.close();
+    const savedTraceParent = this.traceParent;
+    this.traceParent = opts?.parent;
     // 降级链每次 drive 重置：上一轮的降级不该让本轮少一个候选。
     this.runner.resetFallbacks();
     try {
@@ -710,11 +777,12 @@ export class Agent {
           return;
         }
       }
-      yield* this.drive(userText, signal ?? new AbortController().signal);
+      yield* this.drive(userText, signal ?? new AbortController().signal, opts?.resume ?? false);
     } finally {
       // per-prompt 覆盖与降级都是 drive 局部的：结束还原主模型。
       this.runner.restore();
       this.inbox.clear();
+      this.traceParent = savedTraceParent;
       this.running = false;
       // drive 收尾窗口到达、没赶上 turn 边界的任务通知：改走空闲投递（回调或积压）。
       this.inbox.flushLeftover();
@@ -737,20 +805,30 @@ export class Agent {
     return this.inbox.clear();
   }
 
-  private async *drive(userText: string, signal: AbortSignal): AsyncGenerator<AgentEvent> {
-    await this.ensureMemory();
+  private async *drive(
+    userText: string,
+    signal: AbortSignal,
+    recovering = false,
+  ): AsyncGenerator<AgentEvent> {
+    await this.ensureMemory(userText);
 
     // rewind 需要「本轮开始前」的消息数；必须在 pushUser 之前取。
     const preTurnCount = this.conv.length;
 
-    // UserPromptSubmit hook：可拦截输入，或注入 UI 不展示的内部上下文。
-    const prepared = await this.prepareUserInput(userText);
-    if (prepared.blocked) {
-      this.inbox.close();
-      yield { type: "error", message: `输入被 hook 拦截: ${prepared.reason}` };
-      return;
+    if (recovering) {
+      // command inbox 表明原始用户输入已经进入历史，但进程在终态前退出。
+      // 只注入一条不可冒充用户原话的内部恢复指令，避免重复原始 prompt/副作用。
+      this.pushInternalUser(userText);
+    } else {
+      // UserPromptSubmit hook：可拦截输入，或注入 UI 不展示的内部上下文。
+      const prepared = await this.prepareUserInput(userText);
+      if (prepared.blocked) {
+        this.inbox.close();
+        yield { type: "error", message: `输入被 hook 拦截: ${prepared.reason}` };
+        return;
+      }
+      yield* this.pushUser(userText, false, prepared.additionalContext);
     }
-    yield* this.pushUser(userText, false, prepared.additionalContext);
     // 上一轮空闲期积压的后台任务完成通知：随本轮主输入一并交给模型。
     if (this.inbox.promotePending()) {
       yield* this.drainNotices();
@@ -761,7 +839,7 @@ export class Agent {
     this.inbox.open(!signal.aborted);
 
     // 工作区快照：在模型动手前记一份，供用户 undo 回滚本轮的文件改动。尽力而为，失败不影响主流程。
-    if (this.snapshots) {
+    if (this.snapshots && !recovering) {
       const snap = await this.snapshots.take(userText.replace(/\s+/g, " ").trim().slice(0, 60));
       if (snap) {
         yield {
@@ -775,6 +853,7 @@ export class Agent {
     }
 
     let stopContinuations = 0;
+    let verificationAttempts = 0;
     for (let turn = 1; turn <= this.maxTurns; turn++) {
       // 压缩：每轮 provider 调用前检查历史规模
       if (this.compaction) {
@@ -853,6 +932,63 @@ export class Agent {
           if (added > 0) {
             await this.conv.flush();
             continue;
+          }
+        }
+        // Verifier 是完成条件的一部分：发生文件编辑后，必须由确定性检查给出证据。
+        // 失败会作为内部上下文回灌，让模型继续修复；达到返修上限则明确失败而非假装 done。
+        if (this.verifier && this.changedSinceVerification) {
+          verificationAttempts++;
+          const verificationSpan = this.telemetry.startSpan(
+            "anicode.verification.run",
+            {
+              "anicode.verification.attempt": verificationAttempts,
+              "anicode.changed_files.count": this.changedFiles.size,
+            },
+            this.traceParent,
+          );
+          let report: VerificationReport;
+          try {
+            report = await this.verifier.verify({
+              cwd: this.cwd,
+              changedFiles: [...this.changedFiles],
+              signal,
+            });
+            verificationSpan
+              .setAttribute("anicode.verification.status", report.status)
+              .setAttribute("anicode.verification.checks", report.checks.length)
+              .setStatus({ code: report.status === "failed" ? "error" : "ok" });
+          } catch (error) {
+            verificationSpan.recordException(error).setStatus({ code: "error" }).end();
+            throw error;
+          }
+          verificationSpan.end();
+          yield { type: "verification", report };
+          if (report.status === "failed") {
+            // 保持 dirty：模型若未作任何修复就再次宣告完成，仍会重跑并最终失败，
+            // 不能因“一次验证过”而把失败误当成已验证。
+            this.changedSinceVerification = true;
+            if (verificationAttempts < this.verificationMaxAttempts) {
+              this.pushInternalUser(
+                reminder(
+                  `Deterministic verification failed. Fix the failures before finishing.\n${renderVerificationReport(report)}`,
+                ).trim(),
+              );
+              await this.conv.flush();
+              continue;
+            }
+            this.inbox.close();
+            yield {
+              type: "error",
+              message: `验证失败，已达到自动返修上限 ${this.verificationMaxAttempts}\n${renderVerificationReport(report)}`,
+            };
+            return;
+          }
+          this.changedSinceVerification = false;
+          this.changedFiles.clear();
+          if (report.status === "cancelled") {
+            this.inbox.close();
+            yield { type: "error", message: "验证已取消" };
+            return;
           }
         }
         // Stop hook：可要求继续（配额有限，防死循环）
@@ -1014,30 +1150,59 @@ export class Agent {
    * 段落顺序由 assembler 的 provider 顺序决定（env → 记忆 → repo map → skills →
    * browser 指引），subagent 发现夹在中间（不贡献段落），SessionStart hook 收尾。
    */
-  private async ensureMemory(): Promise<void> {
+  private async ensureMemory(query: string): Promise<void> {
     if (this.memoryLoaded) return;
     this.memoryLoaded = true;
+    const span = this.telemetry.startSpan("anicode.context.compile", undefined, this.traceParent);
     const ctx = {
       cwd: this.cwd,
       tools: this.tools,
+      query,
       markReadOnly: (names: string[]) => this.perm.addReadOnlyTools(names),
     };
-    const sections = await this.assembler.collect(ctx);
-    // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
-    // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。
-    if (this.subagentsOpt?.discover) {
-      let discovered: SubagentDefinition[] = [];
-      try {
-        discovered = await discoverSubagents(this.cwd, this.subagentsOpt.dirs);
-      } catch {
-        /* 发现失败不影响主流程；仍注册内置类型 */
+    try {
+      const contributions = await this.assembler.collectContributions(ctx);
+      // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
+      // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。
+      if (this.subagentsOpt?.discover) {
+        let discovered: SubagentDefinition[] = [];
+        try {
+          discovered = await discoverSubagents(this.cwd, this.subagentsOpt.dirs);
+        } catch {
+          /* 发现失败不影响主流程；仍注册内置类型 */
+        }
+        this.registerTaskTool([...discovered, ...this.subagentsOpt.definitions]);
       }
-      this.registerTaskTool([...discovered, ...this.subagentsOpt.definitions]);
-    }
-    // SessionStart hook：会话装配的最后一步，additionalContext 注入 system。
-    sections.push(...(await this.postAssembler.collect(ctx)));
-    if (sections.length > 0) {
-      this.system = composeSystem(this.baseSystem, sections.join("\n\n"));
+      // SessionStart hook：会话装配的最后一步，additionalContext 注入 system。
+      contributions.push(...(await this.postAssembler.collectContributions(ctx)));
+      const presets: Record<string, Pick<ContextSource, "kind" | "priority" | "required">> = {
+        env: { kind: "environment", priority: 90, required: true },
+        "project-memory": { kind: "memory", priority: 100, required: true },
+        "repo-map": { kind: "repository", priority: 65 },
+        skills: { kind: "skill", priority: 75 },
+        "browser-usage": { kind: "instruction", priority: 60 },
+        "session-start-hook": { kind: "runtime", priority: 95, required: true },
+      };
+      const sources: ContextSource[] = contributions.map(({ id, content }) => ({
+        id,
+        content,
+        ...(presets[id] ?? { kind: "runtime", priority: 50 }),
+      }));
+      if (sources.length > 0) {
+        const compiled = this.contextCompiler.compile({ query, sources });
+        this.system = composeSystem(this.baseSystem, compiled.text);
+        span
+          .setAttribute("anicode.context.sources", compiled.selected.length)
+          .setAttribute("anicode.context.dropped", compiled.dropped.length)
+          .setAttribute("anicode.context.tokens", compiled.estimatedTokens)
+          .setAttribute("anicode.context.digest", compiled.digest);
+      }
+      span.setStatus({ code: "ok" });
+    } catch (error) {
+      span.recordException(error).setStatus({ code: "error" });
+      throw error;
+    } finally {
+      span.end();
     }
   }
 }

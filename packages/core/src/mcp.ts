@@ -18,9 +18,14 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { CredentialBroker } from "./security/credentials.js";
+import { sanitizedShellEnv } from "./tools/shell-spawn.js";
 import { t } from "./i18n.js";
 import type { Tool, ToolContext } from "./tools/tool.js";
 import { ToolError } from "./tools/tool.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import type { NetworkProxy } from "./runtime/network-proxy.js";
+import { noTelemetry, traceparent, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
@@ -64,6 +69,13 @@ export interface McpServerCapabilities {
 export interface McpClientHandlers {
   /** server 广播 notifications/tools/list_changed 时触发；用 listTools() 重新拉取。 */
   onToolsChanged?: () => void;
+  telemetry?: Telemetry;
+  /** HTTP MCP 必须经受控出口；宿主不传则 fail-close。 */
+  networkProxy?: NetworkProxy;
+  /** HTTP header / stdio env 的密钥只允许由 Broker 短租约注入。 */
+  credentialBroker?: CredentialBroker;
+  /** 宿主提供时，stdio MCP 进程通过同一 OS 隔离边界启动。 */
+  executionRuntime?: ExecutionRuntime;
 }
 
 /** stdio 传输：本地进程 server。 */
@@ -72,7 +84,12 @@ export interface McpStdioConfig {
   name: string;
   command: string;
   args?: string[];
+  /** 仅用于非敏感配置；疑似密钥的变量会被拒绝。 */
   env?: Record<string, string>;
+  /** env 名 → Broker credential id，例如 GITHUB_TOKEN → env:GITHUB_TOKEN。 */
+  credentialEnv?: Record<string, string>;
+  /** 默认断网；启用时宿主隔离运行时必须具有强制代理出口。 */
+  network?: boolean;
   /** 单个请求的超时（毫秒）；默认 60000。 */
   timeoutMs?: number;
 }
@@ -82,8 +99,16 @@ export interface McpHttpConfig {
   name: string;
   /** server endpoint（Streamable HTTP）。 */
   url: string;
-  /** 附加请求头（如 Authorization: Bearer …）。 */
+  /** 仅用于非敏感请求头；Authorization/Cookie/API key 必须用 credential。 */
   headers?: Record<string, string>;
+  /** Broker 中的凭据引用；值不会进入配置、prompt、事件或 Artifact。 */
+  credential?: {
+    id: string;
+    /** 缺省 authorization；必须与 Broker scope.header 一致。 */
+    header?: string;
+    /** 可选前缀，例如 Bearer。后端保存的仍是原始 token。 */
+    scheme?: string;
+  };
   /** 单个请求的超时（毫秒）；默认 60000。 */
   timeoutMs?: number;
 }
@@ -94,10 +119,40 @@ function isHttp(cfg: McpServerConfig): cfg is McpHttpConfig {
   return typeof (cfg as McpHttpConfig).url === "string";
 }
 
+const SENSITIVE_MCP_HEADER =
+  /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key)$/i;
+const SENSITIVE_MCP_ENV =
+  /(?:^|_)(?:API_?KEY|ACCESS_?KEY(?:_ID)?|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_?KEY)(?:_|$)/i;
+
+function rejectSensitiveHeaders(headers: Record<string, string> | undefined): void {
+  const name = Object.keys(headers ?? {}).find((candidate) => SENSITIVE_MCP_HEADER.test(candidate));
+  if (name) {
+    throw new Error(`Sensitive MCP header ${name} must use credential.id and Credential Broker`);
+  }
+}
+
+function safeMcpEnvironment(env: Record<string, string> | undefined): Record<string, string> {
+  const name = Object.keys(env ?? {}).find((candidate) => SENSITIVE_MCP_ENV.test(candidate));
+  if (name) {
+    throw new Error(
+      `Sensitive MCP environment variable ${name} must use credentialEnv and Credential Broker`,
+    );
+  }
+  return { ...(env ?? {}) };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function shellCommand(file: string, args: readonly string[]): string {
+  return [file, ...args].map(shellQuote).join(" ");
+}
+
 // ---------- 传输抽象 ----------
 
 interface McpTransport {
-  request(method: string, params: unknown): Promise<any>;
+  request(method: string, params: unknown, context?: SpanContext): Promise<any>;
   notify(method: string, params: unknown): void;
   close(): void;
   /** server 主动通知（notifications/*）的回调；由客户端在握手后设置。 */
@@ -119,6 +174,7 @@ export class McpClient {
     private readonly serverName: string,
     private readonly transport: McpTransport,
     capabilities: McpServerCapabilities,
+    private readonly telemetry: Telemetry,
   ) {
     this.capabilities = capabilities;
   }
@@ -127,19 +183,45 @@ export class McpClient {
   static async start(cfg: McpServerConfig, handlers?: McpClientHandlers): Promise<McpClient> {
     const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const transport: McpTransport = isHttp(cfg)
-      ? new HttpTransport(cfg.url, cfg.headers, timeoutMs)
-      : new StdioTransport(cfg.command, cfg.args ?? [], cfg.env, timeoutMs);
-    const init = await transport.request("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "anicode", version: "0.0.1" },
+      ? new HttpTransport(cfg, timeoutMs, handlers?.networkProxy, handlers?.credentialBroker)
+      : new StdioTransport(cfg, timeoutMs, handlers?.credentialBroker, handlers?.executionRuntime);
+    const telemetry = handlers?.telemetry ?? noTelemetry;
+    const initSpan = telemetry.startSpan("anicode.mcp.request", {
+      "rpc.system": "jsonrpc",
+      "rpc.method": "initialize",
+      "anicode.mcp.server": cfg.name,
+      "anicode.mcp.transport": isHttp(cfg) ? "http" : "stdio",
     });
+    let init: any;
+    try {
+      init = await transport.request(
+        "initialize",
+        {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "anicode", version: "0.0.1" },
+        },
+        initSpan.context(),
+      );
+      initSpan.setStatus({ code: "ok" });
+    } catch (error) {
+      initSpan.recordException(error).setStatus({ code: "error" });
+      transport.close();
+      throw error;
+    } finally {
+      initSpan.end();
+    }
     const caps = init?.capabilities ?? {};
-    const client = new McpClient(cfg.name, transport, {
-      tools: Boolean(caps.tools),
-      resources: Boolean(caps.resources),
-      prompts: Boolean(caps.prompts),
-    });
+    const client = new McpClient(
+      cfg.name,
+      transport,
+      {
+        tools: Boolean(caps.tools),
+        resources: Boolean(caps.resources),
+        prompts: Boolean(caps.prompts),
+      },
+      telemetry,
+    );
     transport.onNotification = (method) => {
       if (method === "notifications/tools/list_changed") handlers?.onToolsChanged?.();
     };
@@ -149,7 +231,7 @@ export class McpClient {
 
   /** 拉取工具列表并包装成 core Tool 数组 */
   async listTools(): Promise<Tool[]> {
-    const res = await this.transport.request("tools/list", {});
+    const res = await this.request("tools/list", {});
     const specs: McpToolSpec[] = res?.tools ?? [];
     return specs.map((spec) => this.wrap(spec));
   }
@@ -157,13 +239,13 @@ export class McpClient {
   /** 列出 server 声明的资源；server 未声明 resources 能力时返回空数组。 */
   async listResources(): Promise<McpResource[]> {
     if (!this.capabilities.resources) return [];
-    const res = await this.transport.request("resources/list", {});
+    const res = await this.request("resources/list", {});
     return (res?.resources ?? []) as McpResource[];
   }
 
   /** 读取一个资源的文本内容（blob 内容以占位说明代替，不注入二进制）。 */
   async readResource(uri: string): Promise<string> {
-    const res = await this.transport.request("resources/read", { uri });
+    const res = await this.request("resources/read", { uri });
     const contents: any[] = res?.contents ?? [];
     return contents
       .map((c) =>
@@ -180,13 +262,13 @@ export class McpClient {
   /** 列出 server 的 prompt 模板；未声明 prompts 能力时返回空数组。 */
   async listPrompts(): Promise<McpPrompt[]> {
     if (!this.capabilities.prompts) return [];
-    const res = await this.transport.request("prompts/list", {});
+    const res = await this.request("prompts/list", {});
     return (res?.prompts ?? []) as McpPrompt[];
   }
 
   /** 取一个 prompt 模板渲染后的消息文本（拼接为可直接作为用户输入的文本）。 */
   async getPrompt(name: string, args?: Record<string, string>): Promise<string> {
-    const res = await this.transport.request("prompts/get", {
+    const res = await this.request("prompts/get", {
       name,
       ...(args ? { arguments: args } : {}),
     });
@@ -210,10 +292,33 @@ export class McpClient {
     this.transport.close();
   }
 
+  private async request(method: string, params: unknown, parent?: SpanContext): Promise<any> {
+    const span = this.telemetry.startSpan(
+      "anicode.mcp.request",
+      {
+        "rpc.system": "jsonrpc",
+        "rpc.method": method,
+        "anicode.mcp.server": this.serverName,
+      },
+      parent,
+    );
+    try {
+      const result = await this.transport.request(method, params, span.context());
+      span.setStatus({ code: "ok" });
+      return result;
+    } catch (error) {
+      span.recordException(error).setStatus({ code: "error" });
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
   private wrap(spec: McpToolSpec): Tool {
     const fqName = `${this.serverName}__${spec.name}`;
-    const transport = this.transport;
     const serverName = this.serverName;
+    const callTool = (input: Record<string, unknown>, parent?: SpanContext) =>
+      this.request("tools/call", { name: spec.name, arguments: input }, parent);
     return {
       readOnly: false, // 外部工具默认不可信，走权限门
       def: {
@@ -225,8 +330,8 @@ export class McpClient {
         },
       },
       ruleKey: (input) => `${spec.name} ${JSON.stringify(input).slice(0, 80)}`,
-      async run(input: Record<string, unknown>, _ctx: ToolContext): Promise<string> {
-        const res = await transport.request("tools/call", { name: spec.name, arguments: input });
+      async run(input: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+        const res = await callTool(input, ctx.traceContext);
         return renderToolResult(res);
       },
     };
@@ -245,14 +350,60 @@ class StdioTransport implements McpTransport {
   onNotification?: (method: string, params: unknown) => void;
 
   constructor(
-    command: string,
-    args: string[],
-    env: Record<string, string> | undefined,
+    config: McpStdioConfig,
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
+    broker?: CredentialBroker,
+    executionRuntime?: ExecutionRuntime,
   ) {
-    this.proc = spawn(command, args, {
+    let env: NodeJS.ProcessEnv = { ...sanitizedShellEnv(), ...safeMcpEnvironment(config.env) };
+    for (const [name, credentialId] of Object.entries(config.credentialEnv ?? {})) {
+      if (Object.hasOwn(config.env ?? {}, name)) {
+        throw new Error(`MCP ${config.name} env ${name} cannot be both static and broker-managed`);
+      }
+      if (!broker)
+        throw new Error(`MCP ${config.name} credential ${credentialId} requires Credential Broker`);
+      const lease = broker.lease({
+        credentialId,
+        audience: `mcp:${config.name}`,
+        tool: "stdio",
+        ttlMs: 30_000,
+        maxUses: 1,
+      });
+      const injected = broker.injectEnv(lease, env);
+      if (!(name in injected)) {
+        throw new Error(
+          `MCP ${config.name} credential ${credentialId} is not scoped for env ${name}`,
+        );
+      }
+      env = injected;
+    }
+    let file = config.command;
+    let args = config.args ?? [];
+    let cwd: string | undefined;
+    if (executionRuntime) {
+      if (!executionRuntime.prepare) {
+        throw new Error(
+          "Persistent stdio MCP requires an execution runtime with prepare() support",
+        );
+      }
+      const command = shellCommand(config.command, args);
+      const prepared = executionRuntime.prepare({
+        command,
+        cwd: process.cwd(),
+        policy: "read-only",
+        network: config.network ?? false,
+        env,
+      });
+      file = prepared.file;
+      args = prepared.args;
+      env = prepared.env;
+      cwd = prepared.cwd;
+    }
+    this.proc = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...env },
+      // 禁止把宿主全部密钥隐式继承给第三方 MCP；只注入该 server 明确声明的 env。
+      env,
+      ...(cwd ? { cwd } : {}),
     });
     this.proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
     this.proc.on("exit", () => {
@@ -262,7 +413,7 @@ class StdioTransport implements McpTransport {
     });
   }
 
-  request(method: string, params: unknown): Promise<any> {
+  request(method: string, params: unknown, _context?: SpanContext): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       // 超时：挂死的 server 不该无限期占住一次工具调用；如实告知方法与时限。
@@ -355,19 +506,23 @@ class HttpTransport implements McpTransport {
   onNotification?: (method: string, params: unknown) => void;
 
   constructor(
-    private readonly url: string,
-    private readonly headers: Record<string, string> = {},
+    private readonly config: McpHttpConfig,
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
-  ) {}
+    private readonly proxy?: NetworkProxy,
+    private readonly broker?: CredentialBroker,
+  ) {
+    if (!proxy) throw new Error(`HTTP MCP ${config.name} requires the AniCode Network Proxy`);
+    rejectSensitiveHeaders(config.headers);
+  }
 
-  async request(method: string, params: unknown): Promise<any> {
+  async request(method: string, params: unknown, context?: SpanContext): Promise<any> {
     const id = this.nextId++;
     // 超时覆盖整个请求（含 SSE 流式响应体的读取），abort 统一收束。
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.timeoutMs);
     timer.unref?.();
     try {
-      const res = await this.post({ jsonrpc: "2.0", id, method, params }, ac.signal);
+      const res = await this.post({ jsonrpc: "2.0", id, method, params }, ac.signal, context);
       // initialize 响应会带 Mcp-Session-Id，后续请求需回带。
       const sid = res.headers.get("mcp-session-id");
       if (sid) this.sessionId = sid;
@@ -397,24 +552,52 @@ class HttpTransport implements McpTransport {
   close(): void {
     if (!this.sessionId) return;
     // 尽力释放服务端会话；失败无妨。
-    void fetch(this.url, {
+    void this.fetch({
       method: "DELETE",
-      headers: { ...this.headers, "mcp-session-id": this.sessionId },
+      headers: { ...this.config.headers, "mcp-session-id": this.sessionId },
     }).catch(() => {});
   }
 
-  private post(body: unknown, signal?: AbortSignal): Promise<Response> {
-    return fetch(this.url, {
+  private post(body: unknown, signal?: AbortSignal, context?: SpanContext): Promise<Response> {
+    return this.fetch({
       method: "POST",
       headers: {
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
         ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
-        ...this.headers,
+        ...(context ? { traceparent: traceparent(context) } : {}),
+        ...this.config.headers,
       },
       body: JSON.stringify(body),
       ...(signal ? { signal } : {}),
     });
+  }
+
+  private fetch(init: RequestInit): Promise<Response> {
+    let headers = new Headers(init.headers);
+    const credential = this.config.credential;
+    if (credential) {
+      if (!this.broker) {
+        throw new Error(`HTTP MCP ${this.config.name} credential requires Credential Broker`);
+      }
+      const url = new URL(this.config.url);
+      const lease = this.broker.lease({
+        credentialId: credential.id,
+        audience: `mcp:${this.config.name}`,
+        host: url.hostname,
+        tool: "http",
+        ttlMs: Math.min(this.timeoutMs, 60_000),
+        maxUses: 1,
+      });
+      headers = this.broker.injectHeaders(lease, headers);
+      const header = (credential.header ?? "authorization").toLowerCase();
+      const value = headers.get(header);
+      if (value === null) {
+        throw new Error(`MCP credential ${credential.id} is not scoped for header ${header}`);
+      }
+      if (credential.scheme) headers.set(header, `${credential.scheme} ${value}`);
+    }
+    return this.proxy!.fetch(this.config.url, { ...init, headers });
   }
 
   /** 读取一个 JSON-RPC 响应：application/json 直接解析；text/event-stream 读到匹配 id 的消息。 */
@@ -532,7 +715,13 @@ function extractText(res: any): string {
  * 调用方可对该 client 重新 listTools() 并更新自己的注册表。 */
 export async function connectMcpServers(
   configs: McpServerConfig[],
-  handlers?: { onToolsChanged?: (serverName: string, client: McpClient) => void },
+  handlers?: {
+    onToolsChanged?: (serverName: string, client: McpClient) => void;
+    telemetry?: Telemetry;
+    networkProxy?: NetworkProxy;
+    credentialBroker?: CredentialBroker;
+    executionRuntime?: ExecutionRuntime;
+  },
 ): Promise<{
   tools: Tool[];
   clients: McpClient[];
@@ -543,6 +732,10 @@ export async function connectMcpServers(
     let client: McpClient;
     const perServer: McpClientHandlers = {
       onToolsChanged: () => handlers?.onToolsChanged?.(cfg.name, client),
+      ...(handlers?.telemetry ? { telemetry: handlers.telemetry } : {}),
+      ...(handlers?.networkProxy ? { networkProxy: handlers.networkProxy } : {}),
+      ...(handlers?.credentialBroker ? { credentialBroker: handlers.credentialBroker } : {}),
+      ...(handlers?.executionRuntime ? { executionRuntime: handlers.executionRuntime } : {}),
     };
     client = await McpClient.start(cfg, perServer);
     clients.push(client);

@@ -1,0 +1,61 @@
+name: Agent Runtime Delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_eval_selftest:
+        description: Run the 100+ offline task integrity matrix
+        required: false
+        default: true
+        type: boolean
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: agent-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-delivery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Verify generated OpenAPI SDK contract
+        run: npm run codegen:check
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test runtime and protocol contracts
+        run: npm test
+      - name: Archive runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-runtime-evidence-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            .anicode/**/*.json
+            .anicode/**/*.jsonl
+            packages/eval/**/*.json
+      - name: Package provenance subject
+        if: success()
+        run: |
+          tar -czf anicode-runtime-evidence.tgz \
+            packages/sdk/src/generated.ts \
+            docs/architecture \
+            deploy/remote-runtime
+      - name: Sign build provenance with GitHub OIDC
+        if: success()
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: anicode-runtime-evidence.tgz

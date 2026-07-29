@@ -35,6 +35,8 @@ export interface SandboxSpec {
   readOnlySubpaths?: readonly string[];
   /** 是否允许出网；缺省由调用方决定（见 resolveSandboxNetwork）。 */
   network?: boolean;
+  /** 唯一允许连接的本地显式代理；设置后仍先 deny network*。 */
+  networkProxy?: { host: string; port: number };
 }
 
 export interface WrappedCommand {
@@ -57,14 +59,12 @@ export function resolveSandboxPolicy(
 }
 
 /**
- * 沙箱是否放行出网。默认放行 —— 若默认断网，`npm/pip/cargo install`、`git fetch` 等会被
- * 静默打断，用户多半干脆关掉整个沙箱（更糟）。想要更强隔离（防 exfil）时用
- * AGENTX_SANDBOX_NETWORK=off 一键收紧。
+ * 沙箱是否放行出网。生产默认断网；必须由单次工具调用显式申请并通过受控代理。
  */
 export function resolveSandboxNetwork(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = (env["AGENTX_SANDBOX_NETWORK"] ?? "").trim().toLowerCase();
   if (v === "off" || v === "false" || v === "0" || v === "deny" || v === "none") return false;
-  return true;
+  return v === "on" || v === "true" || v === "1" || v === "allow";
 }
 
 /**
@@ -111,7 +111,14 @@ export function buildSeatbeltProfile(spec: SandboxSpec): string {
       lines.push(`(deny file-write* (subpath ${sbplString(sub)}))`);
     }
   }
-  if (!spec.network) lines.push("(deny network*)");
+  if (spec.networkProxy) {
+    lines.push("(deny network*)");
+    lines.push(
+      `(allow network-outbound (remote ip ${sbplString(
+        `${spec.networkProxy.host}:${spec.networkProxy.port}`,
+      )}))`,
+    );
+  } else if (!spec.network) lines.push("(deny network*)");
   return lines.join("\n") + "\n";
 }
 

@@ -126,7 +126,6 @@ export class Browser {
       "--disable-extensions",
       "--disable-background-networking",
       "--disable-sync",
-      "--no-sandbox",
       "--remote-debugging-port=0",
       `--user-data-dir=${userDataDir}`,
       "--window-size=1280,800",

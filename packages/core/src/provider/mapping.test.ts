@@ -41,7 +41,7 @@ test("registry: 裸模型名按前缀推断（唯一云端 DeepSeek）", () => {
 test("registry: 内置 provider 包含 DeepSeek、custom 与 debug/demo，已删除的不再出现", () => {
   for (const id of ["deepseek", "custom", "debug", "demo"])
     assert.ok(listProviders().includes(id), `缺少 ${id}`);
-  for (const gone of ["anthropic", "openai", "openrouter", "gemini", "groq", "ollama", "vllm"])
+  for (const gone of ["anthropic", "openai", "openrouter", "groq", "ollama", "vllm"])
     assert.ok(!listProviders().includes(gone), `${gone} 应已删除`);
 
   const routed = createProvider("deepseek/vendor/model-name");

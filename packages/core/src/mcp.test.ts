@@ -13,6 +13,9 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import { McpClient } from "./mcp.js";
 import { Agent } from "./agent.js";
+import { CredentialBroker } from "./security/credentials.js";
+import { NetworkProxy } from "./runtime/network-proxy.js";
+import { InMemoryTelemetry } from "./runtime/telemetry.js";
 import { defaultTools } from "./tools/index.js";
 import type { Provider, StreamEvent, ChatMessage, AgentEvent } from "./index.js";
 
@@ -52,12 +55,14 @@ test("MCP: 握手 → 列工具 → 调用 → 错误路径", async () => {
 
 test("MCP(HTTP): 握手带 session、tools/list 走 SSE、tools/call 走 JSON", async () => {
   const seenSession: string[] = [];
+  const seenAuthorization: string[] = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       const sid = req.headers["mcp-session-id"];
       if (sid) seenSession.push(String(sid));
+      if (req.headers.authorization) seenAuthorization.push(req.headers.authorization);
       const msg = body ? JSON.parse(body) : {};
       if (msg.method === "initialize") {
         res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-123" });
@@ -100,8 +105,33 @@ test("MCP(HTTP): 握手带 session、tools/list 走 SSE、tools/call 走 JSON", 
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as any).port;
+  let networkProxy: NetworkProxy | undefined;
   try {
-    const client = await McpClient.start({ name: "remote", url: `http://127.0.0.1:${port}/mcp` });
+    const broker = new CredentialBroker();
+    broker.register({
+      id: "mcp-token",
+      value: "secret-token",
+      scopes: [
+        {
+          audiences: ["mcp:remote"],
+          hosts: ["127.0.0.1"],
+          tools: ["http"],
+          header: "authorization",
+        },
+      ],
+    });
+    networkProxy = new NetworkProxy({
+      broker,
+      policy: { allowPrivateAddresses: true, allowPorts: [port] },
+    });
+    const client = await McpClient.start(
+      {
+        name: "remote",
+        url: `http://127.0.0.1:${port}/mcp`,
+        credential: { id: "mcp-token", scheme: "Bearer" },
+      },
+      { networkProxy, credentialBroker: broker },
+    );
     const tools = await client.listTools();
     const ping = tools.find((t) => t.def.name === "remote__ping");
     assert.ok(ping, "应包装出 remote__ping");
@@ -110,10 +140,32 @@ test("MCP(HTTP): 握手带 session、tools/list 走 SSE、tools/call 走 JSON", 
     assert.equal(out, "pong:42");
     // 初始化返回的 session id 必须在后续请求回带。
     assert.ok(seenSession.includes("sess-123"), "后续请求应回带 Mcp-Session-Id");
+    assert.ok(seenAuthorization.every((value) => value === "Bearer secret-token"));
     client.close();
   } finally {
+    await networkProxy?.close();
     await new Promise<void>((r) => server.close(() => r()));
   }
+});
+
+test("MCP(HTTP): 无受控出口或静态敏感 header 时 fail-close", async () => {
+  await assert.rejects(
+    () => McpClient.start({ name: "remote", url: "https://example.com/mcp" }),
+    /requires the AniCode Network Proxy/,
+  );
+  const proxy = new NetworkProxy({ resolver: async () => ["203.0.113.10"] });
+  await assert.rejects(
+    () =>
+      McpClient.start(
+        {
+          name: "remote",
+          url: "https://example.com/mcp",
+          headers: { Authorization: "Bearer leaked" },
+        },
+        { networkProxy: proxy },
+      ),
+    /must use credential\.id/,
+  );
 });
 
 test("MCP: capabilities + resources/prompts 客户端方法", async () => {
@@ -174,7 +226,8 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
 
 test("MCP: 工具挂进 Agent，端到端调用", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-"));
-  const client = await McpClient.start(serverCfg);
+  const telemetry = new InMemoryTelemetry();
+  const client = await McpClient.start(serverCfg, { telemetry });
   const mcpTools = await client.listTools();
 
   // 内置工具 + MCP 工具合并进一个 registry
@@ -198,15 +251,26 @@ test("MCP: 工具挂进 Agent，端到端调用", async () => {
     tools: registry,
     projectMemory: false,
     permission: { mode: "auto" }, // 自动放行以便断言执行
+    telemetry,
   });
 
   const events: AgentEvent[] = [];
-  for await (const ev of agent.send("用 echo 工具")) events.push(ev);
+  const upstream = { traceId: "c".repeat(32), spanId: "d".repeat(16), traceFlags: 1 };
+  for await (const ev of agent.send("用 echo 工具", undefined, { parent: upstream }))
+    events.push(ev);
 
   const res = events.find((e) => e.type === "tool_result") as any;
   assert.equal(res.name, "fake__echo");
   assert.match(res.content, /echo: 从 agent 调 MCP/);
   assert.ok(events.some((e) => e.type === "done"));
+  const toolSpan = telemetry.spans.find((span) => span.name === "anicode.tool.execute")!;
+  const mcpSpan = telemetry.spans.find(
+    (span) => span.name === "anicode.mcp.request" && span.attributes["rpc.method"] === "tools/call",
+  )!;
+  assert.equal(toolSpan.traceId, upstream.traceId);
+  assert.equal(toolSpan.parentSpanId, upstream.spanId);
+  assert.equal(mcpSpan.traceId, toolSpan.traceId);
+  assert.equal(mcpSpan.parentSpanId, toolSpan.spanId);
 
   client.close();
   await fs.rm(dir, { recursive: true, force: true });

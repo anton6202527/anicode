@@ -1,0 +1,81 @@
+name: Real Repository Eval
+
+on:
+  schedule:
+    - cron: "30 18 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: Number of real tasks to run (280 for the full matrix)
+        required: false
+        default: "40"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-eval-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  catalog-integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Verify the pinned 280-task catalog
+        run: node --import tsx --test packages/eval/src/real-repo.test.ts
+
+  # Real model credentials are supplied by the deployment environment through OIDC/Vault,
+  # never as repository secrets. The runner label should point at an ephemeral runner scale set.
+  real-eval:
+    needs: catalog-integrity
+    if: ${{ vars.ANICODE_REAL_EVAL_ENABLED == 'true' }}
+    runs-on: [self-hosted, anicode-ephemeral-eval]
+    timeout-minutes: 720
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Run real SWE-bench slices
+        env:
+          ANICODE_CREDENTIAL_BACKEND: vault
+          VAULT_ADDR: ${{ vars.ANICODE_VAULT_ADDR }}
+          VAULT_NAMESPACE: ${{ vars.ANICODE_VAULT_NAMESPACE }}
+          ANICODE_VAULT_ROLE: ${{ vars.ANICODE_VAULT_ROLE }}
+          ANICODE_VAULT_PREFIX: ${{ vars.ANICODE_VAULT_PREFIX || 'anicode' }}
+          ANICODE_CREDENTIAL_KEYS: ${{ vars.ANICODE_CREDENTIAL_KEYS }}
+          ANICODE_NETWORK_ALLOW_DOMAINS: ${{ vars.ANICODE_EVAL_NETWORK_ALLOW_DOMAINS }}
+          ANICODE_EXECUTION_BACKEND: container
+          ANICODE_RUNTIME_IMAGE: ${{ vars.ANICODE_EVAL_RUNTIME_IMAGE }}
+          ANICODE_CONTAINER_NETWORK: ${{ vars.ANICODE_EVAL_CONTAINER_NETWORK }}
+          ANICODE_CONTAINER_PROXY_URL: ${{ vars.ANICODE_EVAL_CONTAINER_PROXY_URL }}
+        run: >-
+          npm run eval --
+          --suite real
+          --model "${{ vars.ANICODE_EVAL_MODEL }}"
+          --limit "${{ inputs.limit || 40 }}"
+          --json real-eval.json
+          --baseline packages/eval/baselines/real.json
+          --bootstrap-baseline
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-eval-${{ github.run_id }}
+          # 首次启用时 CLI 会生成待审核基线；下载并提交后，后续 nightly 才执行回归比较。
+          path: |
+            real-eval.json
+            packages/eval/baselines/real.json
+          if-no-files-found: warn
+          retention-days: 30

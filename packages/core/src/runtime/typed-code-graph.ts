@@ -1,0 +1,634 @@
+/** Tree-sitter AST + LSP 类型信息 + 向量库的增量跨语言代码图。 */
+
+import { createHash, randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { Lang, parse, registerDynamicLanguage, type SgNode } from "@ast-grep/napi";
+import python from "@ast-grep/lang-python";
+import go from "@ast-grep/lang-go";
+import rust from "@ast-grep/lang-rust";
+import java from "@ast-grep/lang-java";
+import type { LspPool, LspSymbol } from "../lsp.js";
+import { SqliteVectorStore, localCodeEmbedding, type VectorStore } from "./vector-store.js";
+
+let dynamicRegistered = false;
+function ensureLanguages(): void {
+  if (dynamicRegistered) return;
+  registerDynamicLanguage({ python, go, rust, java });
+  dynamicRegistered = true;
+}
+
+export type CodeLanguage = "javascript" | "typescript" | "tsx" | "python" | "go" | "rust" | "java";
+
+export interface CodeRange {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+}
+
+export interface TypedCodeSymbol {
+  id: string;
+  name: string;
+  kind: string;
+  language: CodeLanguage;
+  path: string;
+  range: CodeRange;
+  signature: string;
+  exported: boolean;
+  container?: string;
+  source: "tree-sitter" | "tree-sitter+lsp" | "lsp";
+}
+
+export interface TypedCodeReference {
+  id: string;
+  name: string;
+  path: string;
+  range: CodeRange;
+  fromSymbolId?: string;
+  targetSymbolIds: string[];
+  resolution: "tree-sitter" | "lsp" | "unresolved";
+}
+
+export interface TypedCodeFile {
+  path: string;
+  language: CodeLanguage;
+  size: number;
+  mtimeMs: number;
+  hash: string;
+  symbols: TypedCodeSymbol[];
+  references: TypedCodeReference[];
+}
+
+export interface TypedCodeGraphSnapshot {
+  version: 3;
+  root: string;
+  updatedAt: string;
+  files: Record<string, TypedCodeFile>;
+}
+
+export interface TypedGraphSearchHit {
+  path: string;
+  score: number;
+  lexical: number;
+  graph: number;
+  semantic: number;
+  symbols: TypedCodeSymbol[];
+  relatedPaths: string[];
+}
+
+export interface TypedCodeGraphOptions {
+  indexFile?: string;
+  vectorStore?: VectorStore;
+  vectorFile?: string;
+  lspPool?: LspPool;
+  maxFiles?: number;
+  maxFileBytes?: number;
+  embedding?: (texts: string[]) => Promise<number[][]>;
+  embeddingDimensions?: number;
+  maxLspSymbolsPerFile?: number;
+  maxLspReferencesPerFile?: number;
+}
+
+const SKIP = new Set([
+  ".git",
+  ".anicode",
+  "node_modules",
+  "dist",
+  "out",
+  "build",
+  "release",
+  "coverage",
+  ".next",
+  ".turbo",
+  "vendor",
+  "__pycache__",
+]);
+
+const DEFINITION_KINDS = new Set([
+  "function_declaration",
+  "function_definition",
+  "method_definition",
+  "method_declaration",
+  "method_definition",
+  "method_declaration",
+  "class_declaration",
+  "class_definition",
+  "interface_declaration",
+  "type_alias_declaration",
+  "enum_declaration",
+  "struct_item",
+  "enum_item",
+  "trait_item",
+  "function_item",
+  "impl_item",
+  "type_declaration",
+  "const_item",
+  "static_item",
+]);
+
+const REFERENCE_KINDS = new Set([
+  "identifier",
+  "type_identifier",
+  "field_identifier",
+  "property_identifier",
+  "shorthand_property_identifier_pattern",
+]);
+
+function languageFor(file: string): { language: CodeLanguage; parser: Lang | string } | undefined {
+  const ext = path.extname(file).toLowerCase();
+  if ([".js", ".jsx", ".mjs", ".cjs"].includes(ext)) {
+    return ext === ".jsx"
+      ? { language: "tsx", parser: Lang.Tsx }
+      : { language: "javascript", parser: Lang.JavaScript };
+  }
+  if (ext === ".ts") return { language: "typescript", parser: Lang.TypeScript };
+  if (ext === ".tsx") return { language: "tsx", parser: Lang.Tsx };
+  if (ext === ".py") return { language: "python", parser: "python" };
+  if (ext === ".go") return { language: "go", parser: "go" };
+  if (ext === ".rs") return { language: "rust", parser: "rust" };
+  if (ext === ".java") return { language: "java", parser: "java" };
+  return undefined;
+}
+
+function hash(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function rangeOf(node: SgNode): CodeRange {
+  const range = node.range();
+  return {
+    startLine: range.start.line + 1,
+    startColumn: range.start.column + 1,
+    endLine: range.end.line + 1,
+    endColumn: range.end.column + 1,
+  };
+}
+
+function nodeName(node: SgNode): SgNode | undefined {
+  const field = (node as unknown as { field(name: string): SgNode | null }).field("name");
+  if (field) return field;
+  return node.children().find((child) => REFERENCE_KINDS.has(String(child.kind())));
+}
+
+function symbolKind(nodeKind: string): string {
+  if (nodeKind.includes("method")) return "method";
+  if (nodeKind.includes("function")) return "function";
+  if (nodeKind.includes("class")) return "class";
+  if (nodeKind.includes("interface") || nodeKind.includes("trait")) return "interface";
+  if (nodeKind.includes("enum")) return "enum";
+  if (nodeKind.includes("struct")) return "struct";
+  if (nodeKind.includes("type")) return "type";
+  if (nodeKind.includes("const")) return "constant";
+  if (nodeKind.includes("static")) return "static";
+  return nodeKind;
+}
+
+function signature(node: SgNode): string {
+  const text = node.text().split(/\r?\n/, 1)[0]!.trim().replace(/\s+/g, " ");
+  return text.slice(0, 240);
+}
+
+function symbolId(file: string, name: string, range: CodeRange): string {
+  return `sym_${createHash("sha256")
+    .update(`${file}\0${name}\0${range.startLine}\0${range.startColumn}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+function parseFile(relative: string, content: string): TypedCodeFile | undefined {
+  const language = languageFor(relative);
+  if (!language) return undefined;
+  ensureLanguages();
+  const root = parse(language.parser, content).root();
+  const symbols: TypedCodeSymbol[] = [];
+  const definitionNameNodes = new Set<number>();
+  const definitionNodes = new Map<number, TypedCodeSymbol>();
+
+  const visitDefinitions = (node: SgNode, container?: string): void => {
+    let nextContainer = container;
+    const kind = String(node.kind());
+    if (DEFINITION_KINDS.has(kind)) {
+      const nameNode = nodeName(node);
+      const name = nameNode?.text().trim();
+      if (name) {
+        const range = rangeOf(nameNode ?? node);
+        const prefix = node.text().slice(0, 80);
+        const symbol: TypedCodeSymbol = {
+          id: symbolId(relative, name, range),
+          name,
+          kind: symbolKind(kind),
+          language: language.language,
+          path: relative,
+          range,
+          signature: signature(node),
+          exported: /\b(?:export|public|pub)\b/.test(prefix),
+          ...(container ? { container } : {}),
+          source: "tree-sitter",
+        };
+        symbols.push(symbol);
+        definitionNodes.set(node.id(), symbol);
+        if (nameNode) definitionNameNodes.add(nameNode.id());
+        if (["class", "interface", "struct", "enum"].includes(symbol.kind)) nextContainer = name;
+      }
+    }
+    for (const child of node.children()) visitDefinitions(child, nextContainer);
+  };
+  visitDefinitions(root);
+
+  const references: TypedCodeReference[] = [];
+  const visitReferences = (node: SgNode, owner?: TypedCodeSymbol): void => {
+    const nextOwner = definitionNodes.get(node.id()) ?? owner;
+    if (REFERENCE_KINDS.has(String(node.kind())) && !definitionNameNodes.has(node.id())) {
+      const name = node.text().trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) {
+        const range = rangeOf(node);
+        references.push({
+          id: `ref_${relative.replace(/[^A-Za-z0-9]/g, "_")}_${range.startLine}_${range.startColumn}`,
+          name,
+          path: relative,
+          range,
+          ...(nextOwner ? { fromSymbolId: nextOwner.id } : {}),
+          targetSymbolIds: [],
+          resolution: "unresolved",
+        });
+      }
+    }
+    for (const child of node.children()) visitReferences(child, nextOwner);
+  };
+  visitReferences(root);
+  return {
+    path: relative,
+    language: language.language,
+    size: Buffer.byteLength(content),
+    mtimeMs: 0,
+    hash: hash(content),
+    symbols,
+    references,
+  };
+}
+
+async function walk(dir: string, out: string[], max: number): Promise<void> {
+  if (out.length >= max) return;
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (out.length >= max) return;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory() && !SKIP.has(entry.name) && !entry.name.startsWith(".")) {
+      await walk(full, out, max);
+    } else if (entry.isFile() && languageFor(full)) out.push(full);
+  }
+}
+
+export class TypedCodeGraph {
+  private snapshot: TypedCodeGraphSnapshot | undefined;
+  private readonly indexFile: string;
+  private readonly vectors: VectorStore;
+  private readonly namespace: string;
+  readonly stats = { parsed: 0, reused: 0, removed: 0, lspEnriched: 0, lspResolved: 0 };
+
+  constructor(
+    readonly root: string,
+    private readonly options: TypedCodeGraphOptions = {},
+  ) {
+    this.root = path.resolve(root);
+    this.indexFile =
+      options.indexFile ?? path.join(this.root, ".anicode", "typed-code-graph-v3.json");
+    this.vectors =
+      options.vectorStore ??
+      new SqliteVectorStore(
+        options.vectorFile ?? path.join(this.root, ".anicode", "code-vectors.db"),
+      );
+    this.namespace = `repo:${createHash("sha256").update(this.root).digest("hex").slice(0, 24)}`;
+  }
+
+  async refresh(): Promise<TypedCodeGraphSnapshot> {
+    this.stats.parsed = 0;
+    this.stats.reused = 0;
+    this.stats.removed = 0;
+    this.stats.lspEnriched = 0;
+    this.stats.lspResolved = 0;
+    const previous = await this.load();
+    const paths: string[] = [];
+    await walk(this.root, paths, this.options.maxFiles ?? 5_000);
+    const files: Record<string, TypedCodeFile> = {};
+    const changed: TypedCodeFile[] = [];
+    for (const absolute of paths) {
+      const stat = await fs.stat(absolute);
+      if (stat.size > (this.options.maxFileBytes ?? 512 * 1024)) continue;
+      const relative = path.relative(this.root, absolute);
+      const cached = previous?.files[relative];
+      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+        files[relative] = cached;
+        this.stats.reused++;
+        continue;
+      }
+      const content = await fs.readFile(absolute, "utf8");
+      const parsed = parseFile(relative, content);
+      if (!parsed) continue;
+      parsed.size = stat.size;
+      parsed.mtimeMs = stat.mtimeMs;
+      await this.enrichWithLsp(absolute, parsed);
+      files[relative] = parsed;
+      changed.push(parsed);
+      this.stats.parsed++;
+    }
+    this.stats.removed = Object.keys(previous?.files ?? {}).filter((file) => !files[file]).length;
+    this.resolveReferences(files);
+    await this.resolveReferencesWithLsp(changed, files);
+    this.snapshot = {
+      version: 3,
+      root: this.root,
+      updatedAt: new Date().toISOString(),
+      files,
+    };
+    await this.updateVectors(changed, files);
+    await this.save(this.snapshot);
+    return this.snapshot;
+  }
+
+  private async enrichWithLsp(absolute: string, file: TypedCodeFile): Promise<void> {
+    const client = this.options.lspPool?.clientFor(path.extname(absolute));
+    if (!client) return;
+    let lspSymbols: LspSymbol[];
+    try {
+      lspSymbols = await client.documentSymbols(absolute);
+    } catch {
+      return;
+    }
+    for (const value of lspSymbols.slice(0, this.options.maxLspSymbolsPerFile ?? 200)) {
+      const existing = file.symbols.find(
+        (symbol) =>
+          symbol.name === value.name && Math.abs(symbol.range.startLine - value.line) <= 1,
+      );
+      if (existing) {
+        existing.kind = value.kind;
+        existing.source = "tree-sitter+lsp";
+        if (value.container) existing.container = value.container;
+      } else {
+        const range: CodeRange = {
+          startLine: value.line,
+          startColumn: value.column,
+          endLine: value.line,
+          endColumn: value.column + value.name.length,
+        };
+        file.symbols.push({
+          id: symbolId(file.path, value.name, range),
+          name: value.name,
+          kind: value.kind,
+          language: file.language,
+          path: file.path,
+          range,
+          signature: `${value.kind} ${value.name}`,
+          exported: true,
+          ...(value.container ? { container: value.container } : {}),
+          source: "lsp",
+        });
+      }
+      this.stats.lspEnriched++;
+    }
+  }
+
+  private resolveReferences(files: Record<string, TypedCodeFile>): void {
+    const definitions = new Map<string, TypedCodeSymbol[]>();
+    const validSymbolIds = new Set<string>();
+    for (const file of Object.values(files)) {
+      for (const symbol of file.symbols) {
+        validSymbolIds.add(symbol.id);
+        const key = symbol.name.toLowerCase();
+        definitions.set(key, [...(definitions.get(key) ?? []), symbol]);
+      }
+    }
+    for (const file of Object.values(files)) {
+      for (const reference of file.references) {
+        reference.targetSymbolIds = reference.targetSymbolIds.filter((id) =>
+          validSymbolIds.has(id),
+        );
+        if (reference.resolution === "lsp" && reference.targetSymbolIds.length > 0) continue;
+        const candidates = definitions.get(reference.name.toLowerCase()) ?? [];
+        // 同文件定义优先，其次 exported；保留歧义边供后续 LSP/reranker 消解。
+        candidates.sort(
+          (a, b) =>
+            Number(b.path === file.path) - Number(a.path === file.path) ||
+            Number(b.exported) - Number(a.exported),
+        );
+        reference.targetSymbolIds = candidates.slice(0, 8).map((symbol) => symbol.id);
+        reference.resolution = candidates.length ? "tree-sitter" : "unresolved";
+      }
+    }
+  }
+
+  private async resolveReferencesWithLsp(
+    changed: TypedCodeFile[],
+    files: Record<string, TypedCodeFile>,
+  ): Promise<void> {
+    if (!this.options.lspPool) return;
+    const symbols = Object.values(files).flatMap((file) => file.symbols);
+    const symbolAt = (
+      absolute: string,
+      line: number,
+      column: number,
+    ): TypedCodeSymbol | undefined => {
+      const relative = path.relative(this.root, path.resolve(absolute));
+      if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+      const candidates = files[relative]?.symbols ?? [];
+      const closest = candidates
+        .map((symbol) => ({
+          symbol,
+          distance:
+            Math.abs(symbol.range.startLine - line) * 1_000 +
+            Math.abs(symbol.range.startColumn - column),
+        }))
+        .sort((a, b) => a.distance - b.distance)[0];
+      return closest && closest.distance <= 2_000 ? closest.symbol : undefined;
+    };
+    for (const file of changed) {
+      const client = this.options.lspPool.clientFor(path.extname(file.path));
+      if (!client) continue;
+      const absolute = path.join(this.root, file.path);
+      for (const reference of file.references.slice(
+        0,
+        this.options.maxLspReferencesPerFile ?? 100,
+      )) {
+        try {
+          const locations = await client.definition(absolute, {
+            line: reference.range.startLine - 1,
+            character: reference.range.startColumn - 1,
+          });
+          const targets = locations
+            .map((location) => symbolAt(location.path, location.line, location.column))
+            .filter((symbol): symbol is TypedCodeSymbol => Boolean(symbol));
+          const ids = [...new Set(targets.map((symbol) => symbol.id))];
+          if (ids.length > 0) {
+            reference.targetSymbolIds = ids;
+            reference.resolution = "lsp";
+            this.stats.lspResolved++;
+          }
+        } catch {
+          // 单个 definition 失败保留 Tree-sitter 名字解析，不拖垮全库索引。
+        }
+      }
+    }
+    // 防止 LSP 返回旧索引中的位置后形成悬空边。
+    const validIds = new Set(symbols.map((symbol) => symbol.id));
+    for (const file of Object.values(files)) {
+      for (const reference of file.references) {
+        reference.targetSymbolIds = reference.targetSymbolIds.filter((id) => validIds.has(id));
+        if (reference.resolution === "lsp" && reference.targetSymbolIds.length === 0) {
+          reference.resolution = "unresolved";
+        }
+      }
+    }
+  }
+
+  private async updateVectors(
+    changed: TypedCodeFile[],
+    files: Record<string, TypedCodeFile>,
+  ): Promise<void> {
+    const texts = changed.map(
+      (file) =>
+        `${file.path}\n${file.symbols.map((symbol) => `${symbol.kind} ${symbol.signature}`).join("\n")}`,
+    );
+    const vectors = this.options.embedding
+      ? await this.options.embedding(texts)
+      : texts.map((text) => localCodeEmbedding(text, this.options.embeddingDimensions ?? 384));
+    await this.vectors.upsert(
+      changed.flatMap((file, index) => {
+        const embedding = vectors[index];
+        if (!embedding) return [];
+        return [
+          {
+            namespace: this.namespace,
+            id: file.path,
+            embedding,
+            content: texts[index]!,
+            metadata: { path: file.path, language: file.language, hash: file.hash },
+          },
+        ];
+      }),
+    );
+    await this.vectors.deleteExcept(this.namespace, new Set(Object.keys(files)));
+  }
+
+  async search(query: string, limit = 20): Promise<TypedGraphSearchHit[]> {
+    const snapshot = this.snapshot ?? (await this.refresh());
+    const terms = [...new Set(query.toLowerCase().match(/[a-z_$][\w$]*|[\p{L}\p{N}_]+/gu) ?? [])];
+    const queryVector = this.options.embedding
+      ? (await this.options.embedding([query]))[0]
+      : localCodeEmbedding(query, this.options.embeddingDimensions ?? 384);
+    const vectorHits = queryVector
+      ? await this.vectors.search(this.namespace, queryVector, Math.max(limit * 3, 30))
+      : [];
+    const semanticByPath = new Map(vectorHits.map((hit) => [hit.id, hit.score]));
+    const symbols = Object.values(snapshot.files).flatMap((file) => file.symbols);
+    const symbolById = new Map(symbols.map((symbol) => [symbol.id, symbol]));
+    return Object.values(snapshot.files)
+      .map((file) => {
+        let lexical = 0;
+        let graph = 0;
+        const related = new Set<string>();
+        const pathTerms = file.path.toLowerCase();
+        for (const term of terms) {
+          if (pathTerms.includes(term)) lexical += 3;
+          for (const symbol of file.symbols) {
+            if (symbol.name.toLowerCase() === term) lexical += 8;
+            else if (symbol.name.toLowerCase().includes(term)) lexical += 3;
+          }
+          for (const reference of file.references) {
+            if (reference.name.toLowerCase() !== term) continue;
+            graph += 2;
+            for (const target of reference.targetSymbolIds) {
+              const destination = symbolById.get(target)?.path;
+              if (destination && destination !== file.path) related.add(destination);
+            }
+          }
+        }
+        for (const reference of file.references) {
+          for (const target of reference.targetSymbolIds) {
+            const destination = symbolById.get(target)?.path;
+            if (destination && destination !== file.path) related.add(destination);
+          }
+        }
+        const semantic = Math.max(0, semanticByPath.get(file.path) ?? 0);
+        return {
+          path: file.path,
+          score: lexical + graph + semantic * 6,
+          lexical,
+          graph,
+          semantic,
+          symbols: file.symbols,
+          relatedPaths: [...related].slice(0, 12),
+        };
+      })
+      .filter((hit) => hit.score > 0 || terms.length === 0)
+      .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+      .slice(0, Math.max(1, limit));
+  }
+
+  async render(query: string, tokenBudget = 1_500): Promise<string> {
+    const hits = await this.search(query, 100);
+    if (!hits.length) return "";
+    const maxChars = tokenBudget * 4;
+    const lines = ['<repo-map mode="tree-sitter+lsp+vector">'];
+    let used = lines[0]!.length;
+    let shown = 0;
+    for (const hit of hits) {
+      const block = [
+        `${hit.path}: # score=${hit.score.toFixed(2)} semantic=${hit.semantic.toFixed(2)}`,
+        ...hit.symbols.slice(0, 16).map((symbol) => `  ${symbol.kind} ${symbol.signature}`),
+        ...(hit.relatedPaths.length ? [`  refs: ${hit.relatedPaths.join(", ")}`] : []),
+      ].join("\n");
+      if (shown && used + block.length + 1 > maxChars) break;
+      lines.push(block);
+      used += block.length + 1;
+      shown++;
+    }
+    if (shown < hits.length) lines.push(`… (+${hits.length - shown} more files)`);
+    lines.push("</repo-map>");
+    return lines.join("\n");
+  }
+
+  async close(): Promise<void> {
+    await this.vectors.close?.();
+  }
+
+  private async load(): Promise<TypedCodeGraphSnapshot | undefined> {
+    if (this.snapshot) return this.snapshot;
+    try {
+      const parsed = JSON.parse(
+        await fs.readFile(this.indexFile, "utf8"),
+      ) as TypedCodeGraphSnapshot;
+      if (parsed.version === 3 && parsed.root === this.root) return parsed;
+    } catch {
+      // 衍生索引损坏时重建。
+    }
+    return undefined;
+  }
+
+  private async save(snapshot: TypedCodeGraphSnapshot): Promise<void> {
+    await fs.mkdir(path.dirname(this.indexFile), { recursive: true, mode: 0o700 });
+    const temporary = `${this.indexFile}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify(snapshot) + "\n", { mode: 0o600, flag: "wx" });
+      await fs.rename(temporary, this.indexFile);
+      await fs.chmod(this.indexFile, 0o600);
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
+  }
+}
+
+export function extractTreeSitterSymbols(
+  file: string,
+  content: string,
+): { name: string; sig: string }[] {
+  return (parseFile(file, content)?.symbols ?? []).map((symbol) => ({
+    name: symbol.name,
+    sig: symbol.signature,
+  }));
+}

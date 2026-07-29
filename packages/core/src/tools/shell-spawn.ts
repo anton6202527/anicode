@@ -74,7 +74,21 @@ export function sanitizedShellEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (key === "BASH_ENV" || key === "ENV" || key.startsWith("BASH_FUNC_")) continue;
+    // Provider/MCP/cloud 凭证属于宿主控制面，绝不能因为 agent 启动一个 shell 就
+    // 批量继承。确需某个密钥时只能由 CredentialBroker 的短租约定向注入。
+    if (isSensitiveEnvName(key)) continue;
     env[key] = value;
   }
   return env;
+}
+
+export function isSensitiveEnvName(name: string): boolean {
+  const key = name.toUpperCase();
+  return (
+    /(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_?KEY)(?:_|$)/.test(key) ||
+    (/^(?:AWS|AZURE|GCP|GOOGLE|ANTHROPIC|OPENAI|DEEPSEEK|GEMINI|GITHUB|GH|NPM|PYPI|TAVILY|BRAVE)_/.test(
+      key,
+    ) &&
+      /(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/.test(key))
+  );
 }

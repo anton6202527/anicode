@@ -45,13 +45,25 @@ export interface AnicodeConfig {
   fallbackModels?: string[];
   /**
    * MCP 服务器：name → 启动配置。两种形态：
-   *   - 本地进程（stdio）：{ command, args?, env? }
-   *   - 远程（Streamable HTTP）：{ url, headers? }
+   *   - 本地进程（stdio）：{ command, args?, env?, credentialEnv?, network? }
+   *   - 远程（Streamable HTTP）：{ url, headers?, credential? }
    */
   mcp?: Record<
     string,
-    | { command: string; args?: string[]; env?: Record<string, string>; timeoutMs?: number }
-    | { url: string; headers?: Record<string, string>; timeoutMs?: number }
+    | {
+        command: string;
+        args?: string[];
+        env?: Record<string, string>;
+        credentialEnv?: Record<string, string>;
+        network?: boolean;
+        timeoutMs?: number;
+      }
+    | {
+        url: string;
+        headers?: Record<string, string>;
+        credential?: { id: string; header?: string; scheme?: string };
+        timeoutMs?: number;
+      }
   >;
   /** 自定义子 agent：name → 定义。 */
   agents?: Record<string, ConfigAgent>;
@@ -320,6 +332,7 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
         name,
         url: c.url,
         ...(c.headers ? { headers: c.headers } : {}),
+        ...(c.credential ? { credential: c.credential } : {}),
         ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
       };
     }
@@ -328,6 +341,8 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
       command: c.command,
       ...(c.args ? { args: c.args } : {}),
       ...(c.env ? { env: c.env } : {}),
+      ...(c.credentialEnv ? { credentialEnv: c.credentialEnv } : {}),
+      ...(c.network !== undefined ? { network: c.network } : {}),
       ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     };
   });
