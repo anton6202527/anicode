@@ -184,8 +184,18 @@ export class WsClient {
   }
 
   send(text: string): void {
-    if (this.closed) return;
+    if (this.closed) throw new Error("WebSocket is closed");
     this.sock.write(encodeTextFrame(text, randomBytes(4)));
+  }
+
+  /** Pending CDP commands must keep Node alive until Chrome answers. */
+  ref(): void {
+    if (!this.closed) this.sock.ref();
+  }
+
+  /** An idle browser connection must not keep a CLI/test process alive forever. */
+  unref(): void {
+    this.sock.unref();
   }
 
   close(): void {

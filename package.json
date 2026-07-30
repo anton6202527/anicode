@@ -14,7 +14,7 @@
     "build:app": "npm run build --workspace @anicode/app",
     "build:vscode": "npm run build --workspace anicode-vscode",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "test": "ANICODE_CREDENTIAL_BACKEND=memory npm run test --workspaces --if-present",
     "eval": "npm run eval --workspace @anicode/eval --",
     "codegen": "npm run codegen --workspace @anicode/sdk",
     "codegen:check": "npm run codegen:check --workspace @anicode/sdk",

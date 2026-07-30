@@ -108,6 +108,7 @@ export class Browser {
 
   private ws!: WsClient;
   private closePromise: Promise<void> | undefined;
+  private terminalError: Error | undefined;
 
   private constructor(
     private readonly proc: ChildProcess,
@@ -157,6 +158,8 @@ export class Browser {
       wsUrl,
       {
         onMessage: (text) => self.dispatch(text),
+        onClose: () => self.failPending(new Error("Chrome DevTools connection closed")),
+        onError: (error) => self.failPending(error),
       },
       timeoutMs,
     );
@@ -171,12 +174,23 @@ export class Browser {
 
   /** 发一条 CDP 命令。sessionId 有值时定向到某个页面会话（flat 模式）。 */
   send(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<any> {
+    if (this.closePromise) return Promise.reject(new Error("Browser closed"));
+    if (this.terminalError) return Promise.reject(this.terminalError);
     const id = this.nextId++;
     const msg: Record<string, unknown> = { id, method, params };
     if (sessionId) msg["sessionId"] = sessionId;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify(msg));
+      // The browser process and idle socket are normally unref'ed. A live command, however,
+      // must keep the event loop referenced or Node 22 can cancel the awaiting test/process.
+      this.ws.ref();
+      try {
+        this.ws.send(JSON.stringify(msg));
+      } catch (error) {
+        this.pending.delete(id);
+        if (this.pending.size === 0) this.ws.unref();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -225,6 +239,7 @@ export class Browser {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
+      if (this.pending.size === 0) this.ws.unref();
       if (msg.error) p.reject(new Error(msg.error.message ?? String(msg.error)));
       else p.resolve(msg.result);
       return;
@@ -232,6 +247,18 @@ export class Browser {
     // 事件：带 sessionId 的分派给对应页面。
     if (msg.method && msg.sessionId) {
       this.sessionListeners.get(msg.sessionId)?.(msg.method, msg.params ?? {});
+    }
+  }
+
+  private failPending(error: Error): void {
+    this.terminalError ??= error;
+    for (const pending of this.pending.values()) pending.reject(this.terminalError);
+    this.pending.clear();
+    this.sessionListeners.clear();
+    try {
+      this.ws?.unref();
+    } catch {
+      /* connection setup/teardown race */
     }
   }
 }
