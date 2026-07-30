@@ -53,7 +53,7 @@ export class PostgresRuntimeDatabase {
   }
 
   private async migrate(): Promise<void> {
-    await this.pool.query(`
+    const migrationSql = `
       CREATE TABLE IF NOT EXISTS anicode_runtime_events (
         stream_id text NOT NULL,
         sequence bigint NOT NULL,
@@ -107,6 +107,66 @@ export class PostgresRuntimeDatabase {
         PRIMARY KEY(namespace, key)
       );
 
+      CREATE TABLE IF NOT EXISTS anicode_worker_jobs (
+        id text PRIMARY KEY,
+        type text NOT NULL,
+        idempotency_key text NOT NULL UNIQUE,
+        payload jsonb NOT NULL,
+        status text NOT NULL CHECK (status IN ('queued', 'leased', 'succeeded', 'failed', 'cancelled')),
+        attempts integer NOT NULL DEFAULT 0,
+        max_attempts integer NOT NULL,
+        lease_owner text,
+        lease_expires_at timestamptz,
+        fencing_token bigint NOT NULL DEFAULT 0,
+        result jsonb,
+        error text,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_anicode_worker_claim
+        ON anicode_worker_jobs(type, status, lease_expires_at, created_at);
+      CREATE INDEX IF NOT EXISTS idx_anicode_worker_retention
+        ON anicode_worker_jobs(status, updated_at);
+
+      CREATE TABLE IF NOT EXISTS anicode_worktree_leases (
+        worktree text PRIMARY KEY,
+        owner text,
+        lease_expires_at timestamptz,
+        fencing_token bigint NOT NULL DEFAULT 0,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS anicode_commands (
+        session_id text NOT NULL,
+        id text NOT NULL,
+        idempotency_key text NOT NULL,
+        status text NOT NULL CHECK (status IN ('accepted', 'running', 'completed', 'failed', 'cancelled')),
+        lease_owner text,
+        lease_expires_at timestamptz,
+        fencing_token bigint NOT NULL DEFAULT 0,
+        data jsonb NOT NULL,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL,
+        PRIMARY KEY(session_id, id),
+        UNIQUE(session_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_anicode_commands_recovery
+        ON anicode_commands(session_id, status, lease_expires_at, created_at);
+
+      CREATE TABLE IF NOT EXISTS anicode_outbox (
+        id text PRIMARY KEY,
+        idempotency_key text NOT NULL UNIQUE,
+        status text NOT NULL CHECK (status IN ('pending', 'sent')),
+        lease_owner text,
+        lease_expires_at timestamptz,
+        fencing_token bigint NOT NULL DEFAULT 0,
+        data jsonb NOT NULL,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_anicode_outbox_pending
+        ON anicode_outbox(status, lease_expires_at, created_at);
+
       CREATE TABLE IF NOT EXISTS anicode_artifacts (
         session_id text NOT NULL,
         id text NOT NULL,
@@ -133,13 +193,116 @@ export class PostgresRuntimeDatabase {
       CREATE INDEX IF NOT EXISTS idx_anicode_audit_time
         ON anicode_runtime_audit(category, timestamp);
 
-      CREATE TABLE IF NOT EXISTS anicode_schema_migrations (
-        version integer PRIMARY KEY,
-        applied_at timestamptz NOT NULL DEFAULT now()
+      INSERT INTO anicode_worker_jobs
+        (id, type, idempotency_key, payload, status, attempts, max_attempts,
+         lease_owner, lease_expires_at, fencing_token, result, error, created_at, updated_at)
+      SELECT
+        item->>'id', item->>'type', item->>'idempotencyKey', item->'payload', item->>'status',
+        COALESCE((item->>'attempts')::integer, 0),
+        COALESCE((item->>'maxAttempts')::integer, 3),
+        item->>'leaseOwner', NULLIF(item->>'leaseExpiresAt', '')::timestamptz,
+        COALESCE((item->>'fencingToken')::bigint, 0), item->'result', item->>'error',
+        (item->>'createdAt')::timestamptz, (item->>'updatedAt')::timestamptz
+      FROM anicode_documents document
+      CROSS JOIN LATERAL jsonb_array_elements(document.data) item
+      WHERE document.namespace = 'worker' AND document.key = 'global'
+        AND item->>'type' NOT LIKE '__worktree__:%'
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO anicode_worktree_leases
+        (worktree, owner, lease_expires_at, fencing_token, updated_at)
+      SELECT
+        item#>>'{payload,worktree}', item->>'leaseOwner',
+        NULLIF(item->>'leaseExpiresAt', '')::timestamptz,
+        COALESCE((item->>'fencingToken')::bigint, 0),
+        (item->>'updatedAt')::timestamptz
+      FROM anicode_documents document
+      CROSS JOIN LATERAL jsonb_array_elements(document.data) item
+      WHERE document.namespace = 'worker' AND document.key = 'global'
+        AND item->>'type' LIKE '__worktree__:%'
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO anicode_commands
+        (session_id, id, idempotency_key, status, lease_owner, lease_expires_at,
+         fencing_token, data, created_at, updated_at)
+      SELECT
+        document.key, item->>'id', item->>'idempotencyKey', item->>'status',
+        item->>'leaseOwner', NULLIF(item->>'leaseExpiresAt', '')::timestamptz,
+        COALESCE((item->>'fencingToken')::bigint, 0), item,
+        (item->>'createdAt')::timestamptz, (item->>'updatedAt')::timestamptz
+      FROM anicode_documents document
+      CROSS JOIN LATERAL jsonb_array_elements(document.data) item
+      WHERE document.namespace = 'commands'
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO anicode_outbox
+        (id, idempotency_key, status, lease_owner, lease_expires_at,
+         fencing_token, data, created_at, updated_at)
+      SELECT
+        item->>'id', COALESCE(item#>>'{event,idempotencyKey}', item->>'id'), item->>'status',
+        item->>'leaseOwner', NULLIF(item->>'leaseExpiresAt', '')::timestamptz,
+        COALESCE((item->>'fencingToken')::bigint, 0), item,
+        (item->>'createdAt')::timestamptz, (item->>'updatedAt')::timestamptz
+      FROM anicode_documents document
+      CROSS JOIN LATERAL jsonb_array_elements(document.data) item
+      WHERE document.namespace = 'outbox' AND document.key = 'global'
+      ON CONFLICT DO NOTHING;
+    `;
+    const version = 3;
+    const checksum = createHash("sha256").update(migrationSql).digest("hex");
+    const client = await this.pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS anicode_schema_migrations (
+          version integer PRIMARY KEY,
+          checksum text,
+          description text,
+          applied_at timestamptz NOT NULL DEFAULT now()
+        );
+        ALTER TABLE anicode_schema_migrations ADD COLUMN IF NOT EXISTS checksum text;
+        ALTER TABLE anicode_schema_migrations ADD COLUMN IF NOT EXISTS description text;
+      `);
+      await client.query(
+        "SELECT pg_advisory_lock(hashtextextended('anicode:schema-migrations', 0))",
       );
-      INSERT INTO anicode_schema_migrations(version) VALUES (1)
-        ON CONFLICT(version) DO NOTHING;
-    `);
+      const future = await client.query(
+        "SELECT version FROM anicode_schema_migrations WHERE version > $1 ORDER BY version LIMIT 1",
+        [version],
+      );
+      if (future.rows[0]) {
+        throw new Error(
+          `Database schema version ${String((future.rows[0] as Row).version)} is newer than this runtime`,
+        );
+      }
+      const applied = await client.query(
+        "SELECT checksum FROM anicode_schema_migrations WHERE version = $1",
+        [version],
+      );
+      if (applied.rows[0]) {
+        if (String((applied.rows[0] as Row).checksum ?? "") !== checksum) {
+          throw new Error(`Database migration ${version} checksum mismatch`);
+        }
+        return;
+      }
+      await client.query("BEGIN");
+      try {
+        await client.query(migrationSql);
+        await client.query(
+          `INSERT INTO anicode_schema_migrations(version, checksum, description)
+           VALUES ($1, $2, $3)`,
+          [version, checksum, "normalized command, outbox, worker queue and worktree leases"],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    } finally {
+      await client
+        .query("SELECT pg_advisory_unlock(hashtextextended('anicode:schema-migrations', 0))")
+        .catch(() => undefined);
+      client.release();
+    }
   }
 
   async transaction<T>(work: (client: PoolClient) => Promise<T>, maxAttempts = 4): Promise<T> {
@@ -216,6 +379,13 @@ export class PostgresRuntimeDatabase {
         input.traceId ?? null,
       ],
     );
+  }
+
+  async healthCheck(): Promise<void> {
+    const result = await this.pool.query("SELECT 1 AS ok");
+    if (Number((result.rows[0] as Row | undefined)?.ok) !== 1) {
+      throw new Error("PostgreSQL readiness query failed");
+    }
   }
 
   close(): Promise<void> {
@@ -456,43 +626,451 @@ export class PostgresSessionStore implements ISessionStore {
   }
 }
 
+function commandFromRow(row: Row): DurableCommand {
+  const command = clone(row.data as DurableCommand);
+  command.status = String(row.status) as DurableCommand["status"];
+  command.updatedAt = new Date(String(row.updated_at)).toISOString();
+  command.fencingToken = Number(row.fencing_token ?? 0);
+  if (row.lease_owner != null) command.leaseOwner = String(row.lease_owner);
+  else delete command.leaseOwner;
+  if (row.lease_expires_at != null) {
+    command.leaseExpiresAt = new Date(String(row.lease_expires_at)).toISOString();
+  } else delete command.leaseExpiresAt;
+  return command;
+}
+
+function commandParams(command: DurableCommand): unknown[] {
+  return [
+    command.sessionId,
+    command.id,
+    command.idempotencyKey,
+    command.status,
+    command.leaseOwner ?? null,
+    command.leaseExpiresAt ?? null,
+    command.fencingToken ?? 0,
+    JSON.stringify(command),
+    command.createdAt,
+    command.updatedAt,
+  ];
+}
+
+async function insertCommandRow(client: PoolClient, command: DurableCommand): Promise<void> {
+  await client.query(
+    `INSERT INTO anicode_commands
+     (session_id, id, idempotency_key, status, lease_owner, lease_expires_at,
+      fencing_token, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)`,
+    commandParams(command),
+  );
+}
+
+async function updateCommandRow(client: PoolClient, command: DurableCommand): Promise<void> {
+  await client.query(
+    `UPDATE anicode_commands
+     SET status = $3, lease_owner = $4, lease_expires_at = $5,
+         fencing_token = $6, data = $7::jsonb, updated_at = $8
+     WHERE session_id = $1 AND id = $2`,
+    [
+      command.sessionId,
+      command.id,
+      command.status,
+      command.leaseOwner ?? null,
+      command.leaseExpiresAt ?? null,
+      command.fencingToken ?? 0,
+      JSON.stringify(command),
+      command.updatedAt,
+    ],
+  );
+}
+
+async function lockedCommand(
+  client: PoolClient,
+  sessionId: string,
+  commandId: string,
+): Promise<DurableCommand> {
+  const selected = await client.query(
+    "SELECT * FROM anicode_commands WHERE session_id = $1 AND id = $2 FOR UPDATE",
+    [sessionId, commandId],
+  );
+  if (!selected.rows[0]) throw new Error(`Unknown durable command: ${commandId}`);
+  return commandFromRow(selected.rows[0] as Row);
+}
+
+function outboxFromRow(row: Row): OutboxMessage {
+  const message = clone(row.data as OutboxMessage);
+  message.status = String(row.status) as OutboxMessage["status"];
+  message.updatedAt = new Date(String(row.updated_at)).toISOString();
+  message.fencingToken = Number(row.fencing_token ?? 0);
+  if (row.lease_owner != null) message.leaseOwner = String(row.lease_owner);
+  else delete message.leaseOwner;
+  if (row.lease_expires_at != null) {
+    message.leaseExpiresAt = new Date(String(row.lease_expires_at)).toISOString();
+  } else delete message.leaseExpiresAt;
+  return message;
+}
+
+function outboxParams(message: OutboxMessage): unknown[] {
+  return [
+    message.id,
+    message.event.idempotencyKey ?? message.id,
+    message.status,
+    message.leaseOwner ?? null,
+    message.leaseExpiresAt ?? null,
+    message.fencingToken ?? 0,
+    JSON.stringify(message),
+    message.createdAt,
+    message.updatedAt,
+  ];
+}
+
+async function insertOutboxRow(client: PoolClient, message: OutboxMessage): Promise<void> {
+  await client.query(
+    `INSERT INTO anicode_outbox
+     (id, idempotency_key, status, lease_owner, lease_expires_at,
+      fencing_token, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)`,
+    outboxParams(message),
+  );
+}
+
+async function updateOutboxRow(client: PoolClient, message: OutboxMessage): Promise<void> {
+  await client.query(
+    `UPDATE anicode_outbox
+     SET status = $2, lease_owner = $3, lease_expires_at = $4,
+         fencing_token = $5, data = $6::jsonb, updated_at = $7
+     WHERE id = $1`,
+    [
+      message.id,
+      message.status,
+      message.leaseOwner ?? null,
+      message.leaseExpiresAt ?? null,
+      message.fencingToken ?? 0,
+      JSON.stringify(message),
+      message.updatedAt,
+    ],
+  );
+}
+
+async function lockedOutbox(client: PoolClient, id: string): Promise<OutboxMessage> {
+  const selected = await client.query("SELECT * FROM anicode_outbox WHERE id = $1 FOR UPDATE", [
+    id,
+  ]);
+  if (!selected.rows[0]) throw new Error(`Unknown outbox message: ${id}`);
+  return outboxFromRow(selected.rows[0] as Row);
+}
+
+function assertOutboxLease(
+  message: OutboxMessage,
+  owner: string,
+  fencingToken: number | undefined,
+): void {
+  if (
+    message.leaseOwner !== owner ||
+    fencingToken === undefined ||
+    message.fencingToken !== fencingToken
+  ) {
+    throw new Error(`Stale fencing token for outbox message ${message.id}`);
+  }
+}
+
 export class PostgresCommandInboxStore implements CommandInboxStore {
   constructor(readonly database: PostgresRuntimeDatabase) {}
-  read(sessionId: string): Promise<DurableCommand[]> {
-    return this.database.readDocument("commands", sessionId, []);
-  }
-  async write(sessionId: string, commands: DurableCommand[]): Promise<void> {
-    await this.transact(sessionId, (current) =>
-      current.splice(0, current.length, ...clone(commands)),
+
+  async read(sessionId: string): Promise<DurableCommand[]> {
+    assertIdentifier(sessionId, "command session id");
+    const result = await this.database.pool.query(
+      "SELECT * FROM anicode_commands WHERE session_id = $1 ORDER BY created_at, id",
+      [sessionId],
     );
+    return result.rows.map((row) => commandFromRow(row as Row));
   }
+
+  async write(sessionId: string, commands: DurableCommand[]): Promise<void> {
+    assertIdentifier(sessionId, "command session id");
+    await this.database.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `commands:${sessionId}`,
+      ]);
+      await client.query("DELETE FROM anicode_commands WHERE session_id = $1", [sessionId]);
+      for (const command of commands) await insertCommandRow(client, command);
+    });
+  }
+
   transact<T>(sessionId: string, fn: (commands: DurableCommand[]) => T | Promise<T>): Promise<T> {
     assertIdentifier(sessionId, "command session id");
-    return this.database.documentTransaction("commands", sessionId, [], (document) =>
-      fn(document as DurableCommand[]),
-    );
+    return this.database.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `commands:${sessionId}`,
+      ]);
+      const selected = await client.query(
+        "SELECT * FROM anicode_commands WHERE session_id = $1 ORDER BY created_at, id FOR UPDATE",
+        [sessionId],
+      );
+      const commands = selected.rows.map((row) => commandFromRow(row as Row));
+      const result = await fn(commands);
+      await client.query("DELETE FROM anicode_commands WHERE session_id = $1", [sessionId]);
+      for (const command of commands) await insertCommandRow(client, command);
+      return result;
+    });
   }
+
   async listSessions(): Promise<string[]> {
     const result = await this.database.pool.query(
-      "SELECT key FROM anicode_documents WHERE namespace = 'commands' ORDER BY key",
+      "SELECT DISTINCT session_id FROM anicode_commands ORDER BY session_id",
     );
-    return result.rows.map((row) => String((row as Row).key));
+    return result.rows.map((row) => String((row as Row).session_id));
+  }
+
+  async insertCommand(command: DurableCommand): Promise<DurableCommand> {
+    const inserted = await this.database.pool.query(
+      `INSERT INTO anicode_commands
+       (session_id, id, idempotency_key, status, lease_owner, lease_expires_at,
+        fencing_token, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
+       ON CONFLICT(session_id, idempotency_key) DO NOTHING
+       RETURNING *`,
+      commandParams(command),
+    );
+    if (inserted.rows[0]) return commandFromRow(inserted.rows[0] as Row);
+    const duplicate = await this.database.pool.query(
+      `SELECT * FROM anicode_commands
+       WHERE session_id = $1 AND idempotency_key = $2`,
+      [command.sessionId, command.idempotencyKey],
+    );
+    if (!duplicate.rows[0]) throw new Error("Command idempotency conflict disappeared");
+    return commandFromRow(duplicate.rows[0] as Row);
+  }
+
+  claimCommand(
+    sessionId: string,
+    commandId: string,
+    owner: string,
+    leaseMs: number,
+    now: number,
+  ): Promise<DurableCommand> {
+    return this.database.transaction(async (client) => {
+      const selected = await client.query(
+        "SELECT * FROM anicode_commands WHERE session_id = $1 AND id = $2 FOR UPDATE",
+        [sessionId, commandId],
+      );
+      if (!selected.rows[0]) throw new Error(`Unknown durable command: ${commandId}`);
+      const command = commandFromRow(selected.rows[0] as Row);
+      const leaseActive =
+        command.leaseExpiresAt !== undefined && Date.parse(command.leaseExpiresAt) > now;
+      if (command.status === "running" && leaseActive && command.leaseOwner !== owner) {
+        throw new Error(`Durable command ${commandId} is leased by ${command.leaseOwner}`);
+      }
+      if (!(["accepted", "running"] as string[]).includes(command.status)) {
+        throw new Error(`Durable command ${commandId} is already ${command.status}`);
+      }
+      command.status = "running";
+      command.attempts++;
+      command.fencingToken = (command.fencingToken ?? 0) + 1;
+      command.leaseOwner = owner;
+      command.leaseExpiresAt = new Date(now + Math.max(1_000, leaseMs)).toISOString();
+      command.updatedAt = new Date(now).toISOString();
+      await updateCommandRow(client, command);
+      return command;
+    });
+  }
+
+  heartbeatCommand(
+    sessionId: string,
+    commandId: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void> {
+    return this.database.transaction(async (client) => {
+      const command = await lockedCommand(client, sessionId, commandId);
+      if (command.status !== "running" || command.leaseOwner !== owner) {
+        throw new Error(`Cannot heartbeat unowned command ${commandId}`);
+      }
+      if (fencingToken !== undefined && command.fencingToken !== fencingToken) {
+        throw new Error(`Stale fencing token for command ${commandId}`);
+      }
+      command.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
+      command.updatedAt = new Date().toISOString();
+      await updateCommandRow(client, command);
+    });
+  }
+
+  finishCommand(
+    sessionId: string,
+    commandId: string,
+    status: "completed" | "failed" | "cancelled",
+    error?: string,
+    lease?: { owner: string; fencingToken: number },
+  ): Promise<void> {
+    return this.database.transaction(async (client) => {
+      const command = await lockedCommand(client, sessionId, commandId);
+      if (
+        lease &&
+        (command.leaseOwner !== lease.owner || command.fencingToken !== lease.fencingToken)
+      ) {
+        throw new Error(`Stale fencing token for command ${commandId}`);
+      }
+      command.status = status;
+      command.updatedAt = new Date().toISOString();
+      delete command.leaseOwner;
+      delete command.leaseExpiresAt;
+      if (error) command.error = error;
+      else delete command.error;
+      await updateCommandRow(client, command);
+    });
+  }
+
+  async getCommand(sessionId: string, commandId: string): Promise<DurableCommand | undefined> {
+    const result = await this.database.pool.query(
+      "SELECT * FROM anicode_commands WHERE session_id = $1 AND id = $2",
+      [sessionId, commandId],
+    );
+    return result.rows[0] ? commandFromRow(result.rows[0] as Row) : undefined;
+  }
+
+  async recoverableCommands(sessionId: string, now: number): Promise<DurableCommand[]> {
+    const result = await this.database.pool.query(
+      `SELECT * FROM anicode_commands
+       WHERE session_id = $1
+         AND (status = 'accepted' OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= $2)))
+       ORDER BY created_at, id`,
+      [sessionId, new Date(now).toISOString()],
+    );
+    return result.rows.map((row) => commandFromRow(row as Row));
   }
 }
 
 export class PostgresOutboxStore implements OutboxStore {
   constructor(readonly database: PostgresRuntimeDatabase) {}
-  read(): Promise<OutboxMessage[]> {
-    return this.database.readDocument("outbox", "global", []);
-  }
-  async write(messages: OutboxMessage[]): Promise<void> {
-    await this.transact((current) => current.splice(0, current.length, ...clone(messages)));
-  }
-  transact<T>(fn: (messages: OutboxMessage[]) => T | Promise<T>): Promise<T> {
-    return this.database.documentTransaction("outbox", "global", [], (document) =>
-      fn(document as OutboxMessage[]),
+
+  async read(): Promise<OutboxMessage[]> {
+    const result = await this.database.pool.query(
+      "SELECT * FROM anicode_outbox ORDER BY created_at, id",
     );
+    return result.rows.map((row) => outboxFromRow(row as Row));
   }
+
+  async write(messages: OutboxMessage[]): Promise<void> {
+    await this.database.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended('outbox', 0))");
+      await client.query("DELETE FROM anicode_outbox");
+      for (const message of messages) await insertOutboxRow(client, message);
+    });
+  }
+
+  transact<T>(fn: (messages: OutboxMessage[]) => T | Promise<T>): Promise<T> {
+    return this.database.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended('outbox', 0))");
+      const selected = await client.query(
+        "SELECT * FROM anicode_outbox ORDER BY created_at, id FOR UPDATE",
+      );
+      const messages = selected.rows.map((row) => outboxFromRow(row as Row));
+      const result = await fn(messages);
+      await client.query("DELETE FROM anicode_outbox");
+      for (const message of messages) await insertOutboxRow(client, message);
+      return result;
+    });
+  }
+
+  async insertMessage(message: OutboxMessage): Promise<OutboxMessage> {
+    const inserted = await this.database.pool.query(
+      `INSERT INTO anicode_outbox
+       (id, idempotency_key, status, lease_owner, lease_expires_at,
+        fencing_token, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+       ON CONFLICT(idempotency_key) DO NOTHING
+       RETURNING *`,
+      outboxParams(message),
+    );
+    if (inserted.rows[0]) return outboxFromRow(inserted.rows[0] as Row);
+    const duplicate = await this.database.pool.query(
+      "SELECT * FROM anicode_outbox WHERE idempotency_key = $1",
+      [message.event.idempotencyKey ?? message.id],
+    );
+    if (!duplicate.rows[0]) throw new Error("Outbox idempotency conflict disappeared");
+    return outboxFromRow(duplicate.rows[0] as Row);
+  }
+
+  claimMessage(owner: string, leaseMs: number): Promise<OutboxMessage | undefined> {
+    return this.database.transaction(async (client) => {
+      const selected = await client.query(
+        `SELECT * FROM anicode_outbox
+         WHERE status = 'pending' AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+         ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1`,
+      );
+      if (!selected.rows[0]) return undefined;
+      const message = outboxFromRow(selected.rows[0] as Row);
+      message.leaseOwner = owner;
+      message.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
+      message.fencingToken = (message.fencingToken ?? 0) + 1;
+      message.updatedAt = new Date().toISOString();
+      await updateOutboxRow(client, message);
+      return message;
+    });
+  }
+
+  markSent(message: OutboxMessage, owner: string, sentEventId: string): Promise<void> {
+    return this.database.transaction(async (client) => {
+      const current = await lockedOutbox(client, message.id);
+      assertOutboxLease(current, owner, message.fencingToken);
+      current.status = "sent";
+      current.sentEventId = sentEventId;
+      current.attempts++;
+      current.updatedAt = new Date().toISOString();
+      delete current.error;
+      delete current.leaseOwner;
+      delete current.leaseExpiresAt;
+      await updateOutboxRow(client, current);
+    });
+  }
+
+  markFailed(message: OutboxMessage, owner: string, error: string): Promise<void> {
+    return this.database.transaction(async (client) => {
+      const current = await lockedOutbox(client, message.id);
+      assertOutboxLease(current, owner, message.fencingToken);
+      current.attempts++;
+      current.error = error;
+      current.updatedAt = new Date().toISOString();
+      delete current.leaseOwner;
+      delete current.leaseExpiresAt;
+      await updateOutboxRow(client, current);
+    });
+  }
+
+  async getMessage(id: string): Promise<OutboxMessage | undefined> {
+    const result = await this.database.pool.query("SELECT * FROM anicode_outbox WHERE id = $1", [
+      id,
+    ]);
+    return result.rows[0] ? outboxFromRow(result.rows[0] as Row) : undefined;
+  }
+
+  async pendingMessages(): Promise<OutboxMessage[]> {
+    const result = await this.database.pool.query(
+      "SELECT * FROM anicode_outbox WHERE status = 'pending' ORDER BY created_at, id",
+    );
+    return result.rows.map((row) => outboxFromRow(row as Row));
+  }
+}
+
+function workerFromRow(row: Row): WorkerJob {
+  return {
+    id: String(row.id),
+    type: String(row.type),
+    payload: clone(row.payload),
+    status: String(row.status) as WorkerJob["status"],
+    idempotencyKey: String(row.idempotency_key),
+    attempts: Number(row.attempts),
+    maxAttempts: Number(row.max_attempts),
+    createdAt: new Date(String(row.created_at)).toISOString(),
+    updatedAt: new Date(String(row.updated_at)).toISOString(),
+    ...(row.lease_owner != null ? { leaseOwner: String(row.lease_owner) } : {}),
+    ...(row.lease_expires_at != null
+      ? { leaseExpiresAt: new Date(String(row.lease_expires_at)).toISOString() }
+      : {}),
+    ...(row.fencing_token != null ? { fencingToken: Number(row.fencing_token) } : {}),
+    ...(row.result != null ? { result: clone(row.result) } : {}),
+    ...(row.error != null ? { error: String(row.error) } : {}),
+  };
 }
 
 export class PostgresWorkerQueueStore implements WorkerQueueStore {
@@ -501,6 +1079,212 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
     return this.database.documentTransaction("worker", "global", [], (document) =>
       fn(document as WorkerJob[]),
     );
+  }
+
+  async enqueueJob(job: WorkerJob): Promise<WorkerJob> {
+    const inserted = await this.database.pool.query(
+      `INSERT INTO anicode_worker_jobs
+       (id, type, idempotency_key, payload, status, attempts, max_attempts,
+        lease_owner, lease_expires_at, fencing_token, result, error, created_at, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14)
+       ON CONFLICT(idempotency_key) DO NOTHING
+       RETURNING *`,
+      [
+        job.id,
+        job.type,
+        job.idempotencyKey,
+        JSON.stringify(job.payload),
+        job.status,
+        job.attempts,
+        job.maxAttempts,
+        job.leaseOwner ?? null,
+        job.leaseExpiresAt ?? null,
+        job.fencingToken ?? 0,
+        job.result === undefined ? null : JSON.stringify(job.result),
+        job.error ?? null,
+        job.createdAt,
+        job.updatedAt,
+      ],
+    );
+    if (inserted.rows[0]) return workerFromRow(inserted.rows[0] as Row);
+    const duplicate = await this.database.pool.query(
+      "SELECT * FROM anicode_worker_jobs WHERE idempotency_key = $1",
+      [job.idempotencyKey],
+    );
+    if (!duplicate.rows[0]) throw new Error("Worker job idempotency conflict disappeared");
+    return workerFromRow(duplicate.rows[0] as Row);
+  }
+
+  claimJob(
+    owner: string,
+    types: string[] | undefined,
+    leaseMs: number,
+  ): Promise<WorkerJob | undefined> {
+    return this.database.transaction(async (client) => {
+      await client.query(
+        `UPDATE anicode_worker_jobs
+         SET status = 'failed', error = 'lease expired after maximum attempts', updated_at = now(),
+             lease_owner = NULL, lease_expires_at = NULL
+         WHERE status = 'leased' AND lease_expires_at <= now() AND attempts >= max_attempts`,
+      );
+      const selected = await client.query(
+        `SELECT id FROM anicode_worker_jobs
+         WHERE ($1::text[] IS NULL OR type = ANY($1::text[]))
+           AND attempts < max_attempts
+           AND (status = 'queued' OR (status = 'leased' AND lease_expires_at <= now()))
+         ORDER BY created_at, id
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1`,
+        [types?.length ? types : null],
+      );
+      const id = (selected.rows[0] as Row | undefined)?.id;
+      if (!id) return undefined;
+      const updated = await client.query(
+        `UPDATE anicode_worker_jobs
+         SET status = 'leased', attempts = attempts + 1, fencing_token = fencing_token + 1,
+             lease_owner = $2, lease_expires_at = now() + ($3::bigint * interval '1 millisecond'),
+             updated_at = now()
+         WHERE id = $1
+         RETURNING *`,
+        [id, owner, Math.max(1_000, leaseMs)],
+      );
+      return workerFromRow(updated.rows[0] as Row);
+    });
+  }
+
+  async heartbeatJob(
+    jobId: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worker_jobs
+       SET lease_expires_at = now() + ($3::bigint * interval '1 millisecond'), updated_at = now()
+       WHERE id = $1 AND status = 'leased' AND lease_owner = $2
+         AND ($4::bigint IS NULL OR fencing_token = $4)`,
+      [jobId, owner, Math.max(1_000, leaseMs), fencingToken ?? null],
+    );
+    if ((result.rowCount ?? 0) !== 1)
+      throw new Error(`Cannot heartbeat unowned worker job ${jobId}`);
+  }
+
+  async finishJob(
+    jobId: string,
+    owner: string,
+    resultValue: unknown,
+    fencingToken?: number,
+  ): Promise<void> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worker_jobs
+       SET status = 'succeeded', result = $3::jsonb, error = NULL, updated_at = now(),
+           lease_owner = NULL, lease_expires_at = NULL
+       WHERE id = $1 AND status = 'leased' AND lease_owner = $2
+         AND ($4::bigint IS NULL OR fencing_token = $4)`,
+      [jobId, owner, JSON.stringify(resultValue ?? null), fencingToken ?? null],
+    );
+    if ((result.rowCount ?? 0) !== 1) throw new Error(`Cannot settle unowned worker job ${jobId}`);
+  }
+
+  async failJob(
+    jobId: string,
+    owner: string,
+    error: string,
+    retry: boolean,
+    fencingToken?: number,
+  ): Promise<void> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worker_jobs
+       SET status = CASE WHEN $4::boolean AND attempts < max_attempts THEN 'queued' ELSE 'failed' END,
+           error = $3, updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+       WHERE id = $1 AND status = 'leased' AND lease_owner = $2
+         AND ($5::bigint IS NULL OR fencing_token = $5)`,
+      [jobId, owner, error, retry, fencingToken ?? null],
+    );
+    if ((result.rowCount ?? 0) !== 1) throw new Error(`Cannot fail unowned worker job ${jobId}`);
+  }
+
+  async cancelJob(jobId: string): Promise<boolean> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worker_jobs
+       SET status = 'cancelled', updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+       WHERE id = $1 AND status IN ('queued', 'leased')`,
+      [jobId],
+    );
+    return (result.rowCount ?? 0) === 1;
+  }
+
+  async listJobs(): Promise<WorkerJob[]> {
+    const result = await this.database.pool.query(
+      "SELECT * FROM anicode_worker_jobs ORDER BY created_at, id",
+    );
+    return result.rows.map((row) => workerFromRow(row as Row));
+  }
+
+  async get(jobId: string): Promise<WorkerJob | undefined> {
+    const result = await this.database.pool.query(
+      "SELECT * FROM anicode_worker_jobs WHERE id = $1",
+      [jobId],
+    );
+    return result.rows[0] ? workerFromRow(result.rows[0] as Row) : undefined;
+  }
+
+  acquireWorktree(worktree: string, owner: string, leaseMs: number) {
+    return this.database.transaction(async (client) => {
+      const selected = await client.query(
+        "SELECT * FROM anicode_worktree_leases WHERE worktree = $1 FOR UPDATE",
+        [worktree],
+      );
+      const current = selected.rows[0] as Row | undefined;
+      if (
+        current?.owner &&
+        String(current.owner) !== owner &&
+        current.lease_expires_at &&
+        new Date(String(current.lease_expires_at)).getTime() > Date.now()
+      ) {
+        throw new Error(`Worktree is owned by ${String(current.owner)}: ${worktree}`);
+      }
+      const result = await client.query(
+        `INSERT INTO anicode_worktree_leases
+         (worktree, owner, lease_expires_at, fencing_token, updated_at)
+         VALUES ($1, $2, now() + ($3::bigint * interval '1 millisecond'), 1, now())
+         ON CONFLICT(worktree) DO UPDATE SET
+           owner = excluded.owner, lease_expires_at = excluded.lease_expires_at,
+           fencing_token = anicode_worktree_leases.fencing_token + 1, updated_at = now()
+         RETURNING lease_expires_at, fencing_token`,
+        [worktree, owner, Math.max(1_000, leaseMs)],
+      );
+      const row = result.rows[0] as Row;
+      return {
+        worktree,
+        owner,
+        expiresAt: new Date(String(row.lease_expires_at)).toISOString(),
+        fencingToken: Number(row.fencing_token),
+      };
+    });
+  }
+
+  async heartbeatWorktree(worktree: string, owner: string, leaseMs: number): Promise<void> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worktree_leases
+       SET lease_expires_at = now() + ($3::bigint * interval '1 millisecond'), updated_at = now()
+       WHERE worktree = $1 AND owner = $2 AND lease_expires_at > now()`,
+      [worktree, owner, Math.max(1_000, leaseMs)],
+    );
+    if ((result.rowCount ?? 0) !== 1)
+      throw new Error(`Cannot heartbeat unowned worktree: ${worktree}`);
+  }
+
+  async releaseWorktree(worktree: string, owner: string, fencingToken?: number): Promise<void> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worktree_leases
+       SET owner = NULL, lease_expires_at = NULL, updated_at = now()
+       WHERE worktree = $1 AND owner = $2
+         AND ($3::bigint IS NULL OR fencing_token = $3)`,
+      [worktree, owner, fencingToken ?? null],
+    );
+    if ((result.rowCount ?? 0) !== 1)
+      throw new Error(`Cannot release unowned worktree: ${worktree}`);
   }
 }
 

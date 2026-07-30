@@ -128,7 +128,7 @@ test(
       assert.ok(images[0]!.data.length > 100, "截图 base64 应非空");
     } finally {
       clearLangOverride();
-      closeAllBrowsers(); // 收尸缓存的浏览器，避免拖住测试进程句柄
+      await closeAllBrowsers(); // 收尸缓存的浏览器，避免拖住测试进程句柄
     }
   },
 );

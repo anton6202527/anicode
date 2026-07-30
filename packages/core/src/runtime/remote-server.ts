@@ -7,6 +7,11 @@ import { noTelemetry, parseTraceparent } from "./telemetry.js";
 import type { ExecutionRuntime, IsolatedRunResult } from "./isolated-runtime.js";
 import { DurableWorkerQueue, type WorkerJob } from "./worker.js";
 
+export interface RemoteIdentity {
+  actor: string;
+  claims?: Record<string, unknown>;
+}
+
 export interface RemoteExecutionRequest {
   command: string;
   workspaceId: string;
@@ -16,6 +21,103 @@ export interface RemoteExecutionRequest {
   timeoutMs?: number;
   idempotencyKey: string;
   traceparent?: string;
+}
+
+interface AuthorizedRemoteExecutionRequest extends RemoteExecutionRequest {
+  actor: string;
+  tenantId: string;
+}
+
+export interface RemoteExecutionGrant {
+  tenantId: string;
+  workspaceId: string;
+  policy: RemoteExecutionRequest["policy"];
+  network: boolean;
+  timeoutMs?: number;
+}
+
+export interface RemoteRuntimeAuthorizer {
+  authorizeSubmit(
+    identity: RemoteIdentity,
+    request: RemoteExecutionRequest,
+  ): Promise<RemoteExecutionGrant>;
+  authorizeJob(
+    identity: RemoteIdentity,
+    action: "read" | "cancel",
+    job: WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult>,
+  ): Promise<void>;
+}
+
+export interface ClaimRemoteRuntimeAuthorizerOptions {
+  tenantClaim?: string;
+  workspaceClaim?: string;
+  permissionClaim?: string;
+  maxTimeoutMs?: number;
+}
+
+function claimStrings(claims: Record<string, unknown> | undefined, name: string): string[] {
+  const value = claims?.[name];
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") return value.split(/[ ,]+/).filter(Boolean);
+  return value === undefined ? [] : [String(value)];
+}
+
+function requireClaim(identity: RemoteIdentity, name: string): string {
+  const value = claimStrings(identity.claims, name)[0];
+  if (!value) throw new RemoteHttpError(403, "authorization_denied", `Missing OIDC claim ${name}`);
+  return validId(value, `OIDC ${name} claim`);
+}
+
+/**
+ * 生产默认授权器。客户端只能申请能力，最终 workspace、写入、联网和超时上限均由
+ * 已验证的 OIDC claims 决定，且 job 默认仅创建者本人可读/取消。
+ */
+export function createClaimRemoteRuntimeAuthorizer(
+  options: ClaimRemoteRuntimeAuthorizerOptions = {},
+): RemoteRuntimeAuthorizer {
+  const tenantClaim = options.tenantClaim ?? "tenant_id";
+  const workspaceClaim = options.workspaceClaim ?? "anicode_workspaces";
+  const permissionClaim = options.permissionClaim ?? "anicode_permissions";
+  const maxTimeoutMs = Math.max(1_000, options.maxTimeoutMs ?? 15 * 60_000);
+  return {
+    async authorizeSubmit(identity, request) {
+      const tenantId = requireClaim(identity, tenantClaim);
+      const workspaces = claimStrings(identity.claims, workspaceClaim);
+      if (!workspaces.includes("*") && !workspaces.includes(request.workspaceId)) {
+        throw new RemoteHttpError(403, "workspace_denied", "Workspace access is denied");
+      }
+      const permissions = claimStrings(identity.claims, permissionClaim);
+      const allowed = (permission: string) =>
+        permissions.includes("*") || permissions.includes(permission);
+      if (request.policy === "workspace-write" && !allowed("workspace:write")) {
+        throw new RemoteHttpError(403, "write_denied", "Workspace write access is denied");
+      }
+      if (request.network && !allowed("network:egress")) {
+        throw new RemoteHttpError(403, "network_denied", "Network access is denied");
+      }
+      if (request.timeoutMs !== undefined && request.timeoutMs > maxTimeoutMs) {
+        throw new RemoteHttpError(403, "timeout_denied", "Requested timeout exceeds policy");
+      }
+      return {
+        tenantId,
+        workspaceId: request.workspaceId,
+        policy: request.policy,
+        network: request.network,
+        ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
+      };
+    },
+    async authorizeJob(identity, _action, job) {
+      const tenantId = requireClaim(identity, tenantClaim);
+      const permissions = claimStrings(identity.claims, permissionClaim);
+      const administrator = permissions.includes("*") || permissions.includes("jobs:admin");
+      if (
+        !administrator &&
+        (job.payload.tenantId !== tenantId || job.payload.actor !== identity.actor)
+      ) {
+        throw new RemoteHttpError(404, "execution_not_found", "Execution not found");
+      }
+    },
+  };
 }
 
 export interface RemoteExecutionView {
@@ -33,11 +135,23 @@ export interface RemoteRuntimeServerOptions {
   queue: DurableWorkerQueue;
   executionRuntime: ExecutionRuntime;
   workspaceRoot: string;
-  authenticate: (request: IncomingMessage) => Promise<{ actor: string }>;
+  authenticate: (request: IncomingMessage) => Promise<RemoteIdentity>;
+  authorizer: RemoteRuntimeAuthorizer;
+  readiness?: () => Promise<Record<string, boolean | string>>;
   telemetry?: Telemetry;
   maxBodyBytes?: number;
   leaseMs?: number;
   workerId?: string;
+}
+
+class RemoteHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 function validId(value: string, label: string): string {
@@ -81,28 +195,51 @@ export class RemoteExecutionService {
     this.leaseMs = Math.max(5_000, options.leaseMs ?? 60_000);
   }
 
-  async submit(request: RemoteExecutionRequest): Promise<RemoteExecutionView> {
+  async submit(
+    identity: RemoteIdentity,
+    request: RemoteExecutionRequest,
+  ): Promise<RemoteExecutionView> {
     validId(request.workspaceId, "workspace id");
     if (!request.command.trim()) throw new Error("Remote command cannot be empty");
     if (!request.idempotencyKey || request.idempotencyKey.length > 256) {
       throw new Error("Invalid remote idempotency key");
     }
     safeWorkspace(this.options.workspaceRoot, request.workspaceId, request.cwd);
-    const job = await this.options.queue.enqueue("remote-execution", request, {
-      idempotencyKey: request.idempotencyKey,
+    const grant = await this.options.authorizer.authorizeSubmit(identity, request);
+    if (grant.workspaceId !== request.workspaceId) {
+      throw new RemoteHttpError(403, "workspace_denied", "Authorized workspace mismatch");
+    }
+    const payload: AuthorizedRemoteExecutionRequest = {
+      ...request,
+      workspaceId: grant.workspaceId,
+      policy: grant.policy,
+      network: grant.network,
+      ...(grant.timeoutMs !== undefined ? { timeoutMs: grant.timeoutMs } : {}),
+      actor: identity.actor,
+      tenantId: grant.tenantId,
+    };
+    const job = await this.options.queue.enqueue("remote-execution", payload, {
+      idempotencyKey: `${grant.tenantId}:${identity.actor}:${request.idempotencyKey}`,
       maxAttempts: 3,
     });
-    return toView(job as WorkerJob<RemoteExecutionRequest, IsolatedRunResult>);
+    return toView(job as WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult>);
   }
 
-  async get(id: string): Promise<RemoteExecutionView | undefined> {
+  async get(identity: RemoteIdentity, id: string): Promise<RemoteExecutionView | undefined> {
     validId(id, "execution id");
-    const job = (await this.options.queue.list()).find((candidate) => candidate.id === id);
-    return job ? toView(job as WorkerJob<RemoteExecutionRequest, IsolatedRunResult>) : undefined;
+    const job = (await this.options.queue.get(id)) as
+      WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult> | undefined;
+    if (!job) return undefined;
+    await this.options.authorizer.authorizeJob(identity, "read", job);
+    return toView(job);
   }
 
-  cancel(id: string): Promise<boolean> {
+  async cancel(identity: RemoteIdentity, id: string): Promise<boolean> {
     validId(id, "execution id");
+    const job = (await this.options.queue.get(id)) as
+      WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult> | undefined;
+    if (!job) return false;
+    await this.options.authorizer.authorizeJob(identity, "cancel", job);
     return this.options.queue.cancel(id);
   }
 
@@ -111,7 +248,7 @@ export class RemoteExecutionService {
       this.workerId,
       ["remote-execution"],
       this.leaseMs,
-    )) as WorkerJob<RemoteExecutionRequest, IsolatedRunResult> | undefined;
+    )) as WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult> | undefined;
     if (!job) return false;
     const span = this.telemetry.startSpan(
       "anicode.remote.execution",
@@ -139,6 +276,11 @@ export class RemoteExecutionService {
         network: job.payload.network,
         ...(job.payload.timeoutMs ? { timeoutMs: job.payload.timeoutMs } : {}),
         ...(context ? { traceContext: context } : {}),
+        workload: {
+          tenantId: job.payload.tenantId,
+          actor: job.payload.actor,
+          executionId: job.id,
+        },
         signal,
       });
       await this.options.queue.finish(job.id, this.workerId, result, job.fencingToken);
@@ -162,18 +304,28 @@ export class RemoteExecutionService {
     return true;
   }
 
-  async run(options: { signal?: AbortSignal; pollMs?: number } = {}): Promise<void> {
-    while (!options.signal?.aborted) {
-      if (!(await this.runOnce(options.signal))) {
-        await new Promise((resolve) => setTimeout(resolve, Math.max(25, options.pollMs ?? 250)));
-      }
-    }
+  async run(
+    options: { signal?: AbortSignal; pollMs?: number; concurrency?: number } = {},
+  ): Promise<void> {
+    const concurrency = Math.max(1, Math.min(64, Math.floor(options.concurrency ?? 1)));
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (!options.signal?.aborted) {
+          if (!(await this.runOnce(options.signal))) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, Math.max(25, options.pollMs ?? 250)),
+            );
+          }
+        }
+      }),
+    );
   }
 }
 
 export class RemoteRuntimeHttpServer {
   readonly service: RemoteExecutionService;
   private server: Server | undefined;
+  private accepting = true;
   constructor(private readonly options: RemoteRuntimeServerOptions) {
     this.service = new RemoteExecutionService(options);
   }
@@ -182,9 +334,17 @@ export class RemoteRuntimeHttpServer {
     if (this.server) throw new Error("Remote Runtime server is already listening");
     const server = createServer((request, response) => {
       void this.route(request, response).catch((error) => {
-        const status = /auth/i.test(error instanceof Error ? error.message : "") ? 401 : 400;
+        const status =
+          error instanceof RemoteHttpError
+            ? error.status
+            : /auth/i.test(error instanceof Error ? error.message : "")
+              ? 401
+              : 400;
         jsonResponse(response, status, {
-          error: error instanceof Error ? error.message : String(error),
+          error: {
+            code: error instanceof RemoteHttpError ? error.code : "invalid_request",
+            message: error instanceof Error ? error.message : String(error),
+          },
         });
       });
     });
@@ -210,29 +370,50 @@ export class RemoteRuntimeHttpServer {
     );
   }
 
+  beginDrain(): void {
+    this.accepting = false;
+  }
+
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://remote-runtime.local");
     if (request.method === "GET" && url.pathname === "/healthz") {
       jsonResponse(response, 200, { ok: true });
       return;
     }
-    await this.options.authenticate(request);
+    if (request.method === "GET" && url.pathname === "/readyz") {
+      const checks = await this.options.readiness?.().catch((error) => ({
+        dependencies: error instanceof Error ? error.message : String(error),
+      }));
+      const ready =
+        this.accepting &&
+        Object.values(checks ?? {}).every((value) => value === true || value === "ok");
+      jsonResponse(response, ready ? 200 : 503, {
+        ready,
+        accepting: this.accepting,
+        checks: checks ?? {},
+      });
+      return;
+    }
+    const identity = await this.options.authenticate(request);
     if (request.method === "POST" && url.pathname === "/v1/executions") {
+      if (!this.accepting) {
+        throw new RemoteHttpError(503, "runtime_draining", "Remote Runtime is draining");
+      }
       const body = await readJson<RemoteExecutionRequest>(
         request,
         this.options.maxBodyBytes ?? 256 * 1024,
       );
-      jsonResponse(response, 202, await this.service.submit(body));
+      jsonResponse(response, 202, await this.service.submit(identity, body));
       return;
     }
     const matched = /^\/v1\/executions\/([^/]+)$/.exec(url.pathname);
     if (matched && request.method === "GET") {
-      const execution = await this.service.get(decodeURIComponent(matched[1]!));
+      const execution = await this.service.get(identity, decodeURIComponent(matched[1]!));
       jsonResponse(response, execution ? 200 : 404, execution ?? { error: "not found" });
       return;
     }
     if (matched && request.method === "DELETE") {
-      const cancelled = await this.service.cancel(decodeURIComponent(matched[1]!));
+      const cancelled = await this.service.cancel(identity, decodeURIComponent(matched[1]!));
       jsonResponse(response, cancelled ? 202 : 409, { cancelled });
       return;
     }

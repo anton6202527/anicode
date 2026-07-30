@@ -5,11 +5,17 @@
 
 import { createInterface } from "node:readline";
 import * as path from "node:path";
+import {
+  PROTOCOL_VERSION,
+  type InitializeResponse,
+  type SessionModeState,
+} from "@agentclientprotocol/sdk";
 import { createId } from "./id.js";
 import type { OpenHandle, SessionHost } from "./host.js";
 import type { AgentEvent } from "./agent.js";
 import type { ContentPart } from "./types.js";
 import type { SessionEvent, SessionSnapshot, SessionSummary } from "./session-manager.js";
+import type { PermissionMode } from "./permission.js";
 import {
   noTelemetry,
   parseTraceparent,
@@ -64,6 +70,8 @@ export const ACP_V1_METHODS = [
   "session/list",
   "session/close",
   "session/delete",
+  "session/fork",
+  "session/set_mode",
 ] as const;
 
 /** ACP v1 JSON-RPC 边界的确定性校验；dispatch 前执行，返回标准 Invalid Params。 */
@@ -78,7 +86,11 @@ export function validateAcpV1Request(request: JsonRpcRequest | JsonRpcNotificati
   if (params !== undefined && (!params || typeof params !== "object" || Array.isArray(params)))
     errors.push("params must be an object");
   if (request.method === "initialize") {
-    if (!Number.isInteger(params?.["protocolVersion"]))
+    if (
+      !Number.isInteger(params?.["protocolVersion"]) ||
+      Number(params?.["protocolVersion"]) < 0 ||
+      Number(params?.["protocolVersion"]) > 65_535
+    )
       errors.push("protocolVersion must be integer");
   } else if (
     request.method.startsWith("session/") &&
@@ -92,6 +104,30 @@ export function validateAcpV1Request(request: JsonRpcRequest | JsonRpcNotificati
     if (typeof params?.["cwd"] !== "string" || !path.isAbsolute(params["cwd"]))
       errors.push("cwd must be absolute");
     if (!Array.isArray(params?.["mcpServers"])) errors.push("mcpServers must be an array");
+    else if ((params?.["mcpServers"] as unknown[]).length > 0)
+      errors.push("dynamic MCP servers are not supported by this adapter");
+    if (params?.["additionalDirectories"] !== undefined) {
+      if (!Array.isArray(params["additionalDirectories"])) {
+        errors.push("additionalDirectories must be an array");
+      } else if ((params["additionalDirectories"] as unknown[]).length > 0) {
+        errors.push("additionalDirectories are not supported by this adapter");
+      }
+    }
+  }
+  if (request.method === "session/list") {
+    if (params?.["cwd"] !== undefined && params["cwd"] !== null) {
+      if (typeof params["cwd"] !== "string" || !path.isAbsolute(params["cwd"]))
+        errors.push("cwd must be absolute");
+    }
+    if (
+      params?.["cursor"] !== undefined &&
+      params["cursor"] !== null &&
+      typeof params["cursor"] !== "string"
+    )
+      errors.push("cursor must be a string");
+  }
+  if (request.method === "session/set_mode" && typeof params?.["modeId"] !== "string") {
+    errors.push("modeId must be non-empty");
   }
   if (request.method === "session/prompt") {
     try {
@@ -135,6 +171,44 @@ function contentBlock(part: ContentPart): Record<string, unknown> | undefined {
   return undefined;
 }
 
+const ACP_MODES = [
+  { id: "default", name: "Default", description: "Ask before sensitive operations." },
+  { id: "accept_edits", name: "Accept edits", description: "Apply workspace edits automatically." },
+  { id: "auto", name: "Auto", description: "Run allowed tools without interactive confirmation." },
+  { id: "plan", name: "Plan", description: "Read-only planning and analysis." },
+] as const;
+
+function permissionMode(id: string): PermissionMode {
+  if (id === "accept_edits") return "acceptEdits";
+  if (id === "default" || id === "auto" || id === "plan") return id;
+  throw new AcpError(-32602, `unknown session mode: ${id}`);
+}
+
+function modeId(mode: PermissionMode): string {
+  if (mode === "acceptEdits") return "accept_edits";
+  // bypass is intentionally never advertised through the remote protocol.
+  return mode === "bypass" ? "auto" : mode;
+}
+
+function encodeCursor(offset: number): string {
+  return Buffer.from(JSON.stringify({ v: 1, offset }), "utf8").toString("base64url");
+}
+
+function decodeCursor(value: unknown): number {
+  if (value === undefined || value === null || value === "") return 0;
+  try {
+    const parsed = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8")) as {
+      v?: number;
+      offset?: number;
+    };
+    if (parsed.v !== 1 || !Number.isSafeInteger(parsed.offset) || parsed.offset! < 0)
+      throw new Error();
+    return parsed.offset!;
+  } catch {
+    throw new AcpError(-32602, "invalid session cursor");
+  }
+}
+
 export class AcpAgentAdapter {
   private readonly host: SessionHost;
   private readonly peer: AcpPeer;
@@ -144,6 +218,8 @@ export class AcpAgentAdapter {
   private readonly telemetry: Telemetry;
   private readonly handles = new Map<string, OpenHandle>();
   private readonly messageSequences = new Map<string, number>();
+  private readonly currentModes = new Map<string, PermissionMode>();
+  private readonly cancelledSessions = new Set<string>();
   private initialized = false;
 
   constructor(options: AcpAdapterOptions) {
@@ -201,24 +277,28 @@ export class AcpAgentAdapter {
     context?: SpanContext,
   ): Promise<unknown> {
     if (method === "initialize") {
+      if (this.initialized) throw new AcpError(-32600, "connection is already initialized");
       const requested = Number(params["protocolVersion"] ?? 1);
       this.initialized = true;
-      return {
-        protocolVersion: requested === 1 ? 1 : 1,
+      const response = {
+        protocolVersion: requested === PROTOCOL_VERSION ? requested : PROTOCOL_VERSION,
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: false, audio: false, embeddedContext: true },
-          mcpCapabilities: { http: false, sse: false },
+          mcpCapabilities: { http: false, sse: false, acp: false },
           sessionCapabilities: {
             resume: {},
             close: {},
             list: {},
+            ...(this.host.forkSession ? { fork: {} } : {}),
             ...(this.deleteSession ? { delete: {} } : {}),
           },
+          auth: {},
         },
         agentInfo: this.agentInfo,
         authMethods: [],
-      };
+      } satisfies InitializeResponse;
+      return response;
     }
     if (!this.initialized) throw new AcpError(-32002, "connection is not initialized");
 
@@ -226,28 +306,45 @@ export class AcpAgentAdapter {
       const cwd = String(params["cwd"] ?? "");
       const created = await this.host.createSession({ cwd, model: this.defaultModel });
       await this.attach(created.id);
-      return { sessionId: created.id };
+      this.currentModes.set(created.id, "default");
+      return {
+        sessionId: created.id,
+        ...(this.host.setPermissionMode ? { modes: this.modeState(created.id) } : {}),
+      };
     }
     if (method === "session/load") {
       const sessionId = String(params["sessionId"] ?? "");
       const handle = await this.attach(sessionId);
       await this.replay(sessionId, handle.snapshot);
-      return null;
+      this.currentModes.set(sessionId, "default");
+      return this.host.setPermissionMode ? { modes: this.modeState(sessionId) } : {};
     }
     if (method === "session/resume") {
       const sessionId = String(params["sessionId"] ?? "");
       await this.attach(sessionId);
-      return {};
+      if (!this.currentModes.has(sessionId)) this.currentModes.set(sessionId, "default");
+      return this.host.setPermissionMode ? { modes: this.modeState(sessionId) } : {};
     }
     if (method === "session/list") {
-      const sessions = await this.host.listSessions();
-      return { sessions: sessions.map(acpSessionInfo) };
+      let sessions = await this.host.listSessions();
+      if (typeof params["cwd"] === "string") {
+        const cwd = path.resolve(params["cwd"]);
+        sessions = sessions.filter((session) => path.resolve(session.cwd) === cwd);
+      }
+      const offset = decodeCursor(params["cursor"]);
+      const page = sessions.slice(offset, offset + 100);
+      const next = offset + page.length;
+      return {
+        sessions: page.map(acpSessionInfo),
+        ...(next < sessions.length ? { nextCursor: encodeCursor(next) } : {}),
+      };
     }
     if (method === "session/delete") {
       if (!this.deleteSession) throw new AcpError(-32601, "session/delete is not supported");
       const sessionId = String(params["sessionId"] ?? "");
       this.handles.get(sessionId)?.close();
       this.handles.delete(sessionId);
+      this.currentModes.delete(sessionId);
       await this.deleteSession(sessionId);
       return {};
     }
@@ -256,21 +353,56 @@ export class AcpAgentAdapter {
       await this.host.interrupt(sessionId);
       this.handles.get(sessionId)?.close();
       this.handles.delete(sessionId);
+      this.currentModes.delete(sessionId);
       return {};
     }
     if (method === "session/cancel") {
-      await this.host.interrupt(String(params["sessionId"] ?? ""));
-      return null;
+      const sessionId = String(params["sessionId"] ?? "");
+      this.cancelledSessions.add(sessionId);
+      await this.host.interrupt(sessionId);
+      return undefined;
+    }
+    if (method === "session/set_mode") {
+      if (!this.host.setPermissionMode) throw new AcpError(-32601, "session modes are unsupported");
+      const sessionId = String(params["sessionId"] ?? "");
+      const mode = permissionMode(String(params["modeId"] ?? ""));
+      await this.host.setPermissionMode(sessionId, mode);
+      this.currentModes.set(sessionId, mode);
+      return {};
+    }
+    if (method === "session/fork") {
+      if (!this.host.forkSession) throw new AcpError(-32601, "session/fork is not supported");
+      const created = await this.host.forkSession(String(params["sessionId"] ?? ""));
+      await this.attach(created.id);
+      this.currentModes.set(created.id, "default");
+      return {
+        sessionId: created.id,
+        ...(this.host.setPermissionMode ? { modes: this.modeState(created.id) } : {}),
+      };
     }
     if (method === "session/prompt") {
       const sessionId = String(params["sessionId"] ?? "");
       await this.attach(sessionId);
-      await this.host.send(sessionId, textOfPrompt(params["prompt"]), {
-        ...(context ? { traceparent: traceparent(context) } : {}),
-      });
-      return { stopReason: "end_turn" };
+      this.cancelledSessions.delete(sessionId);
+      try {
+        await this.host.send(sessionId, textOfPrompt(params["prompt"]), {
+          ...(context ? { traceparent: traceparent(context) } : {}),
+        });
+      } catch (error) {
+        if (!this.cancelledSessions.has(sessionId)) throw error;
+      }
+      const cancelled = this.cancelledSessions.delete(sessionId);
+      return { stopReason: cancelled ? "cancelled" : "end_turn" };
     }
     throw new AcpError(-32601, `method not found: ${method}`);
+  }
+
+  private modeState(sessionId: string): SessionModeState {
+    const current = this.currentModes.get(sessionId) ?? "default";
+    return {
+      currentModeId: modeId(current),
+      availableModes: ACP_MODES.map((mode) => ({ ...mode })),
+    };
   }
 
   private async attach(sessionId: string): Promise<OpenHandle> {

@@ -2,6 +2,11 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: anicode-runtime
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -13,6 +18,20 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: anicode-runner
+  namespace: anicode-runtime
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: anicode-egress-proxy
+  namespace: anicode-runtime
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: anicode-github-control
   namespace: anicode-runtime
 automountServiceAccountToken: false
 ---
@@ -64,6 +83,9 @@ metadata:
   namespace: anicode-runtime
 spec:
   replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
   selector:
     matchLabels:
       app: anicode-remote-runtime
@@ -73,6 +95,14 @@ spec:
         app: anicode-remote-runtime
     spec:
       serviceAccountName: anicode-control-plane
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: anicode-remote-runtime }
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -95,6 +125,8 @@ spec:
               value: anicode-runtime
             - name: ANICODE_REMOTE_WORKSPACE_ROOT
               value: /workspaces
+            - name: ANICODE_REMOTE_WORKER_CONCURRENCY
+              value: "4"
             - name: ANICODE_WORKSPACE_PVC
               value: anicode-workspaces
             - name: ANICODE_EPHEMERAL_WORKSPACE
@@ -129,22 +161,38 @@ spec:
               value: vault
             - name: ANICODE_DATABASE_CREDENTIAL_KEY
               value: runtime:DATABASE_URL
+            - name: ANICODE_PROXY_CLIENT_CREDENTIAL_KEY
+              value: runtime:PROXY_CLIENT_TOKEN
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability:4318
+            - name: ANICODE_OTEL_CREDENTIAL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: anicode-runtime-config
+                  key: otel-credential-id
+                  optional: true
             - name: OTEL_SERVICE_NAME
               value: anicode-remote-runtime
-            - name: ANICODE_CONTROL_PLANE_NETWORK_ALLOW_DOMAINS
-              value: otel-collector.observability
             - name: ANICODE_CONTROL_PLANE_NETWORK_ALLOW_PORTS
-              value: "4318"
+              value: "443,4318"
             - name: ANICODE_CONTROL_PLANE_ALLOW_PRIVATE
               value: "1"
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /readyz, port: http }
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
           livenessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
+            timeoutSeconds: 3
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              exec: { command: ["/bin/sh", "-c", "sleep 10"] }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -152,6 +200,11 @@ spec:
           volumeMounts:
             - { name: tmp, mountPath: /tmp }
             - { name: workload-identity, mountPath: /var/run/secrets/anicode-oidc, readOnly: true }
+            - {
+                name: kubernetes-api-token,
+                mountPath: /var/run/secrets/kubernetes.io/serviceaccount,
+                readOnly: true,
+              }
           resources:
             requests: { cpu: 250m, memory: 256Mi }
             limits: { cpu: "2", memory: 2Gi }
@@ -164,6 +217,13 @@ spec:
               - serviceAccountToken:
                   path: token
                   audience: vault
+                  expirationSeconds: 600
+        - name: kubernetes-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
                   expirationSeconds: 600
 ---
 apiVersion: v1
@@ -181,17 +241,152 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: anicode-github-control
+  namespace: anicode-runtime
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app: anicode-github-control }
+  template:
+    metadata:
+      labels: { app: anicode-github-control }
+    spec:
+      serviceAccountName: anicode-github-control
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: anicode-github-control }
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: github-control
+          image: ghcr.io/OWNER/anicode-control-plane@sha256:REPLACE_WITH_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "github-control", "--workspace", "@anicode/core"]
+          ports:
+            - { name: webhook, containerPort: 8081 }
+          env:
+            - { name: PORT, value: "8081" }
+            - { name: ANICODE_GITHUB_WORKER_CONCURRENCY, value: "4" }
+            - { name: ANICODE_CREDENTIAL_BACKEND, value: vault }
+            - name: ANICODE_GITHUB_OWNER
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: github-owner }
+            - name: ANICODE_GITHUB_REPO
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: github-repo }
+            - name: ANICODE_GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: github-app-id }
+            - name: ANICODE_GITHUB_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: github-installation-id }
+            - name: VAULT_ADDR
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: vault-address }
+            - name: ANICODE_VAULT_ROLE
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: vault-role }
+            - name: ANICODE_VAULT_PREFIX
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: vault-prefix }
+            - { name: ANICODE_OIDC_TOKEN_FILE, value: /var/run/secrets/anicode-oidc/token }
+            - { name: ANICODE_VAULT_AUDIENCE, value: vault }
+            - { name: ANICODE_DATABASE_CREDENTIAL_KEY, value: "runtime:DATABASE_URL" }
+            - { name: ANICODE_GITHUB_PRIVATE_KEY_CREDENTIAL_KEY, value: "github:APP_PRIVATE_KEY" }
+            - { name: ANICODE_GITHUB_WEBHOOK_CREDENTIAL_KEY, value: "github:WEBHOOK_SECRET" }
+            - { name: OTEL_SERVICE_NAME, value: anicode-github-control }
+            - name: ANICODE_OTEL_CREDENTIAL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: anicode-runtime-config
+                  key: otel-credential-id
+                  optional: true
+            - {
+                name: OTEL_EXPORTER_OTLP_ENDPOINT,
+                value: "http://otel-collector.observability:4318",
+              }
+            - { name: ANICODE_CONTROL_PLANE_ALLOW_PRIVATE, value: "1" }
+          startupProbe:
+            httpGet: { path: /healthz, port: webhook }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: webhook }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: webhook }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["/bin/sh", "-c", "sleep 10"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: workload-identity, mountPath: /var/run/secrets/anicode-oidc, readOnly: true }
+          resources:
+            requests: { cpu: 150m, memory: 192Mi }
+            limits: { cpu: "1", memory: 1Gi }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+        - name: workload-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: vault
+                  expirationSeconds: 600
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anicode-github-control
+  namespace: anicode-runtime
+spec:
+  selector: { app: anicode-github-control }
+  ports:
+    - { name: webhook, port: 80, targetPort: webhook }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: anicode-egress-proxy
   namespace: anicode-runtime
 spec:
   replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
   selector:
     matchLabels: { app: anicode-egress-proxy }
   template:
     metadata:
       labels: { app: anicode-egress-proxy }
     spec:
+      serviceAccountName: anicode-egress-proxy
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: anicode-egress-proxy }
       securityContext:
         runAsNonRoot: true
         seccompProfile: { type: RuntimeDefault }
@@ -209,18 +404,55 @@ spec:
                 secretKeyRef: { name: anicode-runtime-config, key: network-allow-domains }
             - { name: ANICODE_NETWORK_ALLOW_PORTS, value: "80,443" }
             - { name: ANICODE_NETWORK_ALLOW_PRIVATE, value: "0" }
+            - { name: ANICODE_CREDENTIAL_BACKEND, value: vault }
+            - name: VAULT_ADDR
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: vault-address }
+            - name: ANICODE_VAULT_ROLE
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: vault-role }
+            - name: ANICODE_VAULT_PREFIX
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: vault-prefix }
+            - { name: ANICODE_OIDC_TOKEN_FILE, value: /var/run/secrets/anicode-oidc/token }
+            - { name: ANICODE_VAULT_AUDIENCE, value: vault }
+            - { name: ANICODE_PROXY_CLIENT_CREDENTIAL_KEY, value: "runtime:PROXY_CLIENT_TOKEN" }
+            - { name: ANICODE_PROXY_MAX_REQUEST_BYTES, value: "8388608" }
+            - { name: ANICODE_PROXY_MAX_RESPONSE_BYTES, value: "33554432" }
+            - { name: ANICODE_PROXY_MAX_TUNNEL_MS, value: "600000" }
+            - { name: ANICODE_PROXY_MAX_TUNNEL_BYTES, value: "268435456" }
+            - { name: ANICODE_PROXY_MAX_TUNNELS, value: "128" }
+          readinessProbe:
+            tcpSocket: { port: proxy }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            tcpSocket: { port: proxy }
+            periodSeconds: 10
+            timeoutSeconds: 2
+          lifecycle:
+            preStop:
+              exec: { command: ["/bin/sh", "-c", "sleep 5"] }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: tmp, mountPath: /tmp }
+            - { name: workload-identity, mountPath: /var/run/secrets/anicode-oidc, readOnly: true }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits: { cpu: "1", memory: 512Mi }
       volumes:
         - name: tmp
           emptyDir: { sizeLimit: 128Mi }
+        - name: workload-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: vault
+                  expirationSeconds: 600
 ---
 apiVersion: v1
 kind: Service
@@ -278,11 +510,65 @@ spec:
     matchLabels: { app: anicode-egress-proxy }
   policyTypes: ["Egress"]
   egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
     - ports:
         - { protocol: TCP, port: 80 }
         - { protocol: TCP, port: 443 }
-        - { protocol: UDP, port: 53 }
-        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: proxy-ingress-from-runners-only
+  namespace: anicode-runtime
+spec:
+  podSelector:
+    matchLabels: { app: anicode-egress-proxy }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: anicode-runner
+              anicode.dev/network: proxy
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: anicode-remote-runtime
+  namespace: anicode-runtime
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: anicode-remote-runtime }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: anicode-egress-proxy
+  namespace: anicode-runtime
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: anicode-egress-proxy }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: anicode-github-control
+  namespace: anicode-runtime
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: anicode-github-control }
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -294,6 +580,48 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: anicode-remote-runtime
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: anicode-egress-proxy
+  namespace: anicode-runtime
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: anicode-egress-proxy
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 60 }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: anicode-github-control
+  namespace: anicode-runtime
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: anicode-github-control
   minReplicas: 2
   maxReplicas: 10
   behavior:

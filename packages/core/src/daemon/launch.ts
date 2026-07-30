@@ -145,6 +145,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   await removeStaleSocket(args.socketPath);
 
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir));
+  const telemetry = telemetryForLocalStack(runtimeStack);
   const manager = new SessionManager({
     store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(args.sessionsDir)),
     runtime: runtimeStack.runtime,
@@ -156,7 +157,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
     verifier: new Verifier({ autoDiscover: true }),
     securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
-    telemetry: telemetryForLocalStack(runtimeStack),
+    telemetry,
     isolatedRuntime: runtimeStack.isolatedRuntime,
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
@@ -171,11 +172,21 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       `（会话目录 ${args.sessionsDir}，权限 ${args.permissionMode}）`,
   );
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     await server.close();
-    await runtimeStack.networkProxy.close();
-    await runtimeStack.database.close();
-    await fs.rm(args.socketPath, { force: true });
+    try {
+      if (telemetry.shutdown) await telemetry.shutdown();
+      else await telemetry.forceFlush?.();
+    } catch {
+      console.error("anicode daemon: OTLP flush failed during shutdown");
+    } finally {
+      await runtimeStack.networkProxy.close();
+      await runtimeStack.database.close();
+      await fs.rm(args.socketPath, { force: true });
+    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

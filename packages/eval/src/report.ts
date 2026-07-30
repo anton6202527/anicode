@@ -4,13 +4,22 @@ import type { TaskResult } from "./runner.js";
 export interface Summary {
   model: string;
   /** 运行时设置（A/B 对比时应逐项一致才可比）。 */
-  settings?: { repomap?: boolean };
+  settings?: {
+    repomap?: boolean;
+    suite?: "offline" | "real";
+    shardIndex?: number;
+    shardCount?: number;
+    runtimeImage?: string;
+    revision?: string;
+    catalog?: string;
+  };
   /** 实际运行的任务数（不含 skipped）。 */
   total: number;
   passed: number;
   /** 因缺工具链跳过的任务数。 */
   skipped: number;
   passRate: number;
+  passRateCi95: { low: number; high: number };
   avgTurns: number;
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -32,13 +41,16 @@ export function summarize(
   const passed = ran.filter((r) => r.passed).length;
   const editCalls = ran.reduce((s, r) => s + r.editCalls, 0);
   const editErrors = ran.reduce((s, r) => s + r.editErrors, 0);
+  const passRate = ran.length ? passed / ran.length : 0;
+  const passRateCi95 = wilsonInterval(passed, ran.length);
   return {
     model,
     ...(settings ? { settings } : {}),
     total: ran.length,
     passed,
     skipped,
-    passRate: ran.length ? passed / ran.length : 0,
+    passRate,
+    passRateCi95,
     avgTurns: ran.length ? ran.reduce((s, r) => s + r.turns, 0) / ran.length : 0,
     totalInputTokens: ran.reduce((s, r) => s + r.inputTokens, 0),
     totalOutputTokens: ran.reduce((s, r) => s + r.outputTokens, 0),
@@ -48,6 +60,57 @@ export function summarize(
     totalWallMs: ran.reduce((s, r) => s + r.wallMs, 0),
     results,
   };
+}
+
+export function mergeSummaries(summaries: Summary[]): Summary {
+  if (summaries.length === 0) throw new Error("No eval summaries to merge");
+  const first = summaries[0]!;
+  const expectedShards = first.settings?.shardCount ?? summaries.length;
+  const shardIndexes = new Set(summaries.map((summary) => summary.settings?.shardIndex));
+  if (summaries.length !== expectedShards || shardIndexes.size !== expectedShards) {
+    throw new Error(`Incomplete eval shard set: received ${summaries.length}/${expectedShards}`);
+  }
+  for (const summary of summaries.slice(1)) {
+    if (summary.model !== first.model) throw new Error("Eval shard model mismatch");
+    for (const field of ["suite", "catalog", "runtimeImage", "revision"] as const) {
+      if (summary.settings?.[field] !== first.settings?.[field]) {
+        throw new Error(`Eval shard ${field} mismatch`);
+      }
+    }
+  }
+  const results = summaries.flatMap((summary) => summary.results);
+  const ids = new Set<string>();
+  for (const result of results) {
+    if (ids.has(result.id)) throw new Error(`Duplicate eval result: ${result.id}`);
+    ids.add(result.id);
+  }
+  return summarize(first.model, results, {
+    ...(first.settings ?? {}),
+    shardIndex: 0,
+    shardCount: 1,
+  });
+}
+
+export function assertComparableSummaries(current: Summary, baseline: Summary): void {
+  if (current.model !== baseline.model) throw new Error("Eval baseline model mismatch");
+  for (const field of ["suite", "catalog", "runtimeImage"] as const) {
+    if (current.settings?.[field] !== baseline.settings?.[field]) {
+      throw new Error(
+        `Eval baseline ${field} mismatch; create and review a separately keyed baseline`,
+      );
+    }
+  }
+}
+
+function wilsonInterval(passed: number, total: number): { low: number; high: number } {
+  if (total === 0) return { low: 0, high: 0 };
+  const z = 1.959963984540054;
+  const rate = passed / total;
+  const denominator = 1 + (z * z) / total;
+  const center = (rate + (z * z) / (2 * total)) / denominator;
+  const margin =
+    (z / denominator) * Math.sqrt((rate * (1 - rate)) / total + (z * z) / (4 * total * total));
+  return { low: Math.max(0, center - margin), high: Math.min(1, center + margin) };
 }
 
 function pad(s: string, w: number): string {
@@ -88,6 +151,9 @@ export function formatReport(sum: Summary): string {
   lines.push("-".repeat(72));
   lines.push(
     `通过率 ${sum.passed}/${sum.total} (${(sum.passRate * 100).toFixed(0)}%)` +
+      ` [95% CI ${(sum.passRateCi95.low * 100).toFixed(0)}–${(sum.passRateCi95.high * 100).toFixed(
+        0,
+      )}%]` +
       (sum.skipped ? ` · 跳过 ${sum.skipped}` : "") +
       ` · ` +
       `平均轮数 ${sum.avgTurns.toFixed(1)} · ` +

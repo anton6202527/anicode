@@ -10,6 +10,7 @@ function summary(overrides: Partial<Summary> = {}): Summary {
     passed: 2,
     skipped: 0,
     passRate: 1,
+    passRateCi95: { low: 0.34, high: 1 },
     avgTurns: 2,
     totalInputTokens: 200,
     totalOutputTokens: 20,

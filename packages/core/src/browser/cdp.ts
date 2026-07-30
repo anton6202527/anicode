@@ -7,7 +7,7 @@
  * 走 CDP flat-session（Target.attachToTarget flatten）多路复用页面会话。
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, promises as fs, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WsClient } from "./ws.js";
@@ -92,8 +92,12 @@ const LIVE = new Set<Browser>();
 let exitHooked = false;
 
 /** 关闭所有存活的浏览器（供宿主优雅退出、测试收尾调用）。 */
-export function closeAllBrowsers(): void {
-  for (const b of [...LIVE]) b.close();
+export async function closeAllBrowsers(): Promise<void> {
+  const results = await Promise.allSettled([...LIVE].map((browser) => browser.close()));
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length > 0) throw new AggregateError(failures, "Failed to close browsers");
 }
 
 /** 一个已启动的浏览器进程 + 浏览器级 WS 连接。newPage() 开一个隔离标签会话。 */
@@ -103,6 +107,7 @@ export class Browser {
   private readonly sessionListeners = new Map<string, (method: string, params: any) => void>();
 
   private ws!: WsClient;
+  private closePromise: Promise<void> | undefined;
 
   private constructor(
     private readonly proc: ChildProcess,
@@ -143,12 +148,8 @@ export class Browser {
     try {
       wsUrl = await readDevToolsWsUrl(userDataDir, timeoutMs, proc);
     } catch (e) {
-      try {
-        proc.kill();
-      } catch {
-        /* ignore */
-      }
-      rmSync(userDataDir, { recursive: true, force: true });
+      await terminateChild(proc);
+      await removeUserDataDir(userDataDir);
       throw e;
     }
     const self = new Browser(proc, userDataDir);
@@ -162,7 +163,8 @@ export class Browser {
     LIVE.add(self);
     if (!exitHooked) {
       exitHooked = true;
-      process.once("exit", closeAllBrowsers);
+      // exit 事件不能等待 Promise，但 close() 在首次 await 前会同步关闭 WS 并 kill Chrome。
+      process.once("exit", () => void closeAllBrowsers());
     }
     return self;
   }
@@ -193,19 +195,23 @@ export class Browser {
     void this.send("Target.closeTarget", { targetId }).catch(() => {});
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     LIVE.delete(this);
-    try {
-      this.ws.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      this.proc.kill();
-    } catch {
-      /* ignore */
-    }
-    rmSync(this.userDataDir, { recursive: true, force: true });
+    this.closePromise = (async () => {
+      try {
+        this.ws.close();
+      } catch {
+        /* ignore */
+      }
+      const closed = new Error("Browser closed");
+      for (const pending of this.pending.values()) pending.reject(closed);
+      this.pending.clear();
+      this.sessionListeners.clear();
+      await terminateChild(this.proc);
+      await removeUserDataDir(this.userDataDir);
+    })();
+    return this.closePromise;
   }
 
   private dispatch(text: string): void {
@@ -228,6 +234,58 @@ export class Browser {
       this.sessionListeners.get(msg.sessionId)?.(msg.method, msg.params ?? {});
     }
   }
+}
+
+/**
+ * Chromium 会在收到 SIGTERM 后继续短暂写 profile；先等进程退出，再删除目录。
+ * SIGTERM 超时才升级 SIGKILL，两个等待都有硬上限，避免宿主退出被卡死。
+ */
+async function terminateChild(proc: ChildProcess): Promise<void> {
+  if (proc.pid === undefined || proc.exitCode !== null || proc.signalCode !== null) return;
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  if (await waitForChild(proc, 2_000)) return;
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    return;
+  }
+  await waitForChild(proc, 1_000);
+}
+
+function waitForChild(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      proc.off("exit", onExit);
+      proc.off("close", onExit);
+      proc.off("error", onError);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const onError = () => finish(proc.exitCode !== null || proc.signalCode !== null);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    proc.once("exit", onExit);
+    proc.once("close", onExit);
+    proc.once("error", onError);
+  });
+}
+
+async function removeUserDataDir(userDataDir: string): Promise<void> {
+  await fs.rm(userDataDir, {
+    recursive: true,
+    force: true,
+    // 防病毒/Spotlight/Chromium helper 仍可能短暂持有或重建文件。
+    maxRetries: 8,
+    retryDelay: 50,
+  });
 }
 
 /** 轮询 user-data-dir 下的 DevToolsActivePort 文件，读回 `ws://127.0.0.1:<port><path>`。 */

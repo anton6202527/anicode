@@ -1,7 +1,7 @@
 /** Remote Runtime OIDC 鉴权：JWT/JWKS 校验，runner/control-plane 不持有长期用户 token。 */
 
 import type { IncomingMessage } from "node:http";
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from "jose";
 
 export interface RemoteOidcAuthenticatorOptions {
   issuer: string;
@@ -9,6 +9,7 @@ export interface RemoteOidcAuthenticatorOptions {
   jwksUri: string;
   algorithms?: string[];
   requiredClaims?: Record<string, string | string[]>;
+  fetch?: typeof fetch;
 }
 
 function claimMatches(actual: unknown, expected: string | string[]): boolean {
@@ -18,7 +19,9 @@ function claimMatches(actual: unknown, expected: string | string[]): boolean {
 }
 
 export function createRemoteOidcAuthenticator(options: RemoteOidcAuthenticatorOptions) {
-  const jwks = createRemoteJWKSet(new URL(options.jwksUri));
+  const jwks = createRemoteJWKSet(new URL(options.jwksUri), {
+    ...(options.fetch ? { [customFetch]: options.fetch } : {}),
+  });
   const issuer = options.issuer.replace(/\/$/, "");
   return async (request: IncomingMessage): Promise<{ actor: string; claims: JWTPayload }> => {
     const authorization = request.headers.authorization;

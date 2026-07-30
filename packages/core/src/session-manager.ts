@@ -39,6 +39,7 @@ import {
   type Artifact,
   type ArtifactInput,
   type ArtifactRecord,
+  type ArtifactStreamRecord,
   type ArtifactStore,
 } from "./runtime/artifacts.js";
 import {
@@ -1034,6 +1035,21 @@ export class SessionManager {
 
   getArtifact(sessionId: string, artifactId: string): Promise<ArtifactRecord | undefined> {
     return this.artifacts.get(sessionId, artifactId);
+  }
+
+  async openArtifact(
+    sessionId: string,
+    artifactId: string,
+  ): Promise<ArtifactStreamRecord | undefined> {
+    if (this.artifacts.open) return this.artifacts.open(sessionId, artifactId);
+    const record = await this.artifacts.get(sessionId, artifactId);
+    if (!record) return undefined;
+    return {
+      artifact: record.artifact,
+      data: (async function* () {
+        yield record.data;
+      })(),
+    };
   }
 
   deleteArtifact(sessionId: string, artifactId: string): Promise<boolean> {

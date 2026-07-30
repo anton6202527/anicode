@@ -1,6 +1,7 @@
 /** GitHub/CI 交付闭环：PR、Check Run、merge queue 与 provenance。 */
 
 import type { CredentialBroker } from "../security/credentials.js";
+import type { GitHubAccessTokenProvider } from "./github-app.js";
 import type { NetworkProxy } from "./network-proxy.js";
 import { noTelemetry, type SpanContext, type Telemetry } from "./telemetry.js";
 
@@ -8,10 +9,13 @@ export interface GitHubDeliveryOptions {
   owner: string;
   repo: string;
   proxy: NetworkProxy;
-  broker: CredentialBroker;
-  credentialId: string;
+  /** Legacy/static credentials are retained for local tests only. Production uses accessTokenProvider. */
+  broker?: CredentialBroker;
+  credentialId?: string;
+  accessTokenProvider?: GitHubAccessTokenProvider;
   apiBase?: string;
   graphqlUrl?: string;
+  apiVersion?: string;
   telemetry?: Telemetry;
   onAudit?: (event: GitHubAuditEvent) => void | Promise<void>;
 }
@@ -31,13 +35,15 @@ export interface GitHubDeliveryInput {
   branch: string;
   title: string;
   body?: string;
-  files: { path: string; content: string; message?: string }[];
+  commitMessage?: string;
+  files: { path: string; content: string; mode?: "100644" | "100755" }[];
   workflow?: string;
   workflowInputs?: Record<string, string>;
 }
 
 export interface GitHubDeliveryResult {
   branch: string;
+  commitSha: string;
   pullRequestNumber: number;
   pullRequestUrl: string;
   workflowDispatched: boolean;
@@ -91,11 +97,19 @@ export interface SlsaProvenanceInput {
 export class GitHubDelivery {
   private readonly base: string;
   private readonly graphqlUrl: string;
+  private readonly apiVersion: string;
   private readonly telemetry: Telemetry;
 
   constructor(private readonly options: GitHubDeliveryOptions) {
+    if (!options.accessTokenProvider && (!options.broker || !options.credentialId)) {
+      throw new Error("GitHub delivery requires an installation token provider");
+    }
+    if (!/^[A-Za-z0-9_.-]+$/.test(options.owner) || !/^[A-Za-z0-9_.-]+$/.test(options.repo)) {
+      throw new Error("GitHub owner and repository names are invalid");
+    }
     this.base = (options.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
     this.graphqlUrl = options.graphqlUrl ?? `${this.base}/graphql`;
+    this.apiVersion = options.apiVersion ?? "2026-03-10";
     this.telemetry = options.telemetry ?? noTelemetry;
   }
 
@@ -156,6 +170,25 @@ export class GitHubDelivery {
     );
   }
 
+  async dispatchWorkflow(
+    workflow: string,
+    ref: string,
+    inputs: Record<string, string>,
+    parent?: SpanContext,
+  ): Promise<void> {
+    if (!/^[A-Za-z0-9_.-]+\.ya?ml$/.test(workflow)) {
+      throw new Error("GitHub workflow name is invalid");
+    }
+    validRef(ref, "GitHub workflow ref");
+    await this.request(
+      "POST",
+      `/actions/workflows/${encodeURIComponent(workflow)}/dispatches`,
+      { ref, inputs },
+      true,
+      parent,
+    );
+  }
+
   /** GraphQL node id 必须来自 PullRequest.node_id；GitHub 会执行 branch protection/queue 规则。 */
   async enqueuePullRequest(pullRequestNodeId: string, parent?: SpanContext): Promise<string> {
     const result = await this.graphql<{
@@ -201,6 +234,59 @@ export class GitHubDelivery {
   }
 
   async deliver(input: GitHubDeliveryInput, parent?: SpanContext): Promise<GitHubDeliveryResult> {
+    validateDeliveryInput(input);
+    const findOpenPulls = () =>
+      this.request<Array<{ number: number; html_url: string }>>(
+        "GET",
+        `/pulls?state=open&head=${encodeURIComponent(`${this.options.owner}:${input.branch}`)}&base=${encodeURIComponent(input.base)}`,
+        undefined,
+        false,
+        parent,
+      );
+    // A branch name is the delivery idempotency boundary. A retry resumes at PR/workflow creation
+    // instead of creating sibling commits or force-updating an existing branch.
+    try {
+      const existingRef = await this.request<{ object: { sha: string } }>(
+        "GET",
+        `/git/ref/heads/${encodeURIComponent(input.branch)}`,
+        undefined,
+        false,
+        parent,
+      );
+      const existingPulls = await findOpenPulls();
+      const pull =
+        existingPulls[0] ??
+        (await this.request<{ number: number; html_url: string }>(
+          "POST",
+          "/pulls",
+          {
+            title: input.title,
+            body: input.body ?? "",
+            head: input.branch,
+            base: input.base,
+            draft: true,
+          },
+          false,
+          parent,
+        ));
+      if (input.workflow && existingPulls.length === 0) {
+        await this.dispatchWorkflow(
+          input.workflow,
+          input.branch,
+          input.workflowInputs ?? {},
+          parent,
+        );
+      }
+      return {
+        branch: input.branch,
+        commitSha: existingRef.object.sha,
+        pullRequestNumber: pull.number,
+        pullRequestUrl: pull.html_url,
+        workflowDispatched: Boolean(input.workflow && existingPulls.length === 0),
+      };
+    } catch (error) {
+      if (!githubStatus(error, 404)) throw error;
+    }
     const baseRef = await this.request<{ object: { sha: string } }>(
       "GET",
       `/git/ref/heads/${encodeURIComponent(input.base)}`,
@@ -208,56 +294,96 @@ export class GitHubDelivery {
       false,
       parent,
     );
-    await this.request(
+    const baseCommit = await this.request<{ tree: { sha: string } }>(
+      "GET",
+      `/git/commits/${encodeURIComponent(baseRef.object.sha)}`,
+      undefined,
+      false,
+      parent,
+    );
+    const blobs = await Promise.all(
+      input.files.map(async (file) => ({
+        path: file.path,
+        mode: file.mode ?? "100644",
+        sha: (
+          await this.request<{ sha: string }>(
+            "POST",
+            "/git/blobs",
+            { content: file.content, encoding: "utf-8" },
+            false,
+            parent,
+          )
+        ).sha,
+      })),
+    );
+    const tree = await this.request<{ sha: string }>(
       "POST",
-      "/git/refs",
+      "/git/trees",
       {
-        ref: `refs/heads/${input.branch}`,
-        sha: baseRef.object.sha,
+        base_tree: baseCommit.tree.sha,
+        tree: blobs.map((file) => ({
+          path: file.path,
+          mode: file.mode,
+          type: "blob",
+          sha: file.sha,
+        })),
       },
       false,
       parent,
     );
-    for (const file of input.files) {
+    const commit = await this.request<{ sha: string }>(
+      "POST",
+      "/git/commits",
+      {
+        message: input.commitMessage ?? input.title,
+        tree: tree.sha,
+        parents: [baseRef.object.sha],
+      },
+      false,
+      parent,
+    );
+    try {
       await this.request(
-        "PUT",
-        `/contents/${file.path.split("/").map(encodeURIComponent).join("/")}`,
+        "POST",
+        "/git/refs",
         {
-          message: file.message ?? `Update ${file.path}`,
-          content: Buffer.from(file.content).toString("base64"),
-          branch: input.branch,
+          ref: `refs/heads/${input.branch}`,
+          sha: commit.sha,
         },
         false,
         parent,
       );
+    } catch (error) {
+      if (!githubStatus(error, 422)) throw error;
+      // Another worker won the idempotency race. Resume through the existing branch.
+      return this.deliver(input, parent);
     }
-    const pull = await this.request<{ number: number; html_url: string }>(
-      "POST",
-      "/pulls",
-      {
-        title: input.title,
-        body: input.body ?? "",
-        head: input.branch,
-        base: input.base,
-        draft: true,
-      },
-      false,
-      parent,
-    );
-    if (input.workflow) {
-      await this.request(
+    const existingPulls = await findOpenPulls();
+    const pull =
+      existingPulls[0] ??
+      (await this.request<{ number: number; html_url: string }>(
         "POST",
-        `/actions/workflows/${encodeURIComponent(input.workflow)}/dispatches`,
-        { ref: input.branch, inputs: input.workflowInputs ?? {} },
-        true,
+        "/pulls",
+        {
+          title: input.title,
+          body: input.body ?? "",
+          head: input.branch,
+          base: input.base,
+          draft: true,
+        },
+        false,
         parent,
-      );
+      ));
+    // A durable retry can safely rebuild the branch/commit. Do not dispatch the workflow twice.
+    if (input.workflow && existingPulls.length === 0) {
+      await this.dispatchWorkflow(input.workflow, input.branch, input.workflowInputs ?? {}, parent);
     }
     return {
       branch: input.branch,
+      commitSha: commit.sha,
       pullRequestNumber: pull.number,
       pullRequestUrl: pull.html_url,
-      workflowDispatched: Boolean(input.workflow),
+      workflowDispatched: Boolean(input.workflow && existingPulls.length === 0),
     };
   }
 
@@ -293,23 +419,36 @@ export class GitHubDelivery {
       },
       parent,
     );
-    const lease = this.options.broker.lease({
-      credentialId: this.options.credentialId,
-      audience: "github-delivery",
-      host: url.hostname,
-      ttlMs: 30_000,
-    });
     try {
-      const response = await this.options.proxy.fetch(url, {
-        method,
-        credentialLease: lease,
-        headers: {
+      const execute = async (forceRefresh = false): Promise<Response> => {
+        const headers: Record<string, string> = {
           accept: "application/vnd.github+json",
-          "x-github-api-version": "2022-11-28",
+          "x-github-api-version": this.apiVersion,
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
-        },
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      });
+        };
+        let credentialLease: string | undefined;
+        if (this.options.accessTokenProvider) {
+          headers.authorization = `Bearer ${await this.options.accessTokenProvider.token(forceRefresh)}`;
+        } else {
+          credentialLease = this.options.broker!.lease({
+            credentialId: this.options.credentialId!,
+            audience: "github-delivery",
+            host: url.hostname,
+            ttlMs: 30_000,
+          });
+        }
+        return this.options.proxy.fetch(url, {
+          method,
+          headers,
+          ...(credentialLease ? { credentialLease } : {}),
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        });
+      };
+      let response = await execute();
+      if (response.status === 401 && this.options.accessTokenProvider) {
+        await response.body?.cancel().catch(() => undefined);
+        response = await execute(true);
+      }
       span.setAttribute("http.response.status_code", response.status);
       const traceId = span.context()?.traceId;
       await this.audit({
@@ -320,10 +459,12 @@ export class GitHubDelivery {
         success: response.ok,
         ...(traceId ? { traceId } : {}),
       });
-      if (!response.ok)
-        throw new Error(
+      if (!response.ok) {
+        throw new GitHubHttpError(
+          response.status,
           `GitHub delivery HTTP ${response.status}: ${(await response.text()).slice(0, 1_000)}`,
         );
+      }
       span.setStatus({ code: "ok" });
       if (acceptsNoContent || response.status === 204) return undefined as T;
       return (await response.json()) as T;
@@ -338,6 +479,71 @@ export class GitHubDelivery {
   private async audit(event: Omit<GitHubAuditEvent, "timestamp">): Promise<void> {
     await this.options.onAudit?.({ timestamp: new Date().toISOString(), ...event });
   }
+}
+
+class GitHubHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "GitHubHttpError";
+  }
+}
+
+function githubStatus(error: unknown, status: number): boolean {
+  return error instanceof GitHubHttpError && error.status === status;
+}
+
+function validRef(value: string, label: string): void {
+  if (
+    !value ||
+    value.length > 240 ||
+    value.startsWith("/") ||
+    value.endsWith("/") ||
+    value.endsWith(".") ||
+    value.includes("..") ||
+    value.includes("//") ||
+    value.includes("@{") ||
+    [...value].some(
+      (character) =>
+        character.charCodeAt(0) <= 0x20 ||
+        character.charCodeAt(0) === 0x7f ||
+        "~^:?*[\\".includes(character),
+    ) ||
+    value.split("/").some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
+  ) {
+    throw new Error(`${label} is not a safe Git ref`);
+  }
+}
+
+function validateDeliveryInput(input: GitHubDeliveryInput): void {
+  validRef(input.base, "GitHub base branch");
+  validRef(input.branch, "GitHub delivery branch");
+  if (input.base === input.branch) throw new Error("GitHub delivery branch must differ from base");
+  if (!input.title.trim()) throw new Error("GitHub delivery title is required");
+  if (input.files.length === 0 || input.files.length > 1_000) {
+    throw new Error("GitHub delivery requires 1-1000 files");
+  }
+  const seen = new Set<string>();
+  let bytes = 0;
+  for (const file of input.files) {
+    const parts = file.path.split("/");
+    if (
+      !file.path ||
+      file.path.startsWith("/") ||
+      file.path.includes("\\") ||
+      parts.some((part) => !part || part === "." || part === ".." || part === ".git")
+    ) {
+      throw new Error(`Unsafe GitHub delivery path: ${file.path}`);
+    }
+    if (seen.has(file.path)) throw new Error(`Duplicate GitHub delivery path: ${file.path}`);
+    seen.add(file.path);
+    const size = Buffer.byteLength(file.content);
+    if (size > 10 * 1024 * 1024) throw new Error(`GitHub delivery file is too large: ${file.path}`);
+    bytes += size;
+  }
+  if (bytes > 50 * 1024 * 1024) throw new Error("GitHub delivery exceeds 50 MiB");
 }
 
 /** SLSA v1 predicate；实际签名/透明日志由 GitHub OIDC + attest-build-provenance 完成。 */

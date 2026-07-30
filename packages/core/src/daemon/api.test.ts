@@ -4,7 +4,9 @@ import {
   ROUTES,
   EVENTS,
   generateOpenApi,
+  matchApiRoute,
   PROTOCOL_VERSION,
+  validateRouteRequest,
   validateOpenApiDocument,
 } from "./api.js";
 
@@ -29,6 +31,48 @@ test("OpenAPI 3.1.1 conformance: operationId/path params/responses 完整且唯�
   const document = generateOpenApi() as { openapi: string };
   assert.equal(document.openapi, "3.1.1");
   assert.deepEqual(validateOpenApiDocument(document as Record<string, unknown>), []);
+  const full = document as Record<string, unknown>;
+  const components = full.components as Record<string, Record<string, unknown>>;
+  assert.ok((components.schemas as Record<string, unknown>).ApiError);
+  const operations = Object.values(full.paths as Record<string, Record<string, unknown>>).flatMap(
+    (path) => Object.values(path),
+  ) as Array<Record<string, unknown>>;
+  assert.ok(
+    operations.every((operation) =>
+      Boolean((operation.responses as Record<string, unknown>).default),
+    ),
+  );
+});
+
+test("route contract: path matching + strict request schema + oneOf", () => {
+  assert.equal(
+    matchApiRoute("GET", "/sessions/s_1/artifacts/art_1/content")?.pathParams.artifactId,
+    "art_1",
+  );
+  assert.deepEqual(
+    validateRouteRequest("POST", "/sessions", { cwd: "/repo", model: "openai/gpt" }),
+    [],
+  );
+  assert.ok(
+    validateRouteRequest("POST", "/sessions", {
+      cwd: "/repo",
+      model: "openai/gpt",
+      typo: true,
+    }).some((issue) => issue.keyword === "additionalProperties"),
+  );
+  assert.ok(
+    validateRouteRequest("POST", "/sessions/s_1/artifacts", {
+      kind: "report",
+      name: "result",
+      text: "a",
+      dataBase64: "Yg==",
+    }).some((issue) => issue.keyword === "oneOf"),
+  );
+  assert.ok(
+    validateRouteRequest("POST", "/sessions/s_1/permission-mode", { mode: "unsafe" }).some(
+      (issue) => issue.keyword === "enum",
+    ),
+  );
 });
 
 test("ROUTES: 路径参数命名合法，method 合法", () => {

@@ -25,8 +25,10 @@ import {
   SecurityPolicyEngine,
   telemetryForLocalStack,
   t,
+  type LocalRuntimeStack,
   type OpenHandle,
   type PermissionDecisionKind,
+  type Telemetry,
 } from "@anicode/core";
 import { applyPluginToggle, PLUGIN_CATALOG, type PluginEntry } from "../shared/plugins.js";
 import type { AppInfo, ModelRow, UserModel } from "../shared/api.js";
@@ -66,6 +68,9 @@ const EVENT_CHANNEL = "anicode:event";
 export class Bridge {
   private readonly manager: SessionManager;
   private readonly plugins: PluginRuntime;
+  private readonly runtimeStack: LocalRuntimeStack;
+  private readonly telemetry: Telemetry;
+  private disposePromise: Promise<void> | undefined;
   /**
    * 被市场关闭的文件系统技能名。稳定引用传给 SessionManager 的 skills.disabled，
    * 开关时原地更新内容 —— 新建的会话在首次 send 读它，即时生效（已进行中的会话不受影响）。
@@ -80,6 +85,8 @@ export class Bridge {
       options.env ?? process.env,
     );
     const telemetry = telemetryForLocalStack(runtimeStack, options.env ?? process.env);
+    this.runtimeStack = runtimeStack;
+    this.telemetry = telemetry;
     this.plugins = new PluginRuntime(options.mcpConnector, options.env, runtimeStack.broker, {
       telemetry,
       networkProxy: runtimeStack.networkProxy,
@@ -371,9 +378,38 @@ export class Bridge {
     return this.plugins.entriesWithStatus();
   }
 
-  dispose(): void {
-    for (const subId of [...this.subscriptions.keys()]) this.closeSubscription(subId);
-    this.plugins.dispose();
-    this.manager.dispose();
+  /**
+   * 完整关闭 Bridge 自己创建的全部资源。幂等 Promise 让 Electron 退出流程和测试都能
+   * 等待 OTLP flush、代理 socket 与 SQLite WAL 真正落盘/关闭。
+   */
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposePromise = (async () => {
+      const failures: unknown[] = [];
+      const attempt = async (close: () => void | Promise<void>) => {
+        try {
+          await close();
+        } catch (error) {
+          failures.push(error);
+        }
+      };
+
+      for (const subId of [...this.subscriptions.keys()]) {
+        await attempt(() => this.closeSubscription(subId));
+      }
+      await attempt(() => this.plugins.dispose());
+      await attempt(() => this.manager.dispose());
+      await attempt(async () => {
+        if (this.telemetry.shutdown) await this.telemetry.shutdown();
+        else await this.telemetry.forceFlush?.();
+      });
+      await attempt(() => this.runtimeStack.networkProxy.close());
+      await attempt(() => this.runtimeStack.database.close());
+
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Failed to dispose one or more Bridge resources");
+      }
+    })();
+    return this.disposePromise;
   }
 }

@@ -1,5 +1,7 @@
 # Agent Runtime 第三轮生产化归档
 
+> 2026-07-30 的最终收口、配置与真实环境验收边界见[Production Agent Runtime closure](./2026-07-30-production-runtime-closure.md)。本页保留为第三轮完成时的快照。
+
 归档日期：2026-07-29
 上一轮：[Agent Runtime 第二轮补齐归档](./2026-07-29-runtime-hardening-round-2.md)
 

@@ -25,6 +25,8 @@
  */
 
 import * as http from "node:http";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { t } from "../i18n.js";
 import { SessionManager, type SessionEvent, type SessionSnapshot } from "../session-manager.js";
 import type { PermissionDecisionKind } from "../host.js";
@@ -32,7 +34,13 @@ import type { PermissionMode } from "../permission.js";
 import { PartsProjector, messagesToParts } from "../parts.js";
 import { createId } from "../id.js";
 import { PatchSetConflictError, type PatchSetChangeInput } from "../runtime/patchset.js";
-import { generateOpenApi, PROTOCOL_VERSION, type EventEnvelope } from "./api.js";
+import {
+  generateOpenApi,
+  PROTOCOL_VERSION,
+  validateRouteRequest,
+  type ApiValidationIssue,
+  type EventEnvelope,
+} from "./api.js";
 
 export interface HttpDaemonOptions {
   /** 默认会话实例（无目录路由、或未配置 resolveInstance 时的实例）。 */
@@ -58,26 +66,71 @@ export interface HttpDaemonOptions {
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
+class HttpRequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly details?: unknown,
+  ) {
+    super(message);
+  }
+}
+
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let exceeded = false;
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => {
+      if (exceeded) return;
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        reject(new Error(t("request body too large", "请求体过大")));
-        req.destroy();
+        exceeded = true;
+        reject(
+          new HttpRequestError(
+            413,
+            "REQUEST_BODY_TOO_LARGE",
+            t("request body too large", "请求体过大"),
+          ),
+        );
         return;
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => {
+      if (!exceeded) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
 }
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
-  const body = JSON.stringify(data);
+  const errorData =
+    status >= 400 &&
+    data &&
+    typeof data === "object" &&
+    typeof (data as { error?: unknown }).error === "string"
+      ? {
+          ...(data as Record<string, unknown>),
+          code:
+            (data as { code?: string }).code ??
+            {
+              400: "BAD_REQUEST",
+              401: "UNAUTHORIZED",
+              404: "NOT_FOUND",
+              405: "METHOD_NOT_ALLOWED",
+              409: "CONFLICT",
+              413: "REQUEST_BODY_TOO_LARGE",
+              415: "UNSUPPORTED_MEDIA_TYPE",
+              426: "UNSUPPORTED_API_VERSION",
+              500: "INTERNAL_ERROR",
+            }[status] ??
+            "HTTP_ERROR",
+          requestId: String(res.getHeader("x-request-id") ?? "unknown"),
+        }
+      : data;
+  const body = JSON.stringify(errorData);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(body),
@@ -228,9 +281,17 @@ export class HttpDaemonServer {
     if (opts.onClose) this.onClose = opts.onClose;
     this.server = http.createServer((req, res) => {
       void this.route(req, res).catch((err) => {
-        if (!res.headersSent)
-          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-        else res.end();
+        if (!res.headersSent) {
+          if (err instanceof HttpRequestError) {
+            json(res, err.status, {
+              error: err.message,
+              code: err.code,
+              ...(err.details !== undefined ? { details: err.details } : {}),
+            });
+          } else {
+            json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+          }
+        } else res.destroy(err instanceof Error ? err : undefined);
       });
     });
   }
@@ -308,8 +369,51 @@ export class HttpDaemonServer {
     );
   }
 
+  private async requestJson(req: http.IncomingMessage, url: URL): Promise<Record<string, unknown>> {
+    const contentType = req.headers["content-type"];
+    if (typeof contentType === "string" && !/^application\/json(?:\s*;|$)/i.test(contentType)) {
+      throw new HttpRequestError(
+        415,
+        "UNSUPPORTED_MEDIA_TYPE",
+        "request content-type must be application/json",
+      );
+    }
+    const raw = await readBody(req);
+    let body: unknown;
+    try {
+      body = JSON.parse(raw || "{}");
+    } catch {
+      throw new HttpRequestError(400, "INVALID_JSON", "request body is not valid JSON");
+    }
+    const issues: ApiValidationIssue[] = validateRouteRequest(req.method ?? "", url.pathname, body);
+    if (issues.length > 0) {
+      throw new HttpRequestError(
+        400,
+        "VALIDATION_ERROR",
+        "request body failed API contract validation",
+        { issues },
+      );
+    }
+    return body as Record<string, unknown>;
+  }
+
   private async route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
+    const incomingRequestId = req.headers["x-request-id"];
+    const requestId =
+      typeof incomingRequestId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(incomingRequestId)
+        ? incomingRequestId
+        : randomUUID();
+    res.setHeader("x-request-id", requestId);
+    res.setHeader("x-anicode-api-version", String(PROTOCOL_VERSION));
+    const requestedVersion = req.headers["x-anicode-api-version"];
+    if (requestedVersion !== undefined && requestedVersion !== String(PROTOCOL_VERSION)) {
+      return json(res, 426, {
+        error: `unsupported API version ${String(requestedVersion)}`,
+        code: "UNSUPPORTED_API_VERSION",
+        details: { supported: [PROTOCOL_VERSION] },
+      });
+    }
     if (!this.authorized(req, url)) return json(res, 401, { error: "unauthorized" });
 
     if (req.method === "GET") {
@@ -323,10 +427,38 @@ export class HttpDaemonServer {
 
     const manager = await this.managerFor(req, url);
 
-    if (req.method === "GET" && url.pathname === "/sessions")
-      return json(res, 200, await manager.listSessions());
+    if (req.method === "GET" && url.pathname === "/sessions") {
+      const sessions = await manager.listSessions();
+      const limitValue = url.searchParams.get("limit");
+      const cursorValue = url.searchParams.get("cursor");
+      if (limitValue === null && cursorValue === null) return json(res, 200, sessions);
+      const limit = Number(limitValue ?? 50);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+        return json(res, 400, { error: "limit must be an integer between 1 and 200" });
+      }
+      let offset = 0;
+      if (cursorValue) {
+        try {
+          const decoded = Buffer.from(cursorValue, "base64url").toString("utf8");
+          const matched = /^v1:(\d+)$/.exec(decoded);
+          if (!matched) throw new Error("invalid cursor");
+          offset = Number(matched[1]);
+          if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("invalid cursor");
+        } catch {
+          return json(res, 400, { error: "cursor is invalid" });
+        }
+      }
+      const items = sessions.slice(offset, offset + limit);
+      if (offset + items.length < sessions.length) {
+        res.setHeader(
+          "x-anicode-next-cursor",
+          Buffer.from(`v1:${offset + items.length}`, "utf8").toString("base64url"),
+        );
+      }
+      return json(res, 200, items);
+    }
     if (req.method === "POST" && url.pathname === "/sessions") {
-      const body = JSON.parse((await readBody(req)) || "{}") as {
+      const body = (await this.requestJson(req, url)) as {
         cwd?: string;
         model?: string;
         title?: string;
@@ -349,7 +481,7 @@ export class HttpDaemonServer {
       }
       if (req.method === "GET") return json(res, 200, await manager.listArtifacts(sessionId));
       if (req.method === "POST") {
-        const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+        const body = (await this.requestJson(req, url)) as Record<string, unknown>;
         if (
           !body.kind ||
           !body.name ||
@@ -360,7 +492,7 @@ export class HttpDaemonServer {
         let data: string | Uint8Array;
         if (typeof body.dataBase64 === "string") {
           try {
-            data = Buffer.from(body.dataBase64, "base64");
+            data = strictBase64(body.dataBase64);
           } catch {
             return json(res, 400, { error: "invalid dataBase64" });
           }
@@ -383,6 +515,35 @@ export class HttpDaemonServer {
         );
       }
       return json(res, 405, { error: "method not allowed" });
+    }
+
+    const artifactContent = /^\/sessions\/([^/]+)\/artifacts\/([^/]+)\/content$/.exec(url.pathname);
+    if (artifactContent) {
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      const sessionId = decodeURIComponent(artifactContent[1]!);
+      const artifactId = decodeURIComponent(artifactContent[2]!);
+      const record = await manager.openArtifact(sessionId, artifactId);
+      if (!record) return json(res, 404, { error: "not found" });
+      const mediaType = /^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+(?:\s*;\s*charset=[\w-]+)?$/i.test(
+        record.artifact.mediaType,
+      )
+        ? record.artifact.mediaType
+        : "application/octet-stream";
+      const checksum = Buffer.from(record.artifact.sha256, "hex").toString("base64");
+      res.writeHead(200, {
+        "content-type": mediaType,
+        "content-length": record.artifact.sizeBytes,
+        "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(record.artifact.name)}`,
+        "content-digest": `sha-256=:${checksum}:`,
+        etag: `"sha256:${record.artifact.sha256}"`,
+        "x-content-type-options": "nosniff",
+      });
+      for await (const chunk of record.data) {
+        if (res.destroyed) throw new Error("artifact client disconnected");
+        if (!res.write(chunk)) await once(res, "drain");
+      }
+      res.end();
+      return;
     }
 
     const artifactItem = /^\/sessions\/([^/]+)\/artifacts\/([^/]+)$/.exec(url.pathname);
@@ -412,7 +573,7 @@ export class HttpDaemonServer {
       if (!(await this.snapshotOf(manager, sessionId))) {
         return json(res, 404, { error: "not found" });
       }
-      const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+      const body = (await this.requestJson(req, url)) as Record<string, unknown>;
       if (!Array.isArray(body.changes) || body.changes.length === 0) {
         return json(res, 400, { error: "changes must be a non-empty array" });
       }
@@ -502,7 +663,7 @@ export class HttpDaemonServer {
       if (!(await manager.getPatchSet(sessionId, patchsetId))) {
         return json(res, 404, { error: "not found" });
       }
-      const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+      const body = (await this.requestJson(req, url)) as Record<string, unknown>;
       try {
         if (action === "approve") {
           if (
@@ -581,7 +742,7 @@ export class HttpDaemonServer {
         return noContent(res);
       }
       if (req.method === "PATCH") {
-        const body = JSON.parse((await readBody(req)) || "{}") as { title?: string };
+        const body = (await this.requestJson(req, url)) as { title?: string };
         if (!body.title) return json(res, 400, { error: "title is required" });
         await manager.setTitle(sessionId, body.title);
         return noContent(res);
@@ -607,20 +768,31 @@ export class HttpDaemonServer {
     }
 
     if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
-    const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+    const body = (await this.requestJson(req, url)) as Record<string, unknown>;
 
     switch (action) {
-      case "send":
+      case "send": {
+        const idempotencyHeader = req.headers["idempotency-key"];
+        if (
+          Array.isArray(idempotencyHeader) ||
+          (typeof idempotencyHeader === "string" &&
+            (!idempotencyHeader || idempotencyHeader.length > 256))
+        ) {
+          return json(res, 400, { error: "Idempotency-Key must contain 1 to 256 characters" });
+        }
+        const idempotencyKey =
+          typeof idempotencyHeader === "string" && idempotencyHeader
+            ? idempotencyHeader
+            : typeof body.idempotencyKey === "string" && body.idempotencyKey
+              ? body.idempotencyKey
+              : undefined;
         await manager.send(
           sessionId,
           String(body.text ?? ""),
-          (typeof body.model === "string" && body.model) ||
-            (typeof body.idempotencyKey === "string" && body.idempotencyKey)
+          (typeof body.model === "string" && body.model) || idempotencyKey
             ? {
                 ...(typeof body.model === "string" && body.model ? { model: body.model } : {}),
-                ...(typeof body.idempotencyKey === "string" && body.idempotencyKey
-                  ? { idempotencyKey: body.idempotencyKey }
-                  : {}),
+                ...(idempotencyKey ? { idempotencyKey } : {}),
                 ...(typeof req.headers.traceparent === "string"
                   ? { traceparent: req.headers.traceparent }
                   : {}),
@@ -630,6 +802,7 @@ export class HttpDaemonServer {
               : undefined,
         );
         return noContent(res);
+      }
       case "interrupt":
         await manager.interrupt(sessionId);
         return noContent(res);

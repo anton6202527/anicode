@@ -18,6 +18,7 @@ import {
   type SecretBackend,
 } from "../security/secret-backends.js";
 import { CommandInbox, DurableOutbox } from "./commands.js";
+import { configuredS3ArtifactStoreFromEnv, type ArtifactStore } from "./artifacts.js";
 import type { ISessionStore } from "../session.js";
 import { DurableRuntime } from "./durable.js";
 import { ContainerIsolatedRuntime } from "./container-runtime.js";
@@ -35,6 +36,7 @@ import {
 } from "./sqlite.js";
 import { DurableWorkerQueue, WorktreeOwnership } from "./worker.js";
 import { telemetryFromEnv, type Telemetry } from "./telemetry.js";
+import { TransactionalExecutionRuntime } from "./transactional-runtime.js";
 
 function csv(value: string | undefined, fallback: string[]): string[] {
   const parsed = value
@@ -48,7 +50,7 @@ export interface LocalRuntimeStack {
   runtime: DurableRuntime;
   database: SqliteRuntimeDatabase;
   broker: CredentialBroker;
-  artifacts: SqliteArtifactStore;
+  artifacts: ArtifactStore;
   sessions: ISessionStore;
   commandInbox: CommandInbox;
   outbox: DurableOutbox;
@@ -189,7 +191,7 @@ function assembleLocalRuntimeStack(
   });
   configureProviderNetworkProxy(networkProxy);
   const workerStore = new SqliteWorkerQueueStore(database);
-  const isolatedRuntime: ExecutionRuntime =
+  const executionBackend: ExecutionRuntime =
     env.ANICODE_EXECUTION_BACKEND === "container"
       ? new ContainerIsolatedRuntime({
           image:
@@ -210,11 +212,23 @@ function assembleLocalRuntimeStack(
           ...(env.ANICODE_NETWORK_PROXY_URL ? { proxyUrl: env.ANICODE_NETWORK_PROXY_URL } : {}),
           requireProxy: true,
         });
+  const isolatedRuntime: ExecutionRuntime =
+    env.ANICODE_TRANSACTIONAL_SHELL === "0"
+      ? executionBackend
+      : new TransactionalExecutionRuntime(executionBackend, {
+          maxFiles: Number(env.ANICODE_TRANSACTIONAL_SHELL_MAX_FILES ?? 200_000),
+          maxChangedBytes: Number(
+            env.ANICODE_TRANSACTIONAL_SHELL_MAX_CHANGED_BYTES ?? 100 * 1024 * 1024,
+          ),
+        });
   return {
     runtime,
     database,
     broker,
-    artifacts: new SqliteArtifactStore(database),
+    artifacts:
+      env.ANICODE_ARTIFACT_BACKEND === "s3"
+        ? configuredS3ArtifactStoreFromEnv(env)
+        : new SqliteArtifactStore(database),
     sessions: new SqliteRuntimeSessionStore(database),
     commandInbox: new CommandInbox(new SqliteCommandInboxStore(database)),
     outbox: new DurableOutbox(new SqliteOutboxStore(database), runtime),

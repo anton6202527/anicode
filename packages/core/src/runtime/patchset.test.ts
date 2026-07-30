@@ -115,3 +115,93 @@ test("PatchSet: stale 文本事务可 rebase 到并发改动后再原子提交",
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("PatchSet: 拒绝 symlink 与运行时状态路径，且保留可执行权限", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-ps-boundary-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-ps-outside-"));
+  try {
+    await fs.mkdir(path.join(root, ".anicode"));
+    await fs.symlink(outside, path.join(root, "escape"));
+    await fs.writeFile(path.join(root, "run.sh"), "#!/bin/sh\necho old\n", { mode: 0o755 });
+    const service = new PatchSetService(root);
+    await assert.rejects(
+      () => service.prepare([{ path: "escape/pwned", content: "no" }]),
+      /symbolic link/,
+    );
+    await assert.rejects(
+      () => service.prepare([{ path: ".anicode/patchsets/forged.json", content: "no" }]),
+      /protected runtime state/,
+    );
+    const patchset = await service.prepare([
+      { path: "run.sh", content: "#!/bin/sh\necho new\n" },
+      { path: "private.sh", content: "#!/bin/sh\ntrue\n", mode: 0o700 },
+    ]);
+    await service.apply(patchset);
+    assert.equal((await fs.stat(path.join(root, "run.sh"))).mode & 0o777, 0o755);
+    assert.equal((await fs.stat(path.join(root, "private.sh"))).mode & 0o777, 0o700);
+    await service.rollback(patchset);
+    assert.equal((await fs.stat(path.join(root, "run.sh"))).mode & 0o777, 0o755);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("PatchSet: workspace lock serializes concurrent apply and rejects stale preview", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-ps-lock-"));
+  try {
+    await fs.writeFile(path.join(root, "shared.txt"), "base");
+    const firstService = new PatchSetService(root);
+    const secondService = new PatchSetService(root);
+    const first = await firstService.prepare([{ path: "shared.txt", content: "first" }]);
+    const second = await secondService.prepare([{ path: "shared.txt", content: "second" }]);
+    const results = await Promise.allSettled([
+      firstService.apply(first),
+      secondService.apply(second),
+    ]);
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    const rejected = results.find((result) => result.status === "rejected");
+    assert.ok(rejected && rejected.status === "rejected");
+    assert.ok(rejected.reason instanceof PatchSetConflictError);
+    assert.ok(
+      ["first", "second"].includes(await fs.readFile(path.join(root, "shared.txt"), "utf8")),
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PatchSet: recovery 等锁后重读状态，不回滚另一个进程刚完成的事务", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-ps-recovery-race-"));
+  try {
+    await fs.writeFile(path.join(root, "shared.txt"), "base");
+    let started!: () => void;
+    let release!: () => void;
+    const writeStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writer = new PatchSetService(root, {
+      writeFile: async (file, content, mode) => {
+        started();
+        await gate;
+        await fs.writeFile(file, content, { mode });
+      },
+    });
+    const recovery = new PatchSetService(root);
+    const patchset = await writer.prepare([{ path: "shared.txt", content: "committed" }]);
+    const applying = writer.apply(patchset);
+    await writeStarted;
+    const recovering = recovery.recoverIncomplete();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    release();
+    await applying;
+    assert.deepEqual(await recovering, []);
+    assert.equal(await fs.readFile(path.join(root, "shared.txt"), "utf8"), "committed");
+    assert.equal((await recovery.load(patchset.id))?.status, "applied");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

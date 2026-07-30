@@ -2,7 +2,9 @@ name: Real Repository Eval
 
 on:
   schedule:
+    # Weekday canary and Sunday full 280-task matrix.
     - cron: "30 18 * * 1-5"
+    - cron: "30 18 * * 0"
   workflow_dispatch:
     inputs:
       limit:
@@ -31,13 +33,39 @@ jobs:
       - name: Verify the pinned 280-task catalog
         run: node --import tsx --test packages/eval/src/real-repo.test.ts
 
-  # Real model credentials are supplied by the deployment environment through OIDC/Vault,
-  # never as repository secrets. The runner label should point at an ephemeral runner scale set.
-  real-eval:
-    needs: catalog-integrity
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      limit: ${{ steps.plan.outputs.limit }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+      shards: ${{ steps.plan.outputs.shards }}
+      baseline: ${{ steps.plan.outputs.baseline }}
+    steps:
+      - id: plan
+        env:
+          REQUESTED_LIMIT: ${{ inputs.limit || '40' }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          limit="$REQUESTED_LIMIT"
+          if [ "$SCHEDULE" = "30 18 * * 0" ]; then limit=280; fi
+          if [ "$limit" -gt 80 ]; then shard_count=20; else shard_count=4; fi
+          shards="$(node -e 'const n=Number(process.argv[1]);process.stdout.write(JSON.stringify(Array.from({length:n},(_,i)=>i)))' "$shard_count")"
+          echo "limit=$limit" >> "$GITHUB_OUTPUT"
+          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "baseline=packages/eval/baselines/real-$limit.json" >> "$GITHUB_OUTPUT"
+
+  # Credentials come from workload identity/Vault. The label must target an ARC ephemeral scale set
+  # configured to forward runner diagnostics before Pod deletion.
+  real-eval-shard:
+    needs: [catalog-integrity, plan]
     if: ${{ vars.ANICODE_REAL_EVAL_ENABLED == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     runs-on: [self-hosted, anicode-ephemeral-eval]
-    timeout-minutes: 720
+    timeout-minutes: 660
     permissions:
       contents: read
       id-token: write
@@ -48,7 +76,7 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci
-      - name: Run real SWE-bench slices
+      - name: Run real SWE-bench shard
         env:
           ANICODE_CREDENTIAL_BACKEND: vault
           VAULT_ADDR: ${{ vars.ANICODE_VAULT_ADDR }}
@@ -61,21 +89,54 @@ jobs:
           ANICODE_RUNTIME_IMAGE: ${{ vars.ANICODE_EVAL_RUNTIME_IMAGE }}
           ANICODE_CONTAINER_NETWORK: ${{ vars.ANICODE_EVAL_CONTAINER_NETWORK }}
           ANICODE_CONTAINER_PROXY_URL: ${{ vars.ANICODE_EVAL_CONTAINER_PROXY_URL }}
+          ANICODE_EVAL_STATE_DIR: .anicode/eval-${{ matrix.shard }}
         run: >-
           npm run eval --
           --suite real
           --model "${{ vars.ANICODE_EVAL_MODEL }}"
-          --limit "${{ inputs.limit || 40 }}"
-          --json real-eval.json
-          --baseline packages/eval/baselines/real.json
+          --limit "${{ needs.plan.outputs.limit }}"
+          --shard-index "${{ matrix.shard }}"
+          --shard-count "${{ needs.plan.outputs.shard_count }}"
+          --concurrency 2
+          --defer-gate
+          --json "real-eval-${{ matrix.shard }}.json"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-eval-shard-${{ matrix.shard }}
+          path: real-eval-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+  aggregate:
+    needs: [plan, real-eval-shard]
+    if: ${{ always() && vars.ANICODE_REAL_EVAL_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: real-eval-shard-*
+          path: real-eval-shards
+      - name: Merge shards and apply the quality gate
+        run: >-
+          npm run eval:merge --workspace @anicode/eval --
+          --input real-eval-shards
+          --output real-eval.json
+          --baseline "${{ needs.plan.outputs.baseline }}"
           --bootstrap-baseline
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: real-eval-${{ github.run_id }}
-          # 首次启用时 CLI 会生成待审核基线；下载并提交后，后续 nightly 才执行回归比较。
           path: |
             real-eval.json
-            packages/eval/baselines/real.json
+            ${{ needs.plan.outputs.baseline }}
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 90

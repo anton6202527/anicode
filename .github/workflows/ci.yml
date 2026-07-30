@@ -21,6 +21,22 @@ jobs:
       fail-fast: false
       matrix:
         node: ["22", "24"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: anicode_test
+          POSTGRES_USER: anicode
+          POSTGRES_PASSWORD: anicode-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U anicode -d anicode_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ANICODE_TEST_DATABASE_URL: postgresql://anicode:anicode-test-only@127.0.0.1:5432/anicode_test
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +47,10 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Production dependency audit
+        if: matrix.node == '24'
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Format check
         run: npm run format:check

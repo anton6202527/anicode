@@ -1,6 +1,6 @@
 /** Kubernetes Job 执行后端：每条命令一个短生命周期 Pod，完成后删除。 */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as dns } from "node:dns";
 import { promises as fs } from "node:fs";
 import { isIP } from "node:net";
@@ -10,6 +10,7 @@ import type {
   IsolatedRunRequest,
   IsolatedRunResult,
 } from "./isolated-runtime.js";
+import { traceparent } from "./telemetry.js";
 
 export interface KubernetesJobRuntimeOptions {
   image: string;
@@ -27,6 +28,8 @@ export interface KubernetesJobRuntimeOptions {
   fetch?: typeof fetch;
   resolver?: (hostname: string) => Promise<string[]>;
   requirePinnedImage?: boolean;
+  maxLogBytes?: number;
+  useWatch?: boolean;
 }
 
 interface KubernetesJobStatus {
@@ -76,13 +79,41 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       throw new Error("Kubernetes execution requires a valid workspace id below workspace root");
     }
     const ephemeral = this.options.ephemeralWorkspace ?? true;
+    if (request.policy === "workspace-write" && !ephemeral) {
+      throw new Error("Kubernetes workspace-write requires transactional ephemeralWorkspace");
+    }
+    const transactionalWrite = ephemeral && request.policy === "workspace-write";
+    const timeoutMs = Math.max(1_000, request.timeoutMs ?? 120_000);
     const name = `anicode-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
     const labels = {
       "app.kubernetes.io/name": "anicode-runner",
       "anicode.dev/network": request.network ? "proxy" : "denied",
+      ...(request.workload?.tenantId
+        ? { "anicode.dev/tenant": labelHash(request.workload.tenantId) }
+        : {}),
+      ...(request.workload?.actor
+        ? { "anicode.dev/actor": labelHash(request.workload.actor) }
+        : {}),
+      ...(request.workload?.executionId
+        ? { "anicode.dev/execution": labelValue(request.workload.executionId) }
+        : {}),
     };
+    const reservedEnvironment = new Set([
+      "ANICODE_JOB_COMMAND",
+      "ANICODE_JOB_NETWORK",
+      "ANICODE_JOB_RELATIVE_CWD",
+      "ANICODE_JOB_SOURCE",
+      "ANICODE_JOB_TIMEOUT_MS",
+      "TMPDIR",
+      "TRACEPARENT",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "NO_PROXY",
+    ]);
     const environment = Object.entries(request.env ?? {})
       .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+      .filter(([name]) => !reservedEnvironment.has(name.toUpperCase()))
       .map(([name, value]) => ({ name, value }));
     if (request.network) {
       environment.push(
@@ -92,6 +123,19 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
         { name: "NO_PROXY", value: "" },
       );
     }
+    if (request.traceContext) {
+      environment.push({ name: "TRACEPARENT", value: traceparent(request.traceContext) });
+    }
+    if (transactionalWrite) {
+      environment.push(
+        { name: "ANICODE_JOB_COMMAND", value: request.command },
+        { name: "ANICODE_JOB_NETWORK", value: request.network ? "1" : "0" },
+        { name: "ANICODE_JOB_RELATIVE_CWD", value: cwdParts.join("/") || "." },
+        { name: "ANICODE_JOB_SOURCE", value: "/source" },
+        { name: "ANICODE_JOB_TIMEOUT_MS", value: String(timeoutMs) },
+        { name: "TMPDIR", value: "/workspace" },
+      );
+    }
     const body = {
       apiVersion: "batch/v1",
       kind: "Job",
@@ -99,7 +143,7 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       spec: {
         backoffLimit: 0,
         ttlSecondsAfterFinished: 300,
-        activeDeadlineSeconds: Math.ceil(Math.max(1_000, request.timeoutMs ?? 120_000) / 1_000),
+        activeDeadlineSeconds: Math.ceil(timeoutMs / 1_000),
         template: {
           metadata: { labels },
           spec: {
@@ -112,8 +156,17 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
                 name: "runner",
                 image: this.options.image,
                 imagePullPolicy: "IfNotPresent",
-                command: ["/bin/sh", "-lc", request.command],
-                workingDir: path.posix.join("/workspace", cwdParts.join("/")),
+                command: transactionalWrite
+                  ? [
+                      "node",
+                      "--import",
+                      "tsx",
+                      "/app/packages/core/src/runtime/kubernetes-job-entry.ts",
+                    ]
+                  : ["/bin/sh", "-lc", request.command],
+                workingDir: transactionalWrite
+                  ? "/source"
+                  : path.posix.join("/workspace", cwdParts.join("/")),
                 env: environment,
                 securityContext: {
                   allowPrivilegeEscalation: false,
@@ -126,11 +179,20 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
                 },
                 volumeMounts: [
                   { name: "workspace", mountPath: "/workspace" },
+                  ...(transactionalWrite
+                    ? [
+                        {
+                          name: "workspace-source",
+                          mountPath: "/source",
+                          subPath: workspaceSubPath,
+                        },
+                      ]
+                    : []),
                   { name: "tmp", mountPath: "/tmp" },
                 ],
               },
             ],
-            ...(ephemeral
+            ...(ephemeral && !transactionalWrite
               ? {
                   initContainers: [
                     {
@@ -168,7 +230,7 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
                       name: "workspace-source",
                       persistentVolumeClaim: {
                         claimName: this.options.workspacePvc,
-                        readOnly: true,
+                        readOnly: !transactionalWrite,
                       },
                     },
                     {
@@ -179,7 +241,10 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
                 : [
                     {
                       name: "workspace",
-                      persistentVolumeClaim: { claimName: this.options.workspacePvc },
+                      persistentVolumeClaim: {
+                        claimName: this.options.workspacePvc,
+                        readOnly: request.policy === "read-only",
+                      },
                     },
                   ]),
               { name: "tmp", emptyDir: { sizeLimit: "512Mi" } },
@@ -206,27 +271,9 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
     let output = "";
     try {
       const deadline = Date.now() + Math.max(1_000, request.timeoutMs ?? 120_000);
-      for (;;) {
-        if (request.signal?.aborted) throw new Error("Kubernetes job cancelled");
-        if (Date.now() >= deadline) {
-          timedOut = true;
-          break;
-        }
-        const job = await this.callJson<KubernetesJobStatus>(
-          `/apis/batch/v1/namespaces/${this.namespace}/jobs/${name}`,
-        );
-        if ((job.status?.succeeded ?? 0) > 0) {
-          exitCode = 0;
-          break;
-        }
-        if ((job.status?.failed ?? 0) > 0) {
-          exitCode = 1;
-          break;
-        }
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.max(100, this.options.pollMs ?? 500)),
-        );
-      }
+      const status = await this.waitForCompletion(name, deadline, request.signal);
+      timedOut = status === "timeout";
+      exitCode = status === "succeeded" ? 0 : status === "failed" ? 1 : null;
       output = await this.logs(name).catch(() => "");
       return {
         exitCode,
@@ -239,6 +286,12 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       request.signal?.removeEventListener("abort", onAbort);
       await cleanup();
     }
+  }
+
+  async healthCheck(): Promise<void> {
+    await this.call(`/apis/batch/v1/namespaces/${this.namespace}/jobs?limit=1`, {
+      method: "GET",
+    });
   }
 
   /** Runner 不获 DNS egress；控制面先解析集群代理并把短任务固定到一个 proxy Pod/IP。 */
@@ -262,7 +315,49 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       `/api/v1/namespaces/${this.namespace}/pods/${encodeURIComponent(pod)}/log?container=runner`,
       { method: "GET" },
     );
-    return response.text();
+    return readLimitedText(response, Math.max(1_024, this.options.maxLogBytes ?? 1024 * 1024));
+  }
+
+  private async waitForCompletion(
+    name: string,
+    deadline: number,
+    signal?: AbortSignal,
+  ): Promise<"succeeded" | "failed" | "timeout"> {
+    if (this.options.useWatch ?? true) {
+      while (Date.now() < deadline) {
+        if (signal?.aborted) throw new Error("Kubernetes job cancelled");
+        const remainingSeconds = Math.max(
+          1,
+          Math.min(30, Math.ceil((deadline - Date.now()) / 1_000)),
+        );
+        const response = await this.call(
+          `/apis/batch/v1/namespaces/${this.namespace}/jobs?watch=1&fieldSelector=${encodeURIComponent(
+            `metadata.name=${name}`,
+          )}&timeoutSeconds=${remainingSeconds}`,
+          { method: "GET", ...(signal ? { signal } : {}) },
+        );
+        const text = await readLimitedText(response, 1024 * 1024);
+        for (const line of text.split("\n").filter(Boolean)) {
+          const event = JSON.parse(line) as { object?: KubernetesJobStatus } & KubernetesJobStatus;
+          const job = event.object ?? event;
+          if ((job.status?.succeeded ?? 0) > 0) return "succeeded";
+          if ((job.status?.failed ?? 0) > 0) return "failed";
+        }
+      }
+      return "timeout";
+    }
+    for (;;) {
+      if (signal?.aborted) throw new Error("Kubernetes job cancelled");
+      if (Date.now() >= deadline) return "timeout";
+      const job = await this.callJson<KubernetesJobStatus>(
+        `/apis/batch/v1/namespaces/${this.namespace}/jobs/${name}`,
+      );
+      if ((job.status?.succeeded ?? 0) > 0) return "succeeded";
+      if ((job.status?.failed ?? 0) > 0) return "failed";
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.max(100, this.options.pollMs ?? 500)),
+      );
+    }
   }
 
   private async callJson<T>(suffix: string): Promise<T> {
@@ -283,4 +378,37 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
     }
     return response;
   }
+}
+
+function labelHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function labelValue(value: string): string {
+  const normalized = value.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 63);
+  return normalized && /^[A-Za-z0-9]/.test(normalized) ? normalized : labelHash(value);
+}
+
+async function readLimitedText(response: Response, limit: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let truncated = false;
+  for (;;) {
+    const item = await reader.read();
+    if (item.done) break;
+    const remaining = limit - size;
+    if (remaining > 0) {
+      const value = Buffer.from(item.value);
+      chunks.push(value.subarray(0, remaining));
+      size += Math.min(value.byteLength, remaining);
+    }
+    if (item.value.byteLength > remaining) {
+      truncated = true;
+      await reader.cancel("response size limit reached");
+      break;
+    }
+  }
+  return `${Buffer.concat(chunks).toString("utf8")}${truncated ? `\n[truncated at ${limit} bytes]` : ""}`;
 }

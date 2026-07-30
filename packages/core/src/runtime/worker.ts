@@ -32,6 +32,32 @@ interface WorkerDocument {
 
 export interface WorkerQueueStore {
   transact<T>(fn: (jobs: WorkerJob[]) => T | Promise<T>): Promise<T>;
+  enqueueJob?(job: WorkerJob): Promise<WorkerJob>;
+  claimJob?(
+    owner: string,
+    types: string[] | undefined,
+    leaseMs: number,
+  ): Promise<WorkerJob | undefined>;
+  heartbeatJob?(
+    jobId: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void>;
+  finishJob?(jobId: string, owner: string, result: unknown, fencingToken?: number): Promise<void>;
+  failJob?(
+    jobId: string,
+    owner: string,
+    error: string,
+    retry: boolean,
+    fencingToken?: number,
+  ): Promise<void>;
+  cancelJob?(jobId: string): Promise<boolean>;
+  listJobs?(): Promise<WorkerJob[]>;
+  get?(jobId: string): Promise<WorkerJob | undefined>;
+  acquireWorktree?(worktree: string, owner: string, leaseMs: number): Promise<WorktreeLease>;
+  heartbeatWorktree?(worktree: string, owner: string, leaseMs: number): Promise<void>;
+  releaseWorktree?(worktree: string, owner: string, fencingToken?: number): Promise<void>;
 }
 
 function clone<T>(value: T): T {
@@ -129,28 +155,32 @@ export class DurableWorkerQueue {
     payload: T,
     options: { idempotencyKey?: string; maxAttempts?: number } = {},
   ) {
+    const key = options.idempotencyKey ?? `job:${randomUUID()}`;
+    const now = new Date().toISOString();
+    const proposed: WorkerJob<T> = {
+      id: `job_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
+      type,
+      payload,
+      status: "queued",
+      idempotencyKey: key,
+      attempts: 0,
+      maxAttempts: Math.max(1, options.maxAttempts ?? 3),
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (this.store.enqueueJob) {
+      return this.store.enqueueJob(proposed) as Promise<WorkerJob<T>>;
+    }
     return this.store.transact(async (jobs) => {
-      const key = options.idempotencyKey ?? `job:${randomUUID()}`;
       const duplicate = jobs.find((job) => job.idempotencyKey === key);
       if (duplicate) return clone(duplicate as WorkerJob<T>);
-      const now = new Date().toISOString();
-      const job: WorkerJob<T> = {
-        id: `job_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
-        type,
-        payload,
-        status: "queued",
-        idempotencyKey: key,
-        attempts: 0,
-        maxAttempts: Math.max(1, options.maxAttempts ?? 3),
-        createdAt: now,
-        updatedAt: now,
-      };
-      jobs.push(job);
-      return clone(job);
+      jobs.push(proposed);
+      return clone(proposed);
     });
   }
 
   claim(owner: string, types?: string[], leaseMs = 60_000): Promise<WorkerJob | undefined> {
+    if (this.store.claimJob) return this.store.claimJob(owner, types, leaseMs);
     return this.store.transact(async (jobs) => {
       const now = Date.now();
       const job = jobs.find(
@@ -179,6 +209,9 @@ export class DurableWorkerQueue {
   }
 
   heartbeat(jobId: string, owner: string, leaseMs = 60_000, fencingToken?: number): Promise<void> {
+    if (this.store.heartbeatJob) {
+      return this.store.heartbeatJob(jobId, owner, leaseMs, fencingToken);
+    }
     return this.store.transact(async (jobs) => {
       const job = jobs.find((candidate) => candidate.id === jobId);
       if (!job || job.status !== "leased" || job.leaseOwner !== owner)
@@ -191,6 +224,7 @@ export class DurableWorkerQueue {
   }
 
   finish(jobId: string, owner: string, result: unknown, fencingToken?: number): Promise<void> {
+    if (this.store.finishJob) return this.store.finishJob(jobId, owner, result, fencingToken);
     return this.settle(jobId, owner, "succeeded", result, fencingToken);
   }
 
@@ -201,6 +235,9 @@ export class DurableWorkerQueue {
     retry = true,
     fencingToken?: number,
   ): Promise<void> {
+    if (this.store.failJob) {
+      return this.store.failJob(jobId, owner, error, retry, fencingToken);
+    }
     return this.store.transact(async (jobs) => {
       const job = jobs.find((candidate) => candidate.id === jobId);
       if (!job || job.status !== "leased" || job.leaseOwner !== owner)
@@ -216,6 +253,7 @@ export class DurableWorkerQueue {
   }
 
   cancel(jobId: string): Promise<boolean> {
+    if (this.store.cancelJob) return this.store.cancelJob(jobId);
     return this.store.transact(async (jobs) => {
       const job = jobs.find((candidate) => candidate.id === jobId);
       if (!job || ["succeeded", "failed", "cancelled"].includes(job.status)) return false;
@@ -228,7 +266,16 @@ export class DurableWorkerQueue {
   }
 
   list(): Promise<WorkerJob[]> {
+    if (this.store.listJobs) return this.store.listJobs();
     return this.store.transact(async (jobs) => clone(jobs));
+  }
+
+  get(jobId: string): Promise<WorkerJob | undefined> {
+    if (this.store.get) return this.store.get(jobId);
+    return this.store.transact(async (jobs) => {
+      const job = jobs.find((candidate) => candidate.id === jobId);
+      return job ? clone(job) : undefined;
+    });
   }
 
   private settle(
@@ -339,6 +386,10 @@ export class WorktreeOwnership {
   constructor(private readonly store: WorkerQueueStore = new MemoryWorkerQueueStore()) {}
 
   acquire(worktree: string, owner: string, leaseMs = 60_000): Promise<WorktreeLease> {
+    const resolved = path.resolve(worktree);
+    if (this.store.acquireWorktree) {
+      return this.store.acquireWorktree(resolved, owner, leaseMs);
+    }
     return this.store.transact(async (rows) => {
       // 复用 store 的 JSON 事务能力，ownership 记录用保留 job type 编码。
       const type = `__worktree__:${path.resolve(worktree)}`;
@@ -381,12 +432,29 @@ export class WorktreeOwnership {
   }
 
   async heartbeat(worktree: string, owner: string, leaseMs = 60_000): Promise<void> {
-    await this.acquire(worktree, owner, leaseMs);
+    const resolved = path.resolve(worktree);
+    if (this.store.heartbeatWorktree) {
+      await this.store.heartbeatWorktree(resolved, owner, leaseMs);
+      return;
+    }
+    await this.store.transact(async (rows) => {
+      const type = `__worktree__:${resolved}`;
+      const row = rows.find((job) => job.type === type);
+      if (!row || row.status !== "leased" || row.leaseOwner !== owner) {
+        throw new Error(`Cannot heartbeat unowned worktree: ${worktree}`);
+      }
+      row.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
+      row.updatedAt = new Date().toISOString();
+    });
   }
 
   release(worktree: string, owner: string, fencingToken?: number): Promise<void> {
+    const resolved = path.resolve(worktree);
+    if (this.store.releaseWorktree) {
+      return this.store.releaseWorktree(resolved, owner, fencingToken);
+    }
     return this.store.transact(async (rows) => {
-      const type = `__worktree__:${path.resolve(worktree)}`;
+      const type = `__worktree__:${resolved}`;
       const row = rows.find((job) => job.type === type);
       if (!row || row.leaseOwner !== owner)
         throw new Error(`Cannot release unowned worktree: ${worktree}`);

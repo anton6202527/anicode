@@ -2,6 +2,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs, realpathSync } from "node:fs";
+import { hostname } from "node:os";
 import * as path from "node:path";
 
 export interface PatchSetChangeInput {
@@ -10,6 +11,8 @@ export interface PatchSetChangeInput {
   content?: string | Uint8Array | null;
   /** 将该路径移动到 path；内容默认沿用源文件，可同时覆盖 content。 */
   renameFrom?: string;
+  /** POSIX permission bits；省略时保留原文件 mode，新文件默认 0644。 */
+  mode?: number;
 }
 
 export interface PatchSetChange {
@@ -23,6 +26,8 @@ export interface PatchSetChange {
   deletedLines: number;
   operation?: "write" | "update" | "delete" | "rename-source" | "rename-target";
   renameGroup?: string;
+  beforeMode?: number;
+  afterMode?: number;
 }
 
 export type PatchSetStatus =
@@ -55,6 +60,7 @@ export interface PatchSet {
   requiredRoles: string[];
   approvals: PatchSetApproval[];
   appliedCount: number;
+  fencingToken?: number;
   error?: string;
 }
 
@@ -153,14 +159,14 @@ async function readMaybe(file: string): Promise<Uint8Array | null> {
   }
 }
 
-async function atomicWrite(file: string, content: Uint8Array): Promise<void> {
+async function atomicWrite(file: string, content: Uint8Array, mode = 0o644): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temporary = path.join(
     path.dirname(file),
     `.${path.basename(file)}.anicode-${process.pid}-${randomUUID()}.tmp`,
   );
   try {
-    await fs.writeFile(temporary, content, { flag: "wx" });
+    await fs.writeFile(temporary, content, { flag: "wx", mode });
     const handle = await fs.open(temporary, "r");
     try {
       await handle.sync();
@@ -168,6 +174,7 @@ async function atomicWrite(file: string, content: Uint8Array): Promise<void> {
       await handle.close();
     }
     await fs.rename(temporary, file);
+    await fs.chmod(file, mode);
   } finally {
     await fs.rm(temporary, { force: true });
   }
@@ -186,9 +193,21 @@ function safeRelative(root: string, candidate: string): string {
   return path.relative(root, absolute);
 }
 
+function normalizeMode(mode: number): number {
+  if (!Number.isInteger(mode) || mode < 0 || mode > 0o777) {
+    throw new Error(`Invalid PatchSet file mode: ${mode}`);
+  }
+  return mode & 0o777;
+}
+
+function protectedWorkspacePath(relative: string): boolean {
+  const first = relative.split(path.sep)[0]?.toLowerCase();
+  return first === ".git" || first === ".anicode";
+}
+
 export interface PatchSetServiceOptions {
   journalDir?: string;
-  writeFile?: (file: string, content: Uint8Array) => Promise<void>;
+  writeFile?: (file: string, content: Uint8Array, mode?: number) => Promise<void>;
   requiredApprovals?: number;
   requiredRoles?: string[];
   onApproval?: (patchset: PatchSet, approval: PatchSetApproval) => void | Promise<void>;
@@ -197,7 +216,9 @@ export interface PatchSetServiceOptions {
 export class PatchSetService {
   readonly root: string;
   private readonly journalDir: string;
-  private readonly writeFile: (file: string, content: Uint8Array) => Promise<void>;
+  private readonly writeFile: (file: string, content: Uint8Array, mode?: number) => Promise<void>;
+  private readonly lockFile: string;
+  private readonly fenceFile: string;
 
   constructor(
     root: string,
@@ -208,34 +229,45 @@ export class PatchSetService {
     this.root = realpathSync.native(path.resolve(root));
     this.journalDir = options.journalDir ?? path.join(this.root, ".anicode", "patchsets");
     this.writeFile = options.writeFile ?? atomicWrite;
+    this.lockFile = path.join(this.journalDir, "workspace.lock");
+    this.fenceFile = path.join(this.journalDir, "workspace.fence");
   }
 
   async prepare(inputs: PatchSetChangeInput[]): Promise<PatchSet> {
     const expanded: Array<{
       path: string;
       content: string | Uint8Array | null;
+      mode?: number;
       operation?: PatchSetChange["operation"];
       renameGroup?: string;
     }> = [];
     for (const input of inputs) {
       if (!input.renameFrom) {
         if (input.content === undefined) throw new Error(`PatchSet content missing: ${input.path}`);
-        expanded.push({ path: input.path, content: input.content });
+        expanded.push({
+          path: input.path,
+          content: input.content,
+          ...(input.mode !== undefined ? { mode: input.mode } : {}),
+        });
         continue;
       }
       const source = safeRelative(this.root, input.renameFrom);
-      const sourceBytes = await readMaybe(path.join(this.root, source));
+      const sourceFile = await this.workspaceFile(source);
+      const sourceBytes = await readMaybe(sourceFile);
       if (sourceBytes === null) throw new Error(`PatchSet rename source does not exist: ${source}`);
+      const sourceMode = (await fs.stat(sourceFile)).mode & 0o777;
       const group = `rename_${randomUUID()}`;
       expanded.push({
         path: source,
         content: null,
         operation: "rename-source",
         renameGroup: group,
+        mode: sourceMode,
       });
       expanded.push({
         path: input.path,
         content: input.content === undefined ? sourceBytes : input.content,
+        mode: input.mode ?? sourceMode,
         operation: "rename-target",
         renameGroup: group,
       });
@@ -247,7 +279,9 @@ export class PatchSetService {
       const relative = safeRelative(this.root, input.path);
       if (seen.has(relative)) throw new Error(`Duplicate PatchSet path: ${relative}`);
       seen.add(relative);
-      const beforeBytes = await readMaybe(path.join(this.root, relative));
+      const target = await this.workspaceFile(relative);
+      const beforeBytes = await readMaybe(target);
+      const beforeMode = beforeBytes === null ? undefined : (await fs.stat(target)).mode & 0o777;
       const requested = inputBytes(input.content);
       const binary =
         requested.encoding === "base64" || isBinary(beforeBytes) || isBinary(requested.bytes);
@@ -266,6 +300,10 @@ export class PatchSetService {
           input.operation ??
           (requested.bytes === null ? "delete" : beforeBytes === null ? "write" : "update"),
         ...(input.renameGroup ? { renameGroup: input.renameGroup } : {}),
+        ...(beforeMode !== undefined ? { beforeMode } : {}),
+        ...(requested.bytes !== null
+          ? { afterMode: normalizeMode(input.mode ?? beforeMode ?? 0o644) }
+          : {}),
       });
     }
     const requiredApprovals = Math.max(0, this.options.requiredApprovals ?? 0);
@@ -327,6 +365,10 @@ export class PatchSetService {
   }
 
   async apply(patchset: PatchSet): Promise<PatchSet> {
+    return this.withWorkspaceLock(async (fencingToken) => this.applyLocked(patchset, fencingToken));
+  }
+
+  private async applyLocked(patchset: PatchSet, fencingToken: number): Promise<PatchSet> {
     if (patchset.status === "pending_approval" || !this.approvalSatisfied(patchset)) {
       throw new Error(`PatchSet ${patchset.id} lacks required approvals`);
     }
@@ -334,7 +376,7 @@ export class PatchSetService {
       throw new Error(`PatchSet ${patchset.id} is ${patchset.status}`);
     const conflicts: string[] = [];
     for (const change of patchset.changes) {
-      const current = await readMaybe(path.join(this.root, change.path));
+      const current = await this.readWorkspace(change.path);
       if (digest(current) !== change.beforeHash) conflicts.push(change.path);
     }
     if (conflicts.length) {
@@ -347,12 +389,14 @@ export class PatchSetService {
 
     patchset.status = "applying";
     patchset.appliedCount = 0;
+    patchset.fencingToken = fencingToken;
     patchset.updatedAt = new Date().toISOString();
     await this.persist(patchset);
     try {
       for (let index = 0; index < patchset.changes.length; index++) {
         const change = patchset.changes[index]!;
-        await this.install(change.path, decode(change.after, change.encoding));
+        await this.assertLock(fencingToken);
+        await this.install(change.path, decode(change.after, change.encoding), change.afterMode);
         patchset.appliedCount = index + 1;
         patchset.updatedAt = new Date().toISOString();
         // 每步推进 journal；SIGKILL 后 recoverIncomplete 可精确回滚已提交前缀。
@@ -375,19 +419,31 @@ export class PatchSetService {
   }
 
   async rollback(idOrPatchSet: string | PatchSet, force = false): Promise<PatchSet> {
+    return this.withWorkspaceLock(async (fencingToken) => {
+      await this.assertLock(fencingToken);
+      return this.rollbackLocked(idOrPatchSet, force, fencingToken);
+    });
+  }
+
+  private async rollbackLocked(
+    idOrPatchSet: string | PatchSet,
+    force: boolean,
+    fencingToken: number,
+  ): Promise<PatchSet> {
     const patchset = await this.resolve(idOrPatchSet);
     if (patchset.status !== "applied")
       throw new Error(`PatchSet ${patchset.id} is ${patchset.status}`);
     if (!force) {
       const conflicts: string[] = [];
       for (const change of patchset.changes) {
-        if (digest(await readMaybe(path.join(this.root, change.path))) !== change.afterHash)
+        if (digest(await this.readWorkspace(change.path)) !== change.afterHash)
           conflicts.push(change.path);
       }
       if (conflicts.length) throw new PatchSetConflictError(conflicts);
     }
+    patchset.fencingToken = fencingToken;
     patchset.appliedCount = patchset.changes.length;
-    const errors = await this.rollbackPrefix(patchset);
+    const errors = await this.rollbackPrefix(patchset, force, fencingToken);
     if (errors.length) throw new Error(`PatchSet rollback failed: ${errors.join("; ")}`);
     patchset.status = "rolled_back";
     patchset.updatedAt = new Date().toISOString();
@@ -407,7 +463,7 @@ export class PatchSetService {
     const unmergeable: string[] = [];
     const conflictedPaths: string[] = [];
     for (const change of original.changes) {
-      const current = await readMaybe(path.join(this.root, change.path));
+      const current = await this.readWorkspace(change.path);
       const before = decode(change.before, change.encoding);
       const after = decode(change.after, change.encoding);
       if (digest(current) === change.beforeHash) {
@@ -454,16 +510,25 @@ export class PatchSetService {
     }
     const recovered: PatchSet[] = [];
     for (const name of names.filter((value) => /^ps_.*\.json$/.test(value))) {
-      const patchset = await this.load(name.slice(0, -5));
-      if (!patchset || patchset.status !== "applying") continue;
-      const errors = await this.rollbackPrefix(patchset);
-      patchset.status = errors.length ? "failed" : "rolled_back";
-      patchset.error = errors.length
-        ? `crash recovery rollback errors: ${errors.join("; ")}`
-        : "recovered incomplete transaction after restart";
-      patchset.updatedAt = new Date().toISOString();
-      await this.persist(patchset);
-      recovered.push(patchset);
+      const id = name.slice(0, -5);
+      const candidate = await this.load(id);
+      if (!candidate || candidate.status !== "applying") continue;
+      const patchset = await this.withWorkspaceLock(async (fencingToken) => {
+        // 另一个进程可能在我们等待锁时完成了事务；必须在锁内重读，绝不能把
+        // 已成功提交的 PatchSet 当作崩溃残留回滚。
+        const current = await this.load(id);
+        if (!current || current.status !== "applying") return undefined;
+        current.fencingToken = fencingToken;
+        const errors = await this.rollbackPrefix(current, false, fencingToken);
+        current.status = errors.length ? "failed" : "rolled_back";
+        current.error = errors.length
+          ? `crash recovery rollback errors: ${errors.join("; ")}`
+          : "recovered incomplete transaction after restart";
+        current.updatedAt = new Date().toISOString();
+        await this.persist(current);
+        return current;
+      });
+      if (patchset) recovered.push(patchset);
     }
     return recovered;
   }
@@ -495,11 +560,20 @@ export class PatchSetService {
     return patchset;
   }
 
-  private async rollbackPrefix(patchset: PatchSet): Promise<string[]> {
+  private async rollbackPrefix(
+    patchset: PatchSet,
+    force = false,
+    fencingToken = patchset.fencingToken,
+  ): Promise<string[]> {
     const errors: string[] = [];
     for (const change of patchset.changes.slice(0, patchset.appliedCount).reverse()) {
       try {
-        await this.install(change.path, decode(change.before, change.encoding));
+        if (fencingToken !== undefined) await this.assertLock(fencingToken);
+        const current = await this.readWorkspace(change.path);
+        if (!force && digest(current) !== change.afterHash) {
+          throw new Error("rollback refused because file changed after apply");
+        }
+        await this.install(change.path, decode(change.before, change.encoding), change.beforeMode);
       } catch (error) {
         errors.push(`${change.path}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -508,18 +582,116 @@ export class PatchSetService {
     return errors;
   }
 
-  private async install(relative: string, content: Uint8Array | null): Promise<void> {
-    const file = path.join(this.root, safeRelative(this.root, relative));
+  private async install(
+    relative: string,
+    content: Uint8Array | null,
+    mode?: number,
+  ): Promise<void> {
+    const file = await this.workspaceFile(relative);
     if (content === null) await fs.rm(file, { force: true });
-    else await this.writeFile(file, content);
+    else await this.writeFile(file, content, normalizeMode(mode ?? 0o644));
   }
 
   private async persist(patchset: PatchSet): Promise<void> {
     await fs.mkdir(this.journalDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.journalDir, 0o700);
     const target = path.join(this.journalDir, `${patchset.id}.json`);
-    await atomicWrite(target, Buffer.from(JSON.stringify(patchset, null, 2) + "\n"));
+    await atomicWrite(target, Buffer.from(JSON.stringify(patchset, null, 2) + "\n"), 0o600);
     await fs.chmod(target, 0o600);
+  }
+
+  private async readWorkspace(relative: string): Promise<Uint8Array | null> {
+    return readMaybe(await this.workspaceFile(relative));
+  }
+
+  /** 拒绝最终文件和任一父目录 symlink，避免 PatchSet 通过工作区链接写到边界外。 */
+  private async workspaceFile(candidate: string): Promise<string> {
+    const relative = safeRelative(this.root, candidate);
+    if (protectedWorkspacePath(relative)) {
+      throw new Error(`PatchSet path is protected runtime state: ${relative}`);
+    }
+    const segments = relative.split(path.sep).filter(Boolean);
+    let current = this.root;
+    for (let index = 0; index < segments.length; index++) {
+      current = path.join(current, segments[index]!);
+      try {
+        const stat = await fs.lstat(current);
+        if (stat.isSymbolicLink()) {
+          throw new Error(`PatchSet path contains a symbolic link: ${relative}`);
+        }
+        if (index < segments.length - 1 && !stat.isDirectory()) {
+          throw new Error(`PatchSet parent is not a directory: ${relative}`);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+    }
+    return path.join(this.root, relative);
+  }
+
+  private async withWorkspaceLock<T>(work: (fencingToken: number) => Promise<T>): Promise<T> {
+    await fs.mkdir(this.journalDir, { recursive: true, mode: 0o700 });
+    const deadline = Date.now() + 30_000;
+    let handle: import("node:fs/promises").FileHandle | undefined;
+    for (;;) {
+      try {
+        handle = await fs.open(this.lockFile, "wx", 0o600);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const stat = await fs.stat(this.lockFile).catch(() => undefined);
+        if (stat && Date.now() - stat.mtimeMs > 5 * 60_000) {
+          await fs.rm(this.lockFile, { force: true });
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error("PatchSet workspace lock timeout");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    let fencingToken = 0;
+    let heartbeat: NodeJS.Timeout | undefined;
+    try {
+      const previous = Number.parseInt(
+        await fs.readFile(this.fenceFile, "utf8").catch(() => "0"),
+        10,
+      );
+      fencingToken = (Number.isSafeInteger(previous) ? previous : 0) + 1;
+      await atomicWrite(this.fenceFile, Buffer.from(`${fencingToken}\n`), 0o600);
+      await handle.truncate(0);
+      await handle.writeFile(
+        JSON.stringify({
+          fencingToken,
+          pid: process.pid,
+          host: hostname(),
+          acquiredAt: new Date().toISOString(),
+        }),
+      );
+      await handle.sync();
+      heartbeat = setInterval(() => void fs.utimes(this.lockFile, new Date(), new Date()), 30_000);
+      return await work(fencingToken);
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      await handle?.close();
+      const owner = await this.readLock().catch(() => undefined);
+      if (owner?.fencingToken === fencingToken) await fs.rm(this.lockFile, { force: true });
+    }
+  }
+
+  private async assertLock(fencingToken: number): Promise<void> {
+    const owner = await this.readLock();
+    if (owner.fencingToken !== fencingToken) {
+      throw new Error(`Stale PatchSet fencing token ${fencingToken}`);
+    }
+  }
+
+  private async readLock(): Promise<{ fencingToken: number }> {
+    const parsed = JSON.parse(await fs.readFile(this.lockFile, "utf8")) as {
+      fencingToken?: unknown;
+    };
+    if (!Number.isSafeInteger(parsed.fencingToken))
+      throw new Error("Invalid PatchSet workspace lock");
+    return { fencingToken: Number(parsed.fencingToken) };
   }
 }
 

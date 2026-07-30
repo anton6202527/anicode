@@ -107,7 +107,17 @@ test("GitHubDelivery: branch/files/draft PR/workflow 构成闭环", async () => 
         method: String(init?.method),
         body: init?.body ? JSON.parse(String(init.body)) : undefined,
       });
+      if (path.endsWith("/git/ref/heads/agent%2Fchange")) {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      }
       if (path.endsWith("/git/ref/heads/main")) return Response.json({ object: { sha: "abc" } });
+      if (path.endsWith("/git/commits/abc")) return Response.json({ tree: { sha: "base-tree" } });
+      if (path.endsWith("/git/blobs")) return Response.json({ sha: "blob-1" });
+      if (path.endsWith("/git/trees")) return Response.json({ sha: "tree-1" });
+      if (path.endsWith("/git/commits") && init?.method === "POST") {
+        return Response.json({ sha: "commit-1" });
+      }
+      if (path.endsWith("/pulls") && init?.method === "GET") return Response.json([]);
       if (path.endsWith("/pulls")) return Response.json({ number: 7, html_url: "https://pr/7" });
       if (path.endsWith("/dispatches")) return new Response(null, { status: 204 });
       return Response.json({ ok: true });
@@ -129,10 +139,13 @@ test("GitHubDelivery: branch/files/draft PR/workflow 构成闭环", async () => 
     workflow: "agent-runtime.yml",
   });
   assert.equal(result.pullRequestNumber, 7);
+  assert.equal(result.commitSha, "commit-1");
   assert.equal(result.workflowDispatched, true);
   assert.deepEqual(
     calls.map((call) => call.method),
-    ["GET", "POST", "PUT", "POST", "POST"],
+    ["GET", "GET", "GET", "POST", "POST", "POST", "POST", "GET", "POST", "POST"],
   );
-  assert.equal((calls[3]!.body as { draft: boolean }).draft, true);
+  assert.equal((calls[8]!.body as { draft: boolean }).draft, true);
+  assert.ok(!calls.some((call) => call.method === "PUT"));
+  assert.deepEqual((calls[4]!.body as { base_tree: string }).base_tree, "base-tree");
 });

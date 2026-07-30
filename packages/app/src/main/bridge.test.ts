@@ -10,6 +10,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { IpcMain } from "electron";
+import { registerOpenAICompatibleProvider } from "@anicode/core";
 import type { EventEnvelope, ModelRow, PluginEntry, UserModel } from "../shared/api.js";
 import { Bridge } from "./bridge.js";
 
@@ -93,12 +94,30 @@ test("Bridge: 创建会话 → 订阅 → 发送，事件经 sender 回流（走
     assert.ok(kinds.has("text"), "缺少流式 text 事件");
     assert.ok(kinds.has("done"), "缺少 done 事件");
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
 test("Bridge: 模型目录标注凭证就绪状态，debug/demo 免 key 可用", async () => {
-  const { bridge } = await tempBridge();
+  registerOpenAICompatibleProvider({
+    id: "bridge-test-cloud",
+    name: "Bridge Test Cloud",
+    baseURL: "https://bridge-test.invalid/v1",
+    apiKeyEnv: "ANICODE_BRIDGE_TEST_MISSING_KEY",
+    catalog: [{ model: "requires-key" }],
+  });
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-catalog-"));
+  const env: NodeJS.ProcessEnv = { ...process.env, ANICODE_CREDENTIAL_BACKEND: "memory" };
+  delete env.ANICODE_BRIDGE_TEST_MISSING_KEY;
+  const bridge = new Bridge({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile: path.join(dir, "plugins.json"),
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    env,
+  });
   const { ipcMain, invoke } = fakeIpc();
   bridge.register(ipcMain);
   const sender = new FakeSender();
@@ -107,11 +126,12 @@ test("Bridge: 模型目录标注凭证就绪状态，debug/demo 免 key 可用",
     const demo = rows.find((r) => r.spec === "debug/demo");
     assert.ok(demo, "目录缺少 debug/demo");
     assert.equal(demo?.ready, true);
-    // 缺 key 的云端模型应标为未就绪（测试环境通常未配置 DeepSeek key）。
-    const cloud = rows.find((r) => r.spec.startsWith("deepseek/") && r.requiresApiKey);
-    if (cloud && !process.env["DEEPSEEK_API_KEY"]) assert.equal(cloud.ready, false);
+    const cloud = rows.find((r) => r.spec === "bridge-test-cloud/requires-key");
+    assert.ok(cloud, "目录缺少测试云端模型");
+    assert.equal(cloud?.ready, false);
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -139,7 +159,7 @@ test("Bridge: 配置 custom/<model> 时可创建首个会话", async () => {
     })) as { model: string };
     assert.equal(session.model, "custom/my-model");
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
@@ -165,7 +185,7 @@ test("Bridge: deleteSession 从列表移除会话", async () => {
     assert.equal(list.length, 1);
     assert.equal(list[0]?.id, a.id);
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
@@ -224,9 +244,9 @@ test("Bridge: 自定义模型进入目录、可被 createProvider 解析、可�
       "debug/my-coder",
     )) as ModelRow[];
     assert.ok(!afterRemove.some((r) => r.spec === "debug/my-coder"));
-    reopened.dispose();
+    await reopened.dispose();
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
@@ -281,11 +301,11 @@ test("Bridge: 自动发现的文件系统技能进入市场、默认启用、可
     reopened.register(ipc2.ipcMain);
     const persisted = (await ipc2.invoke("plugins:list", sender)) as PluginEntry[];
     assert.equal(persisted.find((p) => p.id === "skill.fs.mytool")?.enabled, false);
-    reopened.dispose();
+    await reopened.dispose();
   } finally {
     if (oldHome === undefined) delete process.env["HOME"];
     else process.env["HOME"] = oldHome;
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
@@ -322,8 +342,8 @@ test("Bridge: 插件默认启用内建项，开关状态写盘并回读", async 
     const persisted = (await ipc2.invoke("plugins:list", sender)) as PluginEntry[];
     assert.equal(persisted.find((p) => p.id === "mcp.websearch")?.enabled, true);
     assert.equal(persisted.find((p) => p.id === "core.bash")?.enabled, false);
-    reopened.dispose();
+    await reopened.dispose();
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });

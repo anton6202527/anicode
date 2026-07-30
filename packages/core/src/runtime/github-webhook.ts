@@ -11,16 +11,24 @@ import {
   type Telemetry,
 } from "./telemetry.js";
 import { DurableWorkerQueue, PersistentWorker, type WorkerJob } from "./worker.js";
-import { GitHubDelivery, type GitHubCheckRun } from "./github-delivery.js";
+import {
+  GitHubDelivery,
+  type GitHubCheckConclusion,
+  type GitHubCheckRun,
+} from "./github-delivery.js";
 
 export interface GitHubRepairJob {
   deliveryId: string;
   event: string;
   action: string;
   repository: string;
+  installationId?: number;
   headSha: string;
+  checkRunId?: number;
   pullRequestNumber?: number;
   pullRequestNodeId?: string;
+  headRef?: string;
+  baseRef?: string;
   failedUrl?: string;
   traceparent?: string;
 }
@@ -32,6 +40,9 @@ export interface GitHubWebhookControllerOptions {
   delivery: GitHubDelivery;
   telemetry?: Telemetry;
   maxRepairAttempts?: number;
+  /** Fail closed when a validly signed delivery targets another installation/repository. */
+  expectedRepository?: string;
+  expectedInstallationId?: number;
 }
 
 export interface GitHubWebhookResult {
@@ -86,10 +97,13 @@ export class GitHubWebhookController {
   }): Promise<GitHubWebhookResult> {
     if (!/^[0-9a-f-]{8,128}$/i.test(input.deliveryId))
       throw new Error("Invalid GitHub delivery id");
-    const secret = this.options.broker.trustedValue(this.options.webhookSecretCredentialId, {
-      audience: "github-webhook",
-      tool: "verify-signature",
-    });
+    const secret = await this.options.broker.trustedValueAsync(
+      this.options.webhookSecretCredentialId,
+      {
+        audience: "github-webhook",
+        tool: "verify-signature",
+      },
+    );
     if (!verifyGitHubWebhookSignature(secret, input.rawBody, input.signature)) {
       throw new Error("GitHub webhook authentication failed");
     }
@@ -134,6 +148,19 @@ export class GitHubWebhookController {
     const action = text(payload["action"]) ?? "unknown";
     const repository = object(payload["repository"]);
     const fullName = text(repository["full_name"]) ?? "unknown/unknown";
+    const installationId = number(object(payload["installation"])["id"]);
+    if (
+      this.options.expectedRepository &&
+      fullName.toLowerCase() !== this.options.expectedRepository.toLowerCase()
+    ) {
+      throw new Error(`GitHub webhook repository mismatch: ${fullName}`);
+    }
+    if (
+      this.options.expectedInstallationId !== undefined &&
+      installationId !== this.options.expectedInstallationId
+    ) {
+      throw new Error("GitHub webhook installation mismatch");
+    }
     const suite = object(payload["check_suite"]);
     const run = object(payload["workflow_run"]);
     const checkRun = object(payload["check_run"]);
@@ -149,6 +176,11 @@ export class GitHubWebhookController {
       text(run["head_sha"]) ??
       text(checkRun["head_sha"]) ??
       text(object(payload["merge_group"])["head_sha"]);
+    if (headSha && !/^[0-9a-f]{40,64}$/i.test(headSha)) {
+      throw new Error("GitHub webhook head SHA is invalid");
+    }
+    const headRef = text(object(pull["head"])["ref"]);
+    const baseRef = text(object(pull["base"])["ref"]);
 
     if (event === "check_suite" && ["requested", "rerequested"].includes(action) && headSha) {
       const created = await this.options.delivery.createCheckRun(
@@ -169,7 +201,9 @@ export class GitHubWebhookController {
         event,
         action,
         repository: fullName,
+        ...(installationId !== undefined ? { installationId } : {}),
         headSha,
+        checkRunId: created.id,
         ...(parentTrace ? { traceparent: parentTrace } : {}),
       });
       return { accepted: true, queuedJobId: job.id, checkRun: created };
@@ -188,11 +222,14 @@ export class GitHubWebhookController {
         event,
         action,
         repository: fullName,
+        ...(installationId !== undefined ? { installationId } : {}),
         headSha,
         ...(number(pull["number"] ?? payload["number"]) !== undefined
           ? { pullRequestNumber: number(pull["number"] ?? payload["number"])! }
           : {}),
         ...(text(pull["node_id"]) ? { pullRequestNodeId: text(pull["node_id"])! } : {}),
+        ...(headRef ? { headRef } : {}),
+        ...(baseRef ? { baseRef } : {}),
         ...((text(run["html_url"]) ?? text(checkRun["html_url"]))
           ? { failedUrl: (text(run["html_url"]) ?? text(checkRun["html_url"]))! }
           : {}),
@@ -211,11 +248,14 @@ export class GitHubWebhookController {
         event,
         action,
         repository: fullName,
+        ...(installationId !== undefined ? { installationId } : {}),
         headSha,
         ...(number(payload["number"]) !== undefined
           ? { pullRequestNumber: number(payload["number"])! }
           : {}),
         ...(text(pull["node_id"]) ? { pullRequestNodeId: text(pull["node_id"])! } : {}),
+        ...(headRef ? { headRef } : {}),
+        ...(baseRef ? { baseRef } : {}),
         ...(parentTrace ? { traceparent: parentTrace } : {}),
       });
       return { accepted: true, queuedJobId: job.id };
@@ -227,6 +267,7 @@ export class GitHubWebhookController {
         event,
         action,
         repository: fullName,
+        ...(installationId !== undefined ? { installationId } : {}),
         headSha,
         ...(parentTrace ? { traceparent: parentTrace } : {}),
       });
@@ -259,74 +300,168 @@ export interface GitHubRepairWorkerOptions {
   leaseMs?: number;
 }
 
-/** 修复回调负责跑 agent/verifier；本 worker 负责 durable retry、Check Run 和成功入队。 */
-export function createGitHubRepairWorker(options: GitHubRepairWorkerOptions): PersistentWorker {
+export type GitHubAgentJobType = "github-analysis" | "github-repair" | "github-merge-group";
+
+export interface GitHubAgentWorkerResult {
+  summary: string;
+  pullRequestNodeId?: string;
+  enqueueWhenSuccessful?: boolean;
+  conclusion?: GitHubCheckConclusion;
+}
+
+export interface GitHubAgentWorkerOptions {
+  id: string;
+  queue: DurableWorkerQueue;
+  delivery: GitHubDelivery;
+  execute: (
+    type: GitHubAgentJobType,
+    job: GitHubRepairJob,
+    signal: AbortSignal,
+  ) => Promise<GitHubAgentWorkerResult>;
+  telemetry?: Telemetry;
+  leaseMs?: number;
+}
+
+/** Process every webhook job type; no accepted analysis/merge-group job is left orphaned. */
+export function createGitHubAgentWorker(options: GitHubAgentWorkerOptions): PersistentWorker {
+  const execute =
+    (type: GitHubAgentJobType) =>
+    async (raw: unknown, signal: AbortSignal, context?: SpanContext): Promise<unknown> => {
+      const job = raw as GitHubRepairJob;
+      const labels: Record<
+        GitHubAgentJobType,
+        { name: string; starting: string; success: string }
+      > = {
+        "github-analysis": {
+          name: "AniCode Agent",
+          starting: "Change analysis started",
+          success: "Change analysis verified",
+        },
+        "github-repair": {
+          name: "AniCode Auto Repair",
+          starting: "Automatic repair started",
+          success: "Automatic repair verified",
+        },
+        "github-merge-group": {
+          name: "AniCode Merge Queue",
+          starting: "Merge-group verification started",
+          success: "Merge-group verification passed",
+        },
+      };
+      const label = labels[type];
+      const check = job.checkRunId
+        ? ({ id: job.checkRunId, status: "in_progress" } satisfies GitHubCheckRun)
+        : await options.delivery.createCheckRun(
+            {
+              name: label.name,
+              headSha: job.headSha,
+              externalId: job.deliveryId,
+              status: "in_progress",
+              output: { title: label.starting, summary: job.failedUrl ?? "Durable job accepted" },
+            },
+            context,
+          );
+      try {
+        const result = await options.execute(type, job, signal);
+        const nodeId = result.pullRequestNodeId ?? job.pullRequestNodeId;
+        let queueEntry: string | undefined;
+        if (result.enqueueWhenSuccessful && nodeId) {
+          queueEntry = await options.delivery.enqueuePullRequest(nodeId, context);
+        }
+        await options.delivery.updateCheckRun(
+          check.id,
+          {
+            status: "completed",
+            conclusion: result.conclusion ?? "success",
+            output: {
+              title: label.success,
+              summary: `${result.summary}${queueEntry ? `\n\nMerge queue: ${queueEntry}` : ""}`,
+            },
+          },
+          context,
+        );
+        return { ...result, queueEntry };
+      } catch (error) {
+        await options.delivery
+          .updateCheckRun(
+            check.id,
+            {
+              status: "completed",
+              conclusion: "failure",
+              output: {
+                title: `${label.name} failed`,
+                summary: error instanceof Error ? error.message : String(error),
+              },
+            },
+            context,
+          )
+          .catch(() => undefined);
+        throw error;
+      }
+    };
   return new PersistentWorker(
     options.id,
     options.queue,
     {
-      "github-repair": async (raw, signal, context?: SpanContext) => {
-        const job = raw as GitHubRepairJob;
-        const check = await options.delivery.createCheckRun(
-          {
-            name: "AniCode Auto Repair",
-            headSha: job.headSha,
-            externalId: job.deliveryId,
-            status: "in_progress",
-            output: { title: "Automatic repair started", summary: job.failedUrl ?? "CI failed" },
-          },
-          context,
-        );
-        try {
-          const result = await options.repair(job, signal);
-          const nodeId = result.pullRequestNodeId ?? job.pullRequestNodeId;
-          let queueEntry: string | undefined;
-          if (result.enqueueWhenSuccessful && nodeId) {
-            queueEntry = await options.delivery.enqueuePullRequest(nodeId, context);
-          }
-          await options.delivery.updateCheckRun(
-            check.id,
-            {
-              status: "completed",
-              conclusion: "success",
-              output: {
-                title: "Automatic repair verified",
-                summary: `${result.summary}${queueEntry ? `\n\nMerge queue: ${queueEntry}` : ""}`,
-              },
-            },
-            context,
-          );
-          return { ...result, queueEntry };
-        } catch (error) {
-          await options.delivery
-            .updateCheckRun(
-              check.id,
-              {
-                status: "completed",
-                conclusion: "failure",
-                output: {
-                  title: "Automatic repair failed",
-                  summary: error instanceof Error ? error.message : String(error),
-                },
-              },
-              context,
-            )
-            .catch(() => undefined);
-          throw error;
-        }
-      },
+      "github-analysis": execute("github-analysis"),
+      "github-repair": execute("github-repair"),
+      "github-merge-group": execute("github-merge-group"),
     },
     options.leaseMs ?? 60_000,
     options.telemetry ?? noTelemetry,
   );
 }
 
+export function createGitHubWorkflowExecutor(
+  delivery: GitHubDelivery,
+  options: { workflow?: string; ref?: string } = {},
+): GitHubAgentWorkerOptions["execute"] {
+  const workflow = options.workflow ?? "github-agent.yml";
+  const ref = options.ref ?? "main";
+  return async (type, job) => {
+    await delivery.dispatchWorkflow(workflow, ref, {
+      job_type: type,
+      delivery_id: job.deliveryId,
+      head_sha: job.headSha,
+      repository: job.repository,
+      installation_id: job.installationId === undefined ? "" : String(job.installationId),
+      pull_request_number: job.pullRequestNumber === undefined ? "" : String(job.pullRequestNumber),
+      head_ref: job.headRef ?? "",
+      base_ref: job.baseRef ?? "",
+      failed_url: job.failedUrl ?? "",
+      traceparent: job.traceparent ?? "",
+    });
+    return {
+      summary: `Ephemeral agent workflow ${workflow} was dispatched for ${job.headSha}.`,
+      conclusion: "neutral",
+    };
+  };
+}
+
+/** 修复回调负责跑 agent/verifier；本 worker 负责 durable retry、Check Run 和成功入队。 */
+export function createGitHubRepairWorker(options: GitHubRepairWorkerOptions): PersistentWorker {
+  return createGitHubAgentWorker({
+    id: options.id,
+    queue: options.queue,
+    delivery: options.delivery,
+    execute: (_type, job, signal) => options.repair(job, signal),
+    ...(options.telemetry ? { telemetry: options.telemetry } : {}),
+    ...(options.leaseMs ? { leaseMs: options.leaseMs } : {}),
+  });
+}
+
 export class GitHubWebhookServer {
   private server: Server | undefined;
+  private draining = false;
   constructor(
     private readonly controller: GitHubWebhookController,
     private readonly maxBodyBytes = 2 * 1024 * 1024,
+    private readonly readiness?: () => Promise<void>,
   ) {}
+
+  beginDrain(): void {
+    this.draining = true;
+  }
 
   async listen(port = 0, host = "127.0.0.1"): Promise<string> {
     if (this.server) throw new Error("GitHub webhook server is already listening");
@@ -337,6 +472,9 @@ export class GitHubWebhookServer {
         });
       });
     });
+    server.requestTimeout = 15_000;
+    server.headersTimeout = 10_000;
+    server.keepAliveTimeout = 5_000;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(port, host, () => {
@@ -351,6 +489,7 @@ export class GitHubWebhookServer {
   }
 
   async close(): Promise<void> {
+    this.draining = true;
     const server = this.server;
     this.server = undefined;
     if (!server) return;
@@ -364,8 +503,28 @@ export class GitHubWebhookServer {
       json(response, 200, { ok: true });
       return;
     }
+    if (request.method === "GET" && request.url === "/readyz") {
+      if (this.draining) {
+        json(response, 503, { ok: false, reason: "draining" });
+        return;
+      }
+      try {
+        await this.readiness?.();
+        json(response, 200, { ok: true });
+      } catch (error) {
+        json(response, 503, {
+          ok: false,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/v1/github/webhook") {
       json(response, 404, { error: "not found" });
+      return;
+    }
+    if (this.draining) {
+      json(response, 503, { error: "server is draining" });
       return;
     }
     const chunks: Buffer[] = [];

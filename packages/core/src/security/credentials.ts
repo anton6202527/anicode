@@ -11,6 +11,8 @@ export interface CredentialScope {
   tools?: string[];
   env?: string;
   header?: string;
+  /** 例如 Authorization 的 `Bearer `；前缀由可信 broker 注入。 */
+  headerPrefix?: string;
 }
 
 export interface CredentialRegistration {
@@ -18,6 +20,8 @@ export interface CredentialRegistration {
   /** 仅兼容一次性/测试凭据；生产长期凭据使用 backend reference。 */
   value?: string;
   backend?: SyncSecretBackend;
+  /** Async Vault/KMS reference. Use trustedValueAsync; the plaintext is never retained as source. */
+  asyncBackend?: SecretBackend;
   backendKey?: string;
   scopes: CredentialScope[];
   expiresAt?: string;
@@ -99,6 +103,7 @@ export class CredentialBroker {
   }
 
   private resolveValue(credential: CredentialRegistration): string {
+    if (credential.asyncBackend) throw new Error("Credential requires async trusted access");
     const value = credential.backend
       ? credential.backend.getSync(credential.backendKey ?? credential.id)
       : credential.value;
@@ -111,12 +116,10 @@ export class CredentialBroker {
   }
 
   register(registration: CredentialRegistration): void {
-    if (
-      !registration.id ||
-      (!registration.value && !registration.backend) ||
-      (registration.value !== undefined && registration.backend !== undefined) ||
-      registration.scopes.length === 0
-    ) {
+    const sources = [registration.value, registration.backend, registration.asyncBackend].filter(
+      (source) => source !== undefined,
+    ).length;
+    if (!registration.id || sources !== 1 || registration.scopes.length === 0) {
       throw new Error("Credential id, exactly one value source, and scopes are required");
     }
     this.credentials.set(registration.id, {
@@ -132,7 +135,10 @@ export class CredentialBroker {
   }
 
   registerReference(
-    registration: Omit<CredentialRegistration, "value" | "backend" | "backendKey"> & {
+    registration: Omit<
+      CredentialRegistration,
+      "value" | "backend" | "asyncBackend" | "backendKey"
+    > & {
       backend: SyncSecretBackend;
       backendKey?: string;
     },
@@ -140,9 +146,31 @@ export class CredentialBroker {
     this.register(registration);
   }
 
+  registerAsyncReference(
+    registration: Omit<
+      CredentialRegistration,
+      "value" | "backend" | "asyncBackend" | "backendKey"
+    > & {
+      backend: SecretBackend;
+      backendKey?: string;
+    },
+  ): void {
+    this.register({
+      id: registration.id,
+      asyncBackend: registration.backend,
+      ...(registration.backendKey ? { backendKey: registration.backendKey } : {}),
+      scopes: registration.scopes,
+      ...(registration.expiresAt ? { expiresAt: registration.expiresAt } : {}),
+      ...(registration.version ? { version: registration.version } : {}),
+    });
+  }
+
   /** Vault/KMS 等异步后端在宿主启动时水合；明文不落盘，只保留到进程退出/轮换。 */
   async registerFromBackend(
-    registration: Omit<CredentialRegistration, "value" | "backend" | "backendKey"> & {
+    registration: Omit<
+      CredentialRegistration,
+      "value" | "backend" | "asyncBackend" | "backendKey"
+    > & {
       backend: SecretBackend;
       backendKey?: string;
     },
@@ -210,6 +238,46 @@ export class CredentialBroker {
       throw new Error("Credential scope denied");
     }
     const value = this.resolveValue(credential);
+    this.audit({
+      action: "read",
+      credentialId,
+      ...request,
+      version: credential.version ?? 1,
+    });
+    return value;
+  }
+
+  async trustedValueAsync(
+    credentialId: string,
+    request: { audience: string; host?: string; tool?: string },
+  ): Promise<string> {
+    const credential = this.credentials.get(credentialId);
+    if (!credential) {
+      this.audit({ action: "deny", credentialId, ...request, success: false, reason: "unknown" });
+      throw new Error("Unknown credential");
+    }
+    if (credential.expiresAt && Date.parse(credential.expiresAt) <= Date.now()) {
+      this.audit({ action: "deny", credentialId, ...request, success: false, reason: "expired" });
+      throw new Error("Credential expired");
+    }
+    const allowed = credential.scopes.some(
+      (scope) =>
+        matches(scope.audiences, request.audience) &&
+        matches(scope.hosts, request.host) &&
+        matches(scope.tools, request.tool),
+    );
+    if (!allowed) {
+      this.audit({ action: "deny", credentialId, ...request, success: false, reason: "scope" });
+      throw new Error("Credential scope denied");
+    }
+    const value = credential.asyncBackend
+      ? await credential.asyncBackend.get(credential.backendKey ?? credential.id)
+      : this.resolveValue(credential);
+    if (!value) throw new Error("Credential value is unavailable");
+    this.recentSecrets.set(credential.id, {
+      value,
+      expiresAt: Date.now() + this.redactionTtlMs,
+    });
     this.audit({
       action: "read",
       credentialId,
@@ -312,7 +380,7 @@ export class CredentialBroker {
     const { credential, scope } = this.consume(leaseId);
     if (!scope.header) throw new Error("Credential lease does not permit header injection");
     const result = new Headers(headers);
-    result.set(scope.header, this.resolveValue(credential));
+    result.set(scope.header, `${scope.headerPrefix ?? ""}${this.resolveValue(credential)}`);
     return result;
   }
 
@@ -320,7 +388,9 @@ export class CredentialBroker {
     const credential = this.credentials.get(credentialId);
     if (!credential) throw new Error("Unknown credential");
     if (!value) throw new Error("Credential value cannot be empty");
-    if (credential.backend)
+    if (credential.asyncBackend) {
+      throw new Error("Async credential must be rotated with rotateBackend");
+    } else if (credential.backend)
       credential.backend.putSync(credential.backendKey ?? credential.id, value);
     else credential.value = value;
     credential.version = (credential.version ?? 1) + 1;
@@ -340,7 +410,12 @@ export class CredentialBroker {
     await backend.put(key ?? credentialId, value);
     const credential = this.credentials.get(credentialId);
     if (credential) {
-      credential.value = value;
+      if (credential.asyncBackend) {
+        credential.asyncBackend = backend;
+        credential.backendKey = key ?? credentialId;
+      } else {
+        credential.value = value;
+      }
       credential.version = (credential.version ?? 1) + 1;
       for (const [id, lease] of this.leases)
         if (lease.credentialId === credentialId) this.leases.delete(id);
@@ -380,13 +455,38 @@ export function isCredentialEnvironmentName(name: string): boolean {
 }
 
 export function credentialScopesForEnvironment(name: string): CredentialScope[] {
-  return [
-    { audiences: ["provider:*", "network:*"], hosts: ["*"] },
-    { audiences: ["telemetry:*"], hosts: ["*"] },
-    { audiences: ["tool:*"], tools: ["*"], env: name },
-    { audiences: ["mcp:*"], tools: ["stdio"], env: name },
-    { audiences: ["mcp:*"], hosts: ["*"], tools: ["http"], header: "authorization" },
-  ];
+  const key = name.toUpperCase();
+  if (key === "TAVILY_API_KEY") {
+    return [
+      {
+        audiences: ["network:web-search"],
+        hosts: ["api.tavily.com"],
+        tools: ["web_search"],
+        header: "authorization",
+        headerPrefix: "Bearer ",
+      },
+    ];
+  }
+  if (key === "BRAVE_SEARCH_API_KEY") {
+    return [
+      {
+        audiences: ["network:web-search"],
+        hosts: ["api.search.brave.com"],
+        tools: ["web_search"],
+        header: "x-subscription-token",
+      },
+    ];
+  }
+  const providerHosts: Record<string, string[]> = {
+    OPENAI_API_KEY: ["api.openai.com"],
+    OPENAI_ADMIN_KEY: ["api.openai.com"],
+    ANTHROPIC_API_KEY: ["api.anthropic.com"],
+    DEEPSEEK_API_KEY: ["api.deepseek.com"],
+    GEMINI_API_KEY: ["generativelanguage.googleapis.com"],
+    GOOGLE_API_KEY: ["generativelanguage.googleapis.com"],
+  };
+  // 未知自定义 provider 仍可使用，但不再自动获得 tool/MCP/telemetry 注入权限。
+  return [{ audiences: ["provider:*"], hosts: providerHosts[key] ?? ["*"] }];
 }
 
 /** Vault/KMS 等异步后端：按需水合指定凭据，后端仍是唯一长期存储。 */

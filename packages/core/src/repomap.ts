@@ -222,8 +222,12 @@ export async function gatherRepoMap(cwd: string, opts: RepoMapOptions = {}): Pro
       ...(opts.lspPool ? { lspPool: opts.lspPool } : {}),
       ...(opts.vectorStore ? { vectorStore: opts.vectorStore } : {}),
     });
-    await index.refresh();
-    return index.render(opts.query ?? "", opts.tokenBudget ?? 1500);
+    try {
+      await index.refresh();
+      return await index.render(opts.query ?? "", opts.tokenBudget ?? 1500);
+    } finally {
+      await index.close();
+    }
   }
   const maxFiles = opts.maxFiles ?? 2000;
   const maxBytes = opts.maxFileBytes ?? 256 * 1024;

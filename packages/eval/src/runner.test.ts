@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import type { Provider, StreamEvent, ChatMessage } from "@anicode/core";
 import { BUILTIN_TASKS } from "./tasks/builtin.js";
 import { runTask } from "./runner.js";
-import { summarize, formatReport } from "./report.js";
+import { summarize, formatReport, mergeSummaries } from "./report.js";
 
 /** 每次 stream() 吐出脚本里的下一条 assistant 消息（含 tool_call 时 stopReason=tool_use）。 */
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
@@ -130,4 +130,33 @@ test("report: summarize/formatReport 汇总正确", () => {
   const text = formatReport(sum);
   assert.match(text, /通过率 1\/2/);
   assert.match(text, /编辑失败率 50%/);
+  assert.ok(sum.passRateCi95.low < 0.5 && sum.passRateCi95.high > 0.5);
+});
+
+test("report: complete shards merge once and reject duplicate or missing shards", () => {
+  const result = {
+    id: "a",
+    title: "A",
+    passed: true,
+    turns: 1,
+    toolCalls: 0,
+    editCalls: 0,
+    editErrors: 0,
+    toolErrors: 0,
+    inputTokens: 1,
+    outputTokens: 1,
+    wallMs: 1,
+  };
+  const settings = {
+    suite: "real" as const,
+    catalog: "catalog",
+    runtimeImage: "image@sha256:abc",
+    revision: "sha",
+    shardCount: 2,
+  };
+  const first = summarize("model", [result], { ...settings, shardIndex: 0 });
+  const second = summarize("model", [{ ...result, id: "b" }], { ...settings, shardIndex: 1 });
+  assert.equal(mergeSummaries([first, second]).total, 2);
+  assert.throws(() => mergeSummaries([first]), /Incomplete/);
+  assert.throws(() => mergeSummaries([first, { ...second, results: [result] }]), /Duplicate/);
 });

@@ -18,9 +18,18 @@ export interface RouteDef {
   summary: string;
   /** 请求体 schema（POST/PATCH；JSON object） */
   request?: Record<string, unknown>;
+  parameters?: ApiParameterDef[];
   /** 成功响应：204 表示无 body；schema 表示 200 JSON；"sse" 表示事件流 */
   response: Record<string, unknown> | 204 | "sse";
   tag: "global" | "session" | "message" | "permission" | "artifact" | "runtime" | "patchset";
+}
+
+export interface ApiParameterDef {
+  name: string;
+  in: "query" | "header";
+  required?: boolean;
+  description?: string;
+  schema: Record<string, unknown>;
 }
 
 /** 稳定 operationId：同时供 OpenAPI 与 SDK codegen 使用。 */
@@ -76,6 +85,20 @@ export const ROUTES: RouteDef[] = [
     method: "get",
     path: "/sessions",
     summary: "列出会话",
+    parameters: [
+      {
+        name: "limit",
+        in: "query",
+        description: "分页大小；省略时兼容返回全部会话",
+        schema: { type: "integer", minimum: 1, maximum: 200 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        description: "上一页 x-anicode-next-cursor 返回的不透明游标",
+        schema: { type: "string", minLength: 1, maxLength: 256 },
+      },
+    ],
     response: { type: "array", items: SESSION_SUMMARY },
     tag: "session",
   },
@@ -86,7 +109,11 @@ export const ROUTES: RouteDef[] = [
     request: {
       type: "object",
       required: ["cwd", "model"],
-      properties: { cwd: { type: "string" }, model: { type: "string" }, title: { type: "string" } },
+      properties: {
+        cwd: { type: "string", minLength: 1 },
+        model: { type: "string", minLength: 1 },
+        title: { type: "string", minLength: 1 },
+      },
     },
     response: SESSION_SUMMARY,
     tag: "session",
@@ -109,7 +136,11 @@ export const ROUTES: RouteDef[] = [
     method: "patch",
     path: "/sessions/{id}",
     summary: "改会话标题",
-    request: { type: "object", required: ["title"], properties: { title: { type: "string" } } },
+    request: {
+      type: "object",
+      required: ["title"],
+      properties: { title: { type: "string", minLength: 1 } },
+    },
     response: 204,
     tag: "session",
   },
@@ -148,12 +179,29 @@ export const ROUTES: RouteDef[] = [
     request: {
       type: "object",
       required: ["kind", "name"],
+      oneOf: [{ required: ["text"] }, { required: ["dataBase64"] }],
       properties: {
-        kind: { type: "string" },
-        name: { type: "string" },
+        kind: {
+          type: "string",
+          enum: [
+            "plan",
+            "patch",
+            "diff",
+            "verification",
+            "log",
+            "report",
+            "screenshot",
+            "file",
+            "other",
+          ],
+        },
+        name: { type: "string", minLength: 1 },
         mediaType: { type: "string" },
         text: { type: "string" },
-        dataBase64: { type: "string" },
+        dataBase64: {
+          type: "string",
+          pattern: "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+        },
         metadata: { type: "object" },
       },
     },
@@ -171,6 +219,13 @@ export const ROUTES: RouteDef[] = [
         dataBase64: { type: "string" },
       },
     },
+    tag: "artifact",
+  },
+  {
+    method: "get",
+    path: "/sessions/{id}/artifacts/{artifactId}/content",
+    summary: "流式读取 Artifact 原始内容（支持大对象，不做 base64/堆内聚合）",
+    response: { type: "string", format: "binary" },
     tag: "artifact",
   },
   {
@@ -284,6 +339,13 @@ export const ROUTES: RouteDef[] = [
     method: "get",
     path: "/sessions/{id}/runtime-events",
     summary: "读取 Durable Runtime v2 事件；?afterSequence=N 增量读取",
+    parameters: [
+      {
+        name: "afterSequence",
+        in: "query",
+        schema: { type: "integer", minimum: 0 },
+      },
+    ],
     response: { type: "array", items: { $ref: "#/components/schemas/RuntimeEvent" } },
     tag: "runtime",
   },
@@ -302,12 +364,20 @@ export const ROUTES: RouteDef[] = [
       type: "object",
       required: ["text"],
       properties: {
-        text: { type: "string" },
+        text: { type: "string", minLength: 1 },
         model: { type: "string" },
         idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
       },
     },
     response: 204,
+    parameters: [
+      {
+        name: "Idempotency-Key",
+        in: "header",
+        description: "重试安全的 command 幂等键；优先于同名 JSON 字段",
+        schema: { type: "string", minLength: 1, maxLength: 256 },
+      },
+    ],
     tag: "message",
   },
   {
@@ -384,7 +454,16 @@ export const ROUTES: RouteDef[] = [
     method: "post",
     path: "/sessions/{id}/permission-mode",
     summary: "切换权限模式",
-    request: { type: "object", required: ["mode"], properties: { mode: { type: "string" } } },
+    request: {
+      type: "object",
+      required: ["mode"],
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["default", "acceptEdits", "auto", "bypass", "plan"],
+        },
+      },
+    },
     response: 204,
     tag: "permission",
   },
@@ -434,8 +513,17 @@ export const EVENTS: Record<string, string> = {
 export const PROTOCOL_VERSION = 1;
 
 const COMPONENT_SCHEMAS: Record<string, Record<string, unknown>> = {
-  // 粗粒度 schema：形状以 core 的 TypeScript 类型为准（本表用于文档与 SDK 导航，
-  // 不做运行时校验）。
+  ApiError: {
+    type: "object",
+    required: ["error", "code", "requestId"],
+    additionalProperties: false,
+    properties: {
+      error: { type: "string" },
+      code: { type: "string", pattern: "^[A-Z][A-Z0-9_]*$" },
+      requestId: { type: "string" },
+      details: {},
+    },
+  },
   SessionSummary: {
     type: "object",
     required: ["id", "createdAt", "updatedAt", "cwd", "model", "running"],
@@ -584,6 +672,62 @@ const COMPONENT_SCHEMAS: Record<string, Record<string, unknown>> = {
   },
 };
 
+function closedRequestSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...schema };
+  if (schema.type === "object" && schema.properties && schema.additionalProperties === undefined) {
+    result.additionalProperties = false;
+  }
+  if (schema.properties && typeof schema.properties === "object") {
+    result.properties = Object.fromEntries(
+      Object.entries(schema.properties as Record<string, Record<string, unknown>>).map(
+        ([key, value]) => [key, closedRequestSchema(value)],
+      ),
+    );
+  }
+  if (schema.items && typeof schema.items === "object") {
+    result.items = closedRequestSchema(schema.items as Record<string, unknown>);
+  }
+  for (const keyword of ["oneOf", "anyOf", "allOf"] as const) {
+    if (Array.isArray(schema[keyword])) {
+      result[keyword] = (schema[keyword] as Record<string, unknown>[]).map(closedRequestSchema);
+    }
+  }
+  return result;
+}
+
+const RESPONSE_HEADERS = {
+  "x-request-id": { $ref: "#/components/headers/RequestId" },
+  "x-anicode-api-version": { $ref: "#/components/headers/ApiVersion" },
+};
+
+function successResponse(route: RouteDef): Record<string, unknown> {
+  if (route.response === 204) {
+    return { description: "no content", headers: RESPONSE_HEADERS };
+  }
+  if (route.response === "sse") {
+    return {
+      description: "SSE 事件流；每帧 data 为 EventEnvelope",
+      headers: RESPONSE_HEADERS,
+      content: {
+        "text/event-stream": { schema: { $ref: "#/components/schemas/EventEnvelope" } },
+      },
+    };
+  }
+  const binary = route.response.format === "binary";
+  return {
+    description: "ok",
+    headers: {
+      ...RESPONSE_HEADERS,
+      ...(route.path === "/sessions"
+        ? { "x-anicode-next-cursor": { $ref: "#/components/headers/NextCursor" } }
+        : {}),
+    },
+    content: {
+      [binary ? "application/octet-stream" : "application/json"]: { schema: route.response },
+    },
+  };
+}
+
 /** 生成 OpenAPI 3.1 文档（`GET /doc`）。 */
 export function generateOpenApi(): Record<string, unknown> {
   const paths: Record<string, Record<string, unknown>> = {};
@@ -592,44 +736,41 @@ export function generateOpenApi(): Record<string, unknown> {
       operationId: operationIdFor(route),
       summary: route.summary,
       tags: [route.tag],
-      ...([...route.path.matchAll(/\{([^}]+)\}/g)].length
+      parameters: [
+        { $ref: "#/components/parameters/ApiVersion" },
+        { $ref: "#/components/parameters/RequestId" },
+        ...[...route.path.matchAll(/\{([^}]+)\}/g)].map((match) => ({
+          name: match[1],
+          in: "path",
+          required: true,
+          schema: { type: "string" },
+        })),
+        ...(route.parameters ?? []),
+      ],
+      ...(route.request
         ? {
-            parameters: [...route.path.matchAll(/\{([^}]+)\}/g)].map((match) => ({
-              name: match[1],
-              in: "path",
+            requestBody: {
               required: true,
-              schema: { type: "string" },
-            })),
+              content: { "application/json": { schema: closedRequestSchema(route.request) } },
+            },
           }
         : {}),
-      ...(route.request
-        ? { requestBody: { content: { "application/json": { schema: route.request } } } }
-        : {}),
-      responses:
-        route.response === 204
-          ? { "204": { description: "no content" } }
-          : route.response === "sse"
-            ? {
-                "200": {
-                  description: "SSE 事件流；每帧 data 为 EventEnvelope",
-                  content: {
-                    "text/event-stream": {
-                      schema: { $ref: "#/components/schemas/EventEnvelope" },
-                    },
-                  },
-                },
-              }
-            : {
-                "200": {
-                  description: "ok",
-                  content: { "application/json": { schema: route.response } },
-                },
-              },
+      responses: {
+        [route.response === 204 ? "204" : "200"]: successResponse(route),
+        default: {
+          description: "structured API error",
+          headers: RESPONSE_HEADERS,
+          content: {
+            "application/json": { schema: { $ref: "#/components/schemas/ApiError" } },
+          },
+        },
+      },
     };
     (paths[route.path] ??= {})[route.method] = op;
   }
   return {
     openapi: "3.1.1",
+    jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema",
     info: {
       title: "anicode server",
       version: `${PROTOCOL_VERSION}.0.0`,
@@ -639,7 +780,30 @@ export function generateOpenApi(): Record<string, unknown> {
         "SSE 续传：事件帧携带 id，断线重连带 Last-Event-ID 头（或 ?lastEventId=）可增量补发丢失事件，缓冲失效时自动回落整份快照。",
     },
     paths,
-    components: { schemas: COMPONENT_SCHEMAS },
+    components: {
+      schemas: COMPONENT_SCHEMAS,
+      parameters: {
+        ApiVersion: {
+          name: "x-anicode-api-version",
+          in: "header",
+          required: false,
+          schema: { type: "integer", const: PROTOCOL_VERSION },
+        },
+        RequestId: {
+          name: "x-request-id",
+          in: "header",
+          required: false,
+          schema: { type: "string", minLength: 1, maxLength: 128 },
+        },
+      },
+      headers: {
+        ApiVersion: { schema: { type: "integer", const: PROTOCOL_VERSION } },
+        RequestId: { schema: { type: "string" } },
+        NextCursor: { schema: { type: "string" } },
+      },
+      securitySchemes: { bearerAuth: { type: "http", scheme: "bearer" } },
+    },
+    security: [{ bearerAuth: [] }, {}],
     "x-events": EVENTS,
   };
 }
@@ -673,6 +837,186 @@ export function validateOpenApiDocument(document = generateOpenApi()): string[] 
     const responses = operation["responses"] as Record<string, unknown> | undefined;
     if (!responses || Object.keys(responses).length === 0)
       errors.push(`missing response: ${route.path}`);
+    else if (!responses.default) errors.push(`missing default error response: ${route.path}`);
   }
   return errors;
+}
+
+export interface ApiRouteMatch {
+  route: RouteDef;
+  pathParams: Record<string, string>;
+}
+
+export interface ApiValidationIssue {
+  path: string;
+  keyword: string;
+  message: string;
+}
+
+function routePattern(route: RouteDef): { pattern: RegExp; names: string[] } {
+  const names: string[] = [];
+  const source = route.path
+    .split("/")
+    .map((segment) => {
+      const match = /^\{([^}]+)\}$/.exec(segment);
+      if (match) {
+        names.push(match[1]!);
+        return "([^/]+)";
+      }
+      return segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    })
+    .join("/");
+  return { pattern: new RegExp(`^${source}$`), names };
+}
+
+const ROUTE_PATTERNS = ROUTES.map((route) => ({ route, ...routePattern(route) }));
+
+export function matchApiRoute(method: string, pathname: string): ApiRouteMatch | undefined {
+  const normalizedMethod = method.toLowerCase();
+  for (const candidate of ROUTE_PATTERNS) {
+    if (candidate.route.method !== normalizedMethod) continue;
+    const matched = candidate.pattern.exec(pathname);
+    if (!matched) continue;
+    const pathParams: Record<string, string> = {};
+    try {
+      candidate.names.forEach((name, index) => {
+        pathParams[name] = decodeURIComponent(matched[index + 1]!);
+      });
+    } catch {
+      return undefined;
+    }
+    return { route: candidate.route, pathParams };
+  }
+  return undefined;
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** JSON Schema 2020-12 的受控子集，覆盖 ROUTES 请求契约并限制错误放大。 */
+export function validateJsonSchema(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path = "$",
+  depth = 0,
+): ApiValidationIssue[] {
+  if (depth > 64) return [{ path, keyword: "depth", message: "schema nesting is too deep" }];
+  if (typeof schema.$ref === "string") {
+    const name = schema.$ref.match(/^#\/components\/schemas\/([^/]+)$/)?.[1];
+    const resolved = name ? COMPONENT_SCHEMAS[name] : undefined;
+    return resolved
+      ? validateJsonSchema(value, resolved, path, depth + 1)
+      : [{ path, keyword: "$ref", message: `unresolved schema reference ${schema.$ref}` }];
+  }
+  const issues: ApiValidationIssue[] = [];
+  const add = (keyword: string, message: string, issuePath = path) => {
+    if (issues.length < 64) issues.push({ path: issuePath, keyword, message });
+  };
+
+  if (schema.const !== undefined && !sameJsonValue(value, schema.const)) {
+    add("const", `must equal ${JSON.stringify(schema.const)}`);
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) => sameJsonValue(item, value))) {
+    add("enum", "must be one of the declared values");
+  }
+  for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
+    const branches = schema[keyword];
+    if (!Array.isArray(branches)) continue;
+    const results = (branches as Record<string, unknown>[]).map(
+      (branch) => validateJsonSchema(value, branch, path, depth + 1).length === 0,
+    );
+    const matches = results.filter(Boolean).length;
+    if (keyword === "allOf" && matches !== results.length) add(keyword, "must match every schema");
+    if (keyword === "anyOf" && matches === 0) add(keyword, "must match at least one schema");
+    if (keyword === "oneOf" && matches !== 1) add(keyword, "must match exactly one schema");
+  }
+
+  const type = schema.type;
+  const isObject = value !== null && typeof value === "object" && !Array.isArray(value);
+  const typeMatches =
+    type === undefined ||
+    (type === "object" && isObject) ||
+    (type === "array" && Array.isArray(value)) ||
+    (type === "string" && typeof value === "string") ||
+    (type === "boolean" && typeof value === "boolean") ||
+    (type === "number" && typeof value === "number" && Number.isFinite(value)) ||
+    (type === "integer" && typeof value === "number" && Number.isSafeInteger(value)) ||
+    (type === "null" && value === null);
+  if (!typeMatches) {
+    add("type", `must be ${String(type)}`);
+    return issues;
+  }
+
+  if (isObject) {
+    const object = value as Record<string, unknown>;
+    for (const key of (schema.required as string[] | undefined) ?? []) {
+      if (!Object.prototype.hasOwnProperty.call(object, key)) {
+        add("required", `missing required property ${key}`, `${path}.${key}`);
+      }
+    }
+    const properties =
+      (schema.properties as Record<string, Record<string, unknown>> | undefined) ?? {};
+    for (const [key, child] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(object, key)) {
+        issues.push(...validateJsonSchema(object[key], child, `${path}.${key}`, depth + 1));
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(object)) {
+        if (!(key in properties))
+          add("additionalProperties", `unknown property ${key}`, `${path}.${key}`);
+      }
+    }
+  }
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) {
+      add("minItems", `must contain at least ${schema.minItems} items`);
+    }
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) {
+      add("maxItems", `must contain at most ${schema.maxItems} items`);
+    }
+    if (schema.items && typeof schema.items === "object") {
+      value.forEach((item, index) => {
+        issues.push(
+          ...validateJsonSchema(
+            item,
+            schema.items as Record<string, unknown>,
+            `${path}[${index}]`,
+            depth + 1,
+          ),
+        );
+      });
+    }
+  }
+  if (typeof value === "string") {
+    if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+      add("minLength", `must contain at least ${schema.minLength} characters`);
+    }
+    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) {
+      add("maxLength", `must contain at most ${schema.maxLength} characters`);
+    }
+    if (typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
+      add("pattern", "does not match the required pattern");
+    }
+  }
+  if (typeof value === "number") {
+    if (typeof schema.minimum === "number" && value < schema.minimum) {
+      add("minimum", `must be >= ${schema.minimum}`);
+    }
+    if (typeof schema.maximum === "number" && value > schema.maximum) {
+      add("maximum", `must be <= ${schema.maximum}`);
+    }
+  }
+  return issues.slice(0, 64);
+}
+
+export function validateRouteRequest(
+  method: string,
+  pathname: string,
+  value: unknown,
+): ApiValidationIssue[] {
+  const matched = matchApiRoute(method, pathname);
+  if (!matched?.route.request) return [];
+  return validateJsonSchema(value, closedRequestSchema(matched.route.request));
 }

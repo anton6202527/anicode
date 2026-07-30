@@ -200,10 +200,15 @@ const providers = new Map<string, RegisteredProvider>();
 const canonical = new Map<string, RegisteredProvider>();
 let providerCredentialBroker: CredentialBroker | undefined;
 let providerNetworkProxy: NetworkProxy | undefined;
+let providerEnvironmentFallback = true;
 
 /** 宿主把环境/Keychain/Vault 密钥导入 Broker 后调用；provider adapter 优先从 Broker 取。 */
-export function configureProviderCredentialBroker(broker: CredentialBroker | undefined): void {
+export function configureProviderCredentialBroker(
+  broker: CredentialBroker | undefined,
+  options: { allowEnvironmentFallback?: boolean } = {},
+): void {
   providerCredentialBroker = broker;
+  providerEnvironmentFallback = options.allowEnvironmentFallback ?? broker === undefined;
 }
 
 /** 生产宿主把 provider SDK 的 fetch 也收口到同一策略化出口。 */
@@ -669,8 +674,10 @@ function findCredential(
         continue;
       }
     }
-    const value = nonEmptyEnv(name);
-    if (value !== undefined) return { name, value };
+    if (providerEnvironmentFallback) {
+      const value = nonEmptyEnv(name);
+      if (value !== undefined) return { name, value };
+    }
   }
   return undefined;
 }

@@ -8,6 +8,8 @@
  */
 import { type Tool, type ToolContext, ToolError } from "./tool.js";
 import { t } from "../i18n.js";
+import type { CredentialBroker } from "../security/credentials.js";
+import type { NetworkProxy } from "../runtime/network-proxy.js";
 
 export interface WebSearchResult {
   title: string;
@@ -183,6 +185,59 @@ export function braveBackend(opts: {
   };
 }
 
+export interface BrokerWebSearchOptions {
+  provider: "tavily" | "brave";
+  broker: CredentialBroker;
+  proxy: NetworkProxy;
+  credentialId?: string;
+  endpoint?: string;
+}
+
+/** 搜索密钥只由代理按 host/audience 注入；不会进入工具输入、请求 body 或进程 env。 */
+export function webSearchBackendFromBroker(opts: BrokerWebSearchOptions): WebSearchBackend {
+  const endpoint =
+    opts.endpoint ??
+    (opts.provider === "tavily"
+      ? "https://api.tavily.com/search"
+      : "https://api.search.brave.com/res/v1/web/search");
+  const target = new URL(endpoint);
+  const credentialId =
+    opts.credentialId ??
+    (opts.provider === "tavily" ? "env:TAVILY_API_KEY" : "env:BRAVE_SEARCH_API_KEY");
+  return async (query, { signal, count }) => {
+    const lease = opts.broker.lease({
+      credentialId,
+      audience: "network:web-search",
+      host: target.hostname,
+      tool: "web_search",
+      ttlMs: 30_000,
+      maxUses: 1,
+    });
+    const url =
+      opts.provider === "brave"
+        ? `${endpoint}?q=${encodeURIComponent(query)}&count=${count ?? DEFAULT_COUNT}`
+        : endpoint;
+    const response = await opts.proxy.fetch(url, {
+      method: opts.provider === "tavily" ? "POST" : "GET",
+      signal,
+      headers: { accept: "application/json", "content-type": "application/json" },
+      credentialLease: lease,
+      ...(opts.provider === "tavily"
+        ? {
+            body: JSON.stringify({
+              query,
+              max_results: count ?? DEFAULT_COUNT,
+              search_depth: "basic",
+            }),
+          }
+        : {}),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    const payload = await response.json();
+    return opts.provider === "tavily" ? parseTavilyResponse(payload) : parseBraveResponse(payload);
+  };
+}
+
 // ---------- 环境变量解析 ----------
 
 /**
@@ -192,6 +247,14 @@ export function braveBackend(opts: {
 export function webSearchBackendFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): WebSearchBackend | undefined {
+  if (
+    (env["TAVILY_API_KEY"] || env["BRAVE_SEARCH_API_KEY"]) &&
+    env["ANICODE_ALLOW_LEGACY_SECRET_ENV"] !== "1"
+  ) {
+    throw new Error(
+      "Environment-backed web search secrets are disabled; use webSearchBackendFromBroker()",
+    );
+  }
   if (env["TAVILY_API_KEY"]) return tavilyBackend({ apiKey: env["TAVILY_API_KEY"] });
   if (env["BRAVE_SEARCH_API_KEY"]) return braveBackend({ apiKey: env["BRAVE_SEARCH_API_KEY"] });
   return undefined;

@@ -176,6 +176,113 @@ test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
   }
 });
 
+test("sdk/openapi: pagination、Artifact 原始流/摘要校验、结构化错误与客户端预检", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-contract-"));
+  const { server, baseUrl } = await startServer(dir, scriptedProvider([]));
+  const client = createAnicodeClient({ baseUrl });
+  try {
+    const sessions = await Promise.all(
+      ["one", "two", "three"].map((title) =>
+        client.session.create({ cwd: dir, model: "scripted", title }),
+      ),
+    );
+    const first = await client.session.listPage({ limit: 2 });
+    assert.equal(first.items.length, 2);
+    assert.ok(first.nextCursor);
+    const second = await client.session.listPage({ limit: 2, cursor: first.nextCursor });
+    assert.equal(second.items.length, 1);
+
+    const bytes = new Uint8Array([0, 1, 2, 250, 255]);
+    const artifact = await client.artifact.create(sessions[0]!.id, {
+      kind: "file",
+      name: "payload.bin",
+      mediaType: "application/octet-stream",
+      dataBase64: Buffer.from(bytes).toString("base64"),
+    });
+    const opened = await client.artifact.open(sessions[0]!.id, artifact.id);
+    assert.match(opened.headers.get("content-digest") ?? "", /^sha-256=:/);
+    assert.deepEqual(new Uint8Array(await opened.arrayBuffer()), bytes);
+    assert.deepEqual(await client.artifact.download(sessions[0]!.id, artifact.id), bytes);
+
+    await assert.rejects(
+      () => client.session.create({ cwd: "", model: "scripted" }),
+      (error: unknown) => error instanceof TypeError && /minLength/.test(error.message),
+    );
+    const incompatible = createAnicodeClient({ baseUrl, apiVersion: 999 });
+    await assert.rejects(
+      () => incompatible.global.health(),
+      (error: unknown) =>
+        error instanceof AnicodeApiError &&
+        error.status === 426 &&
+        error.code === "UNSUPPORTED_API_VERSION" &&
+        Boolean(error.requestId),
+    );
+  } finally {
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sdk transport: generated method、API headers 与仅幂等请求重试", async () => {
+  let healthCalls = 0;
+  const seenHeaders: Headers[] = [];
+  const retrying = createAnicodeClient({
+    baseUrl: "https://api.example",
+    maxRetries: 2,
+    retryDelayMs: 1,
+    fetch: (async (_input, init) => {
+      seenHeaders.push(new Headers(init?.headers));
+      healthCalls++;
+      return healthCalls < 3
+        ? Response.json({ error: "busy" }, { status: 503 })
+        : Response.json({ ok: true, name: "anicode", protocol: 1 });
+    }) as typeof fetch,
+  });
+  assert.equal((await retrying.global.health()).ok, true);
+  assert.equal(healthCalls, 3);
+  assert.ok(seenHeaders.every((headers) => headers.get("x-anicode-api-version") === "1"));
+  assert.equal(new Set(seenHeaders.map((headers) => headers.get("x-request-id"))).size, 1);
+
+  let createCalls = 0;
+  const noMutationRetry = createAnicodeClient({
+    baseUrl: "https://api.example",
+    maxRetries: 2,
+    retryDelayMs: 1,
+    fetch: (async () => {
+      createCalls++;
+      return Response.json(
+        { error: "busy", code: "BUSY", requestId: "req-server", details: { retry: false } },
+        { status: 503 },
+      );
+    }) as typeof fetch,
+  });
+  await assert.rejects(
+    () => noMutationRetry.session.create({ cwd: "/repo", model: "test" }),
+    (error: unknown) =>
+      error instanceof AnicodeApiError &&
+      error.code === "BUSY" &&
+      error.requestId === "req-server" &&
+      (error.details as { retry?: boolean }).retry === false,
+  );
+  assert.equal(createCalls, 1);
+
+  let sendCalls = 0;
+  const idempotentMutation = createAnicodeClient({
+    baseUrl: "https://api.example",
+    maxRetries: 1,
+    retryDelayMs: 1,
+    fetch: (async (_input, init) => {
+      sendCalls++;
+      assert.equal(new Headers(init?.headers).get("idempotency-key"), "command-1");
+      return sendCalls === 1
+        ? Response.json({ error: "busy" }, { status: 503 })
+        : new Response(null, { status: 204 });
+    }) as typeof fetch,
+  });
+  await idempotentMutation.session.send("s_1", "run", { idempotencyKey: "command-1" });
+  assert.equal(sendCalls, 2);
+});
+
 test("sdk: event.subscribe —— 信封序保证与 parts 投影事件", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-"));
   const { server, baseUrl } = await startServer(

@@ -10,9 +10,12 @@ import {
   parseBraveResponse,
   tavilyBackend,
   webSearchBackendFromEnv,
+  webSearchBackendFromBroker,
   type WebSearchBackend,
 } from "./web-search.js";
 import { ToolError } from "./tool.js";
+import { CredentialBroker, credentialScopesForEnvironment } from "../security/credentials.js";
+import { NetworkProxy } from "../runtime/network-proxy.js";
 
 const ctx = () => ({ cwd: process.cwd(), signal: new AbortController().signal });
 
@@ -101,8 +104,42 @@ test("tavilyBackend: 注入 fetch，POST 带 api_key 与 query，解析结果", 
   assert.deepEqual(results, [{ title: "T", url: "https://t.test", snippet: "c" }]);
 });
 
-test("webSearchBackendFromEnv: TAVILY 优先于 BRAVE；都无则 undefined", () => {
-  assert.ok(webSearchBackendFromEnv({ TAVILY_API_KEY: "x", BRAVE_SEARCH_API_KEY: "y" } as any));
-  assert.ok(webSearchBackendFromEnv({ BRAVE_SEARCH_API_KEY: "y" } as any));
+test("webSearchBackendFromEnv: 默认拒绝进程密钥，仅显式 legacy 模式兼容", () => {
+  assert.throws(() => webSearchBackendFromEnv({ TAVILY_API_KEY: "x" } as any), /Broker/);
+  assert.ok(
+    webSearchBackendFromEnv({
+      BRAVE_SEARCH_API_KEY: "y",
+      ANICODE_ALLOW_LEGACY_SECRET_ENV: "1",
+    } as any),
+  );
   assert.equal(webSearchBackendFromEnv({} as any), undefined);
+});
+
+test("webSearchBackendFromBroker: secret 由 NetworkProxy 限域注入且不进 body", async () => {
+  const broker = new CredentialBroker();
+  broker.register({
+    id: "env:TAVILY_API_KEY",
+    value: "tavily-secret",
+    scopes: credentialScopesForEnvironment("TAVILY_API_KEY"),
+  });
+  let headers = new Headers();
+  let body = "";
+  const proxy = new NetworkProxy({
+    broker,
+    policy: { allowDomains: ["api.tavily.com"] },
+    resolver: async () => ["93.184.216.34"],
+    fetch: (async (_url, init) => {
+      headers = new Headers(init?.headers);
+      body = String(init?.body ?? "");
+      return Response.json({ results: [{ title: "T", url: "https://t.test" }] });
+    }) as typeof fetch,
+  });
+  try {
+    const backend = webSearchBackendFromBroker({ provider: "tavily", broker, proxy });
+    assert.equal((await backend("query", { signal: new AbortController().signal })).length, 1);
+    assert.equal(headers.get("authorization"), "Bearer tavily-secret");
+    assert.ok(!body.includes("tavily-secret"));
+  } finally {
+    await proxy.close();
+  }
 });

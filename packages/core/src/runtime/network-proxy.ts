@@ -1,6 +1,7 @@
 /** 策略化网络出口：DNS/私网/端口/域名检查 + 可审计 fetch + 短期凭证注入。 */
 
 import { promises as dns } from "node:dns";
+import { timingSafeEqual } from "node:crypto";
 import * as http from "node:http";
 import * as net from "node:net";
 import { isIP } from "node:net";
@@ -234,6 +235,16 @@ export interface NetworkProxyServerOptions {
   host?: string;
   port?: number;
   maxRequestBytes?: number;
+  maxResponseBytes?: number;
+  requestTimeoutMs?: number;
+  connectTimeoutMs?: number;
+  maxTunnelDurationMs?: number;
+  maxTunnelBytes?: number;
+  maxConcurrentTunnels?: number;
+  /** 短期代理凭证；支持 Proxy-Authorization: Bearer 或 Basic 的 password。 */
+  clientToken?: string;
+  /** 生产用动态凭证源；每次新请求/隧道都重新解析，因此后端轮换无需重启代理。 */
+  clientTokenProvider?: () => Promise<string | undefined>;
 }
 
 /**
@@ -243,24 +254,39 @@ export interface NetworkProxyServerOptions {
 export class NetworkProxyServer {
   private server: http.Server | undefined;
   private bound: { host: string; port: number } | undefined;
+  private activeTunnels = 0;
 
-  constructor(private readonly options: NetworkProxyServerOptions) {}
+  constructor(private readonly options: NetworkProxyServerOptions) {
+    if (!options.clientToken && !options.clientTokenProvider) {
+      throw new Error("Network proxy server requires client authentication");
+    }
+  }
 
   async listen(): Promise<string> {
     if (this.bound) return this.url();
     const host = this.options.host ?? "127.0.0.1";
     const server = http.createServer((request, response) => {
       void this.forwardHttp(request, response).catch((error) => {
-        if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
+        const status = proxyStatus(error);
+        if (response.headersSent) {
+          response.destroy(error instanceof Error ? error : new Error(String(error)));
+          return;
+        } else {
+          response.writeHead(status, {
+            "content-type": "text/plain",
+            ...(status === 407 ? { "proxy-authenticate": 'Basic realm="anicode"' } : {}),
+          });
+        }
         response.end(`proxy denied: ${error instanceof Error ? error.message : String(error)}`);
       });
     });
     server.on("connect", (request, socket, head) => {
       void this.forwardConnect(request, socket, head).catch((error) => {
+        const status = proxyStatus(error);
         socket.end(
-          `HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `HTTP/1.1 ${status} ${status === 407 ? "Proxy Authentication Required" : "Bad Gateway"}\r\nContent-Type: text/plain\r\nConnection: close\r\n${
+            status === 407 ? 'Proxy-Authenticate: Basic realm="anicode"\r\n' : ""
+          }\r\n${error instanceof Error ? error.message : String(error)}`,
         );
       });
     });
@@ -300,6 +326,7 @@ export class NetworkProxyServer {
     request: http.IncomingMessage,
     response: http.ServerResponse,
   ): Promise<void> {
+    await this.authenticateClient(request);
     const target = new URL(request.url ?? "", `http://${request.headers.host ?? ""}`);
     const limit = Math.max(1_024, this.options.maxRequestBytes ?? 8 * 1024 * 1024);
     const chunks: Buffer[] = [];
@@ -307,7 +334,7 @@ export class NetworkProxyServer {
     for await (const chunk of request) {
       const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       size += value.byteLength;
-      if (size > limit) throw new Error(`proxy request body exceeds ${limit} bytes`);
+      if (size > limit) throw proxyError(413, `proxy request body exceeds ${limit} bytes`);
       chunks.push(value);
     }
     const headers = new Headers();
@@ -318,18 +345,54 @@ export class NetworkProxyServer {
     }
     const lease = headers.get("x-anicode-credential-lease") ?? undefined;
     headers.delete("x-anicode-credential-lease");
-    const upstream = await this.options.proxy.fetch(target, {
-      ...(request.method ? { method: request.method } : {}),
-      headers,
-      ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
-      ...(lease ? { credentialLease: lease } : {}),
-    });
-    const outgoing: Record<string, string> = {};
-    upstream.headers.forEach((value, name) => {
-      if (!["connection", "transfer-encoding"].includes(name.toLowerCase())) outgoing[name] = value;
-    });
-    response.writeHead(upstream.status, outgoing);
-    response.end(Buffer.from(await upstream.arrayBuffer()));
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.max(1_000, this.options.requestTimeoutMs ?? 120_000),
+    );
+    try {
+      const upstream = await this.options.proxy.fetch(target, {
+        ...(request.method ? { method: request.method } : {}),
+        headers,
+        ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
+        ...(lease ? { credentialLease: lease } : {}),
+        signal: controller.signal,
+      });
+      const outgoing: Record<string, string> = {};
+      upstream.headers.forEach((value, name) => {
+        if (!["connection", "transfer-encoding"].includes(name.toLowerCase())) {
+          outgoing[name] = value;
+        }
+      });
+      const responseLimit = Math.max(1_024, this.options.maxResponseBytes ?? 32 * 1024 * 1024);
+      const declaredLength = Number(upstream.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > responseLimit) {
+        await upstream.body?.cancel("proxy response size limit exceeded");
+        throw proxyError(502, `proxy response body exceeds ${responseLimit} bytes`);
+      }
+      response.writeHead(upstream.status, outgoing);
+      const reader = upstream.body?.getReader();
+      if (!reader) {
+        response.end();
+        return;
+      }
+      let received = 0;
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        received += chunk.value.byteLength;
+        if (received > responseLimit) {
+          await reader.cancel("proxy response size limit exceeded");
+          throw new Error(`proxy response body exceeds ${responseLimit} bytes`);
+        }
+        if (!response.write(Buffer.from(chunk.value))) {
+          await new Promise<void>((resolve) => response.once("drain", resolve));
+        }
+      }
+      response.end();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async forwardConnect(
@@ -337,26 +400,100 @@ export class NetworkProxyServer {
     client: Duplex,
     head: Buffer,
   ): Promise<void> {
-    const authority = request.url ?? "";
-    const split = authority.lastIndexOf(":");
-    if (split <= 0) throw new Error("CONNECT target must be host:port");
-    const hostname = authority.slice(0, split).replace(/^\[|\]$/g, "");
-    const port = Number(authority.slice(split + 1));
-    const authorized = await this.options.proxy.authorize(`https://${hostname}:${port}/`);
-    const upstream = net.connect({ host: authorized.addresses[0]!, port });
-    await new Promise<void>((resolve, reject) => {
-      upstream.once("connect", resolve);
-      upstream.once("error", reject);
-    });
-    client.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: anicode\r\n\r\n");
-    if (head.length) upstream.write(head);
-    upstream.pipe(client);
-    client.pipe(upstream);
-    const destroy = () => {
-      upstream.destroy();
-      client.destroy();
+    await this.authenticateClient(request);
+    const maximum = Math.max(1, this.options.maxConcurrentTunnels ?? 128);
+    if (this.activeTunnels >= maximum) throw proxyError(429, "proxy tunnel concurrency exceeded");
+    this.activeTunnels++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.activeTunnels--;
     };
-    upstream.once("error", destroy);
-    client.once("error", destroy);
+    try {
+      const authority = request.url ?? "";
+      const split = authority.lastIndexOf(":");
+      if (split <= 0) throw new Error("CONNECT target must be host:port");
+      const hostname = authority.slice(0, split).replace(/^\[|\]$/g, "");
+      const port = Number(authority.slice(split + 1));
+      const authorized = await this.options.proxy.authorize(`https://${hostname}:${port}/`);
+      const upstream = net.connect({ host: authorized.addresses[0]!, port });
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("proxy CONNECT timeout")),
+          Math.max(1_000, this.options.connectTimeoutMs ?? 10_000),
+        );
+        const done = (fn: () => void) => () => {
+          clearTimeout(timer);
+          fn();
+        };
+        upstream.once("connect", done(resolve));
+        upstream.once(
+          "error",
+          done(() => reject(new Error("proxy upstream connection failed"))),
+        );
+      });
+      client.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: anicode\r\n\r\n");
+      if (head.length) upstream.write(head);
+      upstream.pipe(client);
+      client.pipe(upstream);
+      const maximumBytes = Math.max(1_024, this.options.maxTunnelBytes ?? 256 * 1024 * 1024);
+      let transferred = head.byteLength;
+      const count = (chunk: Buffer) => {
+        transferred += chunk.byteLength;
+        if (transferred > maximumBytes) destroy();
+      };
+      const destroy = () => {
+        upstream.destroy();
+        client.destroy();
+        release();
+      };
+      const duration = setTimeout(
+        destroy,
+        Math.max(1_000, this.options.maxTunnelDurationMs ?? 10 * 60_000),
+      );
+      const finish = () => {
+        clearTimeout(duration);
+        release();
+      };
+      upstream.on("data", count);
+      client.on("data", count);
+      upstream.once("error", destroy);
+      client.once("error", destroy);
+      upstream.once("close", finish);
+      client.once("close", finish);
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
+
+  private async authenticateClient(request: http.IncomingMessage): Promise<void> {
+    const expected = this.options.clientTokenProvider
+      ? await this.options.clientTokenProvider()
+      : this.options.clientToken;
+    if (!expected) throw proxyError(503, "proxy client credential is unavailable");
+    const header = request.headers["proxy-authorization"];
+    const value = Array.isArray(header) ? header[0] : header;
+    let actual = "";
+    if (value?.startsWith("Bearer ")) actual = value.slice(7).trim();
+    else if (value?.startsWith("Basic ")) {
+      const decoded = Buffer.from(value.slice(6), "base64").toString("utf8");
+      actual = decoded.slice(decoded.indexOf(":") + 1);
+    }
+    const left = Buffer.from(actual);
+    const right = Buffer.from(expected);
+    if (left.length !== right.length || !timingSafeEqual(left, right)) {
+      throw proxyError(407, "proxy authentication required");
+    }
+  }
+}
+
+function proxyError(status: number, message: string): Error {
+  return Object.assign(new Error(message), { status });
+}
+
+function proxyStatus(error: unknown): number {
+  const status = Number((error as { status?: unknown }).status);
+  return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502;
 }

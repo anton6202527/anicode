@@ -46,6 +46,30 @@ export interface CommandInboxStore {
   write(sessionId: string, commands: DurableCommand[]): Promise<void>;
   transact?<T>(sessionId: string, fn: (commands: DurableCommand[]) => T | Promise<T>): Promise<T>;
   listSessions(): Promise<string[]>;
+  insertCommand?(command: DurableCommand): Promise<DurableCommand>;
+  claimCommand?(
+    sessionId: string,
+    commandId: string,
+    owner: string,
+    leaseMs: number,
+    now: number,
+  ): Promise<DurableCommand>;
+  heartbeatCommand?(
+    sessionId: string,
+    commandId: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void>;
+  finishCommand?(
+    sessionId: string,
+    commandId: string,
+    status: Extract<CommandStatus, "completed" | "failed" | "cancelled">,
+    error?: string,
+    lease?: { owner: string; fencingToken: number },
+  ): Promise<void>;
+  getCommand?(sessionId: string, commandId: string): Promise<DurableCommand | undefined>;
+  recoverableCommands?(sessionId: string, now: number): Promise<DurableCommand[]>;
 }
 
 function assertId(value: string, label: string): void {
@@ -178,25 +202,26 @@ export class CommandInbox {
 
   accept(input: AcceptCommandInput): Promise<DurableCommand> {
     const key = input.idempotencyKey ?? `cmd:${randomUUID()}`;
+    const now = new Date().toISOString();
+    const proposed: DurableCommand = {
+      id: `cmd_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
+      sessionId: input.sessionId,
+      text: input.text,
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.traceparent ? { traceparent: input.traceparent } : {}),
+      idempotencyKey: key,
+      messageCountBefore: Math.max(0, Math.floor(input.messageCountBefore ?? 0)),
+      status: "accepted",
+      attempts: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (this.store.insertCommand) return this.store.insertCommand(proposed);
     return this.transact(input.sessionId, async (commands) => {
       const duplicate = commands.find((command) => command.idempotencyKey === key);
       if (duplicate) return cloneCommand(duplicate);
-      const now = new Date().toISOString();
-      const command: DurableCommand = {
-        id: `cmd_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
-        sessionId: input.sessionId,
-        text: input.text,
-        ...(input.model ? { model: input.model } : {}),
-        ...(input.traceparent ? { traceparent: input.traceparent } : {}),
-        idempotencyKey: key,
-        messageCountBefore: Math.max(0, Math.floor(input.messageCountBefore ?? 0)),
-        status: "accepted",
-        attempts: 0,
-        createdAt: now,
-        updatedAt: now,
-      };
-      commands.push(command);
-      return cloneCommand(command);
+      commands.push(proposed);
+      return cloneCommand(proposed);
     });
   }
 
@@ -207,6 +232,9 @@ export class CommandInbox {
     leaseMs = 60_000,
     now = Date.now(),
   ): Promise<DurableCommand> {
+    if (this.store.claimCommand) {
+      return this.store.claimCommand(sessionId, commandId, owner, leaseMs, now);
+    }
     return this.transact(sessionId, async (commands) => {
       const command = commands.find((candidate) => candidate.id === commandId);
       if (!command) throw new Error(`Unknown durable command: ${commandId}`);
@@ -235,6 +263,9 @@ export class CommandInbox {
     leaseMs = 60_000,
     fencingToken?: number,
   ): Promise<void> {
+    if (this.store.heartbeatCommand) {
+      return this.store.heartbeatCommand(sessionId, commandId, owner, leaseMs, fencingToken);
+    }
     return this.transact(sessionId, async (commands) => {
       const command = commands.find((candidate) => candidate.id === commandId);
       if (!command || command.status !== "running" || command.leaseOwner !== owner) {
@@ -255,6 +286,9 @@ export class CommandInbox {
     error?: string,
     lease?: { owner: string; fencingToken: number },
   ): Promise<void> {
+    if (this.store.finishCommand) {
+      return this.store.finishCommand(sessionId, commandId, status, error, lease);
+    }
     return this.transact(sessionId, async (commands) => {
       const command = commands.find((candidate) => candidate.id === commandId);
       if (!command) throw new Error(`Unknown durable command: ${commandId}`);
@@ -274,10 +308,12 @@ export class CommandInbox {
   }
 
   async get(sessionId: string, commandId: string): Promise<DurableCommand | undefined> {
+    if (this.store.getCommand) return this.store.getCommand(sessionId, commandId);
     return (await this.store.read(sessionId)).find((command) => command.id === commandId);
   }
 
   async recoverable(sessionId: string, now = Date.now()): Promise<DurableCommand[]> {
+    if (this.store.recoverableCommands) return this.store.recoverableCommands(sessionId, now);
     return (await this.store.read(sessionId)).filter(
       (command) =>
         command.status === "accepted" ||
@@ -298,12 +334,21 @@ export interface OutboxMessage {
   updatedAt: string;
   sentEventId?: string;
   error?: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
+  fencingToken?: number;
 }
 
 export interface OutboxStore {
   read(): Promise<OutboxMessage[]>;
   write(messages: OutboxMessage[]): Promise<void>;
   transact?<T>(fn: (messages: OutboxMessage[]) => T | Promise<T>): Promise<T>;
+  insertMessage?(message: OutboxMessage): Promise<OutboxMessage>;
+  claimMessage?(owner: string, leaseMs: number): Promise<OutboxMessage | undefined>;
+  markSent?(message: OutboxMessage, owner: string, sentEventId: string): Promise<void>;
+  markFailed?(message: OutboxMessage, owner: string, error: string): Promise<void>;
+  getMessage?(id: string): Promise<OutboxMessage | undefined>;
+  pendingMessages?(): Promise<OutboxMessage[]>;
 }
 
 export class MemoryOutboxStore implements OutboxStore {
@@ -359,6 +404,7 @@ export class FileOutboxStore implements OutboxStore {
 /** Transactional-outbox 语义：enqueue 落盘成功后才尝试发布，发布依靠 event 幂等键去重。 */
 export class DurableOutbox {
   private tail: Promise<unknown> = Promise.resolve();
+  private readonly owner = `outbox-${process.pid}-${randomUUID()}`;
 
   constructor(
     readonly store: OutboxStore,
@@ -384,22 +430,23 @@ export class DurableOutbox {
       ...event,
       idempotencyKey: event.idempotencyKey ?? `outbox:${randomUUID()}`,
     };
+    const now = new Date().toISOString();
+    const proposed: OutboxMessage = {
+      id: `out_${randomUUID()}`,
+      status: "pending",
+      event: stableEvent,
+      attempts: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (this.store.insertMessage) return this.store.insertMessage(proposed);
     return this.transact(async (messages) => {
       const duplicate = messages.find(
         (message) => message.event.idempotencyKey === stableEvent.idempotencyKey,
       );
       if (duplicate) return { ...duplicate, event: { ...duplicate.event } };
-      const now = new Date().toISOString();
-      const message: OutboxMessage = {
-        id: `out_${randomUUID()}`,
-        status: "pending",
-        event: stableEvent,
-        attempts: 0,
-        createdAt: now,
-        updatedAt: now,
-      };
-      messages.push(message);
-      return { ...message, event: { ...message.event } };
+      messages.push(proposed);
+      return { ...proposed, event: { ...proposed.event } };
     });
   }
 
@@ -407,28 +454,35 @@ export class DurableOutbox {
     const published: RuntimeEvent[] = [];
     // 每条投递后立即持久化 ack，避免一个大批次末尾崩溃导致全部重发；重发本身也幂等。
     for (;;) {
-      const pending = (await this.store.read()).find((message) => message.status === "pending");
+      const pending = this.store.claimMessage
+        ? await this.store.claimMessage(this.owner, 60_000)
+        : (await this.store.read()).find((message) => message.status === "pending");
       if (!pending || published.length >= limit) break;
       try {
         const event = await this.runtime.record(pending.event);
-        await this.transact(async (messages) => {
-          const current = messages.find((message) => message.id === pending.id);
-          if (!current) return;
-          current.status = "sent";
-          current.sentEventId = event.id;
-          current.attempts++;
-          current.updatedAt = new Date().toISOString();
-          delete current.error;
-        });
+        if (this.store.markSent) await this.store.markSent(pending, this.owner, event.id);
+        else
+          await this.transact(async (messages) => {
+            const current = messages.find((message) => message.id === pending.id);
+            if (!current) return;
+            current.status = "sent";
+            current.sentEventId = event.id;
+            current.attempts++;
+            current.updatedAt = new Date().toISOString();
+            delete current.error;
+          });
         published.push(event);
       } catch (error) {
-        await this.transact(async (messages) => {
-          const current = messages.find((message) => message.id === pending.id);
-          if (!current) return;
-          current.attempts++;
-          current.error = error instanceof Error ? error.message : String(error);
-          current.updatedAt = new Date().toISOString();
-        });
+        const message = error instanceof Error ? error.message : String(error);
+        if (this.store.markFailed) await this.store.markFailed(pending, this.owner, message);
+        else
+          await this.transact(async (messages) => {
+            const current = messages.find((candidate) => candidate.id === pending.id);
+            if (!current) return;
+            current.attempts++;
+            current.error = message;
+            current.updatedAt = new Date().toISOString();
+          });
         throw error;
       }
     }
@@ -442,7 +496,9 @@ export class DurableOutbox {
       (candidate) => candidate.idempotencyKey === message.event.idempotencyKey,
     );
     if (published) return published;
-    const sent = (await this.store.read()).find((candidate) => candidate.id === message.id);
+    const sent = this.store.getMessage
+      ? await this.store.getMessage(message.id)
+      : (await this.store.read()).find((candidate) => candidate.id === message.id);
     if (!sent?.sentEventId) throw new Error(`Outbox message ${message.id} was not published`);
     const existing = (await this.runtime.events(message.event.streamId)).find(
       (candidate) => candidate.id === sent.sentEventId,
@@ -452,6 +508,7 @@ export class DurableOutbox {
   }
 
   async pending(): Promise<OutboxMessage[]> {
+    if (this.store.pendingMessages) return this.store.pendingMessages();
     return (await this.store.read()).filter((message) => message.status === "pending");
   }
 }

@@ -14,6 +14,7 @@ import { Bridge } from "./bridge.js";
 const RENDERER_DEV_URL = process.env["ELECTRON_RENDERER_URL"];
 
 let bridge: Bridge | undefined;
+let shutdownStarted = false;
 
 async function createBridge(): Promise<Bridge> {
   const userData = app.getPath("userData");
@@ -74,7 +75,13 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("will-quit", () => {
-  bridge?.dispose();
+app.on("will-quit", (event) => {
+  if (shutdownStarted) return;
+  event.preventDefault();
+  shutdownStarted = true;
+  const current = bridge;
   bridge = undefined;
+  void (current?.dispose() ?? Promise.resolve())
+    .catch((error) => console.error("anicode app: resource shutdown failed", error))
+    .finally(() => app.quit());
 });

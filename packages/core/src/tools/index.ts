@@ -32,6 +32,8 @@ export {
   parseTavilyResponse,
   parseBraveResponse,
   webSearchBackendFromEnv,
+  webSearchBackendFromBroker,
+  type BrokerWebSearchOptions,
   type WebSearchBackend,
   type WebSearchResult,
   type WebSearchQuery,

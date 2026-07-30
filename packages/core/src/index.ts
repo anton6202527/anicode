@@ -277,23 +277,38 @@ export {
   type SlsaProvenanceInput,
 } from "./runtime/github-delivery.js";
 export {
+  GitHubAppInstallationTokenSource,
+  type GitHubAccessTokenProvider,
+  type GitHubAppInstallationTokenOptions,
+} from "./runtime/github-app.js";
+export {
   GitHubWebhookController,
   GitHubWebhookServer,
   verifyGitHubWebhookSignature,
   createGitHubRepairWorker,
+  createGitHubAgentWorker,
+  createGitHubWorkflowExecutor,
   type GitHubWebhookControllerOptions,
   type GitHubWebhookResult,
   type GitHubRepairJob,
   type GitHubRepairWorkerOptions,
+  type GitHubAgentJobType,
+  type GitHubAgentWorkerResult,
+  type GitHubAgentWorkerOptions,
 } from "./runtime/github-webhook.js";
 export {
   MemoryArtifactStore,
   FileArtifactStore,
+  S3ArtifactStore,
+  configuredS3ArtifactStoreFromEnv,
   type Artifact,
   type ArtifactKind,
   type ArtifactInput,
+  type ArtifactStreamInput,
   type ArtifactRecord,
+  type ArtifactStreamRecord,
   type ArtifactStore,
+  type S3ArtifactStoreOptions,
 } from "./runtime/artifacts.js";
 export {
   DurableRuntime,
@@ -361,6 +376,7 @@ export {
   type OpenTelemetryTracerLike,
   type RecordedSpan,
   type OtlpHttpTelemetryOptions,
+  type TelemetryExporterStats,
   type TelemetryFromEnvOptions,
 } from "./runtime/telemetry.js";
 export {
@@ -376,15 +392,24 @@ export {
   type ContainerIsolatedRuntimeOptions,
 } from "./runtime/container-runtime.js";
 export {
+  TransactionalExecutionRuntime,
+  type TransactionalExecutionRuntimeOptions,
+} from "./runtime/transactional-runtime.js";
+export {
   KubernetesJobRuntime,
   type KubernetesJobRuntimeOptions,
 } from "./runtime/kubernetes-runtime.js";
 export {
   RemoteRuntimeHttpServer,
   RemoteExecutionService,
+  createClaimRemoteRuntimeAuthorizer,
   type RemoteRuntimeServerOptions,
   type RemoteExecutionRequest,
   type RemoteExecutionView,
+  type RemoteIdentity,
+  type RemoteExecutionGrant,
+  type RemoteRuntimeAuthorizer,
+  type ClaimRemoteRuntimeAuthorizerOptions,
 } from "./runtime/remote-server.js";
 export {
   createRemoteOidcAuthenticator,
@@ -468,6 +493,7 @@ export {
   type TypedCodeFile,
   type TypedCodeSymbol,
   type TypedCodeReference,
+  type CodeReferenceKind,
   type TypedGraphSearchHit,
   type CodeLanguage,
   type CodeRange,
@@ -503,6 +529,8 @@ export {
   parseTavilyResponse,
   parseBraveResponse,
   webSearchBackendFromEnv,
+  webSearchBackendFromBroker,
+  type BrokerWebSearchOptions,
   type WebSearchBackend,
   type WebSearchResult,
   type WebSearchQuery,

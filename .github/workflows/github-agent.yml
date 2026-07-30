@@ -1,0 +1,115 @@
+name: AniCode GitHub Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_type: { description: Durable job type, required: true, type: string }
+      delivery_id: { description: GitHub delivery id, required: true, type: string }
+      head_sha: { description: Commit to inspect or repair, required: true, type: string }
+      repository: { description: Expected owner/repository, required: true, type: string }
+      installation_id: { description: GitHub App installation id, required: false, type: string }
+      pull_request_number: { description: Pull request number, required: false, type: string }
+      head_ref: { description: Pull request head ref, required: false, type: string }
+      base_ref: { description: Pull request base ref, required: false, type: string }
+      failed_url: { description: Failed check URL, required: false, type: string }
+      traceparent: { description: W3C trace context, required: false, type: string }
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+  id-token: write
+
+concurrency:
+  group: anicode-agent-${{ inputs.repository }}-${{ inputs.head_sha }}-${{ inputs.job_type }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    if: ${{ vars.ANICODE_GITHUB_AGENT_ENABLED == 'true' && inputs.repository == github.repository }}
+    runs-on: ${{ vars.ANICODE_GITHUB_AGENT_RUNNER_SCALE_SET || 'anicode-ephemeral-agent' }}
+    timeout-minutes: 90
+    env:
+      ANICODE_GITHUB_JOB_TYPE: ${{ inputs.job_type }}
+      ANICODE_GITHUB_HEAD_SHA: ${{ inputs.head_sha }}
+      ANICODE_GITHUB_FAILED_URL: ${{ inputs.failed_url }}
+      ANICODE_GITHUB_MODEL: ${{ vars.ANICODE_GITHUB_MODEL }}
+      ANICODE_GITHUB_RESULT: ${{ runner.temp }}/anicode-github-result.json
+      ANICODE_CREDENTIAL_BACKEND: vault
+      VAULT_ADDR: ${{ vars.ANICODE_VAULT_ADDR }}
+      VAULT_NAMESPACE: ${{ vars.ANICODE_VAULT_NAMESPACE }}
+      ANICODE_VAULT_ROLE: ${{ vars.ANICODE_VAULT_ROLE }}
+      ANICODE_VAULT_PREFIX: ${{ vars.ANICODE_VAULT_PREFIX || 'anicode' }}
+      ANICODE_CREDENTIAL_KEYS: ${{ vars.ANICODE_CREDENTIAL_KEYS }}
+      ANICODE_NETWORK_ALLOW_DOMAINS: ${{ vars.ANICODE_AGENT_NETWORK_ALLOW_DOMAINS }}
+      ANICODE_EXECUTION_BACKEND: container
+      ANICODE_RUNTIME_IMAGE: ${{ vars.ANICODE_AGENT_RUNTIME_IMAGE }}
+      ANICODE_CONTAINER_NETWORK: ${{ vars.ANICODE_AGENT_CONTAINER_NETWORK }}
+      ANICODE_CONTAINER_PROXY_URL: ${{ vars.ANICODE_AGENT_CONTAINER_PROXY_URL }}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.ANICODE_OTEL_ENDPOINT }}
+      OTEL_SERVICE_NAME: anicode-github-agent
+      TRACEPARENT: ${{ inputs.traceparent }}
+    steps:
+      - name: Validate dispatch boundary
+        env:
+          EXPECTED_INSTALLATION: ${{ vars.ANICODE_GITHUB_INSTALLATION_ID }}
+          DISPATCH_REPOSITORY: ${{ inputs.repository }}
+          DISPATCH_INSTALLATION: ${{ inputs.installation_id }}
+          DISPATCH_HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          test "$DISPATCH_REPOSITORY" = "$GITHUB_REPOSITORY"
+          test -n "$EXPECTED_INSTALLATION"
+          test "$DISPATCH_INSTALLATION" = "$EXPECTED_INSTALLATION"
+          printf '%s' "$DISPATCH_HEAD_SHA" | grep -Eq '^[0-9a-fA-F]{40,64}$'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Run headless agent and deterministic verifier
+        run: npm run github-agent --workspace @anicode/core
+      - name: Publish repair branch and pull request
+        if: ${{ inputs.job_type == 'github-repair' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_ID: ${{ inputs.delivery_id }}
+          BASE_REF: ${{ inputs.base_ref || github.event.repository.default_branch }}
+        run: |
+          if git diff --quiet && test -z "$(git ls-files --others --exclude-standard)"; then
+            echo "Agent produced no source changes."
+            exit 0
+          fi
+          branch="anicode/repair-${DELIVERY_ID:0:36}"
+          remote_sha="$(git ls-remote --heads origin "$branch" | awk '{print $1}')"
+          if test -n "$remote_sha"; then
+            git fetch origin "$branch:refs/remotes/origin/$branch"
+            git switch -C "$branch"
+          else
+            git switch -c "$branch"
+          fi
+          git config user.name "anicode[bot]"
+          git config user.email "anicode[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "fix: repair failed CI (${DELIVERY_ID})"
+          if test -n "$remote_sha"; then
+            git push --force-with-lease="refs/heads/$branch:$remote_sha" --set-upstream origin "$branch"
+          else
+            git push --set-upstream origin "$branch"
+          fi
+          if test -z "$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')"; then
+            gh pr create --draft --base "$BASE_REF" --head "$branch" \
+              --title "fix: automated CI repair" \
+              --body "Automated repair for delivery \`$DELIVERY_ID\`. Deterministic verification passed in workflow \`$GITHUB_RUN_ID\`."
+          fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anicode-github-agent-${{ inputs.delivery_id }}
+          path: ${{ runner.temp }}/anicode-github-result.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -67,11 +67,14 @@ test("GitHub webhook: HMAC、delivery 去重、失败修复、Check Run 与 merg
     queue,
     delivery,
     telemetry,
+    expectedRepository: "owner/repo",
+    expectedInstallationId: 42,
   });
   const payload = Buffer.from(
     JSON.stringify({
       action: "completed",
       repository: { full_name: "owner/repo" },
+      installation: { id: 42 },
       workflow_run: {
         head_sha: "a".repeat(40),
         conclusion: "failure",
@@ -101,6 +104,7 @@ test("GitHub webhook: HMAC、delivery 去重、失败修复、Check Run 与 merg
   assert.equal((await queue.list()).length, 1);
   assert.equal(((await queue.list())[0]?.payload as any).pullRequestNumber, 7);
   assert.equal(((await queue.list())[0]?.payload as any).pullRequestNodeId, "PR_node");
+  assert.equal(((await queue.list())[0]?.payload as any).installationId, 42);
   await assert.rejects(
     () =>
       controller.handle({

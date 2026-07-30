@@ -47,21 +47,27 @@ export interface TypedCodeReference {
   range: CodeRange;
   fromSymbolId?: string;
   targetSymbolIds: string[];
+  kind: CodeReferenceKind;
   resolution: "tree-sitter" | "lsp" | "unresolved";
 }
+
+export type CodeReferenceKind = "call" | "import" | "type" | "inheritance" | "reference";
 
 export interface TypedCodeFile {
   path: string;
   language: CodeLanguage;
   size: number;
   mtimeMs: number;
+  mtimeNs: string;
+  ctimeNs: string;
+  inode: string;
   hash: string;
   symbols: TypedCodeSymbol[];
   references: TypedCodeReference[];
 }
 
 export interface TypedCodeGraphSnapshot {
-  version: 3;
+  version: 4;
   root: string;
   updatedAt: string;
   files: Record<string, TypedCodeFile>;
@@ -88,6 +94,8 @@ export interface TypedCodeGraphOptions {
   embeddingDimensions?: number;
   maxLspSymbolsPerFile?: number;
   maxLspReferencesPerFile?: number;
+  maxLspInvalidatedFiles?: number;
+  embeddingBatchSize?: number;
 }
 
 const SKIP = new Set([
@@ -196,6 +204,44 @@ function symbolId(file: string, name: string, range: CodeRange): string {
     .slice(0, 24)}`;
 }
 
+function referenceKind(node: SgNode): CodeReferenceKind {
+  const ancestors = node.ancestors().slice(0, 8);
+  const kinds = ancestors.map((ancestor) => String(ancestor.kind()));
+  if (
+    kinds.some((kind) =>
+      /(?:import|use_declaration|use_list|extern_crate|package_clause)/.test(kind),
+    )
+  ) {
+    return "import";
+  }
+  if (kinds.some((kind) => /(?:extends|implements|superclass|trait_bounds)/.test(kind))) {
+    return "inheritance";
+  }
+  if (
+    kinds.some((kind) =>
+      /(?:type_annotation|generic_type|type_arguments|type_parameter|return_type)/.test(kind),
+    )
+  ) {
+    return "type";
+  }
+  const call = ancestors.find((ancestor) =>
+    /^(?:call_expression|new_expression|object_creation_expression)$/.test(String(ancestor.kind())),
+  );
+  if (call) {
+    const callee = (call as unknown as { field(name: string): SgNode | null }).field(
+      String(call.kind()) === "new_expression" ? "constructor" : "function",
+    );
+    if (callee) {
+      const target = node.range();
+      const range = callee.range();
+      if (target.start.index >= range.start.index && target.end.index <= range.end.index) {
+        return "call";
+      }
+    }
+  }
+  return "reference";
+}
+
 function parseFile(relative: string, content: string): TypedCodeFile | undefined {
   const language = languageFor(relative);
   if (!language) return undefined;
@@ -250,6 +296,7 @@ function parseFile(relative: string, content: string): TypedCodeFile | undefined
           range,
           ...(nextOwner ? { fromSymbolId: nextOwner.id } : {}),
           targetSymbolIds: [],
+          kind: referenceKind(node),
           resolution: "unresolved",
         });
       }
@@ -262,6 +309,9 @@ function parseFile(relative: string, content: string): TypedCodeFile | undefined
     language: language.language,
     size: Buffer.byteLength(content),
     mtimeMs: 0,
+    mtimeNs: "0",
+    ctimeNs: "0",
+    inode: "0:0",
     hash: hash(content),
     symbols,
     references,
@@ -289,8 +339,16 @@ export class TypedCodeGraph {
   private snapshot: TypedCodeGraphSnapshot | undefined;
   private readonly indexFile: string;
   private readonly vectors: VectorStore;
+  private readonly ownsVectors: boolean;
   private readonly namespace: string;
-  readonly stats = { parsed: 0, reused: 0, removed: 0, lspEnriched: 0, lspResolved: 0 };
+  readonly stats = {
+    parsed: 0,
+    reused: 0,
+    removed: 0,
+    lspEnriched: 0,
+    lspResolved: 0,
+    lspInvalidated: 0,
+  };
 
   constructor(
     readonly root: string,
@@ -298,12 +356,13 @@ export class TypedCodeGraph {
   ) {
     this.root = path.resolve(root);
     this.indexFile =
-      options.indexFile ?? path.join(this.root, ".anicode", "typed-code-graph-v3.json");
+      options.indexFile ?? path.join(this.root, ".anicode", "typed-code-graph-v4.json");
     this.vectors =
       options.vectorStore ??
       new SqliteVectorStore(
         options.vectorFile ?? path.join(this.root, ".anicode", "code-vectors.db"),
       );
+    this.ownsVectors = !options.vectorStore;
     this.namespace = `repo:${createHash("sha256").update(this.root).digest("hex").slice(0, 24)}`;
   }
 
@@ -313,17 +372,28 @@ export class TypedCodeGraph {
     this.stats.removed = 0;
     this.stats.lspEnriched = 0;
     this.stats.lspResolved = 0;
+    this.stats.lspInvalidated = 0;
     const previous = await this.load();
     const paths: string[] = [];
     await walk(this.root, paths, this.options.maxFiles ?? 5_000);
     const files: Record<string, TypedCodeFile> = {};
     const changed: TypedCodeFile[] = [];
     for (const absolute of paths) {
-      const stat = await fs.stat(absolute);
-      if (stat.size > (this.options.maxFileBytes ?? 512 * 1024)) continue;
+      const stat = await fs.stat(absolute, { bigint: true });
+      const size = Number(stat.size);
+      if (size > (this.options.maxFileBytes ?? 512 * 1024)) continue;
       const relative = path.relative(this.root, absolute);
       const cached = previous?.files[relative];
-      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+      const inode = `${stat.dev}:${stat.ino}`;
+      const mtimeNs = stat.mtimeNs.toString();
+      const ctimeNs = stat.ctimeNs.toString();
+      if (
+        cached &&
+        cached.size === size &&
+        cached.mtimeNs === mtimeNs &&
+        cached.ctimeNs === ctimeNs &&
+        cached.inode === inode
+      ) {
         files[relative] = cached;
         this.stats.reused++;
         continue;
@@ -331,18 +401,23 @@ export class TypedCodeGraph {
       const content = await fs.readFile(absolute, "utf8");
       const parsed = parseFile(relative, content);
       if (!parsed) continue;
-      parsed.size = stat.size;
-      parsed.mtimeMs = stat.mtimeMs;
+      parsed.size = size;
+      parsed.mtimeMs = Number(stat.mtimeNs) / 1_000_000;
+      parsed.mtimeNs = mtimeNs;
+      parsed.ctimeNs = ctimeNs;
+      parsed.inode = inode;
       await this.enrichWithLsp(absolute, parsed);
       files[relative] = parsed;
       changed.push(parsed);
       this.stats.parsed++;
     }
-    this.stats.removed = Object.keys(previous?.files ?? {}).filter((file) => !files[file]).length;
+    const removedPaths = Object.keys(previous?.files ?? {}).filter((file) => !files[file]);
+    this.stats.removed = removedPaths.length;
+    const lspCandidates = this.invalidateDependentLspEdges(previous, files, changed, removedPaths);
     this.resolveReferences(files);
-    await this.resolveReferencesWithLsp(changed, files);
+    await this.resolveReferencesWithLsp(lspCandidates, files);
     this.snapshot = {
-      version: 3,
+      version: 4,
       root: this.root,
       updatedAt: new Date().toISOString(),
       files,
@@ -392,6 +467,50 @@ export class TypedCodeGraph {
       }
       this.stats.lspEnriched++;
     }
+  }
+
+  private invalidateDependentLspEdges(
+    previous: TypedCodeGraphSnapshot | undefined,
+    files: Record<string, TypedCodeFile>,
+    changed: TypedCodeFile[],
+    removedPaths: string[],
+  ): TypedCodeFile[] {
+    if (!previous || !this.options.lspPool) return changed;
+    const changedPaths = new Set([...changed.map((file) => file.path), ...removedPaths]);
+    if (changedPaths.size === 0) return changed;
+    const previousSymbolPaths = new Map<string, string>();
+    const affectedNames = new Set<string>();
+    for (const [filePath, file] of Object.entries(previous.files)) {
+      for (const symbol of file.symbols) {
+        previousSymbolPaths.set(symbol.id, filePath);
+        if (changedPaths.has(filePath) && symbol.name.length > 2) {
+          affectedNames.add(symbol.name.toLowerCase());
+        }
+      }
+    }
+    for (const file of changed) {
+      for (const symbol of file.symbols) {
+        if (symbol.name.length > 2) affectedNames.add(symbol.name.toLowerCase());
+      }
+    }
+    const dependent: TypedCodeFile[] = [];
+    for (const file of Object.values(files)) {
+      if (changedPaths.has(file.path)) continue;
+      let invalidated = false;
+      for (const reference of file.references) {
+        if (reference.resolution !== "lsp") continue;
+        const pointsToChangedFile = reference.targetSymbolIds.some((id) =>
+          changedPaths.has(previousSymbolPaths.get(id) ?? ""),
+        );
+        if (!pointsToChangedFile && !affectedNames.has(reference.name.toLowerCase())) continue;
+        reference.targetSymbolIds = [];
+        reference.resolution = "unresolved";
+        invalidated = true;
+      }
+      if (invalidated) dependent.push(file);
+    }
+    this.stats.lspInvalidated = dependent.length;
+    return [...changed, ...dependent.slice(0, this.options.maxLspInvalidatedFiles ?? 250)];
   }
 
   private resolveReferences(files: Record<string, TypedCodeFile>): void {
@@ -492,26 +611,44 @@ export class TypedCodeGraph {
   ): Promise<void> {
     const texts = changed.map(
       (file) =>
-        `${file.path}\n${file.symbols.map((symbol) => `${symbol.kind} ${symbol.signature}`).join("\n")}`,
+        `${file.path}\n${file.symbols.map((symbol) => `${symbol.kind} ${symbol.signature}`).join("\n")}` +
+        `\nreferences ${[...new Set(file.references.map((reference) => reference.name))].slice(0, 256).join(" ")}`,
     );
-    const vectors = this.options.embedding
-      ? await this.options.embedding(texts)
-      : texts.map((text) => localCodeEmbedding(text, this.options.embeddingDimensions ?? 384));
-    await this.vectors.upsert(
-      changed.flatMap((file, index) => {
-        const embedding = vectors[index];
-        if (!embedding) return [];
-        return [
-          {
-            namespace: this.namespace,
-            id: file.path,
-            embedding,
-            content: texts[index]!,
-            metadata: { path: file.path, language: file.language, hash: file.hash },
-          },
-        ];
-      }),
-    );
+    const batchSize = this.options.embeddingBatchSize ?? 64;
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 1_000) {
+      throw new Error("embeddingBatchSize must be between 1 and 1000");
+    }
+    let dimensions = this.options.embeddingDimensions;
+    for (let offset = 0; offset < changed.length; offset += batchSize) {
+      const batchFiles = changed.slice(offset, offset + batchSize);
+      const batchTexts = texts.slice(offset, offset + batchSize);
+      const embeddings = this.options.embedding
+        ? await this.options.embedding(batchTexts)
+        : batchTexts.map((text) => localCodeEmbedding(text, dimensions ?? 384));
+      if (embeddings.length !== batchFiles.length) {
+        throw new Error("Embedding provider returned an unexpected batch size");
+      }
+      dimensions ??= embeddings[0]?.length;
+      for (const embedding of embeddings) {
+        if (
+          !embedding ||
+          embedding.length === 0 ||
+          embedding.length !== dimensions ||
+          embedding.some((value) => !Number.isFinite(value))
+        ) {
+          throw new Error("Embedding provider returned an invalid vector");
+        }
+      }
+      await this.vectors.upsert(
+        batchFiles.map((file, index) => ({
+          namespace: this.namespace,
+          id: file.path,
+          embedding: embeddings[index]!,
+          content: batchTexts[index]!,
+          metadata: { path: file.path, language: file.language, hash: file.hash },
+        })),
+      );
+    }
     await this.vectors.deleteExcept(this.namespace, new Set(Object.keys(files)));
   }
 
@@ -527,6 +664,16 @@ export class TypedCodeGraph {
     const semanticByPath = new Map(vectorHits.map((hit) => [hit.id, hit.score]));
     const symbols = Object.values(snapshot.files).flatMap((file) => file.symbols);
     const symbolById = new Map(symbols.map((symbol) => [symbol.id, symbol]));
+    const incomingBySymbol = new Map<string, Set<string>>();
+    for (const file of Object.values(snapshot.files)) {
+      for (const reference of file.references) {
+        for (const target of reference.targetSymbolIds) {
+          const incoming = incomingBySymbol.get(target) ?? new Set<string>();
+          incoming.add(file.path);
+          incomingBySymbol.set(target, incoming);
+        }
+      }
+    }
     return Object.values(snapshot.files)
       .map((file) => {
         let lexical = 0;
@@ -541,11 +688,29 @@ export class TypedCodeGraph {
           }
           for (const reference of file.references) {
             if (reference.name.toLowerCase() !== term) continue;
-            graph += 2;
+            graph +=
+              reference.kind === "inheritance"
+                ? 4
+                : reference.kind === "call"
+                  ? 3
+                  : reference.kind === "type"
+                    ? 2.5
+                    : reference.kind === "import"
+                      ? 2
+                      : 1.5;
             for (const target of reference.targetSymbolIds) {
               const destination = symbolById.get(target)?.path;
               if (destination && destination !== file.path) related.add(destination);
             }
+          }
+        }
+        for (const symbol of file.symbols) {
+          const incoming = incomingBySymbol.get(symbol.id) ?? new Set<string>();
+          for (const source of incoming) {
+            if (source !== file.path) related.add(source);
+          }
+          if (terms.some((term) => symbol.name.toLowerCase().includes(term))) {
+            graph += Math.min(6, incoming.size * 0.75);
           }
         }
         for (const reference of file.references) {
@@ -594,7 +759,7 @@ export class TypedCodeGraph {
   }
 
   async close(): Promise<void> {
-    await this.vectors.close?.();
+    if (this.ownsVectors) await this.vectors.close?.();
   }
 
   private async load(): Promise<TypedCodeGraphSnapshot | undefined> {
@@ -603,7 +768,7 @@ export class TypedCodeGraph {
       const parsed = JSON.parse(
         await fs.readFile(this.indexFile, "utf8"),
       ) as TypedCodeGraphSnapshot;
-      if (parsed.version === 3 && parsed.root === this.root) return parsed;
+      if (parsed.version === 4 && parsed.root === this.root) return parsed;
     } catch {
       // 衍生索引损坏时重建。
     }

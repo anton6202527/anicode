@@ -44,6 +44,10 @@ interface Args {
   python?: string | undefined;
   keepWorkspaces?: boolean | undefined;
   bootstrapBaseline?: boolean | undefined;
+  concurrency?: number | undefined;
+  shardIndex?: number | undefined;
+  shardCount?: number | undefined;
+  deferGate?: boolean | undefined;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -70,10 +74,41 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--python") args.python = argv[++i];
     else if (a === "--keep-workspaces") args.keepWorkspaces = true;
     else if (a === "--bootstrap-baseline") args.bootstrapBaseline = true;
+    else if (a === "--concurrency") args.concurrency = Number(argv[++i]);
+    else if (a === "--shard-index") args.shardIndex = Number(argv[++i]);
+    else if (a === "--shard-count") args.shardCount = Number(argv[++i]);
+    else if (a === "--defer-gate") args.deferGate = true;
     else if (a === "--help" || a === "-h") args.model = undefined;
     else throw new Error(`未知参数: ${a}`);
   }
   return args;
+}
+
+export function selectShard<T>(items: T[], index = 0, count = 1): T[] {
+  if (!Number.isInteger(count) || count < 1) throw new Error("--shard-count must be >= 1");
+  if (!Number.isInteger(index) || index < 0 || index >= count) {
+    throw new Error("--shard-index must be in [0, shard-count)");
+  }
+  return items.filter((_, itemIndex) => itemIndex % count === index);
+}
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  run: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(items.length, Math.max(1, concurrency)) }, async () => {
+      for (;;) {
+        const index = next++;
+        if (index >= items.length) return;
+        results[index] = await run(items[index]!);
+      }
+    }),
+  );
+  return results;
 }
 
 /** 与基线比较：通过率下降超容忍度则返回失败说明，否则 null。 */
@@ -98,6 +133,7 @@ async function main(): Promise<void> {
     console.error(
       "用法: npm run eval -- --model <provider/model> [--tasks id1,id2] [--lang js,go] " +
         "[--suite offline|real] [--kind fix,debug] [--max-turns N] [--limit N] " +
+        "[--concurrency N] [--shard-index N --shard-count N] " +
         "[--repomap] [--json out.json] " +
         "[--baseline prev.json] [--bootstrap-baseline] [--tolerance 0.06]",
     );
@@ -122,11 +158,15 @@ async function main(): Promise<void> {
   try {
     const created = createProvider(args.model);
     const results: TaskResult[] = [];
+    const concurrency = Math.max(1, Math.min(16, Math.floor(args.concurrency ?? 1)));
+    const shardIndex = Math.floor(args.shardIndex ?? 0);
+    const shardCount = Math.floor(args.shardCount ?? 1);
     if (suite === "real") {
       let tasks = REAL_REPO_TASKS;
       if (args.tasks) tasks = tasks.filter((task) => args.tasks!.includes(task.id));
       if (args.lang) tasks = tasks.filter((task) => args.lang!.includes(task.language));
       if (args.limit !== undefined) tasks = tasks.slice(0, Math.max(0, Math.floor(args.limit)));
+      tasks = selectShard(tasks, shardIndex, shardCount);
       if (tasks.length === 0) {
         console.error("没有匹配的真实仓库任务");
         process.exitCode = 2;
@@ -140,60 +180,78 @@ async function main(): Promise<void> {
         process.exitCode = 2;
         return;
       }
-      console.error(`跑 ${tasks.length} 个真实仓库任务 · 模型 ${args.model}…\n`);
-      for (const task of tasks) {
-        process.stderr.write(`  → ${task.id} (${task.language}) … `);
-        const result = await runRealRepoTask(task, {
-          provider: created.provider,
-          model: created.model,
-          ...(created.modelInfo ? { modelInfo: created.modelInfo } : {}),
-          ...(args.maxTurns ? { maxTurns: args.maxTurns } : {}),
-          ...(args.repomap ? { repomap: true } : {}),
-          ...(args.python ? { python: args.python } : {}),
-          ...(args.keepWorkspaces ? { keepWorkspace: true } : {}),
-          isolatedRuntime: runtimeStack.isolatedRuntime,
-          networkProxy: runtimeStack.networkProxy,
-          telemetry,
-        });
-        console.error(result.passed ? "✓" : `✗${result.error ? " (" + result.error + ")" : ""}`);
-        results.push(result);
-      }
+      console.error(
+        `跑 ${tasks.length} 个真实仓库任务 · 模型 ${args.model} · ` +
+          `分片 ${shardIndex + 1}/${shardCount} · 并发 ${concurrency}…\n`,
+      );
+      results.push(
+        ...(await mapConcurrent(tasks, concurrency, async (task) => {
+          process.stderr.write(`  → ${task.id} (${task.language}) … `);
+          const result = await runRealRepoTask(task, {
+            provider: created.provider,
+            model: created.model,
+            ...(created.modelInfo ? { modelInfo: created.modelInfo } : {}),
+            ...(args.maxTurns ? { maxTurns: args.maxTurns } : {}),
+            ...(args.repomap ? { repomap: true } : {}),
+            ...(args.python ? { python: args.python } : {}),
+            ...(args.keepWorkspaces ? { keepWorkspace: true } : {}),
+            isolatedRuntime: runtimeStack.isolatedRuntime,
+            networkProxy: runtimeStack.networkProxy,
+            telemetry,
+          });
+          console.error(result.passed ? "✓" : `✗${result.error ? " (" + result.error + ")" : ""}`);
+          return result;
+        })),
+      );
     } else {
       let tasks = BUILTIN_TASKS;
       if (args.tasks) tasks = tasks.filter((task) => args.tasks!.includes(task.id));
       if (args.lang) tasks = tasks.filter((task) => args.lang!.includes(task.lang));
       if (args.kind) tasks = tasks.filter((task) => args.kind!.includes(task.kind));
       if (args.limit !== undefined) tasks = tasks.slice(0, Math.max(0, Math.floor(args.limit)));
+      tasks = selectShard(tasks, shardIndex, shardCount);
       if (tasks.length === 0) {
         console.error("没有匹配的任务");
         process.exitCode = 2;
         return;
       }
-      console.error(`跑 ${tasks.length} 个离线任务 · 模型 ${args.model}…\n`);
-      for (const task of tasks) {
-        process.stderr.write(`  → ${task.id} … `);
-        const missing = missingRequirements(task);
-        if (missing.length > 0) {
-          console.error(`↷ 跳过（缺 ${missing.join(", ")}）`);
-          results.push(skippedResult(task, missing));
-          continue;
-        }
-        const result = await runTask(task, {
-          provider: created.provider,
-          model: created.model,
-          ...(created.modelInfo ? { modelInfo: created.modelInfo } : {}),
-          ...(args.maxTurns ? { maxTurns: args.maxTurns } : {}),
-          ...(args.repomap ? { repomap: true } : {}),
-          isolatedRuntime: runtimeStack.isolatedRuntime,
-          networkProxy: runtimeStack.networkProxy,
-          telemetry,
-        });
-        console.error(result.passed ? "✓" : `✗${result.error ? " (" + result.error + ")" : ""}`);
-        results.push(result);
-      }
+      console.error(
+        `跑 ${tasks.length} 个离线任务 · 模型 ${args.model} · ` +
+          `分片 ${shardIndex + 1}/${shardCount} · 并发 ${concurrency}…\n`,
+      );
+      results.push(
+        ...(await mapConcurrent(tasks, concurrency, async (task) => {
+          process.stderr.write(`  → ${task.id} … `);
+          const missing = missingRequirements(task);
+          if (missing.length > 0) {
+            console.error(`↷ 跳过（缺 ${missing.join(", ")}）`);
+            return skippedResult(task, missing);
+          }
+          const result = await runTask(task, {
+            provider: created.provider,
+            model: created.model,
+            ...(created.modelInfo ? { modelInfo: created.modelInfo } : {}),
+            ...(args.maxTurns ? { maxTurns: args.maxTurns } : {}),
+            ...(args.repomap ? { repomap: true } : {}),
+            isolatedRuntime: runtimeStack.isolatedRuntime,
+            networkProxy: runtimeStack.networkProxy,
+            telemetry,
+          });
+          console.error(result.passed ? "✓" : `✗${result.error ? " (" + result.error + ")" : ""}`);
+          return result;
+        })),
+      );
     }
 
-    const sum = summarize(args.model, results, args.repomap ? { repomap: true } : undefined);
+    const sum = summarize(args.model, results, {
+      ...(args.repomap ? { repomap: true } : {}),
+      suite,
+      shardIndex,
+      shardCount,
+      runtimeImage: process.env.ANICODE_RUNTIME_IMAGE ?? "local",
+      revision: process.env.GITHUB_SHA ?? process.env.ANICODE_EVAL_REVISION ?? "local",
+      catalog: suite === "real" ? "swe-bench-pinned-280-v1" : "offline",
+    });
     console.log("\n" + formatReport(sum));
     if (args.json) {
       await fs.writeFile(args.json, JSON.stringify(sum, null, 2), "utf8");
@@ -240,7 +298,7 @@ async function main(): Promise<void> {
     }
 
     // 无基线时：全通过退出 0，否则 1——便于把 eval 接进门禁/看板。
-    process.exitCode = sum.passed === sum.total ? 0 : 1;
+    process.exitCode = args.deferGate || sum.passed === sum.total ? 0 : 1;
   } finally {
     await telemetry.forceFlush?.();
     await runtimeStack.networkProxy.close();
