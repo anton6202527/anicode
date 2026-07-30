@@ -18,16 +18,29 @@ test("config: 全局与项目合并，项目覆盖全局", async () => {
   const { home, cwd, cleanup } = await tmp();
   await fs.writeFile(
     path.join(home, ".config", "anicode", "anicode.json"),
-    JSON.stringify({ model: "global/model", smallModel: true, mcp: { g: { command: "gcmd" } } }),
+    JSON.stringify({
+      model: "global/model",
+      smallModel: true,
+      mcp: { g: { command: "gcmd" } },
+      tui: { keybindings: { reconnect: "ctrl+x" } },
+    }),
   );
   await fs.writeFile(
     path.join(cwd, "anicode.json"),
-    JSON.stringify({ model: "proj/model", mcp: { p: { command: "pcmd", args: ["x"] } } }),
+    JSON.stringify({
+      model: "proj/model",
+      mcp: { p: { command: "pcmd", args: ["x"] } },
+      tui: { keybindings: { externalEditor: "ctrl+e" } },
+    }),
   );
   const { config, sources, warnings } = await loadConfig({ cwd, home });
   assert.equal(config.model, "proj/model"); // 项目覆盖
   assert.equal(config.smallModel, true); // 全局保留
   assert.deepEqual(Object.keys(config.mcp ?? {}).sort(), ["g", "p"]); // mcp 深合并
+  assert.deepEqual(config.tui?.keybindings, {
+    reconnect: "ctrl+x",
+    externalEditor: "ctrl+e",
+  });
   assert.equal(sources.length, 2);
   assert.deepEqual(warnings, []);
   await cleanup();

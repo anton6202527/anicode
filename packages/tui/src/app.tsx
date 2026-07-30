@@ -8,8 +8,26 @@
  */
 
 import * as os from "node:os";
-import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { Box, Text, useApp, useInput, useStdout, type DOMElement } from "ink";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
+import {
+  Box,
+  Text,
+  useApp,
+  useInput,
+  usePaste,
+  useStdout,
+  useWindowSize,
+  type DOMElement,
+  type Key,
+} from "ink";
 import {
   probeLocalProviders,
   discoverSkills,
@@ -25,6 +43,7 @@ import type {
   ModelCatalogEntry,
   PermissionAnswer,
   PermissionMode,
+  PendingPermission,
   ProviderDescriptor,
   SessionEvent,
   SessionHost,
@@ -43,12 +62,25 @@ import {
   type Item,
 } from "./transcript.js";
 import { ensureOllama } from "./ollama.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
+import { MarkdownText } from "./markdown.js";
+import { editInExternalEditor } from "./external-editor.js";
+import type { TerminalCaretController } from "./terminal-caret.js";
+import {
+  clampGraphemeIndex,
+  graphemes,
+  nextGraphemeIndex,
+  previousGraphemeIndex,
+  sliceTerminalColumns,
+} from "./text-layout.js";
 import {
   compositeFrame,
   buildModelPickerOverlay,
   buildSessionsOverlay,
   buildPermissionOverlay,
   buildCommandMenuOverlay,
+  permissionInputPreview,
+  permissionPatchPreview,
   hitTestSprite,
   windowHorizontally,
   dispWidth,
@@ -110,11 +142,34 @@ type Action =
   | { t: "title"; title: string }
   | { t: "todos"; todos: TodoItem[] };
 
+export const MAX_TRANSCRIPT_ROWS = 5_000;
+export const MAX_LIVE_TEXT_CHARS = 256 * 1024;
+const MAX_LIVE_THINKING_CHARS = 32 * 1024;
+
+export function boundTranscriptRows(rows: Row[], max = MAX_TRANSCRIPT_ROWS): Row[] {
+  if (rows.length <= max) return rows;
+  if (max <= 0) return [];
+  if (max === 1) return [rows[rows.length - 1]!];
+  // Preserve the session boundary at the top while bounding the append-only UI
+  // cache. Full history remains durable in SessionHost and can be reloaded.
+  return [rows[0]!, ...rows.slice(-(max - 1))];
+}
+
+function appendTranscriptRow(rows: Row[], row: Row): Row[] {
+  return boundTranscriptRows([...rows, row]);
+}
+
+function appendBoundedText(current: string, delta: string, max: number): string {
+  const next = current + delta;
+  if (next.length <= max) return next;
+  return `… ${t("older live output omitted", "较早的实时输出已省略")} …\n${next.slice(-max)}`;
+}
+
 function reducer(s: State, a: Action): State {
   switch (a.t) {
     case "reset":
       return {
-        items: a.items,
+        items: boundTranscriptRows(a.items),
         activeTools: a.activeTools,
         subagentActivity: new Map(),
         liveText: "",
@@ -130,19 +185,26 @@ function reducer(s: State, a: Action): State {
     case "opening":
       return { ...s, opening: a.v };
     case "push":
-      return { ...s, items: [...s.items, a.item] };
+      return { ...s, items: appendTranscriptRow(s.items, a.item) };
     case "live":
       // 正文开始流式后收起思考展示（对齐 Claude Code：thinking 只在酝酿期可见）。
-      return { ...s, liveText: s.liveText + a.delta, liveThinking: "" };
+      return {
+        ...s,
+        liveText: appendBoundedText(s.liveText, a.delta, MAX_LIVE_TEXT_CHARS),
+        liveThinking: "",
+      };
     case "liveThinking":
-      return { ...s, liveThinking: s.liveThinking + a.delta };
+      return {
+        ...s,
+        liveThinking: appendBoundedText(s.liveThinking, a.delta, MAX_LIVE_THINKING_CHARS),
+      };
     case "resetLive":
       return { ...s, liveText: "", liveThinking: "" };
     case "flushLive":
       if (!s.liveText) return s.liveThinking ? { ...s, liveThinking: "" } : s;
       return {
         ...s,
-        items: [...s.items, { kind: "assistant", text: s.liveText }],
+        items: appendTranscriptRow(s.items, { kind: "assistant", text: s.liveText }),
         liveText: "",
         liveThinking: "",
       };
@@ -182,7 +244,12 @@ function reducer(s: State, a: Action): State {
         subagentActivity = new Map(subagentActivity);
         subagentActivity.delete(a.id);
       }
-      return { ...s, activeTools, subagentActivity, items: [...s.items, item] };
+      return {
+        ...s,
+        activeTools,
+        subagentActivity,
+        items: appendTranscriptRow(s.items, item),
+      };
     }
     case "subagentActivity": {
       // 仅对仍在运行的 task 更新（tool_result 后 task 已从 activeTools 移除）。
@@ -204,9 +271,9 @@ function reducer(s: State, a: Action): State {
 
 /** 思考流只展示尾部：压平空白，按终端宽度截末尾——动态区高度不随思考长度增长。 */
 function thinkingTail(s: string, cols: number): string {
-  const flat = s.replace(/\s+/g, " ").trim();
+  const flat = sanitizeTerminalText(s).replace(/\s+/g, " ").trim();
   const max = Math.max(40, Math.min(cols * 2, 240));
-  return flat.length > max ? `…${flat.slice(-max)}` : flat;
+  return flat.length > max ? `…${flat.slice(nextGraphemeIndex(flat, flat.length - max))}` : flat;
 }
 
 const emptyUsage: Usage = {
@@ -215,6 +282,79 @@ const emptyUsage: Usage = {
   cacheReadTokens: 0,
   cacheWriteTokens: 0,
 };
+
+export const MAX_COMPOSER_BYTES = 128 * 1024;
+export const MAX_RENDERED_ITEM_CHARS = 64 * 1024;
+
+export function truncateInputBytes(
+  text: string,
+  maxBytes: number,
+): { text: string; truncated: boolean } {
+  if (maxBytes <= 0) return { text: "", truncated: text.length > 0 };
+  let bytes = 0;
+  let output = "";
+  for (const part of graphemes(text)) {
+    const size = Buffer.byteLength(part.text, "utf8");
+    if (bytes + size > maxBytes) return { text: output, truncated: true };
+    output += part.text;
+    bytes += size;
+  }
+  return { text: output, truncated: false };
+}
+
+/** Normalize untrusted clipboard/input chunks without ever interpreting LF as submit. */
+export function normalizePastedInput(
+  text: string,
+  maxBytes = MAX_COMPOSER_BYTES,
+): { text: string; truncated: boolean } {
+  const normalized = sanitizeTerminalText(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+  return truncateInputBytes(normalized, maxBytes);
+}
+
+export function terminalDisplayText(text: string, max = MAX_RENDERED_ITEM_CHARS): string {
+  const safe = sanitizeTerminalText(text);
+  if (safe.length <= max) return safe;
+  const start = nextGraphemeIndex(safe, safe.length - max);
+  return `… ${t("older display content omitted", "较早的显示内容已省略")} …\n${safe.slice(start)}`;
+}
+
+export function lineStart(text: string, cursor: number): number {
+  const safe = clampGraphemeIndex(text, cursor);
+  return safe === 0 ? 0 : text.lastIndexOf("\n", safe - 1) + 1;
+}
+
+export function lineEnd(text: string, cursor: number): number {
+  const safe = clampGraphemeIndex(text, cursor);
+  const newline = text.indexOf("\n", safe);
+  return newline < 0 ? text.length : newline;
+}
+
+/** Move one logical composer line while retaining the closest display column. */
+export function moveCursorLine(text: string, cursor: number, direction: -1 | 1): number {
+  const safe = clampGraphemeIndex(text, cursor);
+  const currentStart = lineStart(text, safe);
+  const desiredColumn = dispWidth(text.slice(currentStart, safe));
+  let targetStart: number;
+  let targetEnd: number;
+  if (direction < 0) {
+    if (currentStart === 0) return safe;
+    targetEnd = currentStart - 1;
+    targetStart = targetEnd === 0 ? 0 : text.lastIndexOf("\n", targetEnd - 1) + 1;
+  } else {
+    const currentEnd = lineEnd(text, safe);
+    if (currentEnd === text.length) return safe;
+    targetStart = currentEnd + 1;
+    targetEnd = lineEnd(text, targetStart);
+  }
+  let width = 0;
+  let target = targetStart;
+  for (const part of graphemes(text.slice(targetStart, targetEnd))) {
+    if (width + part.width > desiredColumn) break;
+    width += part.width;
+    target = targetStart + part.end;
+  }
+  return target;
+}
 
 /** 品牌名（欢迎页 logo 与状态栏）。 */
 export const APP_NAME = "AniCode Zen";
@@ -227,10 +367,19 @@ function builtinCommands(): CommandMenuRow[] {
       name: "status",
       description: t("Show current session, model and directory", "显示当前会话、模型与目录"),
     },
+    { name: "usage", description: t("Show token and cache usage", "显示 token 与缓存用量") },
     {
       name: "tasks",
       description: t("List background subagent tasks", "列出后台子 agent 任务"),
     },
+    {
+      name: "tool",
+      description: t(
+        "Toggle the latest tool output /tool [id]",
+        "展开/收起最近工具输出 /tool [id]",
+      ),
+    },
+    { name: "editor", description: t("Edit the prompt in $EDITOR", "使用 $EDITOR 编辑提示词") },
     {
       name: "providers",
       description: t("List providers and credential hints", "列出 provider 及凭证提示"),
@@ -243,6 +392,14 @@ function builtinCommands(): CommandMenuRow[] {
       ),
     },
     { name: "sessions", description: t("List recent sessions", "列出最近会话") },
+    { name: "reconnect", description: t("Reconnect the session stream", "重新连接会话事件流") },
+    {
+      name: "mouse",
+      description: t(
+        "Toggle mouse tracking; off keeps native text selection",
+        "切换鼠标跟踪；关闭时可原生框选文本",
+      ),
+    },
     {
       name: "resume",
       description: t("Resume an existing session /resume <id>", "载入已有会话 /resume <id>"),
@@ -460,7 +617,7 @@ interface FrameCompositor {
   setOverlay: (overlay: Sprite | null) => void;
 }
 
-function useFrameCompositor(): FrameCompositor {
+function useFrameCompositor(enabled: boolean): FrameCompositor {
   const targetRef = useRef<{ row: number; col: number } | null>(null);
   const overlayRef = useRef<Sprite | null>(null);
   // 最近一帧 Ink 的原始清屏帧；弹框开/关/翻页时据此立刻重合成，不必等下一次 Ink 渲染。
@@ -468,6 +625,7 @@ function useFrameCompositor(): FrameCompositor {
   const parkRef = useRef<() => void>(() => {});
   const repaintRef = useRef<() => void>(() => {});
   useEffect(() => {
+    if (!enabled) return;
     const out = process.stdout;
     if (!out.isTTY) return;
     const orig = out.write.bind(out) as (...args: unknown[]) => boolean;
@@ -500,7 +658,7 @@ function useFrameCompositor(): FrameCompositor {
       repaintRef.current = () => {};
       orig("\x1b[?25l");
     };
-  }, []);
+  }, [enabled]);
   const setCaret = useCallback((target: { row: number; col: number } | null) => {
     targetRef.current = target;
     parkRef.current();
@@ -516,29 +674,14 @@ function useFrameCompositor(): FrameCompositor {
 
 /** 终端尺寸（rows/cols）；resize 时更新。非 TTY（测试）给合理默认值。 */
 function useTerminalSize(): { rows: number; cols: number } {
-  const { stdout } = useStdout();
-  const read = (): { rows: number; cols: number } => ({
-    rows: stdout && stdout.rows > 0 ? stdout.rows : 24,
-    cols: stdout && stdout.columns > 0 ? stdout.columns : 80,
-  });
-  const [size, setSize] = useState(read);
-  useEffect(() => {
-    if (!stdout || typeof stdout.on !== "function") return;
-    const onResize = () => setSize(read());
-    stdout.on("resize", onResize);
-    return () => {
-      stdout.off?.("resize", onResize);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stdout]);
-  return size;
+  const { columns, rows } = useWindowSize();
+  return {
+    rows: rows > 0 ? rows : 24,
+    cols: columns > 0 ? columns : 80,
+  };
 }
 
-interface PendingPerm {
-  permId: string;
-  toolName: string;
-  ruleKey: string;
-}
+type PendingPerm = PendingPermission;
 
 interface SessionPickerState {
   rows: SessionSummary[];
@@ -563,6 +706,56 @@ export interface AppProps {
   mcpStatus?: () => Promise<string>;
   /** CLI 版本号，显示在底部状态栏。 */
   version?: string;
+  /** 是否启用 xterm 鼠标跟踪；默认关闭，保留终端原生框选/复制。 */
+  mouse?: boolean;
+  /** 旧 stdout 帧合成器仅保留为显式实验开关，生产默认走 Ink 原生渲染。 */
+  experimentalOverlay?: boolean;
+  /** Deterministic size override for embedding/tests; normal CLI uses useWindowSize. */
+  terminalSize?: { rows: number; cols: number };
+  keybindings?: Partial<Record<TuiKeybindingAction, string>>;
+  /** CLI sets this for a real TTY; embeddings/tests leave terminal modes untouched. */
+  terminalControl?: boolean;
+  /** CLI-owned absolute terminal caret used to anchor IME composition without global patches. */
+  terminalCaret?: TerminalCaretController;
+}
+
+export type TuiKeybindingAction =
+  | "commandPalette"
+  | "externalEditor"
+  | "reconnect"
+  | "toggleToolOutput"
+  | "permissionCycle"
+  | "quit";
+
+export const DEFAULT_KEYBINDINGS: Record<TuiKeybindingAction, string> = {
+  commandPalette: "ctrl+p",
+  externalEditor: "ctrl+g",
+  reconnect: "ctrl+r",
+  toggleToolOutput: "ctrl+o",
+  permissionCycle: "shift+tab",
+  quit: "ctrl+z",
+};
+
+export function matchesKeybinding(input: string, key: Key, binding: string): boolean {
+  const parts = binding
+    .toLowerCase()
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const primary = parts[parts.length - 1];
+  if (!primary) return false;
+  const wantsCtrl = parts.includes("ctrl");
+  const wantsShift = parts.includes("shift");
+  const wantsMeta = parts.includes("meta") || parts.includes("alt") || parts.includes("option");
+  if (key.ctrl !== wantsCtrl || key.meta !== wantsMeta) return false;
+  if (wantsShift && !key.shift) return false;
+  const rawCode = input.length === 1 ? input.charCodeAt(0) : 0;
+  const normalized =
+    rawCode >= 1 && rawCode <= 26 ? String.fromCharCode(96 + rawCode) : input.toLowerCase();
+  if (primary === "tab") return key.tab;
+  if (primary === "enter" || primary === "return") return key.return;
+  if (primary === "escape" || primary === "esc") return key.escape;
+  return normalized === primary;
 }
 
 export function App({
@@ -575,14 +768,37 @@ export function App({
   inspectProviderCredentials = false,
   commands = [],
   mcpStatus,
+  mouse = false,
+  experimentalOverlay = false,
+  terminalSize,
+  keybindings,
+  terminalControl = false,
+  terminalCaret,
 }: AppProps) {
-  const { exit } = useApp();
-  const { rows: termRows, cols: termCols } = useTerminalSize();
+  const { exit, suspendTerminal } = useApp();
+  const suspendTerminalWithCaret = useCallback(
+    async (callback: () => void | Promise<void>): Promise<void> => {
+      terminalCaret?.pause();
+      try {
+        await suspendTerminal(callback);
+      } finally {
+        terminalCaret?.resume();
+      }
+    },
+    [suspendTerminal, terminalCaret],
+  );
+  const detectedSize = useTerminalSize();
+  const termRows = Math.max(1, terminalSize?.rows ?? detectedSize.rows);
+  const termCols = Math.max(1, terminalSize?.cols ?? detectedSize.cols);
+  const bindings = useMemo(() => ({ ...DEFAULT_KEYBINDINGS, ...keybindings }), [keybindings]);
   const { stdout } = useStdout();
+  const [mouseTracking, setMouseTracking] = useState(mouse);
+  useEffect(() => setMouseTracking(mouse), [mouse]);
   // 浮层模式：仅当 Ink 直接驱动真实 TTY 时启用「盖屏弹框」帧合成；
   // ink-testing 用的是另一个 stdout（stdout !== process.stdout），仍走 in-tree 渲染，测试不受影响。
-  const overlayMode = stdout === process.stdout && !!process.stdout.isTTY;
+  const overlayMode = experimentalOverlay && terminalControl && !!stdout.isTTY;
   const [sessionId, setSessionId] = useState(initialId);
+  const [reconnectGeneration, reconnect] = useReducer((value: number) => value + 1, 0);
   const [state, dispatch] = useReducer(reducer, {
     items: [],
     activeTools: new Map(),
@@ -597,24 +813,24 @@ export function App({
     opening: true,
   });
   const [input, setInput] = useState("");
+  const [expandedToolIds, setExpandedToolIds] = useState<Set<string>>(() => new Set());
   // 光标位置（0..input.length）。用 ref 与渲染态双写，保证同 tick 内多次编辑基于最新值。
   const [cursor, setCursor] = useState(0);
   // 输入面板节点 + 真实光标停放（输入法候选框跟随真实光标）。
   const panelRef = useRef<DOMElement | null>(null);
-  const { setCaret, setOverlay } = useFrameCompositor();
+  const { setCaret, setOverlay } = useFrameCompositor(overlayMode);
+  const absoluteCaretEnabled =
+    terminalControl && !!stdout.isTTY && !overlayMode && terminalCaret?.enabled === true;
   const cursorRef = useRef(0);
   // 已提交行的历史，供 ↑/↓ 回溯（最新在末尾）。histRef 为当前浏览位置（null=不在浏览）。
   const historyRef = useRef<string[]>([]);
   const histPosRef = useRef<number | null>(null);
-  // PTY paste 可能一次把整段文本连同 \r/\n 交给 useInput；用 ref 保证同一 tick
-  // 内的分块输入也基于最新值，而不是 React 上一帧的闭包。
+  // 同一 tick 内的分块输入必须基于最新值，而不是 React 上一帧的闭包。
   const inputRef = useRef("");
-  // paste 的最后一个换行可能和前文分成多个 stdin chunk。延迟到当前 I/O
-  // 批次结束再提交，让后续 chunk 有机会合并并取消旧提交。
-  const pasteSubmitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 权限请求队列：并行只读工具可能同时产生多个 ask（如 askRules 命中），逐个裁决
   const [pendings, setPendings] = useState<PendingPerm[]>([]);
   const [permissionIndex, setPermissionIndex] = useState(0);
+  const [confirmAlwaysFor, setConfirmAlwaysFor] = useState<string | null>(null);
   const permissionIndexRef = useRef(0);
   const setPermissionSelection = useCallback((index: number) => {
     const value = ((index % 4) + 4) % 4;
@@ -623,9 +839,14 @@ export function App({
   }, []);
   const [sessions, setSessions] = useState<SessionPickerState | null>(null);
   const activePermissionId = pendings[0]?.permId;
+  const activePermissionRisk = pendings[0]?.risk;
   useEffect(() => {
-    setPermissionSelection(0);
-  }, [activePermissionId, setPermissionSelection]);
+    setPermissionSelection(activePermissionRisk === "high" ? 3 : 0);
+    setConfirmAlwaysFor(null);
+  }, [activePermissionId, activePermissionRisk, setPermissionSelection]);
+  useEffect(() => {
+    if (activePermissionId && terminalControl && stdout.isTTY) stdout.write("\x07");
+  }, [activePermissionId, stdout, terminalControl]);
   // /model 选择器：非空即打开，index 为高亮项，filter 为搜索词。
   const [picker, setPicker] = useState<{ rows: PickerRow[]; index: number; filter: string } | null>(
     null,
@@ -670,16 +891,39 @@ export function App({
     menuIndexRef.current = i;
     setMenuIndex(i);
   }, []);
-  // 真实 TTY 中持续接管 xterm 鼠标/滚轮事件：主结果区用滚轮回看内部历史，
-  // 弹框/菜单则用同一事件选择条目。这样终端不会滚动整块备用屏，输入区始终固定在底部。
-  // 需要选中终端文字时可按住 Shift（iTerm2、Terminal.app、VS Code Terminal 均支持）。
+  const menuWheelRef = useRef({ delta: 0, size: 0 });
+  const menuWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queueMenuWheel = useCallback(
+    (delta: number, size: number): void => {
+      menuWheelRef.current.delta += delta;
+      menuWheelRef.current.size = size;
+      if (menuWheelTimerRef.current) return;
+      menuWheelTimerRef.current = setTimeout(() => {
+        menuWheelTimerRef.current = null;
+        const pending = menuWheelRef.current;
+        menuWheelRef.current = { delta: 0, size: 0 };
+        if (pending.size > 0) {
+          setMenuIdx(Math.max(0, Math.min(menuIndexRef.current + pending.delta, pending.size - 1)));
+        }
+      }, 0);
+    },
+    [setMenuIdx],
+  );
+  useEffect(
+    () => () => {
+      if (menuWheelTimerRef.current) clearTimeout(menuWheelTimerRef.current);
+    },
+    [],
+  );
+  // 鼠标跟踪是显式 opt-in：默认让终端处理拖拽框选/复制，避免搜索结果和长回答
+  // 被 application mouse mode 拦截。开启后才接管点击/滚轮，键盘导航在两种模式下都可用。
   useEffect(() => {
-    if (!overlayMode) return;
+    if (!terminalControl || !stdout.isTTY || !mouseTracking) return;
     stdout.write("\x1b[?1000h\x1b[?1006h");
     return () => {
       stdout.write("\x1b[?1006l\x1b[?1000l");
     };
-  }, [overlayMode, stdout]);
+  }, [mouseTracking, stdout, terminalControl]);
   // 回看滚动偏移：0=贴底看最新，>0=结果视口向上回看的终端行数。
   const [scrollOffset, setScrollOffset] = useState(0);
   const transcriptViewportRef = useRef<DOMElement | null>(null);
@@ -781,21 +1025,16 @@ export function App({
     setSessions({ rows, index: current >= 0 ? current : 0, filter: "" });
   }, [host, sessionId]);
 
-  useEffect(
-    () => () => {
-      if (pasteSubmitRef.current) clearTimeout(pasteSubmitRef.current);
-    },
-    [],
-  );
-
-  // 订阅当前会话：载入 snapshot → 渲染，之后实时收事件
+  // 订阅当前会话：载入 snapshot → 渲染，远端流断开后指数退避重连。
   useEffect(() => {
     let closed = false;
-    let ready = false;
-    const buffered: SessionEvent[] = [];
+    let subscriptionGeneration = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let activeClose: (() => void) | null = null;
     closeRef.current?.();
     closeRef.current = null;
     setPendings([]);
+    setExpandedToolIds(new Set());
     setPermMode("default"); // 新会话回到默认模式
     dispatch({ t: "opening", v: true });
     // 事件合流：流式 token 高频到达时，把一帧内的事件攒成一批，
@@ -810,63 +1049,131 @@ export function App({
       for (const ev of batch) handleEvent(ev, dispatch, setPendings);
     };
     flushRef.current = flush;
-    const onEvent = (ev: SessionEvent) => {
-      if (closed) return;
-      if (!ready) {
-        buffered.push(ev);
-        return;
-      }
-      queue.push(ev);
-      if (!flushTimer) flushTimer = setTimeout(flush, 16);
-    };
-    void host
-      .open(sessionId, onEvent)
-      .then((handle) => {
-        if (closed) {
-          handle.close();
+    const MAX_RECONNECT_ATTEMPTS = 5;
+    const connect = (attempt: number): void => {
+      const generation = ++subscriptionGeneration;
+      let ready = false;
+      const buffered: SessionEvent[] = [];
+      const onEvent = (ev: SessionEvent) => {
+        if (closed || generation !== subscriptionGeneration) return;
+        if (!ready) {
+          buffered.push(ev);
           return;
         }
-        closeRef.current = handle.close;
-        const snap = handle.snapshot;
-        const restored = restoreTranscript(snap.messages);
-        // 会话边界始终保留在顶部；不再注入欢迎 logo。
-        const initialItems: Row[] = [sessionBoundary(snap.meta), ...restored.items];
-        dispatch({
-          t: "reset",
-          items: initialItems,
-          activeTools: restored.activeTools,
-          usage: snap.usage,
-          ...(snap.costUSD !== undefined ? { costUSD: snap.costUSD } : {}),
-          running: snap.running,
-          todos: todosFromMessages(snap.messages),
-          meta: {
-            id: snap.meta.id,
-            cwd: snap.meta.cwd,
-            model: snap.meta.model,
-            ...(snap.meta.title ? { title: snap.meta.title } : {}),
-          },
-        });
-        setPendings(snap.pendingPermissions);
-        setScrollOffset(0);
-        // open 先建立订阅再返回 snapshot。响应飞行期间的事件必须在
-        // snapshot 之后按原顺序回放，不能只特判 permission_request。
-        ready = true;
-        for (const ev of buffered) handleEvent(ev, dispatch, setPendings);
-      })
-      .catch((err) => {
-        if (closed) return;
+        queue.push(ev);
+        if (!flushTimer) flushTimer = setTimeout(flush, 16);
+      };
+      const retry = (error: unknown): void => {
+        if (closed || generation !== subscriptionGeneration) return;
+        activeClose = null;
+        closeRef.current = null;
         dispatch({ t: "opening", v: false });
-        dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
-      });
+        if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(
+                `Connection unavailable: ${errorMessage(error)}. Run /reconnect to retry.`,
+                `连接不可用：${errorMessage(error)}。运行 /reconnect 重试。`,
+              ),
+            },
+          });
+          return;
+        }
+        const delay = Math.min(8_000, 300 * 2 ** attempt);
+        if (attempt === 0) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(`Connection lost; retrying in ${delay}ms…`, `连接已断开；${delay}ms 后重试…`),
+            },
+          });
+        }
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect(attempt + 1);
+        }, delay);
+      };
+
+      void host
+        .open(sessionId, onEvent)
+        .then((handle) => {
+          if (closed || generation !== subscriptionGeneration) {
+            handle.close();
+            return;
+          }
+          activeClose = handle.close;
+          closeRef.current = handle.close;
+          const snap = handle.snapshot;
+          const restored = restoreTranscript(snap.messages);
+          const initialItems: Row[] = [sessionBoundary(snap.meta), ...restored.items];
+          dispatch({
+            t: "reset",
+            items: initialItems,
+            activeTools: restored.activeTools,
+            usage: snap.usage,
+            ...(snap.costUSD !== undefined ? { costUSD: snap.costUSD } : {}),
+            running: snap.running,
+            todos: todosFromMessages(snap.messages),
+            meta: {
+              id: snap.meta.id,
+              cwd: snap.meta.cwd,
+              model: snap.meta.model,
+              ...(snap.meta.title ? { title: snap.meta.title } : {}),
+            },
+          });
+          setPendings(snap.pendingPermissions);
+          setScrollOffset(0);
+          ready = true;
+          for (const ev of buffered) handleEvent(ev, dispatch, setPendings);
+          if (attempt > 0) {
+            dispatch({
+              t: "push",
+              item: { kind: "info", text: t("Connection restored", "连接已恢复") },
+            });
+          }
+          void handle.closed?.then((error) => {
+            if (closed || generation !== subscriptionGeneration) return;
+            handle.close();
+            retry(error ?? new Error(t("subscription closed", "订阅已关闭")));
+          });
+        })
+        .catch(retry);
+    };
+    connect(0);
     return () => {
       closed = true;
+      subscriptionGeneration++;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
       flushRef.current = null;
-      closeRef.current?.();
+      activeClose?.();
       closeRef.current = null;
     };
-  }, [host, sessionId]);
+  }, [host, reconnectGeneration, sessionId]);
+
+  const toggleToolDetail = useCallback(
+    (requestedId?: string): boolean => {
+      const tools = state.items.filter(
+        (item): item is Extract<Item, { kind: "tool" }> => item.kind === "tool" && !!item.detail,
+      );
+      const target = requestedId
+        ? tools.find((tool) => tool.id === requestedId)
+        : tools[tools.length - 1];
+      if (!target) return false;
+      setExpandedToolIds((current) => {
+        const next = new Set(current);
+        if (next.has(target.id)) next.delete(target.id);
+        else next.add(target.id);
+        return next;
+      });
+      return true;
+    },
+    [state.items],
+  );
 
   const runSlash = useCallback(
     async (line: string): Promise<boolean> => {
@@ -886,6 +1193,38 @@ export function App({
       }
       if (cmd === "help") {
         dispatch({ t: "push", item: { kind: "info", text: helpText() } });
+        return true;
+      }
+      if (cmd === "reconnect") {
+        reconnect();
+        return true;
+      }
+      if (cmd === "editor") {
+        try {
+          const edited = await editInExternalEditor(inputRef.current, {
+            cwd: state.meta.cwd,
+            suspendTerminal: suspendTerminalWithCaret,
+          });
+          const normalized = normalizePastedInput(edited);
+          inputRef.current = normalized.text;
+          cursorRef.current = normalized.text.length;
+          setInput(normalized.text);
+          setCursor(normalized.text.length);
+          if (normalized.truncated) {
+            dispatch({
+              t: "push",
+              item: {
+                kind: "info",
+                text: t(
+                  "Editor content was truncated to the composer limit",
+                  "编辑器内容已按输入上限截断",
+                ),
+              },
+            });
+          }
+        } catch (error) {
+          dispatch({ t: "push", item: { kind: "error", text: errorMessage(error) } });
+        }
         return true;
       }
       if (cmd === "tasks") {
@@ -908,6 +1247,15 @@ export function App({
               : t("No background tasks", "无后台任务"),
           },
         });
+        return true;
+      }
+      if (cmd === "tool") {
+        if (!toggleToolDetail(rest[0])) {
+          dispatch({
+            t: "push",
+            item: { kind: "info", text: t("No matching tool output", "没有匹配的工具输出") },
+          });
+        }
         return true;
       }
       if (cmd === "status") {
@@ -941,6 +1289,54 @@ export function App({
               ` · ${state.running ? t("running", "运行中") : t("idle", "空闲")}` +
               ctx +
               (state.meta.title ? ` · ${state.meta.title}` : ""),
+          },
+        });
+        return true;
+      }
+      if (cmd === "usage") {
+        const usage = state.usage;
+        const total =
+          usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+        dispatch({
+          t: "push",
+          item: {
+            kind: "info",
+            text:
+              t(
+                `Input ${usage.inputTokens} · output ${usage.outputTokens} · cache create ${usage.cacheWriteTokens} · cache read ${usage.cacheReadTokens} · total ${total}`,
+                `输入 ${usage.inputTokens} · 输出 ${usage.outputTokens} · 缓存写入 ${usage.cacheWriteTokens} · 缓存读取 ${usage.cacheReadTokens} · 合计 ${total}`,
+              ) + (state.costUSD !== undefined ? ` · $${state.costUSD.toFixed(4)}` : ""),
+          },
+        });
+        return true;
+      }
+      if (cmd === "mouse") {
+        const requested = (rest[0] ?? "").toLowerCase();
+        if (requested && requested !== "on" && requested !== "off") {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t("Usage: /mouse [on|off]", "用法：/mouse [on|off]"),
+            },
+          });
+          return true;
+        }
+        const enabled = requested ? requested === "on" : !mouseTracking;
+        setMouseTracking(enabled);
+        dispatch({
+          t: "push",
+          item: {
+            kind: "info",
+            text: enabled
+              ? t(
+                  "Mouse tracking enabled; use /mouse off for native text selection",
+                  "已开启鼠标跟踪；用 /mouse off 恢复终端原生框选",
+                )
+              : t(
+                  "Mouse tracking disabled; drag to select and copy text normally",
+                  "已关闭鼠标跟踪；现在可直接拖拽框选并复制文本",
+                ),
           },
         });
         return true;
@@ -1381,18 +1777,24 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       openSessionPicker,
       state.meta,
       state.running,
+      state.usage,
+      state.costUSD,
       exit,
       commands,
       mcpStatus,
       sessionId,
       permMode,
+      reconnect,
+      toggleToolDetail,
+      suspendTerminalWithCaret,
+      mouseTracking,
     ],
   );
 
   // 输入缓冲区与光标一起改写：ref 供同 tick 内连续编辑，state 供渲染。
   // 文本变化时把命令菜单高亮重置到首项（新筛选集从头选），仅移动光标时不动高亮。
   const setBuf = useCallback((text: string, cur: number): void => {
-    const c = Math.max(0, Math.min(cur, text.length));
+    const c = clampGraphemeIndex(text, cur);
     if (text !== inputRef.current) {
       menuIndexRef.current = 0;
       setMenuIndex(0);
@@ -1475,10 +1877,39 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     dispatch({ t: "push", item: { kind: "info", text: permModeNotice(next) } });
   }, [host, sessionId, permMode]);
 
+  // Ink 7 separates bracketed paste from key input. Clipboard text is inserted
+  // verbatim (after control-sequence sanitization), including newlines, and is
+  // never submitted implicitly—even when the clipboard ends in LF.
+  usePaste(
+    (pasted) => {
+      const normalized = normalizePastedInput(pasted);
+      if (!normalized.text) return;
+      const buf = inputRef.current;
+      const cur = cursorRef.current;
+      const available = Math.max(0, MAX_COMPOSER_BYTES - Buffer.byteLength(buf, "utf8"));
+      const inserted = truncateInputBytes(normalized.text, available);
+      histPosRef.current = null;
+      setBuf(buf.slice(0, cur) + inserted.text + buf.slice(cur), cur + inserted.text.length);
+      if (normalized.truncated || inserted.truncated) {
+        dispatch({
+          t: "push",
+          item: {
+            kind: "info",
+            text: t(
+              `Paste was truncated at ${MAX_COMPOSER_BYTES / 1024} KiB`,
+              `粘贴内容已按 ${MAX_COMPOSER_BYTES / 1024} KiB 上限截断`,
+            ),
+          },
+        });
+      }
+    },
+    { isActive: !picker && !sessions && pendings.length === 0 },
+  );
+
   useInput((ch, key) => {
     const mouse = parseMouseInput(ch);
     // Ctrl+Z 退出（与 Ctrl+C 一致）；raw 模式下 Ctrl+Z 可能是 "z" 或 SUB 字符。
-    if (key.ctrl && (ch === "z" || ch === "\u001a")) {
+    if (matchesKeybinding(ch, key, bindings.quit)) {
       exit();
       return;
     }
@@ -1759,7 +2190,12 @@ Requirements: read the actual diff and surrounding code before judging; verify e
                   ? "deny"
                   : null;
       if (!kind) return; // 方向键/误触等不应被当成拒绝
+      if (kind === "allow_always" && confirmAlwaysFor !== pending.permId) {
+        setConfirmAlwaysFor(pending.permId);
+        return;
+      }
       setPermissionSelection(0);
+      setConfirmAlwaysFor(null);
       setPendings((q) => q.slice(1));
       void host
         .answerPermission(sessionId, pending.permId, kind)
@@ -1799,9 +2235,21 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       return;
     }
     // Ctrl+P 直接打开命令面板（本质是聚焦 `/` 补全菜单）。
-    if ((key.ctrl && ch === "p") || ch === "\u0010") {
+    if (matchesKeybinding(ch, key, bindings.commandPalette)) {
       setBuf("/", 1);
       setMenuIdx(0);
+      return;
+    }
+    if (matchesKeybinding(ch, key, bindings.reconnect)) {
+      reconnect();
+      return;
+    }
+    if (matchesKeybinding(ch, key, bindings.toggleToolOutput)) {
+      toggleToolDetail();
+      return;
+    }
+    if (matchesKeybinding(ch, key, bindings.externalEditor)) {
+      void runSlash("/editor");
       return;
     }
 
@@ -1827,7 +2275,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       return;
     }
     // shift+tab：切换权限模式轮盘（对齐 Claude Code）。先于命令菜单的 Tab 补全拦截，故菜单开着也能切。
-    if (key.tab && key.shift) {
+    if (matchesKeybinding(ch, key, bindings.permissionCycle)) {
       cyclePermMode();
       return;
     }
@@ -1837,7 +2285,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       const cur = Math.min(menuIndexRef.current, n - 1);
       if (mouse !== null) {
         if (mouse.wheelDelta !== 0) {
-          setMenuIdx(Math.max(0, Math.min(cur + mouse.wheelDelta, n - 1)));
+          queueMenuWheel(mouse.wheelDelta, n);
         } else if (mouse.leftClick && panelRef.current) {
           const sprite = buildCommandMenuOverlay(
             menuRows,
@@ -1873,18 +2321,26 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     const isCtrl = (letter: string, code: string) => key.ctrl && (ch === letter || ch === code);
 
     // —— 光标移动 ——
-    if (key.leftArrow) return setBuf(buf, cur - 1);
-    if (key.rightArrow) return setBuf(buf, cur + 1);
+    if (key.leftArrow) return setBuf(buf, previousGraphemeIndex(buf, cur));
+    if (key.rightArrow) return setBuf(buf, nextGraphemeIndex(buf, cur));
+    if (key.home) return setBuf(buf, lineStart(buf, cur));
+    if (key.end) return setBuf(buf, lineEnd(buf, cur));
     if (isCtrl("a", "")) return setBuf(buf, 0); // 行首
     if (isCtrl("e", "")) return setBuf(buf, buf.length); // 行尾
 
     // —— 历史回溯（↑ 往旧，↓ 往新，越过最新回到空行）——
+    if (key.upArrow && lineStart(buf, cur) > 0) {
+      return setBuf(buf, moveCursorLine(buf, cur, -1));
+    }
     if (key.upArrow) {
       const h = historyRef.current;
       if (h.length === 0) return;
       const pos = Math.max(0, (histPosRef.current ?? h.length) - 1);
       histPosRef.current = pos;
       return setBuf(h[pos]!, h[pos]!.length);
+    }
+    if (key.downArrow && lineEnd(buf, cur) < buf.length) {
+      return setBuf(buf, moveCursorLine(buf, cur, 1));
     }
     if (key.downArrow) {
       const h = historyRef.current;
@@ -1904,57 +2360,84 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     if (isCtrl("w", "")) {
       // 删除光标前一个词：先吃掉空白，再吃掉非空白。
       let i = cur;
-      while (i > 0 && /\s/.test(buf[i - 1]!)) i--;
-      while (i > 0 && !/\s/.test(buf[i - 1]!)) i--;
+      while (i > 0) {
+        const previous = previousGraphemeIndex(buf, i);
+        if (!/\s/u.test(buf.slice(previous, i))) break;
+        i = previous;
+      }
+      while (i > 0) {
+        const previous = previousGraphemeIndex(buf, i);
+        if (/\s/u.test(buf.slice(previous, i))) break;
+        i = previous;
+      }
       return setBuf(buf.slice(0, i) + buf.slice(cur), i);
     }
 
-    if (pasteSubmitRef.current) {
-      clearTimeout(pasteSubmitRef.current);
-      pasteSubmitRef.current = null;
-    }
     const normalized = ch.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const pastedNewline =
-      normalized.includes("\n") && (normalized.replace(/\n/g, "").length > 0 || !key.return);
-    if (pastedNewline) {
-      // 单行 TUI：内部换行只折成空格；只有 paste 本身以换行结尾时才等价
-      // 于 Enter。短 debounce 可合并落在相邻 event-loop tick 的 PTY chunks。
-      const ins = normalized.replace(/\n+/g, " ");
+    if (key.return && (key.shift || key.meta || key.ctrl)) {
       histPosRef.current = null;
-      setBuf(buf.slice(0, cur) + ins + buf.slice(cur), cur + ins.length);
-      if (normalized.endsWith("\n")) {
-        const scheduled = setTimeout(() => {
-          if (pasteSubmitRef.current !== scheduled) return;
-          pasteSubmitRef.current = null;
-          const text = inputRef.current;
-          setBuf("", 0);
-          submitLine(text);
-        }, 25);
-        pasteSubmitRef.current = scheduled;
-      }
+      setBuf(buf.slice(0, cur) + "\n" + buf.slice(cur), cur + 1);
     } else if (key.return) {
       const text = inputRef.current;
       setBuf("", 0);
       submitLine(text);
-    } else if (key.backspace || key.delete) {
+    } else if (key.backspace) {
       if (cur === 0) return;
       histPosRef.current = null;
-      setBuf(buf.slice(0, cur - 1) + buf.slice(cur), cur - 1);
+      const previous = previousGraphemeIndex(buf, cur);
+      setBuf(buf.slice(0, previous) + buf.slice(cur), previous);
+    } else if (key.delete) {
+      if (cur === buf.length) return;
+      histPosRef.current = null;
+      const next = nextGraphemeIndex(buf, cur);
+      setBuf(buf.slice(0, cur) + buf.slice(next), cur);
     } else if (ch && !key.ctrl && !key.meta) {
       histPosRef.current = null;
-      setBuf(buf.slice(0, cur) + normalized + buf.slice(cur), cur + normalized.length);
+      // Unbracketed multi-character chunks are insertion only. A trailing LF
+      // can therefore never execute a prompt accidentally.
+      const safe = normalizePastedInput(normalized).text;
+      setBuf(buf.slice(0, cur) + safe + buf.slice(cur), cur + safe.length);
     }
   });
 
-  // 每次提交后按最新布局把真实光标停到插入点：面板首行是空行，输入行在其下一行；
-  // 列 = 竖条(1) + 前导空格(1) + 光标在可见窗口内的列偏移，再 +1 转成 1-based。
-  // 浮层弹框打开时藏起真实光标——弹框自绘搜索光标块，不再跟随输入框。
+  // CLI 输出层按绝对 CUP 坐标停放真实光标，避开 Ink 全屏相对坐标在不同终端上的偏移。
+  // 弹框接管键盘时把光标归还底部并隐藏，避免 IME 候选框盖住弹框。
+  const caretHidden = !!(picker || pendings[0] || sessions);
+  useLayoutEffect(() => {
+    if (!absoluteCaretEnabled || caretHidden) {
+      terminalCaret?.setTarget(null);
+      return;
+    }
+    const panel = panelRef.current;
+    if (!panel) return;
+    const maxInputRows = Math.max(1, Math.min(5, termRows - 10));
+    const position = composerCaretPosition({
+      panelTop: absoluteTop(panel),
+      text: input,
+      cursor,
+      width: termCols,
+      maxInputRows,
+      terminalRows: termRows,
+    });
+    terminalCaret.setTarget({ row: position.y + 1, col: position.x + 1 });
+  }, [absoluteCaretEnabled, caretHidden, termRows, input, cursor, termCols, state, terminalCaret]);
+  useEffect(() => () => terminalCaret?.setTarget(null), [terminalCaret]);
+
+  // 实验帧合成器保留自己的 stdout 停放逻辑；生产默认只走上面的窄作用域输出适配器。
   useEffect(() => {
-    if (overlayMode && (picker || pendings[0] || sessions)) return setCaret(null);
+    if (!overlayMode) return;
+    if (caretHidden) return setCaret(null);
     const panel = panelRef.current;
     if (!panel) return setCaret(null);
-    const { caretX, startX } = inputView(input, cursor, termCols);
-    setCaret({ row: absoluteTop(panel) + 2, col: 3 + caretX - startX });
+    const position = composerCaretPosition({
+      panelTop: absoluteTop(panel),
+      text: input,
+      cursor,
+      width: termCols,
+      maxInputRows: Math.max(1, Math.min(5, termRows - 10)),
+      terminalRows: termRows,
+    });
+    setCaret({ row: position.y + 1, col: position.x + 1 });
   });
 
   // 浮层弹框精灵：把当前打开的弹框算成一组定宽 ANSI 行，交给写入层合成到整帧上。
@@ -1977,7 +2460,16 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     }
     if (pendings[0]) {
       const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
-      return show(buildPermissionOverlay(pendings, termRows, termCols, permissionIndex, anchor));
+      return show(
+        buildPermissionOverlay(
+          pendings,
+          termRows,
+          termCols,
+          permissionIndex,
+          anchor,
+          confirmAlwaysFor === pendings[0].permId,
+        ),
+      );
     }
     if (sessions) {
       const visible = filterSessionRows(sessions.rows, sessions.filter);
@@ -2003,6 +2495,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     picker,
     pendings,
     permissionIndex,
+    confirmAlwaysFor,
     sessions,
     sessionId,
     input,
@@ -2084,6 +2577,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         running={state.running}
         spinner={spinner}
         width={termCols}
+        maxInputRows={Math.max(1, Math.min(5, termRows - 10))}
       />
       {hintItems.length > 0 ? (
         <Box justifyContent="flex-end">
@@ -2103,7 +2597,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
   const cwdLabel = tildify(state.meta.cwd);
   const costPart =
     state.costUSD !== undefined && state.costUSD > 0 ? ` · $${state.costUSD.toFixed(4)}` : "";
-  const statusRight = `${u.inputTokens}/${u.outputTokens} tokens${costPart}`;
+  const cachePart =
+    u.cacheReadTokens > 0 || u.cacheWriteTokens > 0
+      ? ` · cache ${u.cacheReadTokens}r/${u.cacheWriteTokens}w`
+      : "";
+  const statusRight = `${u.inputTokens}/${u.outputTokens} tokens${cachePart}${costPart}`;
 
   // 底部控件：会话列表 / 授权弹窗 / 输入框。浮层模式下前两者改为盖屏合成，这里只留输入框。
   const controls = (
@@ -2118,19 +2616,48 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       ) : null}
       {!overlayMode && pendings[0] ? (
         <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
-          <Text color="yellow">
-            {t("⚠ Permission request: ", "⚠ 授权请求: ")}
-            <Text bold>{pendings[0].toolName}</Text>
-            <Text dimColor>{` · ${truncate(pendings[0].ruleKey, 72)}`}</Text>
-            {pendings.length > 1 ? (
-              <Text dimColor>
-                {t(
-                  `(${pendings.length - 1} more pending)`,
-                  `（还有 ${pendings.length - 1} 个待裁决）`,
-                )}
-              </Text>
-            ) : null}
-          </Text>
+          <Box>
+            <Text color="yellow">
+              {`${t("⚠ Permission request: ", "⚠ 授权请求: ")}${sanitizeTerminalText(
+                pendings[0].toolName,
+              )} · ${(pendings[0].risk ?? "medium").toUpperCase()}${
+                pendings.length > 1
+                  ? t(
+                      ` (${pendings.length - 1} more pending)`,
+                      `（还有 ${pendings.length - 1} 个待裁决）`,
+                    )
+                  : ""
+              }`}
+            </Text>
+          </Box>
+          {pendings[0].cwd ? (
+            <Box>
+              <Text dimColor>{`cwd: ${sanitizeTerminalText(pendings[0].cwd)}`}</Text>
+            </Box>
+          ) : null}
+          <Box>
+            <Text>{sanitizeTerminalText(pendings[0].ruleKey)}</Text>
+          </Box>
+          <Box>
+            <Text dimColor>{permissionInputPreview(pendings[0].input)}</Text>
+          </Box>
+          {termRows >= 18
+            ? permissionPatchPreview(pendings[0].input, 6).map((line, index) => (
+                <Box key={`patch:${index}`}>
+                  <Text
+                    color={line.startsWith("+") ? "green" : line.startsWith("-") ? "red" : "gray"}
+                    wrap="truncate"
+                  >
+                    {truncWidth(line, Math.max(1, termCols - 4))}
+                  </Text>
+                </Box>
+              ))
+            : null}
+          {pendings[0].rulePartsComplete === false ? (
+            <Text color="red" bold>
+              {t("Command analysis is incomplete", "无法完整解析命令边界")}
+            </Text>
+          ) : null}
           {[
             { keyName: "y", label: t("Allow once", "允许一次"), color: "green" },
             {
@@ -2145,16 +2672,23 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             },
             { keyName: "n", label: t("Deny", "拒绝"), color: "red" },
           ].map(({ keyName, label, color }, index) => (
-            <Text
-              key={keyName}
-              inverse={index === permissionIndex}
-              bold={index === permissionIndex}
-            >
-              {index === permissionIndex ? "› " : "  "}[<Text color={color}>{keyName}</Text>]{" "}
-              {label}
-            </Text>
+            <Box key={keyName}>
+              <Text inverse={index === permissionIndex} bold={index === permissionIndex}>
+                {index === permissionIndex ? "› " : "  "}[<Text color={color}>{keyName}</Text>]{" "}
+                {label}
+              </Text>
+            </Box>
           ))}
-          <Text dimColor>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
+          {confirmAlwaysFor === pendings[0].permId ? (
+            <Box>
+              <Text color="red" bold>
+                {t("Press p/Enter again to persist this rule", "再次按 p/Enter 才会永久保存此规则")}
+              </Text>
+            </Box>
+          ) : null}
+          <Box>
+            <Text dimColor>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
+          </Box>
         </Box>
       ) : null}
       {inputCluster}
@@ -2162,7 +2696,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
   );
 
   return (
-    <Box flexDirection="column" height={termRows} overflow="hidden">
+    <Box flexDirection="column" width={termCols} height={termRows} overflow="hidden">
       {conversationEmpty ? (
         // 首次进入 / 空会话：opencode 风格欢迎页——顶部保留会话边界与信息条目，
         // 大 logo + 输入框（含 Tip）作为一组垂直居中。
@@ -2170,7 +2704,12 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           {state.items
             .filter((i) => i.kind !== "logo")
             .map((item, i) => (
-              <ItemView key={`top:${i}`} item={item as Item} width={termCols} />
+              <ItemView
+                key={`top:${i}`}
+                item={item as Item}
+                width={termCols}
+                expanded={item.kind === "tool" && expandedToolIds.has(item.id)}
+              />
             ))}
           <Box
             flexGrow={1}
@@ -2213,14 +2752,19 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             >
               {visibleItems.map((item, i) =>
                 item.kind === "logo" ? null : (
-                  <ItemView key={baseKey + i} item={item} width={termCols} />
+                  <ItemView
+                    key={baseKey + i}
+                    item={item}
+                    width={termCols}
+                    expanded={item.kind === "tool" && expandedToolIds.has(item.id)}
+                  />
                 ),
               )}
 
               {state.liveText ? (
                 <Box>
                   <Text color="green">{spinner} </Text>
-                  <Text>{state.liveText}</Text>
+                  <Text>{terminalDisplayText(state.liveText)}</Text>
                 </Box>
               ) : state.running && state.liveThinking ? (
                 // 思考酝酿期：暗色斜体滚动展示尾部（对齐 Claude Code 的 thinking 可见性）。
@@ -2251,7 +2795,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
                     {activity ? (
                       <Text dimColor wrap="truncate">
                         {"  ↳ "}
-                        {truncate(activity, Math.max(0, termCols - 6))}
+                        {truncate(sanitizeTerminalText(activity), Math.max(0, termCols - 6))}
                       </Text>
                     ) : null}
                   </Box>
@@ -2262,22 +2806,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             </Box>
           </Box>
 
-          {scrollOffset > 0 ? (
-            <Box justifyContent="center">
-              <Text color="cyan">
-                {t(
-                  "↑ scrolling back through history · PageDown to bottom",
-                  "↑ 回看历史中 · PageDown 回到底部",
-                )}
-              </Text>
-            </Box>
-          ) : null}
-
           {controls}
         </>
       )}
 
-      <Box marginTop={1} justifyContent="space-between">
+      <Box justifyContent="space-between">
         {/* 路径拿左侧剩余列（尾部优先，从头截断）；token/花费固定在右。 */}
         <Text dimColor wrap="truncate">
           {truncWidthStart(cwdLabel, termCols - dispWidth(statusRight) - 1)}
@@ -2307,11 +2840,8 @@ function handleEvent(
     return;
   }
   if (se.type === "permission_request") {
-    setPendings((q) =>
-      mergePendings(q, [{ permId: se.permId, toolName: se.toolName, ruleKey: se.ruleKey }]),
-    );
-    // 终端响铃：用户可能不在窗口前，授权请求值得一声提醒（终端可自行静音/转徽标）。
-    process.stdout.write("\x07");
+    const { type: _type, ...pending } = se;
+    setPendings((q) => mergePendings(q, [pending]));
     return;
   }
   if (se.type === "permission_resolved") {
@@ -2402,7 +2932,7 @@ function handleEvent(
         t: "toolFinish",
         id: ev.id,
         status: ev.isError ? "err" : "ok",
-        detail: firstLine(ev.content),
+        detail: ev.content,
       });
       break;
     case "turn_end":
@@ -2491,6 +3021,10 @@ function helpText(): string {
       "/status               显示当前会话、模型与目录",
     ),
     t(
+      "/usage                Show token/cache/cost totals",
+      "/usage                显示 token/缓存/成本统计",
+    ),
+    t(
       "/providers            List canonical providers and credential hints",
       "/providers            列出 canonical provider 及凭证提示",
     ),
@@ -2507,6 +3041,10 @@ function helpText(): string {
       "/sessions             搜索并切换会话（也可用 /resume、/continue）",
     ),
     t(
+      "/mouse [on|off]       Mouse tracking; off allows native drag-selection/copy",
+      "/mouse [on|off]       鼠标跟踪；off 可直接拖拽框选/复制",
+    ),
+    t(
       "/resume <sessionId>   Load directly; without an id, open the picker",
       "/resume <sessionId>   直接载入；不带 id 时打开选择器",
     ),
@@ -2517,6 +3055,10 @@ function helpText(): string {
     t(
       "Ctrl+P command palette · Ctrl+X then n/l/m/s/c/u/q for common actions",
       "Ctrl+P 命令面板 · Ctrl+X 后按 n/l/m/s/c/u/q 执行常用操作",
+    ),
+    t(
+      "Ctrl+G external editor · Ctrl+O tool output · Ctrl+R reconnect (configurable under tui.keybindings)",
+      "Ctrl+G 外部编辑器 · Ctrl+O 工具输出 · Ctrl+R 重连（可在 tui.keybindings 配置）",
     ),
     t(
       "Shift+Tab             Cycle permission mode: default → accept-edits → plan → bypass",
@@ -2705,13 +3247,13 @@ const PICKER_HL = "#f6b17a";
 function truncWidthStart(s: string, max: number): string {
   if (dispWidth(s) <= max) return s;
   if (max <= 0) return "";
-  const chars = [...s];
+  const chars = graphemes(s);
   let out = "";
   let w = 0;
   for (let i = chars.length - 1; i >= 0; i--) {
-    const cw = dispWidth(chars[i]!);
+    const cw = chars[i]!.width;
     if (w + cw > max - 1) break;
-    out = chars[i]! + out;
+    out = chars[i]!.text + out;
     w += cw;
   }
   return "…" + out;
@@ -2902,12 +3444,14 @@ export function WelcomeTip({ width }: { width: number }) {
           <Text color="#f59e0b" bold>
             Tip
           </Text>
-          <Text dimColor>{t(" Run ", " 运行 ")}</Text>
-          <Text bold>/init</Text>
+          <Text dimColor>
+            {t(" Describe the outcome directly, or run ", " 直接说明目标，或运行 ")}
+          </Text>
+          <Text bold>/help</Text>
           <Text dimColor>
             {t(
-              " to analyze this repository and generate AGENTS.md project memory",
-              " 分析当前仓库并生成 AGENTS.md 项目记忆",
+              " to explore commands; research, writing, analysis, planning, and code are all welcome",
+              " 查看命令；调研、写作、分析、规划和代码任务都可以",
             )}
           </Text>
         </Text>
@@ -3106,8 +3650,8 @@ const PANEL_BAR = "#22d3ee";
 // 取词放到调用点（渲染时），保证 /lang 切换后占位文案随之更新（不是 import 期冻结一次）。
 const panelPlaceholder = () =>
   t(
-    "Type a request to begin… e.g. “fix a failing test”",
-    "输入需求开始… 例如「修复一个失败的测试」",
+    "Describe your goal… e.g. “research this topic” or “fix a failing test”",
+    "输入你的目标… 例如「调研这个主题」或「修复失败测试」",
   );
 const PANEL_DIM = "#9a9a9a";
 
@@ -3117,16 +3661,7 @@ function pad(width: number, used: number): string {
 
 /** 按显示列取 s 的 [from, to) 段；宽字符被窗口边界劈开时用空格占位，避免整行错列。 */
 function sliceCols(s: string, from: number, to: number): string {
-  let x = 0;
-  let out = "";
-  for (const ch of s) {
-    const start = x;
-    const end = x + dispWidth(ch);
-    x = end;
-    if (end <= from || start >= to) continue;
-    out += start < from || end > to ? " ".repeat(Math.min(end, to) - Math.max(start, from)) : ch;
-  }
-  return out;
+  return sliceTerminalColumns(s, from, to);
 }
 
 /** 按显示宽度把文本折成多行（保留原有换行；CJK 无词边界，按列硬折即可）。 */
@@ -3150,7 +3685,7 @@ function wrapCols(text: string, width: number): string[] {
  */
 function UserBubble({ text, width }: { text: string; width: number }) {
   const avail = Math.max(1, width - 3); // 竖条(1) + 左空格(1) + 右留白(1)
-  const lines = wrapCols(text, avail);
+  const lines = wrapCols(terminalDisplayText(text), avail);
   const rows: { content: React.ReactNode; used: number }[] = [
     { content: null, used: 0 },
     ...lines.map((line) => ({
@@ -3204,13 +3739,89 @@ function fitSegments(segs: Seg[], budget: number): Seg[] {
  */
 export function inputView(text: string, cursor: number, width: number) {
   const avail = Math.max(1, width - 2); // 竖条 + 前导空格之后留给文本的列数
-  const c = Math.max(0, Math.min(cursor, text.length));
+  const c = clampGraphemeIndex(text, cursor);
   const caretX = dispWidth(text.slice(0, c));
-  const at = text.slice(c, c + 1) || " "; // 文末光标是一个空块
+  const next = nextGraphemeIndex(text, c);
+  const at = text.slice(c, next) || " "; // 文末光标是一个空块
   const endX = caretX + dispWidth(at);
   const totalX = Math.max(dispWidth(text), endX);
   const startX = totalX <= avail ? 0 : Math.min(caretX, Math.max(0, endX - avail));
   return { avail, caretX, at, endX, startX };
+}
+
+export interface ComposerLayout {
+  lines: Array<{ text: string; start: number; end: number }>;
+  activeLine: number;
+  visibleStart: number;
+  visibleLines: Array<{ text: string; start: number; end: number }>;
+  activeVisibleLine: number;
+}
+
+export interface ComposerCaretPosition {
+  /** Ink output-relative column, zero-based. */
+  x: number;
+  /** Ink output-relative row, zero-based. */
+  y: number;
+}
+
+/**
+ * 输入框插入点在 Ink 整帧中的真实终端坐标。这里与 InputPanel 共用 composerLayout /
+ * inputView，确保中文宽字符、emoji、水平开窗和多行输入时 IME 光标都落在绘制光标上。
+ */
+export function composerCaretPosition(options: {
+  panelTop: number;
+  text: string;
+  cursor: number;
+  width: number;
+  maxInputRows: number;
+  terminalRows: number;
+}): ComposerCaretPosition {
+  const layout = composerLayout(options.text, options.cursor, options.maxInputRows);
+  const line = layout.lines[layout.activeLine]!;
+  const { caretX, startX } = inputView(line.text, options.cursor - line.start, options.width);
+  return {
+    // 竖条占第 0 列、前导空格占第 1 列，文本/插入点从第 2 列开始。
+    x: Math.max(0, Math.min(options.width - 1, 2 + caretX - startX)),
+    // 面板第 0 行是上留白，编辑器从下一行开始。
+    y: Math.max(
+      0,
+      Math.min(options.terminalRows - 1, options.panelTop + 1 + layout.activeVisibleLine),
+    ),
+  };
+}
+
+/** Logical-line viewport for the multiline composer. */
+export function composerLayout(
+  text: string,
+  cursor: number,
+  maxVisibleLines: number,
+): ComposerLayout {
+  const safe = clampGraphemeIndex(text, cursor);
+  const rawLines = text.split("\n");
+  let offset = 0;
+  const lines = rawLines.map((line) => {
+    const entry = { text: line, start: offset, end: offset + line.length };
+    offset += line.length + 1;
+    return entry;
+  });
+  const currentStart = lineStart(text, safe);
+  const activeLine = Math.max(
+    0,
+    lines.findIndex((line) => line.start === currentStart),
+  );
+  const count = Math.max(1, maxVisibleLines);
+  const visibleStart = Math.max(
+    0,
+    Math.min(activeLine - Math.floor(count / 2), Math.max(0, lines.length - count)),
+  );
+  const visibleLines = lines.slice(visibleStart, visibleStart + count);
+  return {
+    lines,
+    activeLine,
+    visibleStart,
+    visibleLines,
+    activeVisibleLine: activeLine - visibleStart,
+  };
 }
 
 export function InputPanel({
@@ -3221,6 +3832,7 @@ export function InputPanel({
   running,
   spinner,
   width,
+  maxInputRows = 5,
 }: {
   panelRef?: React.Ref<DOMElement>;
   text: string;
@@ -3229,7 +3841,15 @@ export function InputPanel({
   running: boolean;
   spinner: string;
   width: number;
+  maxInputRows?: number;
 }) {
+  if (width <= 3) {
+    return (
+      <Box width={Math.max(1, width)} ref={panelRef} overflow="hidden">
+        <Text wrap="truncate">{running ? spinner : "›"}</Text>
+      </Box>
+    );
+  }
   const barColor = running ? "gray" : PANEL_BAR;
   const cursorCell = (ch: string) => (
     <Text color="black" backgroundColor="#dcdcdc">
@@ -3237,35 +3857,48 @@ export function InputPanel({
     </Text>
   );
 
-  // 输入行内容（不含左侧竖条）：前导空格 + 文本/占位 + 光标。inputW 含前导空格。
-  const { avail, caretX, at, endX, startX } = inputView(text, cursor, width);
-  let inputNode: React.ReactNode;
-  let inputW: number;
-  if (text) {
-    // 只画窗口内的部分：光标块两侧各取可见片段，宽度合计不超过 avail。
-    const before = sliceCols(text, startX, caretX);
-    const after = sliceCols(text, endX, startX + avail);
-    inputNode = (
-      <>
-        {" "}
-        {before}
-        {cursorCell(at)}
-        {after}
-      </>
-    );
-    inputW = 1 + dispWidth(before) + dispWidth(at) + dispWidth(after);
-  } else {
-    // 占位文案按剩余列截断，窄屏下才不会折行把面板撑破。
-    const ph = truncWidth(panelPlaceholder(), Math.max(0, avail - 1));
-    inputNode = (
-      <>
-        {" "}
-        {cursorCell(" ")}
-        <Text color={PANEL_DIM}>{ph}</Text>
-      </>
-    );
-    inputW = 1 + 1 + dispWidth(ph);
-  }
+  const layout = composerLayout(text, cursor, maxInputRows);
+  const editorRows = layout.visibleLines.map((line, visibleIndex) => {
+    const active = visibleIndex === layout.activeVisibleLine;
+    const localCursor = active ? cursor - line.start : line.text.length;
+    const { avail, caretX, at, endX, startX } = inputView(line.text, localCursor, width);
+    if (!text && active) {
+      const ph = truncWidth(panelPlaceholder(), Math.max(0, avail - 1));
+      return {
+        key: line.start,
+        node: (
+          <>
+            {" "}
+            {cursorCell(" ")}
+            <Text color={PANEL_DIM}>{ph}</Text>
+          </>
+        ),
+        used: 2 + dispWidth(ph),
+      };
+    }
+    if (!active) {
+      const content = truncWidth(line.text, avail);
+      return {
+        key: line.start,
+        node: <> {content}</>,
+        used: 1 + dispWidth(content),
+      };
+    }
+    const before = sliceCols(line.text, startX, caretX);
+    const after = sliceCols(line.text, endX, startX + avail);
+    return {
+      key: line.start,
+      node: (
+        <>
+          {" "}
+          {before}
+          {cursorCell(at)}
+          {after}
+        </>
+      ),
+      used: 1 + dispWidth(before) + dispWidth(at) + dispWidth(after),
+    };
+  });
 
   // 模型行只显示 provider 后面的模型标识；项目名与会话标题已在其他界面提供。
   // 例如 deepseek/deepseek-v4-flash → deepseek-v4-flash；OpenRouter 的嵌套 model id 保留。
@@ -3293,7 +3926,9 @@ export function InputPanel({
   return (
     <Box flexDirection="column" width={width} ref={panelRef}>
       {rowLine(null, 0)}
-      {rowLine(inputNode, inputW)}
+      {editorRows.map((row) => (
+        <React.Fragment key={row.key}>{rowLine(row.node, row.used)}</React.Fragment>
+      ))}
       {rowLine(null, 0)}
       {rowLine(
         <>
@@ -3319,10 +3954,18 @@ export function InputPanel({
 // memo：历史条目引用不变时跳过重渲染，流式期间只有尾部活动条目会更新。
 const ItemView = React.memo(ItemViewImpl);
 
-function ItemViewImpl({ item, width }: { item: Item; width?: number }) {
+function ItemViewImpl({
+  item,
+  width,
+  expanded = false,
+}: {
+  item: Item;
+  width?: number;
+  expanded?: boolean;
+}) {
   switch (item.kind) {
     case "info":
-      return <Text dimColor>{item.text}</Text>;
+      return <Text dimColor>{terminalDisplayText(item.text)}</Text>;
     case "user":
       // 有终端宽度时用青色竖条 + 深灰底的气泡（对齐 opencode）；无宽度（兜底）退回 ❯ 前缀。
       return width ? (
@@ -3332,14 +3975,14 @@ function ItemViewImpl({ item, width }: { item: Item; width?: number }) {
           <Text color="blue" bold>
             ❯{" "}
           </Text>
-          <Text>{item.text}</Text>
+          <Text>{terminalDisplayText(item.text)}</Text>
         </Box>
       );
     case "assistant":
       return (
         <Box>
           <Text color="green">● </Text>
-          <Text>{item.text}</Text>
+          <MarkdownText text={terminalDisplayText(item.text)} />
         </Box>
       );
     case "tool": {
@@ -3360,15 +4003,26 @@ function ItemViewImpl({ item, width }: { item: Item; width?: number }) {
               ? "yellow"
               : "gray";
       return (
-        <Box>
-          <Text color={color as never}> {mark} </Text>
-          <Text bold>{item.name}</Text>
-          <Text dimColor> {truncate(item.ruleKey, 50)}</Text>
-          {item.detail ? <Text dimColor> — {item.detail}</Text> : null}
+        <Box flexDirection="column">
+          <Text color={color as never}>
+            {` ${mark} ${sanitizeTerminalText(item.name)}`}
+            <Text dimColor> {truncWidth(sanitizeTerminalText(item.ruleKey), 50)}</Text>
+            {item.detail ? (
+              <Text dimColor> — {firstLine(sanitizeTerminalText(item.detail))}</Text>
+            ) : null}
+            {item.detail ? (
+              <Text dimColor>{expanded ? " [ctrl+o: collapse]" : " [ctrl+o: expand]"}</Text>
+            ) : null}
+          </Text>
+          {expanded && item.detail ? (
+            <Box marginLeft={3} borderStyle="single" borderColor="gray" paddingX={1}>
+              <MarkdownText text={terminalDisplayText(item.detail, 16 * 1024)} />
+            </Box>
+          ) : null}
         </Box>
       );
     }
     case "error":
-      return <Text color="red">✖ {item.text}</Text>;
+      return <Text color="red">✖ {terminalDisplayText(item.text)}</Text>;
   }
 }

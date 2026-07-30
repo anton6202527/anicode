@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "./agent.js";
+import { Agent, defaultSystem } from "./agent.js";
 import type { Provider, StreamEvent, ChatMessage } from "./types.js";
 
 /** 按预设脚本逐轮回放的假 provider；每次 stream() 消费一条脚本 */
@@ -38,6 +38,17 @@ async function collect(agent: Agent, text: string) {
   for await (const ev of agent.send(text)) events.push(ev);
   return events;
 }
+
+test("默认 system 定位为通用 Agent，不注入单一职业身份", () => {
+  const system = defaultSystem();
+  assert.match(system, /general-purpose AI agent|通用型 AI Agent/);
+  assert.match(system, /software engineering|软件工程/);
+  const forbiddenEnglish = new RegExp(["AI", "coding", "assistant"].join("\\s+"), "i");
+  const forbiddenChinese = new RegExp(["AI", "编程", "助手"].join("\\s*"), "i");
+  assert.doesNotMatch(system, forbiddenEnglish);
+  assert.doesNotMatch(system, forbiddenChinese);
+  assert.match(system, /identity label|身份标签/);
+});
 
 test("Agent: 工具调用 → 执行 → 结果回传 → 收尾", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));

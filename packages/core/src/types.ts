@@ -87,9 +87,12 @@ export interface StreamRequest {
 // ---------- 流式事件 ----------
 
 export interface Usage {
+  /** Input tokens billed at the normal input rate, excluding cache reads/writes. */
   inputTokens: number;
   outputTokens: number;
+  /** Input tokens served from a provider prompt cache. */
   cacheReadTokens: number;
+  /** Input tokens written to a provider prompt cache. */
   cacheWriteTokens: number;
 }
 

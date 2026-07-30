@@ -10,6 +10,9 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
   const file = path.join(dir, "trace.jsonl");
   let disposed = false;
+  let sendArgs: unknown[] = [];
+  let undoArgs: unknown[] = [];
+  const optionalCalls: string[] = [];
   const host: SessionHost = {
     async listSessions() {
       throw new Error("private host failure sk-super-secret-value");
@@ -52,13 +55,42 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
         close() {},
       };
     },
-    async send() {},
+    async send(...args) {
+      sendArgs = args;
+    },
     async interrupt() {},
-    async undo() {
+    async undo(...args) {
+      undoArgs = args;
       return { restored: 0, deleted: 0 };
     },
     async answerPermission() {
       return true;
+    },
+    async forkSession(sessionId, opts) {
+      optionalCalls.push(`fork:${sessionId}:${opts?.upToMessage}`);
+      return {
+        id: "forked",
+        createdAt: "2026-07-14T00:00:00.000Z",
+        updatedAt: "2026-07-14T00:00:00.000Z",
+        cwd: "/work",
+        model: "debug/demo",
+        running: false,
+      };
+    },
+    async compact(sessionId) {
+      optionalCalls.push(`compact:${sessionId}`);
+      return { compacted: true, beforeTokens: 10, afterTokens: 4 };
+    },
+    async setPermissionMode(sessionId, mode) {
+      optionalCalls.push(`mode:${sessionId}:${mode}`);
+    },
+    async setPermissionProfile(sessionId, name) {
+      optionalCalls.push(`profile:${sessionId}:${name}`);
+      return "acceptEdits";
+    },
+    async listPermissionProfiles(sessionId) {
+      optionalCalls.push(`profiles:${sessionId}`);
+      return { default: { mode: "default" } };
     },
     dispose() {
       disposed = true;
@@ -68,7 +100,17 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
   const wrapped = withDebugLogging(host, new DebugLogger(file));
   const seen: string[] = [];
   await wrapped.open("s1", (event) => seen.push(event.type));
-  await wrapped.send("s1", "sk-this-must-not-appear");
+  await wrapped.send("s1", "sk-this-must-not-appear", {
+    model: "debug/once",
+    idempotencyKey: "idem-1",
+    traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
+  });
+  await wrapped.undo("s1", "cp-1", "both");
+  await wrapped.forkSession?.("s1", { title: "private fork title", upToMessage: 3 });
+  await wrapped.compact?.("s1");
+  await wrapped.setPermissionMode?.("s1", "plan");
+  assert.equal(await wrapped.setPermissionProfile?.("s1", "workspace"), "acceptEdits");
+  assert.deepEqual(await wrapped.listPermissionProfiles?.("s1"), { default: { mode: "default" } });
   await assert.rejects(wrapped.listSessions(), /private host failure/);
   assert.equal(await wrapped.answerPermission("s1", "p1", "allow"), true);
   wrapped.dispose();
@@ -76,6 +118,23 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
   const log = await fs.readFile(file, "utf8");
   assert.deepEqual(seen, ["agent", "agent"]);
   assert.equal(disposed, true);
+  assert.deepEqual(sendArgs, [
+    "s1",
+    "sk-this-must-not-appear",
+    {
+      model: "debug/once",
+      idempotencyKey: "idem-1",
+      traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
+    },
+  ]);
+  assert.deepEqual(undoArgs, ["s1", "cp-1", "both"]);
+  assert.deepEqual(optionalCalls, [
+    "fork:s1:3",
+    "compact:s1",
+    "mode:s1:plan",
+    "profile:s1:workspace",
+    "profiles:s1",
+  ]);
   assert.doesNotMatch(
     log,
     /private answer|sk-this-must-not-appear|very-secret-token|private host failure|super-secret-value/,

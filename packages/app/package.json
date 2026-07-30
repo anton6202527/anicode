@@ -22,18 +22,29 @@
       "output": "release",
       "buildResources": "build-resources"
     },
-    "files": ["out/**/*", "package.json"],
-    "extraMetadata": { "main": "out/main/index.js" },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "out/main/index.js"
+    },
     "npmRebuild": false,
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "category": "public.app-category.developer-tools"
     },
     "win": {
-      "target": ["nsis"]
+      "target": [
+        "nsis"
+      ]
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "category": "Development"
     }
   },
@@ -48,14 +59,14 @@
     "@napi-rs/keyring": "^1.3.0"
   },
   "devDependencies": {
-    "@types/react": "^18.3.0",
-    "@types/react-dom": "^18.3.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
     "electron": "^43.0.0",
     "electron-builder": "^26.15.7",
     "electron-vite": "^5.0.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "vite": "^7.0.0"
   }
 }

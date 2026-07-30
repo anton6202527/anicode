@@ -111,6 +111,7 @@ export {
   type Checkpoint,
   type RewindMode,
   type PermissionAnswer,
+  type PendingPermission,
 } from "./session-manager.js";
 export { SnapshotStore, type Snapshot, type RestoreResult } from "./snapshot.js";
 export {

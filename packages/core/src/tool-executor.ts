@@ -244,6 +244,10 @@ export class ToolExecutor {
     let decision: PermissionDecision = await this.o.perm.check({
       toolName: call.name,
       input: args,
+      cwd: this.o.cwd,
+      readOnly: tool.readOnly,
+      mutatesFiles: tool.mutatesFiles ?? false,
+      network: args["network"] === true,
       ruleKey,
       ...(tool.ruleParts ? { ruleParts: tool.ruleParts(args) } : {}),
       ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(args) } : {}),
@@ -260,6 +264,10 @@ export class ToolExecutor {
       decision = this.o.perm.validateUpdatedInput({
         toolName: call.name,
         input: updated,
+        cwd: this.o.cwd,
+        readOnly: tool.readOnly,
+        mutatesFiles: tool.mutatesFiles ?? false,
+        network: updated["network"] === true,
         ruleKey: updatedRuleKey,
         ...(tool.ruleParts ? { ruleParts: tool.ruleParts(updated) } : {}),
         ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(updated) } : {}),

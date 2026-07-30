@@ -143,7 +143,7 @@ test("TUI 回归: Ctrl+U 删到行首只保留光标后内容", async () => {
   }
 });
 
-test("TUI 回归: PageUp/滚轮只回看结果区，输入框保持在固定行", async () => {
+test("TUI 回归: PageUp/滚轮只回看结果区，不显示额外状态提示", async () => {
   const events: SessionEvent[] = [];
   for (let i = 0; i < 8; i++) {
     events.push({
@@ -159,12 +159,14 @@ test("TUI 回归: PageUp/滚轮只回看结果区，输入框保持在固定行"
   try {
     const initial = view.lastFrame() ?? "";
     assert.doesNotMatch(initial, /回看历史中/);
-    const inputRow = initial.split("\n").findIndex((line) => line.includes("输入需求开始"));
+    const inputRow = initial.split("\n").findIndex((line) => line.includes("输入你的目标"));
     assert.ok(inputRow >= 0, `未找到输入框占位行：\n${initial}`);
 
     view.stdin.write("[5~"); // PageUp
     await tick(40);
-    assert.match(view.lastFrame() ?? "", /回看历史中/);
+    const pagedUp = view.lastFrame() ?? "";
+    assert.doesNotMatch(pagedUp, /回看历史中|PageDown 回到底部/);
+    assert.notEqual(pagedUp, initial);
     view.stdin.write("[6~"); // PageDown 回底
     await tick(40);
     assert.doesNotMatch(view.lastFrame() ?? "", /回看历史中/);
@@ -173,9 +175,10 @@ test("TUI 回归: PageUp/滚轮只回看结果区，输入框保持在固定行"
     view.stdin.write("\u001b[<64;10;10M".repeat(3));
     await tick(40);
     const scrolled = view.lastFrame() ?? "";
-    assert.match(scrolled, /回看历史中/);
+    assert.doesNotMatch(scrolled, /回看历史中|PageDown 回到底部/);
+    assert.notEqual(scrolled, initial);
     assert.equal(
-      scrolled.split("\n").findIndex((line) => line.includes("输入需求开始")),
+      scrolled.split("\n").findIndex((line) => line.includes("输入你的目标")),
       inputRow,
     );
     view.stdin.write("\u001b[<65;10;10M".repeat(3));
@@ -228,7 +231,7 @@ test("TUI 回归: 单条超长回复可按行滚动，不会把输入区推出�
     const atBottom = view.lastFrame() ?? "";
     assert.match(atBottom, /TAIL_MARK/);
     assert.doesNotMatch(atBottom, /HEAD_MARK/);
-    const inputRow = atBottom.split("\n").findIndex((line) => line.includes("输入需求开始"));
+    const inputRow = atBottom.split("\n").findIndex((line) => line.includes("输入你的目标"));
     assert.ok(inputRow >= 0);
 
     view.stdin.write("\u001b[<64;10;10M".repeat(30));
@@ -237,7 +240,7 @@ test("TUI 回归: 单条超长回复可按行滚动，不会把输入区推出�
     assert.match(atTop, /HEAD_MARK/);
     assert.doesNotMatch(atTop, /TAIL_MARK/);
     assert.equal(
-      atTop.split("\n").findIndex((line) => line.includes("输入需求开始")),
+      atTop.split("\n").findIndex((line) => line.includes("输入你的目标")),
       inputRow,
     );
 

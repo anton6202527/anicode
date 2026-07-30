@@ -83,6 +83,8 @@ export interface AnicodeConfig {
         viewport?: { width: number; height: number };
         launchTimeoutMs?: number;
       };
+  /** TUI-only preferences. Unknown action names are ignored by the frontend. */
+  tui?: { keybindings?: Record<string, string> };
   /** 额外注入 system 的规则文件路径（相对 cwd 或绝对）。 */
   instructions?: string[];
   /**
@@ -183,6 +185,7 @@ const KNOWN_KEYS = new Set([
   "agents",
   "lsp",
   "browser",
+  "tui",
   "hooks",
   "instructions",
   "permissions",
@@ -242,6 +245,17 @@ function merge(base: AnicodeConfig, over: AnicodeConfig): AnicodeConfig {
     ...(base.mcp || over.mcp ? { mcp: { ...base.mcp, ...over.mcp } } : {}),
     ...(base.agents || over.agents ? { agents: { ...base.agents, ...over.agents } } : {}),
     ...(base.lsp || over.lsp ? { lsp: { ...base.lsp, ...over.lsp } } : {}),
+    ...(base.tui || over.tui
+      ? {
+          tui: {
+            ...base.tui,
+            ...over.tui,
+            ...(base.tui?.keybindings || over.tui?.keybindings
+              ? { keybindings: { ...base.tui?.keybindings, ...over.tui?.keybindings } }
+              : {}),
+          },
+        }
+      : {}),
     ...(base.permissionProfiles || over.permissionProfiles
       ? { permissionProfiles: { ...base.permissionProfiles, ...over.permissionProfiles } }
       : {}),

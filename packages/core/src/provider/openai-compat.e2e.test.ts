@@ -134,7 +134,7 @@ test("OpenAI 兼容层: 完整工具调用回路", async () => {
   const done1 = events1.find((e) => e.type === "done");
   assert.ok(done1 && done1.type === "done");
   assert.equal(done1.stopReason, "tool_use");
-  assert.equal(done1.usage.inputTokens, 100);
+  assert.equal(done1.usage.inputTokens, 60);
   assert.equal(done1.usage.cacheReadTokens, 40);
 
   // 分片参数被正确聚合

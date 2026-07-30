@@ -30,6 +30,8 @@ interface ClientSubscription {
   active: boolean;
   closed: boolean;
   activation?: NodeJS.Immediate;
+  closedPromise: Promise<Error | undefined>;
+  resolveClosed: (error: Error | undefined) => void;
 }
 
 export class DaemonClient implements SessionHost {
@@ -98,6 +100,13 @@ export class DaemonClient implements SessionHost {
   private markTerminal(error: Error): void {
     this.terminalError ??= error;
     this.failPending(this.terminalError);
+    for (const sub of this.listeners.values()) {
+      if (sub.closed) continue;
+      sub.closed = true;
+      if (sub.activation) clearImmediate(sub.activation);
+      sub.resolveClosed(this.terminalError);
+    }
+    this.listeners.clear();
   }
 
   /** 用户 listener 属于 UI 边界；单个渲染器异常不能截断 socket 帧分发。 */
@@ -223,10 +232,22 @@ export class DaemonClient implements SessionHost {
       // listener 的尾事件直接丢弃；它们会进入随后取得的 snapshot，不能再回放。
       previous.closed = true;
       if (previous.activation) clearImmediate(previous.activation);
+      previous.resolveClosed(undefined);
       this.listeners.delete(sessionId);
       await this.request((id) => ({ id, method: "close", sessionId }));
     }
-    const sub: ClientSubscription = { listener, buffered: [], active: false, closed: false };
+    let resolveClosed!: (error: Error | undefined) => void;
+    const closedPromise = new Promise<Error | undefined>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const sub: ClientSubscription = {
+      listener,
+      buffered: [],
+      active: false,
+      closed: false,
+      closedPromise,
+      resolveClosed,
+    };
     this.listeners.set(sessionId, sub);
     let response: { snapshot?: SessionSnapshot; alreadyOpen?: boolean };
     try {
@@ -256,9 +277,11 @@ export class DaemonClient implements SessionHost {
     });
     return {
       snapshot,
+      closed: sub.closedPromise,
       close: () => {
         if (sub.closed) return;
         sub.closed = true;
+        sub.resolveClosed(undefined);
         if (sub.activation) clearImmediate(sub.activation);
         if (this.listeners.get(sessionId) !== sub) return;
         this.listeners.delete(sessionId);
@@ -361,6 +384,7 @@ export class DaemonClient implements SessionHost {
     for (const sub of this.listeners.values()) {
       sub.closed = true;
       if (sub.activation) clearImmediate(sub.activation);
+      sub.resolveClosed(undefined);
     }
     this.listeners.clear();
     this.markTerminal(new Error(t("daemon client has been disposed", "daemon client 已释放")));

@@ -37,6 +37,12 @@ export interface PermissionDecision {
 export interface PermissionRequest {
   toolName: string;
   input: Record<string, unknown>;
+  /** Execution context shown by approval UIs; optional for third-party callers. */
+  cwd?: string;
+  /** Tool safety metadata copied into the approval request. */
+  readOnly?: boolean;
+  mutatesFiles?: boolean;
+  network?: boolean;
   /** 工具自报的"人类可读的动作摘要"，用于 UI 展示与规则匹配 */
   ruleKey: string;
   /**

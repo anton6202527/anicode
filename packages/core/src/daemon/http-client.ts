@@ -129,6 +129,11 @@ export class HttpSessionHost implements SessionHost {
       snapshotReject = reject;
     });
     let gotSnapshot = false;
+    let streamError: Error | undefined;
+    let closedResolve!: (error: Error | undefined) => void;
+    const closed = new Promise<Error | undefined>((resolve) => {
+      closedResolve = resolve;
+    });
 
     const pump = async (): Promise<void> => {
       try {
@@ -152,14 +157,19 @@ export class HttpSessionHost implements SessionHost {
             // 其余命名事件（server.*/message.*/permission.*）面向 SDK，host 层忽略。
           }
         }
-        if (!gotSnapshot)
+        if (!gotSnapshot) {
           snapshotReject(new Error(t("SSE closed before snapshot", "SSE 在 snapshot 前关闭")));
+        } else {
+          streamError = new Error(t("SSE subscription closed", "SSE 订阅已关闭"));
+        }
       } catch (err) {
-        if (!gotSnapshot) snapshotReject(err instanceof Error ? err : new Error(String(err)));
+        streamError = err instanceof Error ? err : new Error(String(err));
+        if (!gotSnapshot) snapshotReject(streamError);
         // snapshot 之后的流错误：订阅静默终止（对齐 socket 客户端断连语义），
         // 前端可经 close/重开恢复。
       } finally {
         this.aborts.delete(ac);
+        closedResolve(streamError);
       }
     };
     void pump();
@@ -167,6 +177,7 @@ export class HttpSessionHost implements SessionHost {
     const snapshot = await snapshotP;
     return {
       snapshot,
+      closed,
       close: () => {
         ac.abort();
         this.aborts.delete(ac);

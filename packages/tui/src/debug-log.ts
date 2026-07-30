@@ -235,20 +235,80 @@ export function withDebugLogging(host: SessionHost, logger: DebugLogger): Sessio
           },
         };
       }),
-    send: (sessionId, text) =>
-      timed(logger, "send", { sessionId, ...logger.textField("text", text) }, () =>
-        host.send(sessionId, text),
+    send: (sessionId, text, opts) =>
+      timed(
+        logger,
+        "send",
+        {
+          sessionId,
+          ...logger.textField("text", text),
+          ...(opts?.model ? { model: opts.model } : {}),
+          ...(opts?.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+          ...(opts?.traceparent ? { traceparent: opts.traceparent } : {}),
+        },
+        () => host.send(sessionId, text, opts),
       ),
     interrupt: (sessionId) =>
       timed(logger, "interrupt", { sessionId }, () => host.interrupt(sessionId)),
-    undo: (sessionId, checkpointId) =>
-      timed(logger, "undo", { sessionId, ...(checkpointId ? { checkpointId } : {}) }, () =>
-        host.undo(sessionId, checkpointId),
+    undo: (sessionId, checkpointId, mode) =>
+      timed(
+        logger,
+        "undo",
+        { sessionId, ...(checkpointId ? { checkpointId } : {}), ...(mode ? { mode } : {}) },
+        () => host.undo(sessionId, checkpointId, mode),
       ),
     answerPermission: (sessionId: string, permId: string, decision: PermissionDecisionKind) =>
       timed(logger, "answerPermission", { sessionId, permId, decision }, () =>
         host.answerPermission(sessionId, permId, decision),
       ),
+    ...(host.forkSession
+      ? {
+          forkSession: (sessionId: string, opts?: { title?: string; upToMessage?: number }) =>
+            timed(
+              logger,
+              "forkSession",
+              {
+                sessionId,
+                ...(opts?.title ? logger.textField("title", opts.title) : {}),
+                ...(opts?.upToMessage !== undefined ? { upToMessage: opts.upToMessage } : {}),
+              },
+              () => host.forkSession!(sessionId, opts),
+            ),
+        }
+      : {}),
+    ...(host.compact
+      ? {
+          compact: (sessionId: string) =>
+            timed(logger, "compact", { sessionId }, () => host.compact!(sessionId)),
+        }
+      : {}),
+    ...(host.setPermissionMode
+      ? {
+          setPermissionMode: (
+            sessionId: string,
+            mode: Parameters<NonNullable<SessionHost["setPermissionMode"]>>[1],
+          ) =>
+            timed(logger, "setPermissionMode", { sessionId, mode }, () =>
+              host.setPermissionMode!(sessionId, mode),
+            ),
+        }
+      : {}),
+    ...(host.setPermissionProfile
+      ? {
+          setPermissionProfile: (sessionId: string, name: string) =>
+            timed(logger, "setPermissionProfile", { sessionId, name }, () =>
+              host.setPermissionProfile!(sessionId, name),
+            ),
+        }
+      : {}),
+    ...(host.listPermissionProfiles
+      ? {
+          listPermissionProfiles: (sessionId: string) =>
+            timed(logger, "listPermissionProfiles", { sessionId }, () =>
+              host.listPermissionProfiles!(sessionId),
+            ),
+        }
+      : {}),
     dispose: () => {
       try {
         logger.log("host.dispose");

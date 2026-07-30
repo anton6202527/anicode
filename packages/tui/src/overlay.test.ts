@@ -9,6 +9,8 @@ import {
   buildModelPickerOverlay,
   buildSessionsOverlay,
   buildPermissionOverlay,
+  permissionInputPreview,
+  permissionPatchPreview,
   buildCommandMenuOverlay,
   hitTestSprite,
   windowHorizontally,
@@ -26,6 +28,33 @@ test("overlay: sliceAnsi 取纯文本可见区间", () => {
   assert.equal(strip(sliceAnsi("hello", 1, 3)), "el");
   assert.equal(strip(sliceAnsi("hello", 0, 100)), "hello");
   assert.equal(strip(sliceAnsi("hello", 10, 20)), "");
+});
+
+test("overlay: 授权参数预览稳定排序并隐藏 credential", () => {
+  const preview = permissionInputPreview({
+    z: "ok",
+    apiKey: "sk-super-secret-value",
+    nested: { authorization: "Bearer private", a: 1 },
+  });
+  assert.equal(
+    preview,
+    '{"apiKey":"[REDACTED]","nested":{"a":1,"authorization":"[REDACTED]"},"z":"ok"}',
+  );
+  assert.doesNotMatch(preview, /super-secret|Bearer private/);
+});
+
+test("overlay: PatchSet 授权预览有界、可读且脱敏", () => {
+  const lines = permissionPatchPreview(
+    {
+      patch:
+        "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-KEY=old\n+KEY=sk-super-secret-value\n+NEXT=1\n+MORE=2",
+    },
+    6,
+  );
+  assert.equal(lines.length, 6);
+  assert.match(lines.join("\n"), /\[REDACTED\]/);
+  assert.doesNotMatch(lines.join("\n"), /sk-super/);
+  assert.match(lines[5] ?? "", /truncated/);
 });
 
 test("overlay: sliceAnsi 右半段续接颜色状态", () => {
@@ -123,7 +152,9 @@ test("overlay: 会话列表与授权弹框定宽且含关键信息", () => {
   assert.equal(anchored.left, 0);
   assert.equal(anchored.width, 80);
   assert.equal(anchored.top + anchored.lines.length, 24, "授权层末行应贴住输入框上缘");
-  assert.ok(anchored.lines[8]!.includes("48;2;246;177;122"), "第三项应为方向键高亮项");
+  const thirdOptionRow = anchored.hitRows?.findIndex((option) => option === 2) ?? -1;
+  assert.ok(thirdOptionRow >= 0);
+  assert.ok(anchored.lines[thirdOptionRow]!.includes("48;2;246;177;122"), "第三项应为方向键高亮项");
 });
 
 test("overlay: 命令菜单钉在锚点上方、定宽、含命令与描述与高亮", () => {
