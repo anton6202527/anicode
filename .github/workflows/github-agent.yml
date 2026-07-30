@@ -34,7 +34,6 @@ jobs:
       ANICODE_GITHUB_HEAD_SHA: ${{ inputs.head_sha }}
       ANICODE_GITHUB_FAILED_URL: ${{ inputs.failed_url }}
       ANICODE_GITHUB_MODEL: ${{ vars.ANICODE_GITHUB_MODEL }}
-      ANICODE_GITHUB_RESULT: ${{ runner.temp }}/anicode-github-result.json
       ANICODE_CREDENTIAL_BACKEND: vault
       VAULT_ADDR: ${{ vars.ANICODE_VAULT_ADDR }}
       VAULT_NAMESPACE: ${{ vars.ANICODE_VAULT_NAMESPACE }}
@@ -72,6 +71,8 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Run headless agent and deterministic verifier
+        env:
+          ANICODE_GITHUB_RESULT: ${{ runner.temp }}/anicode-github-result.json
         run: npm run github-agent --workspace @anicode/core
       - name: Publish repair branch and pull request
         if: ${{ inputs.job_type == 'github-repair' }}

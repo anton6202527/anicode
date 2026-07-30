@@ -14,6 +14,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  workflow-contract:
+    name: workflow contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Validate GitHub Actions context and shell contracts
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
   quality:
     name: quality (node ${{ matrix.node }})
     runs-on: ubuntu-latest
