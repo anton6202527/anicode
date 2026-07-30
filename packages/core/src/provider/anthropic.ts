@@ -28,7 +28,10 @@ import type {
   Usage,
 } from "../types.js";
 import { emptyUsage } from "../types.js";
-import { ANTHROPIC_OAUTH_BETA } from "../auth/oauth.js";
+import {
+  ANTHROPIC_OAUTH_BETA,
+  ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
+} from "../auth/oauth.js";
 import type { TokenSource } from "../auth/token-source.js";
 
 export interface AnthropicProviderOptions {
@@ -43,6 +46,8 @@ export interface AnthropicProviderOptions {
    * 身份 system 块，并在每次请求前取新 token（临期自动续期）。与 apiKey 互斥优先。
    */
   tokenSource?: TokenSource;
+  /** Internal tests only. Subscription OAuth is not an authorized production integration. */
+  allowUnverifiedSubscriptionOAuthForTesting?: boolean;
 }
 
 export class AnthropicProvider implements Provider {
@@ -55,6 +60,9 @@ export class AnthropicProvider implements Provider {
   private builtToken: string | undefined;
 
   constructor(opts: AnthropicProviderOptions = {}) {
+    if (opts.tokenSource && !opts.allowUnverifiedSubscriptionOAuthForTesting) {
+      throw new Error(ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE);
+    }
     this.tokenSource = opts.tokenSource;
     this.baseURL = opts.baseURL;
     this.maxRetries = opts.maxRetries ?? 0;

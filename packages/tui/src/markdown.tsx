@@ -39,23 +39,10 @@ function inline(text: string): React.ReactNode[] {
   });
 }
 
-/** 表格、代码和框线内容需要连续显示，不参与正文的行间留白。 */
-function compactRows(lines: readonly string[]): boolean[] {
-  let fenced = false;
-  return lines.map((line) => {
-    if (/^\s*```/.test(line)) {
-      fenced = !fenced;
-      return true;
-    }
-    return fenced || /^\s*(?:\||[┌┬┐├┼┤└┴┘│─])/.test(line);
-  });
-}
-
 /** Small, dependency-free Markdown renderer for terminal conversation output. */
 export function MarkdownText({ text }: { text: string }) {
   const safe = sanitizeTerminalText(text);
   const lines = safe.split("\n");
-  const compact = compactRows(lines);
   const rows: React.ReactNode[] = [];
   let fenced = false;
   let language = "";
@@ -100,17 +87,10 @@ export function MarkdownText({ text }: { text: string }) {
           </Text>,
         );
       } else {
-        rows.push(<Text key={index}>{inline(line)}</Text>);
+        // Ink 不会给空 Text 分配终端行；用一个空格保留 Markdown 显式段落间隔。
+        rows.push(<Text key={index}>{line ? inline(line) : " "}</Text>);
       }
     }
-
-    const next = lines[index + 1];
-    const needsGap =
-      next !== undefined &&
-      line.trim().length > 0 &&
-      next.trim().length > 0 &&
-      !(compact[index] && compact[index + 1]);
-    if (needsGap) rows.push(<Text key={`${index}:gap`}> </Text>);
   }
   return <Box flexDirection="column">{rows}</Box>;
 }

@@ -20,9 +20,27 @@ import type { OpenHandle, PermissionDecisionKind, SessionHost } from "../host.js
 import type { PermissionMode, PermissionProfile } from "../permission.js";
 
 export interface HttpSessionHostOptions {
-  /** 形如 http://127.0.0.1:8317（不带尾斜杠）。 */
+  /** 回环可用 http；非回环必须使用 https。 */
   baseUrl: string;
   token?: string;
+}
+
+export function secureHttpBaseUrl(input: string): string {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new TypeError("Invalid AniCode server URL");
+  }
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  if (url.username || url.password || url.search || url.hash) {
+    throw new TypeError("AniCode server URL must not contain credentials, query, or fragment");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new TypeError("Non-loopback AniCode server URLs must use HTTPS");
+  }
+  return url.href.replace(/\/+$/, "");
 }
 
 interface SseFrame {
@@ -58,7 +76,7 @@ export class HttpSessionHost implements SessionHost {
   private disposed = false;
 
   constructor(opts: HttpSessionHostOptions) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = secureHttpBaseUrl(opts.baseUrl);
     if (opts.token) this.token = opts.token;
   }
 
@@ -110,7 +128,6 @@ export class HttpSessionHost implements SessionHost {
     const ac = new AbortController();
     this.aborts.add(ac);
     const url = new URL(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}/events`);
-    if (this.token) url.searchParams.set("token", this.token);
     const res = await fetch(url, { headers: this.headers(), signal: ac.signal });
     if (!res.ok || !res.body) {
       this.aborts.delete(ac);

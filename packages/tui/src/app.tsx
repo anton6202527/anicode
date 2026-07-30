@@ -29,6 +29,7 @@ import {
   type Key,
 } from "ink";
 import {
+  diagnoseProvider,
   probeLocalProviders,
   discoverSkills,
   expandCommand,
@@ -3101,8 +3102,8 @@ function providersText(
       "Provider（canonical id · 协议 · 位置 · 凭证）",
     ),
     ...providers.map((provider) => {
-      const configuredEnv = inspectCredentials
-        ? provider.apiKeyEnv.find((name) => Boolean(process.env[name]?.trim()))
+      const credentialState = inspectCredentials
+        ? inspectProviderCredential(provider, `${provider.id}/__credential_status__`)
         : undefined;
       const credential = !provider.requiresApiKey
         ? t("No API key required", "无需 API key")
@@ -3111,8 +3112,11 @@ function providersText(
               `Credential validated by host (${provider.apiKeyEnv.join(t(" or ", " 或 ")) || "API key"})`,
               `凭证由宿主校验（${provider.apiKeyEnv.join(t(" or ", " 或 ")) || "API key"}）`,
             )
-          : configuredEnv
-            ? t(`${configuredEnv} configured`, `${configuredEnv} 已配置`)
+          : credentialState?.ready
+            ? t(
+                `${credentialState.source ?? t("Credential", "凭证")} configured`,
+                `${credentialState.source ?? t("Credential", "凭证")} 已配置`,
+              )
             : t(
                 `Missing ${provider.apiKeyEnv.join(t(" or ", " 或 ")) || t("API key env var", "API key 环境变量")}`,
                 `缺少 ${provider.apiKeyEnv.join(t(" or ", " 或 ")) || t("API key env var", "API key 环境变量")}`,
@@ -3165,6 +3169,27 @@ interface PickerRow {
   readyHint: string;
 }
 
+/**
+ * 读取 provider 的安全凭证状态。生产环境中的 Key 会在启动时从 process.env 迁入
+ * CredentialBroker，因此必须优先走 registry 诊断；自定义测试 descriptor 未注册时才
+ * 回退到环境变量。这里只返回存在性和变量名，不暴露凭证值。
+ */
+function inspectProviderCredential(
+  provider: ProviderDescriptor,
+  spec: string,
+): { ready: boolean; source?: string } {
+  try {
+    const diagnostics = diagnoseProvider(spec);
+    return {
+      ready: diagnostics.hasCredentials,
+      ...(diagnostics.credentialEnv ? { source: diagnostics.credentialEnv } : {}),
+    };
+  } catch {
+    const source = provider.apiKeyEnv.find((name) => Boolean(process.env[name]?.trim()));
+    return { ready: Boolean(source), ...(source ? { source } : {}) };
+  }
+}
+
 /** 把打平的模型目录转成选择器行，并按（就绪·推荐）优先稳定排序。 */
 export function buildPickerRows(
   catalog: readonly ModelCatalogEntry[],
@@ -3191,10 +3216,15 @@ export function buildPickerRows(
       ready = undefined;
       readyHint = t("Credential validated by host", "凭证由宿主校验");
     } else {
-      const configured = apiKeyEnv.find((name) => Boolean(process.env[name]?.trim()));
-      ready = Boolean(configured);
-      readyHint = configured
-        ? t(`${configured} configured`, `${configured} 已配置`)
+      const credentialState = descriptor
+        ? inspectProviderCredential(descriptor, entry.spec)
+        : { ready: false };
+      ready = credentialState.ready;
+      readyHint = ready
+        ? t(
+            `${credentialState.source ?? t("Credential", "凭证")} configured`,
+            `${credentialState.source ?? t("Credential", "凭证")} 已配置`,
+          )
         : t(
             `Missing ${apiKeyEnv.join("/") || "API key"}`,
             `缺 ${apiKeyEnv.join("/") || "API key"}`,

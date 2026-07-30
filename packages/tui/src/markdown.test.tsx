@@ -24,14 +24,15 @@ test("MarkdownText: terminal control sequences are stripped", async () => {
   view.unmount();
 });
 
-test("MarkdownText: prose rows are spaced while table rows stay compact", async () => {
-  const view = render(<MarkdownText text={"Summary\nDetails\n| A | B |\n| - | - |\n| 1 | 2 |"} />);
+test("MarkdownText: adjacent rows stay compact while explicit blank lines remain", async () => {
+  const view = render(
+    <MarkdownText text={"Summary\nDetails\n\n| A | B |\n| - | - |\n| 1 | 2 |"} />,
+  );
   await new Promise((resolve) => setTimeout(resolve, 20));
   const lines = (view.lastFrame() ?? "").split("\n");
   assert.equal(lines[0], "Summary");
-  assert.equal(lines[1]?.trim(), "");
-  assert.equal(lines[2], "Details");
-  assert.equal(lines[3]?.trim(), "");
-  assert.deepEqual(lines.slice(4), ["| A | B |", "| - | - |", "| 1 | 2 |"]);
+  assert.equal(lines[1], "Details");
+  assert.equal(lines[2]?.trim(), "");
+  assert.deepEqual(lines.slice(3), ["| A | B |", "| - | - |", "| 1 | 2 |"]);
   view.unmount();
 });

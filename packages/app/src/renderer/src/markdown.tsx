@@ -6,6 +6,7 @@
 import React, { useState } from "react";
 import { t } from "@anicode/core/i18n";
 import { parseMarkdown, type MdBlock, type Span } from "@anicode/shared";
+import { trustedExternalUrl } from "../../shared/security.js";
 
 export function Markdown({ text }: { text: string }) {
   return <>{parseMarkdown(text).map((block, i) => renderBlock(block, i))}</>;
@@ -68,12 +69,16 @@ function renderSpan(span: Span, key: number): React.ReactNode {
       return <strong key={key}>{renderSpans(span.children)}</strong>;
     case "em":
       return <em key={key}>{renderSpans(span.children)}</em>;
-    case "link":
-      return (
-        <a key={key} href={span.href} className="md-link" target="_blank" rel="noreferrer">
+    case "link": {
+      const href = trustedExternalUrl(span.href);
+      return href ? (
+        <a key={key} href={href} className="md-link" target="_blank" rel="noreferrer">
           {renderSpans(span.children)}
         </a>
+      ) : (
+        <React.Fragment key={key}>{renderSpans(span.children)}</React.Fragment>
       );
+    }
   }
 }
 

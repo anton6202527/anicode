@@ -116,13 +116,15 @@ test("http host: permission-mode / permission-profile 端到端可切", async ()
   }
 });
 
-test("http host: 配了 token 后无凭据请求 401，带凭据可用（SSE 走查询参数）", async () => {
+test("http host: token 只接受 Authorization header，URL 查询参数被拒绝", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-"));
   const { server, baseUrl } = await startHttp(dir, scriptedProvider([]), "s3cret");
   const anon = new HttpSessionHost({ baseUrl });
   const auth = new HttpSessionHost({ baseUrl, token: "s3cret" });
   try {
     await assert.rejects(() => anon.listSessions(), /unauthorized|401/);
+    const leakedQuery = await fetch(`${baseUrl}/sessions?token=s3cret`);
+    assert.equal(leakedQuery.status, 401);
     const meta = await auth.createSession({ cwd: dir, model: "scripted" });
     const handle = await auth.open(meta.id, () => {});
     assert.equal(handle.snapshot.meta.id, meta.id);
@@ -130,6 +132,41 @@ test("http host: 配了 token 后无凭据请求 401，带凭据可用（SSE 走
   } finally {
     anon.dispose();
     auth.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("http security: clients require TLS off loopback and server refuses non-loopback bind", async () => {
+  assert.throws(
+    () => new HttpSessionHost({ baseUrl: "http://example.com:8317" }),
+    /must use HTTPS/,
+  );
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-bind-"));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  const server = new HttpDaemonServer({ manager });
+  await assert.rejects(() => server.listen(0, "0.0.0.0"), /loopback host/);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("http security: per-address rate limit returns 429 and Retry-After", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-rate-"));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  const server = new HttpDaemonServer({ manager, rateLimit: { maxRequests: 1 } });
+  await server.listen(0);
+  const baseUrl = `http://127.0.0.1:${server.port()}`;
+  try {
+    assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
+    const limited = await fetch(`${baseUrl}/healthz`);
+    assert.equal(limited.status, 429);
+    assert.ok(limited.headers.get("retry-after"));
+  } finally {
     await server.close();
     await fs.rm(dir, { recursive: true, force: true });
   }

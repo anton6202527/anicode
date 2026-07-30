@@ -21,11 +21,11 @@
  *      `resolveInstance` 惰性路由到按目录隔离的 SessionManager（未配置则忽略、用默认实例）。
  *
  * 安全：默认只应绑定 127.0.0.1；可选 token —— 提供时所有请求须带
- * `Authorization: Bearer <token>`（SSE 亦可用 `?token=` 查询参数，便于 EventSource）。
+ * `Authorization: Bearer <token>`；SSE 同样只接受 header，凭证绝不进入 URL。
  */
 
 import * as http from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { t } from "../i18n.js";
 import { SessionManager, type SessionEvent, type SessionSnapshot } from "../session-manager.js";
@@ -62,9 +62,16 @@ export interface HttpDaemonOptions {
   feedLingerMs?: number;
   /** 监听关闭后的宿主资源清理（数据库、worker 等）。 */
   onClose?: () => void | Promise<void>;
+  /** 单个 socket 地址在窗口内允许的请求数。默认每分钟 600。 */
+  rateLimit?: { windowMs?: number; maxRequests?: number };
 }
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
 
 class HttpRequestError extends Error {
   constructor(
@@ -265,6 +272,9 @@ export class HttpDaemonServer {
   private replayBufferSize: number;
   private feedLingerMs: number;
   private onClose?: () => void | Promise<void>;
+  private rateWindowMs: number;
+  private rateMaxRequests: number;
+  private requestRates = new Map<string, { startedAt: number; count: number }>();
   /** 活跃 SSE 连接的清理器，close 时逐个断开。 */
   private sseCleanups = new Set<() => void>();
   /** 目录 → 实例的 memo（并发 boot 去重）。 */
@@ -278,6 +288,8 @@ export class HttpDaemonServer {
     if (opts.resolveInstance) this.resolveInstance = opts.resolveInstance;
     this.replayBufferSize = opts.replayBufferSize ?? 1024;
     this.feedLingerMs = opts.feedLingerMs ?? 15_000;
+    this.rateWindowMs = Math.max(1_000, opts.rateLimit?.windowMs ?? 60_000);
+    this.rateMaxRequests = Math.max(1, opts.rateLimit?.maxRequests ?? 600);
     if (opts.onClose) this.onClose = opts.onClose;
     this.server = http.createServer((req, res) => {
       void this.route(req, res).catch((err) => {
@@ -294,10 +306,22 @@ export class HttpDaemonServer {
         } else res.destroy(err instanceof Error ? err : undefined);
       });
     });
+    this.server.requestTimeout = 30_000;
+    this.server.headersTimeout = 15_000;
+    this.server.keepAliveTimeout = 5_000;
+    this.server.maxRequestsPerSocket = 100;
+    this.server.maxConnections = 128;
   }
 
-  /** 监听：默认只绑回环地址；绑 0.0.0.0 请务必配 token。 */
+  /** 明文 Node HTTP server 只能绑回环；远程入口必须经同机 HTTPS/mTLS 反向代理。 */
   listen(port: number, host = "127.0.0.1"): Promise<void> {
+    if (!isLoopbackHost(host)) {
+      return Promise.reject(
+        new Error(
+          "HTTP daemon may only bind a loopback host; use a TLS reverse proxy for remote access",
+        ),
+      );
+    }
     return new Promise((res, rej) => {
       this.server.once("error", rej);
       this.server.listen(port, host, () => res());
@@ -321,16 +345,37 @@ export class HttpDaemonServer {
       inst.firehose?.close();
     }
     this.streams.clear();
+    this.requestRates.clear();
     await new Promise<void>((res) => this.server.close(() => res()));
     await this.onClose?.();
   }
 
-  private authorized(req: http.IncomingMessage, url: URL): boolean {
+  private authorized(req: http.IncomingMessage): boolean {
     if (!this.token) return true;
     const header = req.headers.authorization;
-    if (header === `Bearer ${this.token}`) return true;
-    // EventSource 无法设 header，允许 SSE 用查询参数带 token。
-    return url.searchParams.get("token") === this.token;
+    if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
+    const presented = Buffer.from(header.slice(7));
+    const expected = Buffer.from(this.token);
+    return presented.length === expected.length && timingSafeEqual(presented, expected);
+  }
+
+  private withinRateLimit(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+    const now = Date.now();
+    const key = req.socket.remoteAddress ?? "unknown";
+    let rate = this.requestRates.get(key);
+    if (!rate || now - rate.startedAt >= this.rateWindowMs) {
+      rate = { startedAt: now, count: 0 };
+      this.requestRates.set(key, rate);
+    }
+    rate.count++;
+    if (rate.count <= this.rateMaxRequests) return true;
+    const retrySeconds = Math.max(
+      1,
+      Math.ceil((rate.startedAt + this.rateWindowMs - now) / 1_000),
+    );
+    res.setHeader("retry-after", String(retrySeconds));
+    json(res, 429, { error: "rate limit exceeded", code: "RATE_LIMITED" });
+    return false;
   }
 
   /** 按请求携带的目录路由到实例（未配置 resolveInstance 或无目录 → 默认实例）。 */
@@ -406,6 +451,9 @@ export class HttpDaemonServer {
         : randomUUID();
     res.setHeader("x-request-id", requestId);
     res.setHeader("x-anicode-api-version", String(PROTOCOL_VERSION));
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("x-content-type-options", "nosniff");
+    if (!this.withinRateLimit(req, res)) return;
     const requestedVersion = req.headers["x-anicode-api-version"];
     if (requestedVersion !== undefined && requestedVersion !== String(PROTOCOL_VERSION)) {
       return json(res, 426, {
@@ -414,7 +462,7 @@ export class HttpDaemonServer {
         details: { supported: [PROTOCOL_VERSION] },
       });
     }
-    if (!this.authorized(req, url)) return json(res, 401, { error: "unauthorized" });
+    if (!this.authorized(req)) return json(res, 401, { error: "unauthorized" });
 
     if (req.method === "GET") {
       if (url.pathname === "/healthz") return json(res, 200, { ok: true });

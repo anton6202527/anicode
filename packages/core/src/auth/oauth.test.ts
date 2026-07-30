@@ -11,6 +11,7 @@ import {
   exchangeCode,
   refreshTokens,
   ANTHROPIC_CLIENT_ID,
+  ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
 } from "./oauth.js";
 import { AuthStore } from "./store.js";
 import { AnthropicOAuthTokenSource } from "./token-source.js";
@@ -51,12 +52,40 @@ test("oauth: exchangeCode 用注入 fetch 组装正确请求并解析", async ()
   }) as unknown as typeof fetch;
   const t = await exchangeCode(
     { code: "c", verifier: "v", state: "s" },
-    { fetch: fakeFetch, now: () => 0 },
+    { fetch: fakeFetch, now: () => 0, allowUnverifiedForTesting: true },
   );
   assert.equal(t.access, "AT");
   assert.equal(captured!.body.grant_type, "authorization_code");
   assert.equal(captured!.body.code_verifier, "v");
   assert.equal(captured!.body.client_id, ANTHROPIC_CLIENT_ID);
+});
+
+test("oauth: production token exchange and token source fail closed", async () => {
+  const neverFetch = (async () => {
+    throw new Error("network must not be reached");
+  }) as unknown as typeof fetch;
+  await assert.rejects(
+    exchangeCode({ code: "c", verifier: "v" }, { fetch: neverFetch }),
+    new RegExp(ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE),
+  );
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-auth-disabled-"));
+  try {
+    const store = new AuthStore(path.join(dir, "auth.json"));
+    await store.set("anthropic", {
+      type: "oauth",
+      access: "must-not-be-used",
+      refresh: "must-not-be-used",
+      expiresAt: Date.now() + 60_000,
+    });
+    const source = new AnthropicOAuthTokenSource(store, "anthropic");
+    await assert.rejects(
+      source.getAccessToken(),
+      new RegExp(ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE),
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("oauth: refreshTokens 沿用旧 refresh（当响应未回传时）", async () => {
@@ -65,7 +94,11 @@ test("oauth: refreshTokens 沿用旧 refresh（当响应未回传时）", async 
     status: 200,
     json: async () => ({ access_token: "AT2", expires_in: 3600 }),
   })) as unknown as typeof fetch;
-  const t = await refreshTokens("OLD_RT", { fetch: fakeFetch, now: () => 0 });
+  const t = await refreshTokens("OLD_RT", {
+    fetch: fakeFetch,
+    now: () => 0,
+    allowUnverifiedForTesting: true,
+  });
   assert.equal(t.access, "AT2");
   assert.equal(t.refresh, "OLD_RT");
 });
@@ -85,6 +118,7 @@ test("token-source: 未过期直接返回，临期自动刷新并回写", async 
     let refreshCalls = 0;
     const src = new AnthropicOAuthTokenSource(store, "anthropic", {
       now: () => now,
+      allowUnverifiedForTesting: true,
       refresh: async () => {
         refreshCalls++;
         return { access: "A2", refresh: "R2", expiresAt: now + 3_600_000 };
@@ -112,6 +146,7 @@ test("token-source: 并发临期请求共享同一次刷新", async () => {
     let refreshCalls = 0;
     const src = new AnthropicOAuthTokenSource(store, "anthropic", {
       now: () => 1_000_000,
+      allowUnverifiedForTesting: true,
       refresh: async () => {
         refreshCalls++;
         await new Promise((r) => setTimeout(r, 10));

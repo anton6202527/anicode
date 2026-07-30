@@ -94,6 +94,84 @@ test("Remote Runtime server: OIDC boundary、durable queue、ephemeral execution
   }
 });
 
+test("Remote Runtime server: side effects default to no retry; quotas and retry-safe contract fail closed", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-remote-retry-"));
+  await fs.mkdir(path.join(root, "project"));
+  let calls = 0;
+  let executionId: string | undefined;
+  const runtime: ExecutionRuntime = {
+    async run(request) {
+      calls++;
+      executionId = request.env?.["ANICODE_EXECUTION_ID"];
+      throw new Error("runtime crashed after an unknown execution boundary");
+    },
+  };
+  const server = new RemoteRuntimeHttpServer({
+    queue: new DurableWorkerQueue(),
+    executionRuntime: runtime,
+    workspaceRoot: root,
+    authenticate: async () => ({ actor: "user-1", claims: { tenant_id: "tenant-1" } }),
+    authorizer: {
+      async authorizeSubmit(_identity, request) {
+        return {
+          tenantId: "tenant-1",
+          workspaceId: request.workspaceId,
+          policy: request.policy,
+          network: request.network,
+        };
+      },
+      async authorizeJob() {},
+    },
+    quotas: { maxQueuedPerActor: 1, maxOutstandingPerTenant: 2 },
+  });
+  try {
+    const endpoint = await server.listen();
+    const submit = (idempotencyKey: string, extra: Record<string, unknown> = {}) =>
+      fetch(`${endpoint}/v1/executions`, {
+        method: "POST",
+        headers: { authorization: "Bearer ignored", "content-type": "application/json" },
+        body: JSON.stringify({
+          command: "dangerous-command",
+          workspaceId: "project",
+          policy: "workspace-write",
+          network: false,
+          idempotencyKey,
+          ...extra,
+        }),
+      });
+
+    const accepted = await submit("no-replay");
+    assert.equal(accepted.status, 202);
+    const first = (await accepted.json()) as { id: string };
+    const duplicate = await submit("no-replay");
+    assert.equal((await duplicate.json() as { id: string }).id, first.id);
+    const quota = await submit("queued-behind-first");
+    assert.equal(quota.status, 429);
+    assert.equal(((await quota.json()) as { error: { code: string } }).error.code, "actor_queue_full");
+
+    assert.equal(await server.service.runOnce(), true);
+    assert.equal(await server.service.runOnce(), false);
+    assert.equal(calls, 1, "default never policy must not replay an unknown side effect");
+    assert.ok(executionId?.startsWith("job_"));
+    const failed = (await (
+      await fetch(`${endpoint}/v1/executions/${first.id}`, {
+        headers: { authorization: "Bearer ignored" },
+      })
+    ).json()) as { status: string };
+    assert.equal(failed.status, "failed");
+
+    const unsafe = await submit("unsafe-retry", { retryPolicy: "safe" });
+    assert.equal(unsafe.status, 400);
+    assert.equal(
+      ((await unsafe.json()) as { error: { code: string } }).error.code,
+      "unsafe_retry_policy",
+    );
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Remote Runtime server: OIDC claims enforce tenant、workspace 与 capability boundaries", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-remote-authz-"));
   await fs.mkdir(path.join(root, "project"));

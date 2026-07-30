@@ -12,7 +12,7 @@ import * as path from "node:path";
 import type { IpcMain } from "electron";
 import { registerOpenAICompatibleProvider } from "@anicode/core";
 import type { EventEnvelope, ModelRow, PluginEntry, UserModel } from "../shared/api.js";
-import { Bridge } from "./bridge.js";
+import { Bridge, type BridgeOptions } from "./bridge.js";
 
 type Handler = (event: { sender: FakeSender }, ...args: unknown[]) => unknown;
 
@@ -45,7 +45,9 @@ function fakeIpc(): {
   return { ipcMain, invoke };
 }
 
-async function tempBridge(): Promise<{ bridge: Bridge; dir: string }> {
+async function tempBridge(
+  isTrustedSender: BridgeOptions["isTrustedSender"] = () => true,
+): Promise<{ bridge: Bridge; dir: string }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-"));
   const bridge = new Bridge({
     cwd: dir,
@@ -54,19 +56,31 @@ async function tempBridge(): Promise<{ bridge: Bridge; dir: string }> {
     modelsFile: path.join(dir, "models.json"),
     appName: "anicode",
     appVersion: "0.0.1-test",
+    isTrustedSender,
   });
   return { bridge, dir };
 }
 
+test("Bridge: rejects IPC from an untrusted renderer", async () => {
+  const { bridge } = await tempBridge(() => false);
+  const { ipcMain, invoke } = fakeIpc();
+  bridge.register(ipcMain);
+  try {
+    await assert.rejects(() => invoke("app:info", new FakeSender()), /untrusted IPC sender/);
+  } finally {
+    await bridge.dispose();
+  }
+});
+
 test("Bridge: 创建会话 → 订阅 → 发送，事件经 sender 回流（走 debug/demo，离线）", async () => {
-  const { bridge } = await tempBridge();
+  const { bridge, dir } = await tempBridge();
   const { ipcMain, invoke } = fakeIpc();
   bridge.register(ipcMain);
   const sender = new FakeSender();
 
   try {
     const meta = (await invoke("host:createSession", sender, {
-      cwd: process.cwd(),
+      cwd: dir,
       model: "debug/demo",
     })) as {
       id: string;
@@ -116,6 +130,7 @@ test("Bridge: 模型目录标注凭证就绪状态，debug/demo 免 key 可用",
     modelsFile: path.join(dir, "models.json"),
     appName: "anicode",
     appVersion: "0.0.1-test",
+    isTrustedSender: () => true,
     env,
   });
   const { ipcMain, invoke } = fakeIpc();
@@ -144,6 +159,7 @@ test("Bridge: 配置 custom/<model> 时可创建首个会话", async () => {
     modelsFile: path.join(dir, "models.json"),
     appName: "anicode",
     appVersion: "0.0.1-test",
+    isTrustedSender: () => true,
     defaultModel: "custom/my-model",
   });
   const { ipcMain, invoke } = fakeIpc();
@@ -164,17 +180,17 @@ test("Bridge: 配置 custom/<model> 时可创建首个会话", async () => {
 });
 
 test("Bridge: deleteSession 从列表移除会话", async () => {
-  const { bridge } = await tempBridge();
+  const { bridge, dir } = await tempBridge();
   const { ipcMain, invoke } = fakeIpc();
   bridge.register(ipcMain);
   const sender = new FakeSender();
   try {
     const a = (await invoke("host:createSession", sender, {
-      cwd: process.cwd(),
+      cwd: dir,
       model: "debug/demo",
     })) as { id: string };
     const b = (await invoke("host:createSession", sender, {
-      cwd: process.cwd(),
+      cwd: dir,
       model: "debug/demo",
     })) as { id: string };
     let list = (await invoke("host:listSessions", sender)) as { id: string }[];
@@ -210,7 +226,7 @@ test("Bridge: 自定义模型进入目录、可被 createProvider 解析、可�
 
     // 该 spec 能真正建会话（provider 存在，model 自由，免 key）。
     const meta = (await invoke("host:createSession", sender, {
-      cwd: process.cwd(),
+      cwd: dir,
       model: "debug/my-coder",
     })) as {
       model: string;
@@ -230,6 +246,7 @@ test("Bridge: 自定义模型进入目录、可被 createProvider 解析、可�
       modelsFile: path.join(dir, "models.json"),
       appName: "anicode",
       appVersion: "0.0.1-test",
+      isTrustedSender: () => true,
     });
     const ipc2 = fakeIpc();
     reopened.register(ipc2.ipcMain);
@@ -295,6 +312,7 @@ test("Bridge: 自动发现的文件系统技能进入市场、默认启用、可
       modelsFile: path.join(dir, "models.json"),
       appName: "anicode",
       appVersion: "0.0.1-test",
+      isTrustedSender: () => true,
     });
     await reopened.init();
     const ipc2 = fakeIpc();
@@ -335,6 +353,7 @@ test("Bridge: 插件默认启用内建项，开关状态写盘并回读", async 
       modelsFile: path.join(dir, "models.json"),
       appName: "anicode",
       appVersion: "0.0.1-test",
+      isTrustedSender: () => true,
     });
     await reopened.init();
     const ipc2 = fakeIpc();

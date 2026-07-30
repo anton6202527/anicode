@@ -60,8 +60,8 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
-/** 轮询等待帧内容满足条件（默认 3s 超时）——比固定 tick 抗环境时序漂移。 */
-async function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+/** 轮询等待帧内容满足条件——CI 冷启动与原生模块加载时也不依赖固定 sleep。 */
+async function waitFor(cond: () => boolean, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond() && Date.now() < deadline) await tick(25);
   if (!cond()) throw new Error(`Timed out after ${timeoutMs}ms waiting for TUI frame`);
@@ -383,14 +383,13 @@ test("TUI: /resume 回显已有会话的历史", async () => {
   const { stdin, lastFrame } = render(
     <App host={host} cwd="/wrong-prop-cwd" model="wrong-prop-model" sessionId="s_start" />,
   );
-  await tick();
-  assert.match(lastFrame() ?? "", /起点历史-5/);
+  await waitFor(() => /起点历史-5/.test(lastFrame() ?? ""));
 
   // /resume 到旧会话
   for (const ch of "/resume s_old") stdin.write(ch);
   await tick();
   stdin.write("\r");
-  await tick(120);
+  await waitFor(() => /会话边界 s_old/.test(lastFrame() ?? ""));
 
   // 界面回显了旧会话的历史
   const frame = lastFrame() ?? "";
@@ -423,7 +422,7 @@ test("TUI: /sessions 列出会话", async () => {
   for (const ch of "/sessions") stdin.write(ch);
   await tick();
   stdin.write("\r");
-  await tick(80);
+  await waitFor(() => /会话列表/.test(lastFrame() ?? ""));
 
   const frame = lastFrame() ?? "";
   assert.match(frame, /会话列表/);
@@ -436,7 +435,7 @@ test("TUI: /sessions 列出会话", async () => {
   const filtered = lastFrame() ?? "";
   assert.match(filtered, /会话A/);
   stdin.write("\r");
-  await tick(100);
+  await waitFor(() => /会话边界 s_a/.test(lastFrame() ?? ""));
   assert.match(lastFrame() ?? "", /会话边界 s_a/);
 
   host.dispose();
@@ -459,22 +458,22 @@ test("TUI: Ctrl+P 打开命令面板，Ctrl+X leader 可新建会话", async () 
   await tick(80);
 
   view.stdin.write("\u0010"); // Ctrl+P
-  await tick(30);
+  await waitFor(() => /\/sessions/.test(view.lastFrame() ?? ""));
   assert.match(view.lastFrame() ?? "", /\/status/);
   assert.match(view.lastFrame() ?? "", /\/sessions/);
   view.stdin.write("\u001b");
 
   view.stdin.write("\u0018"); // Ctrl+X
-  await tick(20);
+  await waitFor(() => /n 新建/.test(view.lastFrame() ?? ""));
   assert.match(view.lastFrame() ?? "", /n 新建/);
   view.stdin.write("n");
-  await tick(100);
+  await waitFor(() => created !== undefined && /会话边界 s_new/.test(view.lastFrame() ?? ""));
   assert.deepEqual(created, { cwd: "/keys/project", model: "debug/demo" });
   assert.match(view.lastFrame() ?? "", /会话边界 s_new/);
 
   // PTY 可能把 leader 与下一键合成一个 chunk；也必须识别，不能污染输入框。
   view.stdin.write("\u0018l");
-  await tick(80);
+  await waitFor(() => /会话列表/.test(view.lastFrame() ?? ""));
   assert.match(view.lastFrame() ?? "", /会话列表/);
   assert.doesNotMatch(view.lastFrame() ?? "", /\u0018l/);
 
@@ -672,13 +671,15 @@ test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认",
   assert.match(frame, /↑↓ 选择 · Enter 确认/);
 
   view.stdin.write("\u001b[B");
+  await waitFor(() => /› \[a\]/.test(view.lastFrame() ?? ""));
   view.stdin.write("\u001b[B");
+  await waitFor(() => /› \[p\]/.test(view.lastFrame() ?? ""));
   view.stdin.write("\r");
-  await tick(80);
+  await waitFor(() => /再次按 p\/Enter/.test(view.lastFrame() ?? ""));
   assert.deepEqual(decisions, []);
   assert.match(view.lastFrame() ?? "", /再次按 p\/Enter/);
   view.stdin.write("\r");
-  await tick(80);
+  await waitFor(() => decisions.length === 1);
   assert.deepEqual(decisions, ["allow_always"]);
   assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
   view.unmount();
@@ -795,7 +796,7 @@ test("TUI: /providers 显示安全元数据，/model 以当前 cwd 新建并切�
     for (const ch of `/model ${spec}`) view.stdin.write(ch);
     await tick();
     view.stdin.write("\r");
-    await tick(120);
+    await waitFor(() => created !== undefined && /会话边界 s_new/.test(view.lastFrame() ?? ""));
 
     assert.deepEqual(created, { cwd: "/model/project", model: spec });
     const modelFrame = view.lastFrame() ?? "";
@@ -878,7 +879,7 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
     for (const ch of "/model") view.stdin.write(ch);
     await tick();
     view.stdin.write("\r");
-    await tick(40);
+    await waitFor(() => /选择模型/.test(view.lastFrame() ?? ""));
 
     const pickerFrame = view.lastFrame() ?? "";
     assert.match(pickerFrame, /选择模型/);
@@ -891,7 +892,7 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
 
     // Esc 取消不新建会话
     view.stdin.write("\u001b");
-    await tick(40);
+    await waitFor(() => !/选择模型/.test(view.lastFrame() ?? ""));
     assert.doesNotMatch(view.lastFrame() ?? "", /选择模型/);
     assert.equal(created, undefined);
 
@@ -899,12 +900,12 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
     for (const ch of "/model") view.stdin.write(ch);
     await tick();
     view.stdin.write("\r");
-    await tick(40);
+    await waitFor(() => /选择模型/.test(view.lastFrame() ?? ""));
     view.stdin.write("\u001b[<65;10;10M".repeat(8)); // 触控板会批量合并滚轮事件
     await tick(20);
     assert.doesNotMatch(view.lastFrame() ?? "", /\[<65;/); // 鼠标序列不能污染搜索词
     view.stdin.write("\r");
-    await tick(120);
+    await waitFor(() => created !== undefined && /会话边界 s_new/.test(view.lastFrame() ?? ""));
 
     assert.deepEqual(created, {
       cwd: "/pick/project",

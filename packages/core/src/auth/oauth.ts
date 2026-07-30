@@ -1,14 +1,9 @@
 /**
- * Anthropic OAuth（Claude Pro/Max 订阅登录）—— PKCE 授权码流。
+ * Anthropic 订阅 OAuth 的隔离实现。
  *
- * 让用户用已有的 Claude 订阅直接跑 agent，无需去控制台建 API key（对齐 opencode 的
- * `auth login`，降低采用门槛）。流程：
- *   1. buildAuthUrl() 生成授权 URL + PKCE verifier + state；用户在浏览器授权；
- *   2. 回调页展示 `code#state`，用户粘回；exchangeCode() 换取 access/refresh token；
- *   3. token 存 AuthStore；请求时带 `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`；
- *   4. 临期用 refreshTokens() 续期。
- *
- * 纯函数（PKCE / URL / 响应解析）无 I/O、可离线测试；网络交换用注入式 fetch 便于测试。
+ * 第三方客户端在获得 Anthropic 明确书面授权前不得走这条生产路径。授权 URL、PKCE 与
+ * 响应解析保留为离线兼容测试；所有会产生网络请求或消费令牌的入口默认 fail closed，
+ * 仅允许显式的测试依赖开启。
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -92,11 +87,19 @@ export function parseTokenResponse(json: unknown, now: number = Date.now()): OAu
 
 type FetchLike = typeof fetch;
 
+export const ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE =
+  "Anthropic subscription OAuth is disabled pending explicit written authorization for third-party clients; use an Anthropic API key or an officially supported enterprise provider";
+
+function requireTestOnlyOAuth(allowed: boolean | undefined): void {
+  if (!allowed) throw new Error(ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE);
+}
+
 /** 用授权码换取 token。 */
 export async function exchangeCode(
   input: { code: string; verifier: string; state?: string },
-  deps: { fetch?: FetchLike; now?: () => number } = {},
+  deps: { fetch?: FetchLike; now?: () => number; allowUnverifiedForTesting?: boolean } = {},
 ): Promise<OAuthTokens> {
+  requireTestOnlyOAuth(deps.allowUnverifiedForTesting);
   const doFetch = deps.fetch ?? fetch;
   const res = await doFetch(ANTHROPIC_TOKEN_URL, {
     method: "POST",
@@ -125,8 +128,9 @@ export async function exchangeCode(
 /** 用 refresh_token 续期。 */
 export async function refreshTokens(
   refresh: string,
-  deps: { fetch?: FetchLike; now?: () => number } = {},
+  deps: { fetch?: FetchLike; now?: () => number; allowUnverifiedForTesting?: boolean } = {},
 ): Promise<OAuthTokens> {
+  requireTestOnlyOAuth(deps.allowUnverifiedForTesting);
   const doFetch = deps.fetch ?? fetch;
   const res = await doFetch(ANTHROPIC_TOKEN_URL, {
     method: "POST",

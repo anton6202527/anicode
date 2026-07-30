@@ -21,6 +21,8 @@ export interface RemoteExecutionRequest {
   timeoutMs?: number;
   idempotencyKey: string;
   traceparent?: string;
+  /** 默认 never。只有 read-only 且断网的命令可显式声明 safe 并在租约失败后重试。 */
+  retryPolicy?: "never" | "safe";
 }
 
 interface AuthorizedRemoteExecutionRequest extends RemoteExecutionRequest {
@@ -129,6 +131,14 @@ export interface RemoteExecutionView {
   fencingToken?: number;
   createdAt: string;
   updatedAt: string;
+  /** indeterminate 表示执行租约丢失，外部观察者不能假定命令从未运行。 */
+  outcome: "known" | "indeterminate";
+}
+
+export interface RemoteRuntimeQuotas {
+  maxOutstandingPerTenant?: number;
+  maxQueuedPerActor?: number;
+  maxCommandChars?: number;
 }
 
 export interface RemoteRuntimeServerOptions {
@@ -142,6 +152,8 @@ export interface RemoteRuntimeServerOptions {
   maxBodyBytes?: number;
   leaseMs?: number;
   workerId?: string;
+  quotas?: RemoteRuntimeQuotas;
+  httpRateLimit?: { windowMs?: number; maxRequests?: number };
 }
 
 class RemoteHttpError extends Error {
@@ -159,6 +171,56 @@ function validId(value: string, label: string): string {
     throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`);
   }
   return value;
+}
+
+function parseRemoteExecutionRequest(value: unknown): RemoteExecutionRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new RemoteHttpError(400, "invalid_request", "Execution request must be an object");
+  }
+  const input = value as Record<string, unknown>;
+  if (typeof input["command"] !== "string") throw new Error("command must be a string");
+  if (typeof input["workspaceId"] !== "string") throw new Error("workspaceId must be a string");
+  if (input["cwd"] !== undefined && typeof input["cwd"] !== "string") {
+    throw new Error("cwd must be a string");
+  }
+  if (input["policy"] !== "read-only" && input["policy"] !== "workspace-write") {
+    throw new Error("policy must be read-only or workspace-write");
+  }
+  if (typeof input["network"] !== "boolean") throw new Error("network must be boolean");
+  if (
+    input["timeoutMs"] !== undefined &&
+    (typeof input["timeoutMs"] !== "number" ||
+      !Number.isSafeInteger(input["timeoutMs"]) ||
+      input["timeoutMs"] < 1_000)
+  ) {
+    throw new Error("timeoutMs must be an integer of at least 1000");
+  }
+  if (typeof input["idempotencyKey"] !== "string") {
+    throw new Error("idempotencyKey must be a string");
+  }
+  if (input["traceparent"] !== undefined && typeof input["traceparent"] !== "string") {
+    throw new Error("traceparent must be a string");
+  }
+  if (
+    input["retryPolicy"] !== undefined &&
+    input["retryPolicy"] !== "never" &&
+    input["retryPolicy"] !== "safe"
+  ) {
+    throw new Error("retryPolicy must be never or safe");
+  }
+  return {
+    command: input["command"],
+    workspaceId: input["workspaceId"],
+    policy: input["policy"],
+    network: input["network"],
+    idempotencyKey: input["idempotencyKey"],
+    ...(typeof input["cwd"] === "string" ? { cwd: input["cwd"] } : {}),
+    ...(typeof input["timeoutMs"] === "number" ? { timeoutMs: input["timeoutMs"] } : {}),
+    ...(typeof input["traceparent"] === "string" ? { traceparent: input["traceparent"] } : {}),
+    ...(input["retryPolicy"] === "never" || input["retryPolicy"] === "safe"
+      ? { retryPolicy: input["retryPolicy"] }
+      : {}),
+  };
 }
 
 function safeWorkspace(root: string, workspaceId: string, cwd = "."): string {
@@ -182,6 +244,10 @@ function toView(job: WorkerJob<RemoteExecutionRequest, IsolatedRunResult>): Remo
     ...(job.fencingToken !== undefined ? { fencingToken: job.fencingToken } : {}),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
+    outcome:
+      job.status === "failed" && /lease expired|indeterminate/i.test(job.error ?? "")
+        ? "indeterminate"
+        : "known",
   };
 }
 
@@ -189,10 +255,17 @@ export class RemoteExecutionService {
   private readonly telemetry: Telemetry;
   private readonly workerId: string;
   private readonly leaseMs: number;
+  private readonly maxOutstandingPerTenant: number;
+  private readonly maxQueuedPerActor: number;
+  private readonly maxCommandChars: number;
+  private submitTail: Promise<unknown> = Promise.resolve();
   constructor(private readonly options: RemoteRuntimeServerOptions) {
     this.telemetry = options.telemetry ?? noTelemetry;
     this.workerId = options.workerId ?? `remote-${process.pid}`;
     this.leaseMs = Math.max(5_000, options.leaseMs ?? 60_000);
+    this.maxOutstandingPerTenant = Math.max(1, options.quotas?.maxOutstandingPerTenant ?? 100);
+    this.maxQueuedPerActor = Math.max(1, options.quotas?.maxQueuedPerActor ?? 20);
+    this.maxCommandChars = Math.max(1_024, options.quotas?.maxCommandChars ?? 32_768);
   }
 
   async submit(
@@ -201,10 +274,24 @@ export class RemoteExecutionService {
   ): Promise<RemoteExecutionView> {
     validId(request.workspaceId, "workspace id");
     if (!request.command.trim()) throw new Error("Remote command cannot be empty");
+    if (request.command.length > this.maxCommandChars) {
+      throw new RemoteHttpError(413, "command_too_large", "Remote command exceeds policy limit");
+    }
     if (!request.idempotencyKey || request.idempotencyKey.length > 256) {
       throw new Error("Invalid remote idempotency key");
     }
     safeWorkspace(this.options.workspaceRoot, request.workspaceId, request.cwd);
+    const retryPolicy = request.retryPolicy ?? "never";
+    if (retryPolicy !== "never" && retryPolicy !== "safe") {
+      throw new Error("Invalid remote retry policy");
+    }
+    if (retryPolicy === "safe" && (request.policy !== "read-only" || request.network)) {
+      throw new RemoteHttpError(
+        400,
+        "unsafe_retry_policy",
+        "Retry-safe executions must be read-only with network disabled",
+      );
+    }
     const grant = await this.options.authorizer.authorizeSubmit(identity, request);
     if (grant.workspaceId !== request.workspaceId) {
       throw new RemoteHttpError(403, "workspace_denied", "Authorized workspace mismatch");
@@ -215,14 +302,39 @@ export class RemoteExecutionService {
       policy: grant.policy,
       network: grant.network,
       ...(grant.timeoutMs !== undefined ? { timeoutMs: grant.timeoutMs } : {}),
+      retryPolicy,
       actor: identity.actor,
       tenantId: grant.tenantId,
     };
-    const job = await this.options.queue.enqueue("remote-execution", payload, {
-      idempotencyKey: `${grant.tenantId}:${identity.actor}:${request.idempotencyKey}`,
-      maxAttempts: 3,
+    const queueKey = `${grant.tenantId}:${identity.actor}:${request.idempotencyKey}`;
+    const pending = this.submitTail.catch(() => undefined).then(async () => {
+      const jobs = (await this.options.queue.list()) as WorkerJob<
+        AuthorizedRemoteExecutionRequest,
+        IsolatedRunResult
+      >[];
+      const duplicate = jobs.find((job) => job.idempotencyKey === queueKey);
+      if (duplicate) return duplicate;
+      const outstanding = jobs.filter(
+        (job) =>
+          job.payload?.tenantId === grant.tenantId &&
+          (job.status === "queued" || job.status === "leased"),
+      );
+      if (outstanding.length >= this.maxOutstandingPerTenant) {
+        throw new RemoteHttpError(429, "tenant_quota_exceeded", "Tenant execution quota exceeded");
+      }
+      const actorQueued = outstanding.filter(
+        (job) => job.payload.actor === identity.actor && job.status === "queued",
+      );
+      if (actorQueued.length >= this.maxQueuedPerActor) {
+        throw new RemoteHttpError(429, "actor_queue_full", "Actor execution queue is full");
+      }
+      return this.options.queue.enqueue("remote-execution", payload, {
+        idempotencyKey: queueKey,
+        maxAttempts: retryPolicy === "safe" ? 3 : 1,
+      }) as Promise<WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult>>;
     });
-    return toView(job as WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult>);
+    this.submitTail = pending;
+    return toView(await pending);
   }
 
   async get(identity: RemoteIdentity, id: string): Promise<RemoteExecutionView | undefined> {
@@ -276,6 +388,7 @@ export class RemoteExecutionService {
         network: job.payload.network,
         ...(job.payload.timeoutMs ? { timeoutMs: job.payload.timeoutMs } : {}),
         ...(context ? { traceContext: context } : {}),
+        env: { ANICODE_EXECUTION_ID: job.id },
         workload: {
           tenantId: job.payload.tenantId,
           actor: job.payload.actor,
@@ -293,7 +406,7 @@ export class RemoteExecutionService {
         job.id,
         this.workerId,
         error instanceof Error ? error.message : String(error),
-        true,
+        job.payload.retryPolicy === "safe",
         job.fencingToken,
       );
       span.recordException(error).setStatus({ code: "error" });
@@ -326,6 +439,7 @@ export class RemoteRuntimeHttpServer {
   readonly service: RemoteExecutionService;
   private server: Server | undefined;
   private accepting = true;
+  private readonly requestRates = new Map<string, { startedAt: number; count: number }>();
   constructor(private readonly options: RemoteRuntimeServerOptions) {
     this.service = new RemoteExecutionService(options);
   }
@@ -355,6 +469,11 @@ export class RemoteRuntimeHttpServer {
         resolve();
       });
     });
+    server.requestTimeout = 30_000;
+    server.headersTimeout = 15_000;
+    server.keepAliveTimeout = 5_000;
+    server.maxRequestsPerSocket = 100;
+    server.maxConnections = 256;
     this.server = server;
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Remote Runtime bind failed");
@@ -365,6 +484,7 @@ export class RemoteRuntimeHttpServer {
     const server = this.server;
     this.server = undefined;
     if (!server) return;
+    this.requestRates.clear();
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
@@ -375,6 +495,7 @@ export class RemoteRuntimeHttpServer {
   }
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.withinRateLimit(request, response)) return;
     const url = new URL(request.url ?? "/", "http://remote-runtime.local");
     if (request.method === "GET" && url.pathname === "/healthz") {
       jsonResponse(response, 200, { ok: true });
@@ -399,9 +520,8 @@ export class RemoteRuntimeHttpServer {
       if (!this.accepting) {
         throw new RemoteHttpError(503, "runtime_draining", "Remote Runtime is draining");
       }
-      const body = await readJson<RemoteExecutionRequest>(
-        request,
-        this.options.maxBodyBytes ?? 256 * 1024,
+      const body = parseRemoteExecutionRequest(
+        await readJson<unknown>(request, this.options.maxBodyBytes ?? 256 * 1024),
       );
       jsonResponse(response, 202, await this.service.submit(identity, body));
       return;
@@ -419,6 +539,28 @@ export class RemoteRuntimeHttpServer {
     }
     jsonResponse(response, 404, { error: "not found" });
   }
+
+  private withinRateLimit(request: IncomingMessage, response: ServerResponse): boolean {
+    const windowMs = Math.max(1_000, this.options.httpRateLimit?.windowMs ?? 60_000);
+    const maximum = Math.max(1, this.options.httpRateLimit?.maxRequests ?? 1_200);
+    const now = Date.now();
+    const key = request.socket.remoteAddress ?? "unknown";
+    let rate = this.requestRates.get(key);
+    if (!rate || now - rate.startedAt >= windowMs) {
+      rate = { startedAt: now, count: 0 };
+      this.requestRates.set(key, rate);
+    }
+    rate.count++;
+    if (rate.count <= maximum) return true;
+    response.setHeader(
+      "retry-after",
+      String(Math.max(1, Math.ceil((rate.startedAt + windowMs - now) / 1_000))),
+    );
+    jsonResponse(response, 429, {
+      error: { code: "rate_limited", message: "Remote Runtime request rate exceeded" },
+    });
+    return false;
+  }
 }
 
 async function readJson<T>(request: IncomingMessage, limit: number): Promise<T> {
@@ -434,6 +576,10 @@ async function readJson<T>(request: IncomingMessage, limit: number): Promise<T> 
 }
 
 function jsonResponse(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
   response.end(JSON.stringify(body));
 }

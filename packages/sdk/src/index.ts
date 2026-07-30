@@ -75,9 +75,9 @@ export interface PreparedPatchSet {
 }
 
 export interface AnicodeClientOptions {
-  /** 形如 http://127.0.0.1:8317（不带尾斜杠）。 */
+  /** 回环可用 http；非回环必须使用 https。 */
   baseUrl: string;
-  /** server 配置的 Bearer token（SSE 自动转查询参数）。 */
+  /** server 配置的 Bearer token；REST 与 SSE 均只通过 Authorization header 发送。 */
   token?: string;
   /** 自定义 fetch（测试注入）。缺省用全局 fetch。 */
   fetch?: typeof fetch;
@@ -101,6 +101,24 @@ export class AnicodeApiError extends Error {
     super(message);
     this.name = "AnicodeApiError";
   }
+}
+
+export function secureAnicodeBaseUrl(input: string): string {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new TypeError("Invalid AniCode server URL");
+  }
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  if (url.username || url.password || url.search || url.hash) {
+    throw new TypeError("AniCode server URL must not contain credentials, query, or fragment");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new TypeError("Non-loopback AniCode server URLs must use HTTPS");
+  }
+  return url.href.replace(/\/+$/, "");
 }
 
 export interface SubscribeOptions {
@@ -230,7 +248,7 @@ function splitSse(buffer: string): { payloads: string[]; rest: string } {
 }
 
 export function createAnicodeClient(opts: AnicodeClientOptions): AnicodeClient {
-  const baseUrl = opts.baseUrl.replace(/\/+$/, "");
+  const baseUrl = secureAnicodeBaseUrl(opts.baseUrl);
   const doFetch = opts.fetch ?? fetch;
   const maxRetries = opts.maxRetries ?? 2;
   const retryDelayMs = opts.retryDelayMs ?? 100;
@@ -379,7 +397,6 @@ export function createAnicodeClient(opts: AnicodeClientOptions): AnicodeClient {
     subOpts: SubscribeOptions,
   ): AsyncGenerator<EventEnvelope> {
     const url = new URL(`${baseUrl}${path}`);
-    if (opts.token) url.searchParams.set("token", opts.token);
     if (subOpts.lastEventId) url.searchParams.set("lastEventId", subOpts.lastEventId);
     const res = await doFetch(url, {
       headers: headers(subOpts.lastEventId ? { "last-event-id": subOpts.lastEventId } : {}),

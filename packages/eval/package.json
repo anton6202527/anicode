@@ -9,7 +9,7 @@
     "eval:merge": "tsx src/merge-cli.ts",
     "eval:sync-real": "tsx scripts/sync-real-repo-catalog.ts",
     "typecheck": "tsc --noEmit",
-    "test": "ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'"
+    "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "@anicode/core": "*"

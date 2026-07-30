@@ -13,8 +13,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createInterface } from "node:readline";
-import { spawn } from "node:child_process";
 import React from "react";
 import { render } from "ink";
 import {
@@ -53,9 +51,7 @@ import {
   SecurityPolicyEngine,
   telemetryFromEnv,
   telemetryForLocalStack,
-  buildAuthUrl,
-  exchangeCode,
-  parseCallbackCode,
+  ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
   t,
   type SessionHost,
   type AnicodeConfig,
@@ -632,8 +628,8 @@ export function helpText(): string {
       `  exec --prompt <text>      无头执行一条提示词（默认 JSONL）\n`,
     ) +
     t(
-      `  auth login [provider]     Log in with a Claude subscription (default anthropic), no API key needed\n`,
-      `  auth login [provider]     用 Claude 订阅登录（默认 anthropic），免 API key\n`,
+      `  auth login [provider]     Disabled pending provider authorization; configure an API key\n`,
+      `  auth login [provider]     等待提供商授权，当前已禁用；请配置 API key\n`,
     ) +
     t(
       `  auth logout [provider]    Log out and delete local credentials\n`,
@@ -848,11 +844,11 @@ export async function runServeCommand(
       throw new Error(t(`Unknown serve argument: ${arg}`, `serve 未知参数: ${arg}`));
     }
   }
-  if (hostAddr !== "127.0.0.1" && hostAddr !== "localhost" && !token) {
+  if (hostAddr !== "127.0.0.1" && hostAddr !== "localhost" && hostAddr !== "::1") {
     throw new Error(
       t(
-        "Binding a non-loopback host requires --token (or ANICODE_HTTP_TOKEN)",
-        "绑定非回环地址必须配 --token（或 ANICODE_HTTP_TOKEN）",
+        "The HTTP daemon is loopback-only; put an HTTPS/mTLS reverse proxy in front for remote access",
+        "HTTP daemon 仅允许绑定回环地址；远程访问请在前面部署 HTTPS/mTLS 反向代理",
       ),
     );
   }
@@ -960,8 +956,8 @@ export async function runAuthCommand(
     if (creds.length === 0) {
       log(
         t(
-          "No logged-in credentials yet. Run `anicode auth login` to log in with a Claude subscription.",
-          "尚无已登录凭证。运行 `anicode auth login` 用 Claude 订阅登录。",
+          "No OAuth credentials. Configure the provider API key documented for your selected model.",
+          "尚无 OAuth 凭证。请为所选模型配置对应 provider 的 API key。",
         ),
       );
       return;
@@ -989,41 +985,12 @@ export async function runAuthCommand(
   }
 
   if (sub === "login") {
-    if (provider !== "anthropic") {
-      throw new Error(
-        t(
-          `Only anthropic subscription login is supported for now, received: ${provider}`,
-          `暂仅支持 anthropic 的订阅登录，收到: ${provider}`,
-        ),
-      );
-    }
-    const { url, verifier, state } = buildAuthUrl();
-    log(
+    throw new Error(
       t(
-        "Open the following link in your browser and authorize (auto-open attempted):\n",
-        "请在浏览器中打开以下链接并授权（已尝试自动打开）：\n",
+        `${ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE}. Requested provider: ${provider}`,
+        `Anthropic 订阅 OAuth 在第三方客户端获得明确书面授权前已禁用；请使用 Anthropic API key 或官方支持的企业 provider。请求的 provider: ${provider}`,
       ),
     );
-    log(url + "\n");
-    tryOpenBrowser(url);
-    log(
-      t(
-        "After authorizing, the page shows a `code#state`; paste it here and press Enter:",
-        "授权后页面会显示一段 `code#state`，粘贴到这里后回车：",
-      ),
-    );
-    const pasted = await readLine(io.input ?? process.stdin);
-    const { code, state: pastedState } = parseCallbackCode(pasted);
-    if (!code) throw new Error(t("No authorization code read", "未读到授权码"));
-    const tokens = await exchangeCode({ code, verifier, state: pastedState ?? state });
-    await store.set("anthropic", store.fromTokens(tokens));
-    log(
-      t(
-        "\n✅ Login successful. You can now run anicode with a Claude subscription without ANTHROPIC_API_KEY.",
-        "\n✅ 登录成功。现在无需 ANTHROPIC_API_KEY 即可用 Claude 订阅运行 anicode。",
-      ),
-    );
-    return;
   }
 
   throw new Error(
@@ -1032,36 +999,6 @@ export async function runAuthCommand(
       `用法: anicode auth <login|logout|list> [provider]`,
     ),
   );
-}
-
-/** 读一行（去掉换行）。 */
-function readLine(input: NodeJS.ReadableStream): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const rl = createInterface({ input });
-    rl.once("line", (line) => {
-      rl.close();
-      resolve(line.trim());
-    });
-    rl.once("close", () => resolve(""));
-    rl.once("error", reject);
-  });
-}
-
-/** 尽力打开系统浏览器；失败静默（用户仍可手动复制链接）。 */
-function tryOpenBrowser(url: string): void {
-  const cmd =
-    process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  try {
-    const child = spawn(cmd, [url], {
-      stdio: "ignore",
-      detached: true,
-      shell: process.platform === "win32",
-    });
-    child.on("error", () => {});
-    child.unref();
-  } catch {
-    /* 手动复制链接即可 */
-  }
 }
 
 function errorMessage(error: unknown): string {

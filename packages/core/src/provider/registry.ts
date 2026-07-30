@@ -619,14 +619,13 @@ function diagnosticsFor(entry: RegisteredProvider, model: string): ProviderDiagn
   const baseURL = envBase ?? d.baseURL;
   const credential = findCredential(d.apiKeyEnv, `provider:${d.id}`, baseURL);
   const warnings: string[] = [];
-  // OAuth 订阅登录也算有凭证（无需 API key）。
-  const hasOAuth = defaultAuthStore().getSync(d.id)?.type === "oauth";
-  const hasCredentials = Boolean(credential) || Boolean(entry.directCredential) || hasOAuth;
+  // Third-party subscription OAuth is intentionally not accepted as production credentials.
+  const hasCredentials = Boolean(credential) || Boolean(entry.directCredential);
   if (d.requiresApiKey && !hasCredentials) {
     warnings.push(
       t(
-        `Missing credentials: set ${d.apiKeyEnv.join(" or ") || "the provider's API key"}, or run auth login to sign in with a subscription`,
-        `缺少凭证：请设置 ${d.apiKeyEnv.join(" 或 ") || "provider 对应的 API key"}，或运行 auth login 用订阅登录`,
+        `Missing credentials: set ${d.apiKeyEnv.join(" or ") || "the provider's API key"}`,
+        `缺少凭证：请设置 ${d.apiKeyEnv.join(" 或 ") || "provider 对应的 API key"}`,
       ),
     );
   }

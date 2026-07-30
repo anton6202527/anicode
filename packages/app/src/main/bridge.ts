@@ -8,7 +8,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { IpcMain, WebContents } from "electron";
+import type { IpcMain, IpcMainInvokeEvent, WebContents } from "electron";
 import {
   SessionManager,
   SessionStore,
@@ -47,6 +47,50 @@ export interface BridgeOptions {
   /** 可注入的 MCP 连接器与环境（测试用）；默认走 core 的真实实现与 process.env。 */
   mcpConnector?: McpConnector;
   env?: NodeJS.ProcessEnv;
+  /** Main-frame allowlist owned by the BrowserWindow lifecycle. */
+  isTrustedSender: (event: IpcMainInvokeEvent) => boolean;
+}
+
+function record(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function stringValue(value: unknown, label: string, maximum = 4_096): string {
+  if (typeof value !== "string" || !value.trim() || value.length > maximum) {
+    throw new TypeError(`${label} must be a non-empty string of at most ${maximum} characters`);
+  }
+  return value;
+}
+
+function sessionId(value: unknown): string {
+  const id = stringValue(value, "sessionId", 256);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id)) throw new TypeError("Invalid sessionId");
+  return id;
+}
+
+function parseUserModel(value: unknown): UserModel {
+  const input = record(value, "model");
+  if (input["free"] !== undefined && typeof input["free"] !== "boolean") {
+    throw new TypeError("model.free must be boolean");
+  }
+  if (input["openWeight"] !== undefined && typeof input["openWeight"] !== "boolean") {
+    throw new TypeError("model.openWeight must be boolean");
+  }
+  return {
+    provider: stringValue(input["provider"], "model.provider", 128),
+    model: stringValue(input["model"], "model.model", 256),
+    ...(input["label"] !== undefined
+      ? { label: stringValue(input["label"], "model.label", 256) }
+      : {}),
+    ...(input["note"] !== undefined
+      ? { note: stringValue(input["note"], "model.note", 1_024) }
+      : {}),
+    ...(typeof input["free"] === "boolean" ? { free: input["free"] } : {}),
+    ...(typeof input["openWeight"] === "boolean" ? { openWeight: input["openWeight"] } : {}),
+  };
 }
 
 /** 本地资源解析：debug/本地 provider 免 key；云端缺 key 时给出清晰错误。 */
@@ -135,56 +179,84 @@ export class Bridge {
   }
 
   register(ipcMain: IpcMain): void {
-    ipcMain.handle("app:info", (): AppInfo => this.appInfo());
+    const handle = (
+      channel: string,
+      handler: (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown,
+    ): void => {
+      ipcMain.handle(channel, (event, ...args) => {
+        if (!this.options.isTrustedSender(event)) throw new Error("Blocked untrusted IPC sender");
+        return handler(event, ...args);
+      });
+    };
 
-    ipcMain.handle("host:listSessions", () => this.manager.listSessions());
-    ipcMain.handle(
-      "host:createSession",
-      (_e, input: { cwd: string; model: string; title?: string }) =>
-        this.manager.createSession(input),
+    handle("app:info", (): AppInfo => this.appInfo());
+    handle("host:listSessions", () => this.manager.listSessions());
+    handle("host:createSession", (_event, value) => {
+      const input = record(value, "session");
+      const cwd = path.resolve(stringValue(input["cwd"], "session.cwd"));
+      if (cwd !== path.resolve(this.options.cwd)) throw new Error("Session cwd is outside app workspace");
+      return this.manager.createSession({
+        cwd,
+        model: stringValue(input["model"], "session.model", 256),
+        ...(input["title"] !== undefined
+          ? { title: stringValue(input["title"], "session.title", 512) }
+          : {}),
+      });
+    });
+    handle("host:send", (_event, id, text) =>
+      this.manager.send(sessionId(id), stringValue(text, "text", 1_048_576)),
     );
-    ipcMain.handle("host:send", (_e, sessionId: string, text: string) =>
-      this.manager.send(sessionId, text),
+    handle("host:interrupt", (_event, id) => this.manager.interrupt(sessionId(id)));
+    handle("host:setTitle", (_event, id, title) =>
+      this.manager.setTitle(sessionId(id), stringValue(title, "title", 512)),
     );
-    ipcMain.handle("host:interrupt", (_e, sessionId: string) => this.manager.interrupt(sessionId));
-    ipcMain.handle("host:setTitle", (_e, sessionId: string, title: string) =>
-      this.manager.setTitle(sessionId, title),
-    );
-    ipcMain.handle("host:deleteSession", (_e, sessionId: string) =>
-      this.manager.deleteSession(sessionId),
-    );
-    ipcMain.handle(
-      "host:answerPermission",
-      (_e, sessionId: string, permId: string, decision: PermissionDecisionKind) =>
-        this.manager.answerPermission(sessionId, permId, decision),
-    );
+    handle("host:deleteSession", (_event, id) => this.manager.deleteSession(sessionId(id)));
+    handle("host:answerPermission", (_event, id, permissionId, value) => {
+      const decisions: PermissionDecisionKind[] = [
+        "allow",
+        "allow_remember",
+        "allow_always",
+        "deny",
+      ];
+      if (!decisions.includes(value as PermissionDecisionKind)) {
+        throw new TypeError("Invalid permission decision");
+      }
+      return this.manager.answerPermission(
+        sessionId(id),
+        stringValue(permissionId, "permissionId", 256),
+        value as PermissionDecisionKind,
+      );
+    });
 
-    ipcMain.handle("host:open", async (event, sessionId: string) => {
+    handle("host:open", async (event, id) => {
       const subId = randomUUID();
       const sender = event.sender;
-      const handle = await this.manager.open(sessionId, (ev) => {
+      const openHandle = await this.manager.open(sessionId(id), (ev) => {
         if (sender.isDestroyed()) return;
         sender.send(EVENT_CHANNEL, { subId, event: ev });
       });
-      this.subscriptions.set(subId, { handle, sender });
+      this.subscriptions.set(subId, { handle: openHandle, sender });
       // 渲染进程窗口销毁时，主动回收其所有订阅，避免向已销毁 sender 推事件。
       sender.once("destroyed", () => this.closeSubscription(subId));
-      return { subId, snapshot: handle.snapshot };
+      return { subId, snapshot: openHandle.snapshot };
     });
-    ipcMain.handle("host:close", (_e, subId: string) => {
-      this.closeSubscription(subId);
+    handle("host:close", (_event, id) => {
+      this.closeSubscription(stringValue(id, "subscriptionId", 64));
     });
 
-    ipcMain.handle("meta:catalog", () => this.catalogRows());
-    ipcMain.handle("meta:providers", () => listProviderDetails());
-    ipcMain.handle("meta:userModels", () => this.readUserModels());
-    ipcMain.handle("meta:addUserModel", (_e, model: UserModel) => this.addUserModel(model));
-    ipcMain.handle("meta:removeUserModel", (_e, spec: string) => this.removeUserModel(spec));
-
-    ipcMain.handle("plugins:list", () => this.listPlugins());
-    ipcMain.handle("plugins:setEnabled", (_e, id: string, enabled: boolean) =>
-      this.setPluginEnabled(id, enabled),
+    handle("meta:catalog", () => this.catalogRows());
+    handle("meta:providers", () => listProviderDetails());
+    handle("meta:userModels", () => this.readUserModels());
+    handle("meta:addUserModel", (_event, model) => this.addUserModel(parseUserModel(model)));
+    handle("meta:removeUserModel", (_event, spec) =>
+      this.removeUserModel(stringValue(spec, "model spec", 384)),
     );
+
+    handle("plugins:list", () => this.listPlugins());
+    handle("plugins:setEnabled", (_event, id, enabled) => {
+      if (typeof enabled !== "boolean") throw new TypeError("enabled must be boolean");
+      return this.setPluginEnabled(stringValue(id, "plugin id", 256), enabled);
+    });
   }
 
   /** 主进程能读 env，这里算好每个模型的凭证就绪状态再下发给渲染进程；含内置目录 + 用户自定义。 */

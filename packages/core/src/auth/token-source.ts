@@ -7,7 +7,11 @@
 
 import { t } from "../i18n.js";
 import type { AuthStore, OAuthCredential } from "./store.js";
-import { refreshTokens, type OAuthTokens } from "./oauth.js";
+import {
+  ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
+  refreshTokens,
+  type OAuthTokens,
+} from "./oauth.js";
 
 export interface TokenSource {
   getAccessToken(): Promise<string>;
@@ -19,6 +23,7 @@ const REFRESH_BUFFER_MS = 60_000;
 export interface AnthropicTokenSourceDeps {
   now?: () => number;
   refresh?: typeof refreshTokens;
+  allowUnverifiedForTesting?: boolean;
 }
 
 export class AnthropicOAuthTokenSource implements TokenSource {
@@ -31,6 +36,9 @@ export class AnthropicOAuthTokenSource implements TokenSource {
   ) {}
 
   async getAccessToken(): Promise<string> {
+    if (!this.deps.allowUnverifiedForTesting) {
+      throw new Error(ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE);
+    }
     const now = (this.deps.now ?? Date.now)();
     const cred = await this.store.get(this.providerId);
     if (!cred || cred.type !== "oauth") {
@@ -62,6 +70,7 @@ export class AnthropicOAuthTokenSource implements TokenSource {
     const refresh = this.deps.refresh ?? refreshTokens;
     const tokens: OAuthTokens = await refresh(cred.refresh, {
       ...(this.deps.now ? { now: this.deps.now } : {}),
+      allowUnverifiedForTesting: true,
     });
     await this.store.set(this.providerId, this.store.fromTokens(tokens));
     return tokens.access;

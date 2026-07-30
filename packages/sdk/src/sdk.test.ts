@@ -330,7 +330,7 @@ test("sdk: event.subscribe —— 信封序保证与 parts 投影事件", async 
   }
 });
 
-test("sdk: token 鉴权 —— 无凭据 401，带凭据可用（SSE 走查询参数）", async () => {
+test("sdk: token 鉴权 —— 无凭据 401，REST/SSE 均走 Authorization header", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-"));
   const { server, baseUrl } = await startServer(dir, scriptedProvider([]), "s3cret");
   const anon = createAnicodeClient({ baseUrl });

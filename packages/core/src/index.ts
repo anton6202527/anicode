@@ -126,6 +126,7 @@ export {
   type AuthorizationRequest,
   ANTHROPIC_CLIENT_ID,
   ANTHROPIC_OAUTH_BETA,
+  ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
 } from "./auth/oauth.js";
 export { AuthStore, type Credential, type OAuthCredential } from "./auth/store.js";
 export { AnthropicOAuthTokenSource, type TokenSource } from "./auth/token-source.js";

@@ -775,7 +775,7 @@ export function generateOpenApi(): Record<string, unknown> {
       title: "anicode server",
       version: `${PROTOCOL_VERSION}.0.0`,
       description:
-        "AniCode server-first HTTP API。鉴权：可选 Bearer token（SSE 可用 ?token= 查询参数）。" +
+        "AniCode server-first HTTP API。鉴权：可选 Bearer token，REST 与 SSE 均只接受 Authorization header。" +
         "多实例路由：请求可带 x-anicode-directory 头或 ?directory= 选择按目录隔离的会话实例（server 配置 resolveInstance 时生效，否则忽略）。" +
         "SSE 续传：事件帧携带 id，断线重连带 Last-Event-ID 头（或 ?lastEventId=）可增量补发丢失事件，缓冲失效时自动回落整份快照。",
     },
