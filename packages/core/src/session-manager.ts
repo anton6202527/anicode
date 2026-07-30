@@ -75,9 +75,23 @@ import {
 // ---------- 对外事件与快照 ----------
 
 /** 会话级事件：包裹 AgentEvent，另加权限询问与运行态变化 */
+export interface PendingPermission {
+  permId: string;
+  toolName: string;
+  ruleKey: string;
+  input?: Record<string, unknown>;
+  cwd?: string;
+  ruleParts?: string[];
+  rulePartsComplete?: boolean;
+  readOnly?: boolean;
+  mutatesFiles?: boolean;
+  network?: boolean;
+  risk?: "low" | "medium" | "high";
+}
+
 export type SessionEvent =
   | { type: "agent"; event: AgentEvent }
-  | { type: "permission_request"; permId: string; toolName: string; ruleKey: string }
+  | ({ type: "permission_request" } & PendingPermission)
   | { type: "permission_resolved"; permId: string; decision: PermissionAnswer }
   /** 会话标题变化（自动命名或显式改名），供所有订阅端更新 UI。 */
   | { type: "title"; title: string }
@@ -125,7 +139,7 @@ export interface SessionSnapshot {
   costUSD?: number;
   running: boolean;
   /** 订阅时仍待裁决的权限请求（重连场景不至于卡死） */
-  pendingPermissions: { permId: string; toolName: string; ruleKey: string }[];
+  pendingPermissions: PendingPermission[];
   /** 后台子 agent 任务一览（无 task 工具或无任务时为空数组/缺省）。 */
   backgroundTasks?: BackgroundTaskSummary[];
   /** 当前上下文占用（最近一轮真实输入 token / 模型窗口）；未跑过轮次时缺省。 */
@@ -228,7 +242,25 @@ export interface SessionManagerOptions {
 interface PendingPerm {
   toolName: string;
   ruleKey: string;
+  input?: Record<string, unknown>;
+  cwd?: string;
+  ruleParts?: string[];
+  rulePartsComplete?: boolean;
+  readOnly?: boolean;
+  mutatesFiles?: boolean;
+  network?: boolean;
+  risk: NonNullable<PendingPermission["risk"]>;
   resolve: (d: PermissionDecision) => void;
+}
+
+function permissionRisk(r: PermissionRequest): NonNullable<PendingPermission["risk"]> {
+  const destructive =
+    /(?:^|[;&|]\s*)(?:rm\s+-[^\n]*r|sudo\b|mkfs\b|dd\s+if=|git\s+(?:reset\s+--hard|clean\s+-[^\n]*f)|chmod\s+-R\b|chown\s+-R\b)/i.test(
+      r.ruleKey,
+    );
+  if (r.network || r.rulePartsComplete === false || destructive) return "high";
+  if (r.mutatesFiles || r.readOnly === false) return "medium";
+  return "low";
 }
 
 interface SendWaiter {
@@ -295,6 +327,14 @@ class ManagedSession {
         permId,
         toolName: p.toolName,
         ruleKey: p.ruleKey,
+        ...(p.input ? { input: p.input } : {}),
+        ...(p.cwd ? { cwd: p.cwd } : {}),
+        ...(p.ruleParts ? { ruleParts: p.ruleParts } : {}),
+        ...(p.rulePartsComplete !== undefined ? { rulePartsComplete: p.rulePartsComplete } : {}),
+        ...(p.readOnly !== undefined ? { readOnly: p.readOnly } : {}),
+        ...(p.mutatesFiles !== undefined ? { mutatesFiles: p.mutatesFiles } : {}),
+        ...(p.network !== undefined ? { network: p.network } : {}),
+        risk: p.risk,
       })),
       ...(this.agent.contextUsage ? { contextUsage: this.agent.contextUsage } : {}),
       ...(this.agent.backgroundTasks.length > 0
@@ -345,8 +385,21 @@ class ManagedSession {
     const base = r.toolCallId || "perm";
     const permId = this.pending.has(base) ? `${base}_${++this.permSeq}` : base;
     return new Promise((resolve) => {
-      this.pending.set(permId, { toolName: r.toolName, ruleKey: r.ruleKey, resolve });
-      this.emit({ type: "permission_request", permId, toolName: r.toolName, ruleKey: r.ruleKey });
+      const prompt: PendingPermission & { risk: NonNullable<PendingPermission["risk"]> } = {
+        permId,
+        toolName: r.toolName,
+        ruleKey: r.ruleKey,
+        input: r.input,
+        ...(r.cwd ? { cwd: r.cwd } : {}),
+        ...(r.ruleParts ? { ruleParts: r.ruleParts } : {}),
+        ...(r.rulePartsComplete !== undefined ? { rulePartsComplete: r.rulePartsComplete } : {}),
+        ...(r.readOnly !== undefined ? { readOnly: r.readOnly } : {}),
+        ...(r.mutatesFiles !== undefined ? { mutatesFiles: r.mutatesFiles } : {}),
+        ...(r.network !== undefined ? { network: r.network } : {}),
+        risk: permissionRisk(r),
+      };
+      this.pending.set(permId, { ...prompt, resolve });
+      this.emit({ type: "permission_request", ...prompt });
     });
   }
 

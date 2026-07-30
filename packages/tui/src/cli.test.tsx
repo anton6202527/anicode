@@ -1,31 +1,103 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { registerOpenAICompatibleProvider, type SessionHost } from "@anicode/core";
 import {
+  colorlessTerminalOutput,
   enterTerminalScreen,
+  helpText,
+  installTerminalExitGuard,
   parseArgs,
+  parseExecArgs,
   resolveConfiguredProvider,
   resolveDefaultModel,
+  runExecCommand,
   selectSessionId,
   startRawModeWatchdog,
   validateArgs,
 } from "./cli.js";
 
-test("CLI: Ink 首帧前进入备用屏，退出时只恢复一次", () => {
+test("CLI: Ink 管理备用屏，清理器只做一次紧急恢复", () => {
   const chunks: string[] = [];
-  const restore = enterTerminalScreen({
-    isTTY: true,
-    write(chunk) {
-      chunks.push(chunk);
+  const raw: boolean[] = [];
+  const restore = enterTerminalScreen(
+    {
+      isTTY: true,
+      write(chunk) {
+        chunks.push(chunk);
+      },
     },
-  });
-  assert.ok(chunks[0]?.startsWith("\u001b[?1049h\u001b[H"));
+    {
+      isTTY: true,
+      isRaw: false,
+      setRawMode(enabled) {
+        raw.push(enabled);
+      },
+    },
+    { alternateScreen: true },
+  );
+  assert.match(chunks[0] ?? "", /\?1006l/);
+  assert.match(chunks[0] ?? "", /\?1000l/);
+  assert.doesNotMatch(chunks.join(""), /\?1049h/);
   assert.ok(chunks.join("").includes("\u001b]11;#0a0a0a\u0007"));
 
   restore();
   restore();
   assert.equal(chunks.filter((chunk) => chunk.includes("\u001b[?1049l")).length, 1);
-  assert.ok(chunks.join("").includes("\u001b[?1006l\u001b[?1000l"));
+  assert.ok(chunks.join("").includes("\u001b[?1006l"));
+  assert.ok(chunks.join("").includes("\u001b[?1000l"));
+  assert.ok(chunks.join("").includes("\u001b[?2004l"));
+  assert.deepEqual(raw, [false]);
+});
+
+test("CLI: --plain 关闭颜色、鼠标与备用屏，颜色适配器保留光标控制", () => {
+  const args = parseArgs(["--plain"]);
+  assert.equal(args.noColor, true);
+  assert.equal(args.mouse, false);
+  assert.equal(args.noAltScreen, true);
+
+  const chunks: string[] = [];
+  const output = colorlessTerminalOutput({
+    isTTY: true,
+    write(chunk: string) {
+      chunks.push(chunk);
+      return true;
+    },
+    on() {},
+    off() {},
+  } as unknown as NodeJS.WriteStream);
+  output.write("\u001b[31mred\u001b[0m\u001b[2J");
+  assert.equal(chunks.join(""), "red\u001b[2J");
+});
+
+test("CLI: 默认保留终端原生框选，--mouse 才显式开启跟踪", () => {
+  assert.equal(parseArgs([]).mouse, false);
+  assert.equal(parseArgs(["--no-mouse"]).mouse, false);
+  assert.equal(parseArgs(["--mouse"]).mouse, true);
+  assert.throws(() => parseArgs(["--mouse", "--no-mouse"]), /不能与|cannot be used with/);
+  assert.throws(() => parseArgs(["--plain", "--mouse"]), /不能与|cannot be used with/);
+});
+
+test("CLI: 收到 SIGTERM 时先幂等恢复终端再重发原信号", () => {
+  const events = new EventEmitter();
+  const killed: Array<[number, NodeJS.Signals]> = [];
+  let cleaned = 0;
+  const target = Object.assign(events, {
+    pid: 4242,
+    kill(pid: number, signal: NodeJS.Signals) {
+      killed.push([pid, signal]);
+      return true;
+    },
+  }) as unknown as NodeJS.Process;
+
+  const remove = installTerminalExitGuard(() => cleaned++, target);
+  events.emit("SIGTERM");
+  events.emit("SIGTERM");
+
+  assert.equal(cleaned, 1);
+  assert.deepEqual(killed, [[4242, "SIGTERM"]]);
+  assert.equal(events.listenerCount("SIGTERM"), 0);
+  remove();
 });
 
 test("CLI: TUI 运行期间持续重申 raw mode，停止后不再改写终端", async () => {
@@ -38,8 +110,11 @@ test("CLI: TUI 运行期间持续重申 raw mode，停止后不再改写终端",
     },
   };
   const stop = startRawModeWatchdog(input, 10);
-  await new Promise((resolve) => setTimeout(resolve, 35));
-  assert.ok(calls.length >= 6);
+  const deadline = Date.now() + 250;
+  while (calls.length < 4 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(calls.length >= 4);
   for (let i = 0; i < calls.length; i += 2) {
     assert.deepEqual(calls.slice(i, i + 2), [false, true]);
   }
@@ -122,6 +197,9 @@ test("CLI: demo 与隔离会话目录适合零配置本地调试", () => {
   assert.equal(args.cwd, "/work");
   assert.equal(args.sessionsDir, "/tmp/anicode-test-sessions");
   assert.equal(args.debugLog, "/tmp/anicode-test.jsonl");
+  assert.equal(args.daemon, false);
+  assert.equal(args.http, undefined);
+  assert.match(helpText(), /无需 AniCode 后端服务|no AniCode backend\/server/);
   assert.doesNotThrow(() => validateArgs(args));
 });
 
@@ -217,6 +295,10 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
       listProviders: false,
       listModels: false,
       traceContent: false,
+      noColor: false,
+      mouse: false,
+      noAltScreen: false,
+      plain: false,
     });
     const meta = await host.createSession({ cwd: dir, model: "debug/demo" });
     const events: unknown[] = [];
@@ -238,4 +320,53 @@ test("CLI: --http 与 --daemon 互斥", () => {
     () => parseArgs(["--http", "http://127.0.0.1:1", "--daemon"]),
     /不能同时使用|together/,
   );
+});
+
+test("CLI exec: 参数严格解析，默认 JSONL", () => {
+  const parsed = parseExecArgs(["--demo", "--prompt", "hello", "--timeout", "5000"]);
+  assert.equal(parsed.args.model, "debug/demo");
+  assert.equal(parsed.prompt, "hello");
+  assert.equal(parsed.jsonl, true);
+  assert.equal(parsed.timeoutMs, 5000);
+  assert.throws(() => parseExecArgs(["--demo", "--timeout", "nope", "--prompt", "x"]), /正毫秒数/);
+});
+
+test("CLI exec: demo 模型无 TTY 完成一次 JSONL 会话", async () => {
+  const { promises: fs } = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-exec-"));
+  const chunks: string[] = [];
+  const output = {
+    write: (chunk: string) => (chunks.push(chunk), true),
+  } as unknown as NodeJS.WritableStream;
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  try {
+    await runExecCommand(
+      [
+        "--demo",
+        "--cwd",
+        dir,
+        "--sessions",
+        path.join(dir, "sessions"),
+        "--prompt",
+        "hello",
+        "--jsonl",
+      ],
+      { output, error: output },
+    );
+    const records = chunks
+      .join("")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string });
+    assert.equal(records[0]?.type, "session.started");
+    assert.ok(records.some((record) => record.type === "session.event"));
+    assert.equal(records[records.length - 1]?.type, "session.completed");
+  } finally {
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

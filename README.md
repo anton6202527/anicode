@@ -1,6 +1,6 @@
 # anicode
 
-一个 TypeScript 编写、前端无关的 AI coding agent。当前仓库包含：
+一个 TypeScript 编写、前端无关的通用型 AI Agent：调研、分析、写作、规划、数据与工具协作都是一等能力，软件工程是重点强化的核心长项。当前仓库包含：
 
 ```text
 packages/
@@ -16,7 +16,7 @@ packages/
 Electron IPC、VSCode webview postMessage 只是同一契约的不同「传输」实现，可互换。transcript / Markdown /
 diff 等前端无关的纯逻辑集中在 `@anicode/shared`，三端共用、单独测试。
 
-当前全仓类型检查通过，离线测试 **core 470 + eval 9 + SDK 5 + shared 6 + TUI 74 + app 19 + vscode 8，共 591 个**。默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，昂贵的真实模型运行留给显式 nightly job。
+当前全仓类型检查通过，离线测试 **642 项（641 通过、1 个 PostgreSQL 集成项在未配置数据库时按预期跳过）**。默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，昂贵的真实模型运行留给显式 nightly job。
 
 ## 先本地调试 TUI
 
@@ -29,6 +29,9 @@ npm run dev:tui
 
 启动时会自动读取项目根目录的 `.env.local` / `.env`，并使用 `anicode.json` 或
 `.anicode/anicode.json` 指定的默认模型；若没有可用云端凭证则回退到零网络的 `debug/demo`。
+
+CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite，凭证存在本机 OS Keychain，不需要 AniCode 后端服务、PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。使用云端模型时仍需对应模型 provider 的凭证或订阅；这不是 AniCode 自身的后端依赖。
+
 开发数据隔离到：
 
 ```text
@@ -71,6 +74,7 @@ TUI 内可用命令：
 ```text
 /help
 /status
+/usage                    # 输入/输出/cache create/cache read/成本
 /providers
 /model                    # 打开内置模型选择器（↑/↓ 选择 · Enter 新建 · Esc 取消）
 /model <provider/model>   # 直接用目标模型新建会话，不热改旧会话
@@ -79,11 +83,16 @@ TUI 内可用命令：
 /new [标题]
 /undo                     # 撤销上一轮文件改动（对话不回滚）
 /plan [on|off]            # 只读规划模式
+/tool [id]                # 展开/收起完整工具输出（Ctrl+O）
+/editor                   # 用 $EDITOR 编辑多行提示词（Ctrl+G）
+/reconnect                # 重连远端事件流（Ctrl+R）
 /lang <en|zh>             # 运行时切换中英文
 /exit
 ```
 
-运行中按 Enter 可追加 steering 指令，按 Esc 中断。授权提示支持 `y` 允许、`a` 允许并记住、`n` 拒绝。
+运行中按 Enter 可追加 steering 指令，按 Esc 中断。Shift/Ctrl+Enter 插入换行；bracketed paste
+保留多行且绝不自动提交。授权卡片固定在输入框上方，支持方向键/Enter、`y/a/p/n`，高风险默认选中拒绝，
+永久授权需二次确认。默认不接管终端鼠标，搜索结果与回答可直接拖拽框选/复制；若需点击和滚轮导航，用 `--mouse` 启动或在 TUI 中执行 `/mouse on`，用 `/mouse off` 随时恢复原生框选。快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
 
 安装 workspace 后也可以直接检查 CLI：
 
@@ -155,25 +164,25 @@ anicode 现在使用数据驱动 registry，模型字符串格式为 `provider/m
 
 内置 canonical provider：
 
-| Provider | 协议/用途 | 凭证或端点变量 |
-|---|---|---|
-| `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` |
-| `openai` | OpenAI Chat Completions | `OPENAI_API_KEY`, `OPENAI_BASE_URL` |
-| `openrouter` | OpenAI-compatible | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL` |
-| `deepseek` | OpenAI-compatible | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` |
-| `gemini` | Gemini OpenAI compatibility | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
-| `xai` | OpenAI-compatible | `XAI_API_KEY`, `XAI_BASE_URL` |
-| `groq` | OpenAI-compatible | `GROQ_API_KEY`, `GROQ_BASE_URL` |
-| `mistral` | OpenAI-compatible | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL` |
-| `together` | OpenAI-compatible | `TOGETHER_API_KEY`, `TOGETHER_BASE_URL` |
-| `fireworks` | OpenAI-compatible | `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL` |
-| `cerebras` | OpenAI-compatible | `CEREBRAS_API_KEY`, `CEREBRAS_BASE_URL` |
-| `ollama` | 本地 OpenAI compatibility | `OLLAMA_BASE_URL`，默认 `127.0.0.1:11434/v1` |
-| `lmstudio` | 本地 OpenAI compatibility | `LMSTUDIO_BASE_URL`，默认 `127.0.0.1:1234/v1` |
-| `vllm` | 本地 OpenAI compatibility | `VLLM_BASE_URL`，默认 `127.0.0.1:8000/v1` |
-| `llamacpp` | 本地 OpenAI compatibility | `LLAMACPP_BASE_URL`，默认 `127.0.0.1:8080/v1` |
-| `custom` | 自定义 OpenAI-compatible 服务 | `CUSTOM_OPENAI_BASE_URL`, `CUSTOM_OPENAI_API_KEY` |
-| `debug` | 零网络调试 | 无 |
+| Provider     | 协议/用途                     | 凭证或端点变量                                          |
+| ------------ | ----------------------------- | ------------------------------------------------------- |
+| `anthropic`  | Anthropic Messages            | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`               |
+| `openai`     | OpenAI Chat Completions       | `OPENAI_API_KEY`, `OPENAI_BASE_URL`                     |
+| `openrouter` | OpenAI-compatible             | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`             |
+| `deepseek`   | OpenAI-compatible             | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`                 |
+| `gemini`     | Gemini OpenAI compatibility   | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
+| `xai`        | OpenAI-compatible             | `XAI_API_KEY`, `XAI_BASE_URL`                           |
+| `groq`       | OpenAI-compatible             | `GROQ_API_KEY`, `GROQ_BASE_URL`                         |
+| `mistral`    | OpenAI-compatible             | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL`                   |
+| `together`   | OpenAI-compatible             | `TOGETHER_API_KEY`, `TOGETHER_BASE_URL`                 |
+| `fireworks`  | OpenAI-compatible             | `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`               |
+| `cerebras`   | OpenAI-compatible             | `CEREBRAS_API_KEY`, `CEREBRAS_BASE_URL`                 |
+| `ollama`     | 本地 OpenAI compatibility     | `OLLAMA_BASE_URL`，默认 `127.0.0.1:11434/v1`            |
+| `lmstudio`   | 本地 OpenAI compatibility     | `LMSTUDIO_BASE_URL`，默认 `127.0.0.1:1234/v1`           |
+| `vllm`       | 本地 OpenAI compatibility     | `VLLM_BASE_URL`，默认 `127.0.0.1:8000/v1`               |
+| `llamacpp`   | 本地 OpenAI compatibility     | `LLAMACPP_BASE_URL`，默认 `127.0.0.1:8080/v1`           |
+| `custom`     | 自定义 OpenAI-compatible 服务 | `CUSTOM_OPENAI_BASE_URL`, `CUSTOM_OPENAI_API_KEY`       |
+| `debug`      | 零网络调试                    | 无                                                      |
 
 别名包括 `demo`、`lm-studio`、`llama.cpp`。
 
@@ -292,10 +301,26 @@ registerOpenAICompatibleProvider({
 --daemon [socket]
 --debug-log [file]
 --trace-content
+--plain
+--no-color
+--mouse
+--no-mouse
+--no-alt-screen
 --list-providers
 --help
 --version
 ```
+
+无头/CI 用法（默认 JSONL；默认拒绝需要交互的权限）：
+
+```bash
+anicode exec --demo --prompt "summarize this repository"
+anicode exec --model openai/<model> --auto --jsonl --prompt "run tests and fix failures"
+printf 'review the current diff' | anicode exec --text
+```
+
+`NO_COLOR`、`INK_SCREEN_READER=true` 与非备用屏模式均受支持。交互命令在 stdin/stdout 不是 TTY 时会明确失败，
+避免把 ANSI 控制序列写入管道；管道/CI 应使用 `anicode exec`。
 
 参数解析是严格的：未知参数、缺值、重复和互斥组合会直接报错。`--sessions` 与权限模式属于本地进程，daemon 客户端不能覆盖 daemon 的配置。
 
@@ -328,7 +353,7 @@ npm run build:app
 npm run build:vscode
 ```
 
-当前覆盖 615 个测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端 UI 交互。CI 在 Node 22/24 与 PostgreSQL 16 上运行完整矩阵；本地未配置 PostgreSQL URL 时，相关集成用例会明确跳过。
+当前覆盖 642 个测试（641 passed + 1 skipped），包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端 UI 交互。CI 在 Node 22/24 与 PostgreSQL 16 上运行完整矩阵；本地未配置 PostgreSQL URL 时，相关集成用例会明确跳过。
 
 `@anicode/eval` 还提供带自校验的真实编辑任务，可汇总通过率、轮数、token 与编辑失败率：
 
@@ -342,7 +367,7 @@ npm run eval --workspace @anicode/eval -- --model <provider/model> --json out.js
 - **小模型路由（Claude Code）**：摘要压缩等杂活自动走便宜快速模型（`SessionManagerOptions.smallModel: true` 按 provider 推导，如 anthropic→haiku、groq→llama-3.1-8b），解析失败静默回退主模型。省这类调用 70–80% 成本。见 `provider/registry.ts` 的 `defaultSmallModel`、`agent.ts` 的 `streamText`。
 - **编辑自愈 + 反射（Aider/Cline）**：`edit` 精确匹配失败时退到「按行去空白」的模糊匹配；全都匹配不上则抛出附「文件中最接近片段」的反射式错误，让模型据此自我纠正（Aider 经验：关掉自愈编辑错误率数倍上升）。见 `tools/fs.ts` 的 `applyEdit`。
 - **跨平台 OS 沙箱（Codex/Claude Code）**：bash 可选用 macOS Seatbelt 或 Linux bubblewrap 包裹——只放行「工作区 + 临时目录」写入，可禁网，并把 `.git` 收紧为只读。见 `tools/sandbox.ts`。
-- **工程化系统提示 + 环境接地（Claude Code/Codex）**：把「先探后改、工具路由、并行批处理、最小改动、改完自验证」写进默认系统提示，并在会话开始注入 `<env>` + `<git-status>` 快照。这是把通用模型行为收敛到「优秀 coding agent」的最大杠杆，且缓存友好。见 `agent.ts`、`env.ts`。
+- **通用任务路由 + 工程能力强化（Claude Code/Codex）**：默认 system 先识别调研、写作、分析、规划或工程任务，不因运行在仓库里就假定用户要改代码；真正进入软件工程时，再强制「先探后改、最小改动、改完自验证」。见 `agent.ts`、`env.ts`。
 - **ripgrep 检索后端（Claude Code）**：grep/glob 优先走 ripgrep（尊重 .gitignore、跳过二进制、mtime 排序），支持输出模式/上下文行/大小写；无 rg 回退 JS。检索更快、结果更规整。见 `tools/ripgrep.ts`、`tools/fs.ts`。
 - **后台长时命令（Claude Code 的 run_in_background/BashOutput/KillShell）**：dev server / watch 构建 / 日志跟随不再被 120s 超时打死。并**针对性规避该功能的已知坑**：读取严格增量（读过即清，不会同一段日志反复进上下文）、缓冲有界、结束即回收、上限满时淘汰已结束者（不会假装"kill 一下就能腾位"）、filter 略过的行数如实回报（不静默吞掉 dev server 打印的端口号），且**从不主动往历史塞后台提醒**。后台与前台共用同一套沙箱。见 `tools/shells.ts`。
 - **多模态 read（Claude Code）**：`read` 可直接看截图/设计稿/图表。工具经 `ctx.attachImage` 回传图片（沿用既有 emit/addUsage 回调范式，`run()` 仍返回纯文本，既有工具零改动），Agent 把图片排在本轮 tool_result 之后送入同一条 user 消息 —— 两端 provider 的映射本就支持独立 image 块，**实测无需改 provider**。魔数校验防「后缀是图但内容不是」拖垮整轮请求；无视觉能力或超限则如实降级为文本。见 `tools/fs.ts`、`tools/tool.ts`。

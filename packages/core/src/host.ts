@@ -21,6 +21,8 @@ export type PermissionDecisionKind = PermissionAnswer;
 
 export interface OpenHandle {
   snapshot: SessionSnapshot;
+  /** Resolves when a remote subscription ends. Local in-process handles omit it. */
+  closed?: Promise<Error | undefined>;
   /** 取消订阅 */
   close(): void;
 }

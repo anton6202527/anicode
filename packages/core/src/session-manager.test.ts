@@ -147,6 +147,9 @@ test("SessionManager: 权限广播，任一订阅者可裁决", async () => {
   const perm = events.find((e) => e.type === "permission_request") as any;
   assert.equal(perm.permId, "c1");
   assert.equal(perm.toolName, "write");
+  assert.equal(perm.cwd, dir);
+  assert.equal(perm.risk, "medium");
+  assert.deepEqual(perm.input, { path: "x.txt", content: "data" });
   for (const received of [events, observerEvents]) {
     const requestAt = received.findIndex((e) => e.type === "permission_request");
     const resolvedAt = received.findIndex(

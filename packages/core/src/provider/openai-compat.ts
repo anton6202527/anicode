@@ -138,10 +138,18 @@ export class OpenAICompatProvider implements Provider {
       }
       if (choice?.finish_reason) finishReason = choice.finish_reason;
       if (chunk.usage) {
+        // OpenAI-compatible APIs report prompt_tokens as the total prompt, including
+        // prompt_tokens_details.cached_tokens.  AniCode's Usage fields are disjoint so
+        // cost, context size and ccusage-style exports never count cache reads twice.
+        const promptTokens = chunk.usage.prompt_tokens ?? 0;
+        const cacheReadTokens = Math.min(
+          promptTokens,
+          Math.max(0, chunk.usage.prompt_tokens_details?.cached_tokens ?? 0),
+        );
         usage = {
-          inputTokens: chunk.usage.prompt_tokens ?? 0,
+          inputTokens: Math.max(0, promptTokens - cacheReadTokens),
           outputTokens: chunk.usage.completion_tokens ?? 0,
-          cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? 0,
+          cacheReadTokens,
           cacheWriteTokens: 0, // OpenAI 缓存写入不单独计费/上报
         };
       }

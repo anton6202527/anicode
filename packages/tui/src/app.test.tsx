@@ -21,13 +21,18 @@ import {
   type ProviderDescriptor,
   type SessionEvent,
   type SessionHost,
+  type PendingPermission,
 } from "@anicode/core";
 import { clearLangOverride } from "@anicode/core";
 import {
   App,
+  boundTranscriptRows,
+  composerCaretPosition,
+  composerLayout,
   dispWidth,
   inputView,
   InputPanel,
+  matchesKeybinding,
   subagentActivityLine,
   Welcome,
   WelcomeTip,
@@ -56,9 +61,10 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
 /** 轮询等待帧内容满足条件（默认 3s 超时）——比固定 tick 抗环境时序漂移。 */
-async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+async function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond() && Date.now() < deadline) await tick(25);
+  if (!cond()) throw new Error(`Timed out after ${timeoutMs}ms waiting for TUI frame`);
 }
 
 const zeroUsage = {
@@ -74,7 +80,7 @@ function offlineHost(
     cwd?: string;
     model?: string;
     eventsBeforeSnapshot?: SessionEvent[];
-    pendingPermissions?: { permId: string; toolName: string; ruleKey: string }[];
+    pendingPermissions?: PendingPermission[];
     onInterrupt?: () => void;
     onSend?: (text: string) => void;
     onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
@@ -149,6 +155,102 @@ function offlineHost(
     dispose() {},
   };
 }
+
+test("TUI: 远端事件流断开后自动重连并恢复 snapshot", async () => {
+  let opens = 0;
+  let closeFirst!: (error: Error | undefined) => void;
+  const host = offlineHost();
+  const baseOpen = host.open.bind(host);
+  host.open = async (sessionId, listener) => {
+    opens++;
+    const handle = await baseOpen(sessionId, listener);
+    if (opens !== 1) return handle;
+    return {
+      ...handle,
+      closed: new Promise<Error | undefined>((resolve) => {
+        closeFirst = resolve;
+      }),
+    };
+  };
+  const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_remote" />);
+  await tick(80);
+  closeFirst(new Error("transport reset"));
+  await waitFor(() => opens >= 2 && /连接已恢复/.test(view.lastFrame() ?? ""), 2_000);
+
+  assert.equal(opens, 2);
+  view.unmount();
+});
+
+test("TUI: transcript UI cache 有硬上限并保留会话边界", () => {
+  const rows = [
+    { kind: "info", text: "boundary" } as const,
+    ...Array.from({ length: 10 }, (_, i) => ({ kind: "info" as const, text: String(i) })),
+  ];
+  const bounded = boundTranscriptRows(rows, 4);
+  assert.deepEqual(
+    bounded.map((row) => ("text" in row ? row.text : row.kind)),
+    ["boundary", "7", "8", "9"],
+  );
+});
+
+test("TUI: multiline composer keeps the active logical line visible", () => {
+  const text = "one\ntwo\nthree";
+  const layout = composerLayout(text, text.indexOf("w"), 2);
+  assert.equal(layout.lines[layout.activeLine]?.text, "two");
+  assert.ok(layout.activeVisibleLine >= 0 && layout.activeVisibleLine < 2);
+});
+
+test("TUI: configurable keybinding parser distinguishes modifiers", () => {
+  const key = {
+    upArrow: false,
+    downArrow: false,
+    leftArrow: false,
+    rightArrow: false,
+    pageDown: false,
+    pageUp: false,
+    home: false,
+    end: false,
+    return: false,
+    escape: false,
+    ctrl: true,
+    shift: false,
+    tab: false,
+    backspace: false,
+    delete: false,
+    meta: false,
+    super: false,
+    hyper: false,
+    capsLock: false,
+    numLock: false,
+  };
+  assert.equal(matchesKeybinding("x", key, "ctrl+x"), true);
+  assert.equal(matchesKeybinding("x", key, "meta+x"), false);
+});
+
+test("TUI: 极窄极矮终端不会输出越界帧", async () => {
+  for (const terminalSize of [
+    { rows: 4, cols: 10 },
+    { rows: 6, cols: 16 },
+  ]) {
+    const view = render(
+      <App
+        host={offlineHost()}
+        cwd="/work"
+        model="debug/demo"
+        sessionId="s_tiny"
+        terminalSize={terminalSize}
+      />,
+    );
+    await tick(80);
+    const plain = (view.lastFrame() ?? "").replace(SGR, "");
+    const lines = plain.split("\n");
+    assert.ok(lines.length <= terminalSize.rows, `${terminalSize.rows} rows`);
+    for (const line of lines) {
+      assert.ok(dispWidth(line) <= terminalSize.cols, `${dispWidth(line)} > ${terminalSize.cols}`);
+    }
+    view.unmount();
+  }
+});
 
 test("TUI: 键入 → 授权 → 文件落盘 → 渲染（走 SessionHost）", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-tui-"));
@@ -484,6 +586,37 @@ test("TUI: open 响应前的所有事件在 snapshot 后按序回放", async () 
   view.unmount();
 });
 
+test("TUI: Ctrl+O 展开和收起完整工具输出", async () => {
+  const host = offlineHost({
+    eventsBeforeSnapshot: [
+      {
+        type: "agent",
+        event: { type: "tool_start", id: "detail-tool", name: "bash", ruleKey: "npm test" },
+      },
+      {
+        type: "agent",
+        event: {
+          type: "tool_result",
+          id: "detail-tool",
+          name: "bash",
+          content: "first line\nsecond detail line",
+          isError: false,
+        },
+      },
+    ],
+  });
+  const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_tool" />);
+  await tick(100);
+  assert.doesNotMatch(view.lastFrame() ?? "", /second detail line/);
+  view.stdin.write("\u000f");
+  await tick(50);
+  assert.match(view.lastFrame() ?? "", /second detail line/);
+  view.stdin.write("\u000f");
+  await tick(50);
+  assert.doesNotMatch(view.lastFrame() ?? "", /second detail line/);
+  view.unmount();
+});
+
 test("TUI: 权限弹窗期间 Escape 可中断会话", async () => {
   let interrupts = 0;
   const host = offlineHost({
@@ -504,6 +637,27 @@ test("TUI: 权限弹窗期间 Escape 可中断会话", async () => {
   view.unmount();
 });
 
+test("TUI: 模型与工具正文中的终端控制序列不能进入渲染帧", async () => {
+  const host = offlineHost({
+    eventsBeforeSnapshot: [
+      {
+        type: "agent",
+        event: {
+          type: "text",
+          text: "safe\x1b]52;c;SGVsbG8=\x07\x1b[2Jvisible",
+        },
+      },
+      { type: "agent", event: { type: "done", usage: zeroUsage, turns: 1 } },
+    ],
+  });
+  const view = render(<App host={host} cwd="/fallback" model="fallback" sessionId="s_offline" />);
+  await tick(100);
+  const frame = view.lastFrame() ?? "";
+  assert.match(frame, /safevisible/);
+  assert.doesNotMatch(frame, /\x1b\]52|\x1b\[2J/);
+  view.unmount();
+});
+
 test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认", async () => {
   const decisions: string[] = [];
   const host = offlineHost({
@@ -514,11 +668,15 @@ test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认",
   await tick(80);
   const frame = view.lastFrame() ?? "";
   assert.match(frame, /授权请求/);
-  assert.match(frame, /输入需求/);
+  assert.match(frame, /输入你的目标/);
   assert.match(frame, /↑↓ 选择 · Enter 确认/);
 
   view.stdin.write("\u001b[B");
   view.stdin.write("\u001b[B");
+  view.stdin.write("\r");
+  await tick(80);
+  assert.deepEqual(decisions, []);
+  assert.match(view.lastFrame() ?? "", /再次按 p\/Enter/);
   view.stdin.write("\r");
   await tick(80);
   assert.deepEqual(decisions, ["allow_always"]);
@@ -545,6 +703,23 @@ test("TUI: /help 与 /status 显示快捷帮助和 snapshot 实际元数据", as
   assert.match(frame, /\/providers/);
   assert.match(frame, /\/model <provider\/model>/);
   assert.match(frame, /会话 s_status · status\/model · \/status\/cwd · 空闲/);
+  view.unmount();
+});
+
+test("TUI: /mouse 可切换跟踪，off 明确恢复原生框选/复制", async () => {
+  const host = offlineHost({ id: "s_mouse", cwd: "/work", model: "debug/demo" });
+  const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_mouse" />);
+  await tick(60);
+
+  for (const ch of "/mouse on") view.stdin.write(ch);
+  view.stdin.write("\r");
+  await tick(50);
+  assert.match(view.lastFrame() ?? "", /鼠标跟踪|Mouse tracking/);
+
+  for (const ch of "/mouse off") view.stdin.write(ch);
+  view.stdin.write("\r");
+  await tick(50);
+  assert.match(view.lastFrame() ?? "", /拖拽框选|drag to select/);
   view.unmount();
 });
 
@@ -741,13 +916,17 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
   }
 });
 
-test("TUI: PTY 整块 paste 的尾随回车会提交且不进入消息内容", async () => {
+test("TUI: bracketed paste 的尾随换行只插入、绝不隐式提交", async () => {
   const sent: string[] = [];
   const host = offlineHost({ onSend: (text) => sent.push(text) });
   const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_offline" />);
   await tick(80);
 
-  view.stdin.write("pasted request\r");
+  view.stdin.write("\u001b[200~pasted request\n\u001b[201~");
+  await tick(40);
+
+  assert.deepEqual(sent, []);
+  view.stdin.write("\r");
   await tick(80);
 
   assert.deepEqual(sent, ["pasted request"]);
@@ -755,34 +934,55 @@ test("TUI: PTY 整块 paste 的尾随回车会提交且不进入消息内容", a
   view.unmount();
 });
 
-test("TUI: 含内部换行但无尾随回车的 paste 只填入输入框", async () => {
+test("TUI: bracketed paste 保留内部换行直到用户显式提交", async () => {
   const sent: string[] = [];
   const host = offlineHost({ onSend: (text) => sent.push(text) });
   const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_offline" />);
   await tick(80);
 
-  view.stdin.write("first line\nsecond line");
+  view.stdin.write("\u001b[200~first line\nsecond line\u001b[201~");
   await tick(40);
   assert.deepEqual(sent, []);
 
   view.stdin.write("\r");
   await tick(80);
-  assert.deepEqual(sent, ["first line second line"]);
+  assert.deepEqual(sent, ["first line\nsecond line"]);
   view.unmount();
 });
 
-test("TUI: 被拆成多个 stdin chunk 的多行 paste 只提交一次", async () => {
+test("TUI: 被拆成多个 stdin chunk 的 bracketed paste 保持原子且不自动提交", async () => {
   const sent: string[] = [];
   const host = offlineHost({ onSend: (text) => sent.push(text) });
   const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_offline" />);
   await tick(80);
 
-  view.stdin.write("first line\n");
+  view.stdin.write("\u001b[200~first line\n");
   await tick(5); // PTY 的下一块可能落在后续 event-loop tick
-  view.stdin.write("second line\r");
+  view.stdin.write("second line\n\u001b[201~");
+  await tick(40);
+
+  assert.deepEqual(sent, []);
+  view.stdin.write("\r");
   await tick(80);
 
-  assert.deepEqual(sent, ["first line second line"]);
+  assert.deepEqual(sent, ["first line\nsecond line"]);
+  view.unmount();
+});
+
+test("TUI: 光标与退格不会拆开 emoji grapheme", async () => {
+  const sent: string[] = [];
+  const host = offlineHost({ onSend: (text) => sent.push(text) });
+  const view = render(<App host={host} cwd="/work" model="debug/demo" sessionId="s_unicode" />);
+  await tick(80);
+
+  view.stdin.write("\u001b[200~a👨‍💻b\u001b[201~");
+  await tick(20);
+  view.stdin.write("\u001b[D");
+  view.stdin.write("\u007f");
+  view.stdin.write("\r");
+  await tick(80);
+
+  assert.deepEqual(sent, ["ab"]);
   view.unmount();
 });
 
@@ -940,12 +1140,13 @@ test("TUI: 始终画 3 行大 logo，窄屏只裁两侧不折行", () => {
   }
 });
 
-test("TUI: 空会话 Tip 提示 /init，宽度始终受终端约束", () => {
+test("TUI: 空会话 Tip 展示通用能力与 /help，宽度始终受终端约束", () => {
   for (const width of [80, 48, 28]) {
     const frame = (render(<WelcomeTip width={width} />).lastFrame() ?? "").replace(SGR, "");
     assert.match(frame, /Tip/);
-    assert.match(frame, /\/init/);
-    assert.match(frame, /AGENTS\.md/);
+    assert.match(frame, /\/help/);
+    assert.match(frame, /调研|research/);
+    assert.match(frame, /代码|code/);
     for (const line of frame.split("\n")) {
       assert.ok(dispWidth(line) <= width, `width=${width} Tip 行超宽: ${JSON.stringify(line)}`);
     }
@@ -1017,6 +1218,35 @@ test("TUI: 中文与窄屏下真实光标列都落在窗口内", () => {
       }
     }
   }
+});
+
+test("TUI: IME 真实光标与中文、多行输入面板中的绘制插入点重合", () => {
+  const visualPosition = composerCaretPosition({
+    panelTop: 3,
+    text: "深圳的",
+    cursor: "深圳的".length,
+    width: 80,
+    maxInputRows: 5,
+    terminalRows: 24,
+  });
+  assert.deepEqual(
+    visualPosition,
+    // panel 下一行；竖条 + 空格后，3 个汉字占 6 列。
+    { x: 8, y: 4 },
+  );
+  const multiline = "第一行\n第二行\n第三行";
+  assert.deepEqual(
+    composerCaretPosition({
+      panelTop: 8,
+      text: multiline,
+      cursor: multiline.length,
+      width: 20,
+      maxInputRows: 2,
+      terminalRows: 24,
+    }),
+    // 只显示末两行，第三行是可见窗口内第 2 行。
+    { x: 8, y: 10 },
+  );
 });
 
 test("TUI: /mcp 未配置时提示；配置后展示状态与 MCP prompt 命令可执行", async () => {

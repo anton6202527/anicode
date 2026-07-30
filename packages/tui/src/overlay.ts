@@ -10,45 +10,19 @@
  */
 
 import { t } from "@anicode/core";
+import { sanitizeTerminalText } from "./terminal-text.js";
+import { graphemes, terminalWidth, truncateTerminalWidth } from "./text-layout.js";
 
 // ---------- 显示宽度 ----------
 
 /** 终端显示宽度：CJK/全角/emoji 记 2，其余记 1。 */
 export function dispWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) {
-    const c = ch.codePointAt(0) ?? 0;
-    const wide =
-      c >= 0x1100 &&
-      (c <= 0x115f ||
-        c === 0x2329 ||
-        c === 0x232a ||
-        (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) ||
-        (c >= 0xac00 && c <= 0xd7a3) ||
-        (c >= 0xf900 && c <= 0xfaff) ||
-        (c >= 0xfe30 && c <= 0xfe4f) ||
-        (c >= 0xff00 && c <= 0xff60) ||
-        (c >= 0xffe0 && c <= 0xffe6) ||
-        (c >= 0x1f300 && c <= 0x1faff) ||
-        (c >= 0x20000 && c <= 0x3fffd));
-    w += wide ? 2 : 1;
-  }
-  return w;
+  return terminalWidth(s);
 }
 
 /** 按显示宽度截断，超出补省略号（保证浮层行不因超宽而折行）。 */
 export function truncWidth(s: string, max: number): string {
-  if (dispWidth(s) <= max) return s;
-  if (max <= 0) return "";
-  let out = "";
-  let w = 0;
-  for (const ch of s) {
-    const cw = dispWidth(ch);
-    if (w + cw > max - 1) break;
-    out += ch;
-    w += cw;
-  }
-  return out + "…";
+  return truncateTerminalWidth(s, max);
 }
 
 // ---------- ANSI 基元 ----------
@@ -93,7 +67,7 @@ function renderSpan(s: Span, baseBg: string): string {
   if (s.fg) pre += fgOf(s.fg);
   if (s.bold) pre += BOLD;
   if (s.dim) pre += DIM;
-  return pre + s.text + RESET;
+  return pre + sanitizeTerminalText(s.text) + RESET;
 }
 
 /**
@@ -104,8 +78,9 @@ function line(width: number, spans: Span[], baseBg: string = DLG.bg): string {
   let out = "";
   let w = 0;
   for (const s of spans) {
-    out += renderSpan(s, baseBg);
-    w += dispWidth(s.text);
+    const text = sanitizeTerminalText(s.text);
+    out += renderSpan({ ...s, text }, baseBg);
+    w += dispWidth(text);
   }
   if (w < width) out += bgOf(baseBg) + " ".repeat(width - w) + RESET;
   return out;
@@ -113,10 +88,12 @@ function line(width: number, spans: Span[], baseBg: string = DLG.bg): string {
 
 /** 两端对齐行：左段靠左、右段靠右，中间用 baseBg 撑开。 */
 function lineLR(width: number, left: Span[], right: Span[], baseBg: string = DLG.bg): string {
-  const lw = left.reduce((a, s) => a + dispWidth(s.text), 0);
-  const rw = right.reduce((a, s) => a + dispWidth(s.text), 0);
+  const safeLeft = left.map((s) => ({ ...s, text: sanitizeTerminalText(s.text) }));
+  const safeRight = right.map((s) => ({ ...s, text: sanitizeTerminalText(s.text) }));
+  const lw = safeLeft.reduce((a, s) => a + dispWidth(s.text), 0);
+  const rw = safeRight.reduce((a, s) => a + dispWidth(s.text), 0);
   const gap = Math.max(1, width - lw - rw);
-  return line(width, [...left, { text: " ".repeat(gap) }, ...right], baseBg);
+  return line(width, [...safeLeft, { text: " ".repeat(gap) }, ...safeRight], baseBg);
 }
 
 // ---------- 帧合成 ----------
@@ -183,8 +160,15 @@ export function sliceAnsi(str: string, start: number, end: number): string {
       i = j + 1;
       continue;
     }
-    const cp = str.codePointAt(i)!;
-    const chStr = String.fromCodePoint(cp);
+    const visibleTail = str.slice(i);
+    const nextAnsi = visibleTail.indexOf("\x1b");
+    const plain = nextAnsi < 0 ? visibleTail : visibleTail.slice(0, nextAnsi);
+    const part = graphemes(plain)[0];
+    if (!part) {
+      i += 1;
+      continue;
+    }
+    const chStr = part.text;
     const cw = dispWidth(chStr);
     const cStart = col;
     const cEnd = col + cw;
@@ -268,13 +252,13 @@ function dialogWidth(termCols: number): number {
 /** 横向滚动条：轨道 ─、滑块 █、两端 ◀▶ 表示还可左右；整行显示宽度恒为 view。 */
 function hbar(view: number, total: number, off: number): string {
   const maxOff = total - view;
-  const inner = Math.max(1, view - 2);
+  const left = off > 0 ? "◀" : " ";
+  const right = off < maxOff ? "▶" : " ";
+  const inner = Math.max(1, view - dispWidth(left) - dispWidth(right));
   const thumb = Math.max(1, Math.min(inner, Math.round((inner * view) / total)));
   const pos = maxOff <= 0 ? 0 : Math.round((off / maxOff) * (inner - thumb));
   let track = "";
   for (let i = 0; i < inner; i++) track += i >= pos && i < pos + thumb ? "█" : "─";
-  const left = off > 0 ? "◀" : " ";
-  const right = off < maxOff ? "▶" : " ";
   return fgOf(DLG.accent) + left + fgOf(DLG.dim) + track + fgOf(DLG.accent) + right + RESET;
 }
 
@@ -538,6 +522,96 @@ export function buildSessionsOverlay(
 export interface PermissionLike {
   toolName: string;
   ruleKey: string;
+  permId?: string;
+  input?: Record<string, unknown>;
+  cwd?: string;
+  ruleParts?: string[];
+  rulePartsComplete?: boolean;
+  readOnly?: boolean;
+  mutatesFiles?: boolean;
+  network?: boolean;
+  risk?: "low" | "medium" | "high";
+}
+
+const SECRET_FIELD = /(?:authorization|cookie|password|passwd|secret|token|api.?key|credential)/i;
+const SECRET_VALUE = /\b(?:sk|key|token|pat|ghp|github_pat)-?[A-Za-z0-9_\-.]{8,}\b/gi;
+
+/** Stable, redacted JSON for an approval card. */
+export function permissionInputPreview(input: Record<string, unknown> | undefined): string {
+  if (!input || Object.keys(input).length === 0) return "{}";
+  const seen = new WeakSet<object>();
+  try {
+    return JSON.stringify(input, (key, value: unknown) => {
+      if (key && SECRET_FIELD.test(key)) return "[REDACTED]";
+      if (typeof value === "string") return value.replace(SECRET_VALUE, "[REDACTED]");
+      if (value && typeof value === "object") {
+        if (seen.has(value)) return "[Circular]";
+        seen.add(value);
+        if (Array.isArray(value)) return value;
+        return Object.fromEntries(
+          Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)),
+        );
+      }
+      return value;
+    });
+  } catch {
+    return "[unserializable input]";
+  }
+}
+
+/** Extract a bounded, redacted unified-diff preview from PatchSet/edit inputs. */
+export function permissionPatchPreview(
+  input: Record<string, unknown> | undefined,
+  maxLines = 6,
+): string[] {
+  if (!input) return [];
+  const candidate = Object.entries(input).find(
+    ([key, value]) =>
+      typeof value === "string" &&
+      /(?:patch|diff|new_?text|content)/i.test(key) &&
+      (/(?:^|\n)(?:diff --git|@@ |\+\+\+ |--- |[+-][^+-])/m.test(value) ||
+        /(?:patch|diff)/i.test(key)),
+  );
+  if (!candidate) return [];
+  const raw = sanitizeTerminalText(candidate[1] as string).replace(SECRET_VALUE, "[REDACTED]");
+  const lines = raw.split("\n");
+  const clipped = lines.slice(0, Math.max(1, maxLines));
+  if (lines.length > clipped.length) clipped[clipped.length - 1] = "… diff truncated …";
+  return clipped;
+}
+
+function wrapPermissionText(text: string, width: number, maxLines: number): string[] {
+  const safe = sanitizeTerminalText(text).replace(/\r/g, "");
+  if (width <= 0) return [];
+  const out: string[] = [];
+  for (const logical of safe.split("\n")) {
+    let line = "";
+    let used = 0;
+    for (const part of graphemes(logical)) {
+      const cw = part.width;
+      if (line && used + cw > width) {
+        out.push(line);
+        line = "";
+        used = 0;
+        if (out.length >= maxLines) break;
+      }
+      if (cw <= width) {
+        line += part.text;
+        used += cw;
+      }
+    }
+    if (out.length >= maxLines) break;
+    out.push(line);
+  }
+  const clipped = out.slice(0, maxLines);
+  if (
+    (out.length > maxLines ||
+      dispWidth(safe) > clipped.reduce((n, line) => n + dispWidth(line), 0)) &&
+    clipped.length
+  ) {
+    clipped[clipped.length - 1] = truncWidth(clipped[clipped.length - 1]!, width);
+  }
+  return clipped;
 }
 
 export function buildPermissionOverlay(
@@ -546,17 +620,19 @@ export function buildPermissionOverlay(
   termCols: number,
   selected = 0,
   anchorTop?: number,
+  confirmAlways = false,
 ): Sprite {
   // 与输入面板同宽同左缘；不再居中挡住正在看的上下文。
   const width = Math.max(1, termCols);
   const inner = width - 2 * PADX;
   const p = pendings[0]!;
+  const compact = (anchorTop ?? termRows) < 20;
   const blank = () => line(width, []);
   const bodyL = (spans: Span[], baseBg: string = DLG.bg) => line(width, [PAD, ...spans], baseBg);
   const bodyLR = (l: Span[], r: Span[]) => lineLR(width, [PAD, ...l], [...r, PAD]);
 
   const L: string[] = [];
-  L.push(blank());
+  if (!compact) L.push(blank());
   L.push(
     bodyLR(
       [{ text: t("⚠ Permission request", "⚠ 授权请求"), fg: DLG.accent, bold: true }],
@@ -570,15 +646,76 @@ export function buildPermissionOverlay(
         : [],
     ),
   );
-  L.push(blank());
+  if (!compact) L.push(blank());
   L.push(
     bodyL([
       { text: t("Tool ", "工具 "), fg: DLG.dim },
       { text: p.toolName, fg: DLG.text, bold: true },
     ]),
   );
-  L.push(bodyL([{ text: truncWidth(p.ruleKey, inner), fg: DLG.dim }]));
-  L.push(blank());
+  const risk = p.risk ?? "medium";
+  const riskColor = risk === "high" ? DLG.err : risk === "medium" ? DLG.accent : DLG.ok;
+  L.push(
+    bodyL([
+      { text: t("Risk ", "风险 "), fg: DLG.dim },
+      { text: risk.toUpperCase(), fg: riskColor, bold: true },
+      ...(p.network ? [{ text: t(" · network", " · 网络"), fg: DLG.err }] : []),
+      ...(p.mutatesFiles ? [{ text: t(" · files", " · 文件写入"), fg: DLG.accent }] : []),
+    ]),
+  );
+  if (p.cwd && !compact) {
+    L.push(
+      bodyL([
+        { text: t("CWD ", "目录 "), fg: DLG.dim },
+        { text: truncWidth(p.cwd, inner - 5), fg: DLG.text },
+      ]),
+    );
+  }
+  if (p.permId && !compact) {
+    L.push(bodyL([{ text: `ID ${truncWidth(p.permId, inner - 3)}`, fg: DLG.dim }]));
+  }
+  if (!compact) {
+    L.push(bodyL([{ text: t("Operation", "完整操作"), fg: DLG.section, bold: true }]));
+  }
+  for (const operationLine of wrapPermissionText(p.ruleKey, Math.max(1, inner), compact ? 2 : 4)) {
+    L.push(bodyL([{ text: operationLine, fg: DLG.text }]));
+  }
+  if (!compact) {
+    L.push(bodyL([{ text: t("Arguments", "参数"), fg: DLG.section, bold: true }]));
+  }
+  for (const inputLine of wrapPermissionText(
+    permissionInputPreview(p.input),
+    Math.max(1, inner),
+    compact ? 1 : 3,
+  )) {
+    L.push(bodyL([{ text: inputLine, fg: DLG.dim }]));
+  }
+  if (!compact) {
+    const preview = permissionPatchPreview(p.input, 3);
+    if (preview.length > 0) {
+      L.push(bodyL([{ text: t("Patch preview", "补丁预览"), fg: DLG.section, bold: true }]));
+      for (const patchLine of preview) {
+        const color = patchLine.startsWith("+")
+          ? DLG.ok
+          : patchLine.startsWith("-")
+            ? DLG.err
+            : DLG.dim;
+        L.push(bodyL([{ text: truncWidth(patchLine, inner), fg: color }]));
+      }
+    }
+  }
+  if (p.rulePartsComplete === false) {
+    L.push(
+      bodyL([
+        {
+          text: t("⚠ Command analysis is incomplete", "⚠ 无法完整解析命令边界"),
+          fg: DLG.err,
+          bold: true,
+        },
+      ]),
+    );
+  }
+  if (!compact) L.push(blank());
   const options = [
     { key: "y", label: t("Allow once", "允许一次"), color: DLG.ok },
     { key: "a", label: t("Allow for this session", "本会话允许并记住"), color: DLG.accent },
@@ -590,6 +727,7 @@ export function buildPermissionOverlay(
     { key: "n", label: t("Deny", "拒绝"), color: DLG.err },
   ];
   const index = Math.max(0, Math.min(selected, options.length - 1));
+  const optionStart = L.length;
   options.forEach((option, optionIndex) => {
     const active = optionIndex === index;
     L.push(
@@ -606,19 +744,32 @@ export function buildPermissionOverlay(
       ),
     );
   });
-  L.push(blank());
+  if (confirmAlways) {
+    L.push(
+      bodyL([
+        {
+          text: t("Press p/Enter again to persist this rule", "再次按 p/Enter 才会永久保存此规则"),
+          fg: DLG.err,
+          bold: true,
+        },
+      ]),
+    );
+  }
+  if (!compact) L.push(blank());
   L.push(
     bodyLR(
       [{ text: t("esc interrupt", "esc 中断"), fg: DLG.dim }],
       [{ text: t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认"), fg: DLG.dim }],
     ),
   );
-  L.push(blank());
+  if (!compact) L.push(blank());
   return {
     ...(anchorTop === undefined
       ? place(L, width, termRows, termCols)
       : placeAbove(L, width, anchorTop, 0)),
-    hitRows: [null, null, null, null, null, null, 0, 1, 2, 3, null, null, null],
+    hitRows: L.map((_, row) =>
+      row >= optionStart && row < optionStart + options.length ? row - optionStart : null,
+    ),
   };
 }
 

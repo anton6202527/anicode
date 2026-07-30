@@ -17,6 +17,12 @@ const outfile = path.join(here, "dist", "cli.js");
 
 // 版本号单一事实源：从发布包 package.json 注入，避免源码里硬编码版本与之漂移。
 const pkg = JSON.parse(await fs.readFile(path.join(here, "package.json"), "utf8"));
+const externalPackages = new Set();
+
+function packageName(specifier) {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
 
 /** 把相对的 ".js" import 解析到实际的 .ts/.tsx 源文件 */
 const tsResolvePlugin = {
@@ -51,6 +57,7 @@ const externalizePlugin = {
       if (p.startsWith(".") || p.startsWith("/") || path.isAbsolute(p)) return null;
       if (p.startsWith("@anicode/")) return null; // 内联工作区包（经 exports 解析到 src）
       if (p.startsWith("node:")) return { path: p, external: true };
+      externalPackages.add(packageName(p));
       return { path: p, external: true }; // ink / react / @anthropic-ai/sdk / openai / ...
     });
   },
@@ -67,13 +74,25 @@ await build({
   bundle: true,
   platform: "node",
   format: "esm",
-  target: "node18",
+  target: "node22",
   jsx: "automatic",
   loader: { ".ts": "ts", ".tsx": "tsx" },
   define: { __ANICODE_VERSION__: JSON.stringify(pkg.version) },
   plugins: [externalizePlugin, tsResolvePlugin],
   logLevel: "info",
 });
+
+const declaredRuntimePackages = new Set([
+  ...Object.keys(pkg.dependencies ?? {}),
+  ...Object.keys(pkg.optionalDependencies ?? {}),
+  ...Object.keys(pkg.peerDependencies ?? {}),
+]);
+const undeclared = [...externalPackages]
+  .filter((name) => !declaredRuntimePackages.has(name))
+  .sort();
+if (undeclared.length > 0) {
+  throw new Error(`发布包存在未声明的运行时依赖: ${undeclared.join(", ")}`);
+}
 
 // cli.tsx 源码自带 `#!/usr/bin/env tsx` shebang，会被 esbuild 保留在产物开头。
 // 剥掉产物开头的所有 shebang 行，再补上唯一正确的 node shebang（shebang 只在第 1 行有效）。

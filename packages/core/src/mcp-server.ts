@@ -51,8 +51,8 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
     {
       name: "anicode",
       description:
-        "Run the anicode coding agent on a task in a workspace directory. " +
-        "Starts a fresh session, works autonomously (edit files / run commands per its permission policy), " +
+        "Run the general-purpose anicode agent on a task, optionally grounded in a workspace directory. " +
+        "Starts a fresh session and uses available tools autonomously (including files and commands when relevant and allowed), " +
         "and returns the final answer plus a sessionId for follow-ups via anicode_reply.",
       inputSchema: {
         type: "object",

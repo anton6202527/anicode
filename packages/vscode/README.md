@@ -1,6 +1,6 @@
 # anicode for VSCode
 
-在 VSCode 侧边栏里与 anicode 自研 coding agent 对话。扩展主机进程内
+在 VSCode 侧边栏里使用 anicode 通用型 Agent，并在工程场景中发挥强化的代码理解、编辑与验证能力。扩展主机进程内
 运行 `@anicode/core` 的 `SessionManager`，webview 只负责渲染——与 daemon / Electron app
 是同一套 `SessionHost` 契约的不同传输实现。
 

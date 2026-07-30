@@ -65,8 +65,10 @@ import {
   type LocalRuntimeStack,
   type Telemetry,
 } from "@anicode/core";
-import { App } from "./app.js";
+import { App, type TuiKeybindingAction } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
+import { TuiErrorBoundary } from "./error-boundary.js";
+import { createTerminalCaretOutput } from "./terminal-caret.js";
 
 // 版本号由 build.mjs 经 esbuild define 注入（发布包 package.json 单一事实源）；
 // tsx 直跑源码（无 define）时回落到下面的常量。
@@ -90,24 +92,135 @@ interface TerminalScreenOutput {
   write: (chunk: string) => unknown;
 }
 
+interface TerminalScreenInput {
+  isTTY?: boolean;
+  isRaw?: boolean;
+  destroyed?: boolean;
+  setRawMode?: (enabled: boolean) => unknown;
+}
+
+interface TerminalScreenOptions {
+  color?: boolean;
+  /** Emergency fallback only; Ink owns the normal alternate-screen lifecycle. */
+  alternateScreen?: boolean;
+}
+
+const SGR_COLOR = /\u001b\[[0-9;:]*m/g;
+
+export function stripAnsiColors(text: string): string {
+  return text.replace(SGR_COLOR, "");
+}
+
+/** Output adapter used by --no-color; cursor/erase control sequences are retained. */
+export function colorlessTerminalOutput(output: NodeJS.WriteStream): NodeJS.WriteStream {
+  const write = ((chunk: unknown, ...args: unknown[]) => {
+    const safe =
+      typeof chunk === "string"
+        ? stripAnsiColors(chunk)
+        : Buffer.isBuffer(chunk)
+          ? Buffer.from(stripAnsiColors(chunk.toString("utf8")), "utf8")
+          : chunk;
+    return (output.write as (...values: unknown[]) => boolean).call(output, safe, ...args);
+  }) as NodeJS.WriteStream["write"];
+  return new Proxy(output, {
+    get(target, property) {
+      if (property === "write") return write;
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 /**
- * 在 Ink 首帧之前进入备用屏，避免首帧先写入普通回滚缓冲而让终端整页产生滚动。
- * 返回的清理函数会关闭鼠标跟踪、复位配色并恢复原屏幕。
+ * 在 Ink 首帧之前设置可选终端配色。备用屏由 Ink 7 原生管理；这里的清理函数
+ * 负责 raw mode、鼠标/粘贴状态与配色复位，并保留一次紧急备用屏退出兜底。
  */
-export function enterTerminalScreen(output: TerminalScreenOutput = process.stdout): () => void {
+export function enterTerminalScreen(
+  output: TerminalScreenOutput = process.stdout,
+  input: TerminalScreenInput = process.stdin,
+  options: TerminalScreenOptions = {},
+): () => void {
   if (!output.isTTY) return () => {};
-  output.write("\x1b[?1049h\x1b[H");
-  output.write("\x1b]11;#0a0a0a\x07");
-  output.write("\x1b]17;#264f78\x07\x1b]19;#dcdcdc\x07");
+  const initialRaw = input.isRaw === true;
+  const color = options.color ?? true;
+  // Start from a known selection-friendly baseline. If a previous TUI crashed while
+  // application mouse mode was active, these resets return drag events to the terminal;
+  // App will opt back in after mounting only when --mouse was requested.
+  output.write("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+  if (color) {
+    output.write("\x1b]11;#0a0a0a\x07");
+    output.write("\x1b]17;#264f78\x07\x1b]19;#dcdcdc\x07");
+  }
   let active = true;
   return () => {
     if (!active) return;
     active = false;
-    output.write("\x1b[?1006l\x1b[?1000l");
-    output.write("\x1b]111\x07");
-    output.write("\x1b]117\x07\x1b]119\x07");
-    output.write("\x1b[?1049l");
+    if (input.isTTY && !input.destroyed && input.setRawMode) {
+      try {
+        input.setRawMode(initialRaw);
+      } catch {
+        /* best effort: the TTY may already have been detached */
+      }
+    }
+    output.write(
+      "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+    );
+    if (color) {
+      output.write("\x1b]111\x07");
+      output.write("\x1b]117\x07\x1b]119\x07");
+    }
+    if (options.alternateScreen) output.write("\x1b[?1049l");
   };
+}
+
+type GuardedSignal = "SIGINT" | "SIGTERM" | "SIGHUP";
+
+/**
+ * Restore the terminal before catchable process termination paths.  Signal handlers
+ * remove themselves and re-raise the original signal so callers still observe the
+ * conventional exit status (130/143/129) instead of a false successful exit.
+ */
+export function installTerminalExitGuard(
+  cleanup: () => void,
+  target: NodeJS.Process = process,
+): () => void {
+  let installed = true;
+  const signals: GuardedSignal[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+  const remove = () => {
+    if (!installed) return;
+    installed = false;
+    for (const signal of signals) target.off(signal, handlers[signal]);
+    target.off("exit", onExit);
+    target.off("uncaughtException", onUncaughtException);
+    target.off("unhandledRejection", onUnhandledRejection);
+  };
+  const terminate = (signal: GuardedSignal) => {
+    cleanup();
+    remove();
+    target.kill(target.pid, signal);
+  };
+  const handlers: Record<GuardedSignal, () => void> = {
+    SIGINT: () => terminate("SIGINT"),
+    SIGTERM: () => terminate("SIGTERM"),
+    SIGHUP: () => terminate("SIGHUP"),
+  };
+  const onExit = () => cleanup();
+  const rethrow = (reason: unknown) => {
+    cleanup();
+    remove();
+    queueMicrotask(() => {
+      throw reason instanceof Error ? reason : new Error(String(reason));
+    });
+  };
+  const onUncaughtException = (error: Error) => rethrow(error);
+  const onUnhandledRejection = (reason: unknown) => rethrow(reason);
+
+  for (const signal of signals) target.once(signal, handlers[signal]);
+  target.once("exit", onExit);
+  target.once("uncaughtException", onUncaughtException);
+  target.once("unhandledRejection", onUnhandledRejection);
+  return remove;
 }
 
 /**
@@ -117,11 +230,12 @@ export function enterTerminalScreen(output: TerminalScreenOutput = process.stdou
  *
  * Node 的 `stdin.isRaw` 与 libuv 的 TTY mode 都是上次 setRawMode 的缓存，不能反映
  * 外部 termios 改动；单独重复 `setRawMode(true)` 也会被 libuv 当作无变化而跳过。
- * 因此 TUI 存活期间需要先 false 再 true 强制重申。停止后仍由 Ink 恢复原始状态。
+ * 因此启动及 SIGCONT（从 job control 恢复）时先 false 再 true 强制重申。
+ * 可选 interval 只供诊断/兼容旧终端，生产默认不轮询，避免打断 bracketed paste。
  */
 export function startRawModeWatchdog(
   input: RawModeInput = process.stdin,
-  intervalMs = 200,
+  intervalMs = 0,
 ): () => void {
   if (!input.isTTY || typeof input.setRawMode !== "function") return () => {};
   const restore = () => {
@@ -131,11 +245,11 @@ export function startRawModeWatchdog(
   };
   restore();
   process.on("SIGCONT", restore);
-  const timer = setInterval(restore, intervalMs);
-  timer.unref?.();
+  const timer = intervalMs > 0 ? setInterval(restore, intervalMs) : undefined;
+  timer?.unref?.();
   return () => {
     process.off("SIGCONT", restore);
-    clearInterval(timer);
+    if (timer) clearInterval(timer);
   };
 }
 
@@ -162,6 +276,14 @@ export interface CliArgs {
   listModels: boolean;
   debugLog?: string;
   traceContent: boolean;
+  /** Disable styling while retaining the interactive layout. */
+  noColor: boolean;
+  /** Opt into xterm mouse tracking. Off by default so terminal selection/copy stays native. */
+  mouse: boolean;
+  /** Render in the primary screen buffer. */
+  noAltScreen: boolean;
+  /** Minimal terminal-effects mode: no colors, mouse tracking or alternate screen. */
+  plain: boolean;
 }
 
 function requiredValue(argv: string[], index: number, flag: string): string {
@@ -192,6 +314,10 @@ export function parseArgs(argv: string[]): CliArgs {
   let httpToken: string | undefined;
   let permissionMode: CliArgs["permissionMode"] = "default";
   let profile: string | undefined;
+  let noColor = "NO_COLOR" in process.env;
+  let mouse = false;
+  let noAltScreen = false;
+  let plain = false;
   const seen = new Set<string>();
 
   const mark = (flag: string): void => {
@@ -295,6 +421,53 @@ export function parseArgs(argv: string[]): CliArgs {
         mark(arg);
         traceContent = true;
         break;
+      case "--no-color":
+        mark(arg);
+        noColor = true;
+        break;
+      case "--mouse":
+        mark(arg);
+        if (seen.has("--no-mouse") || seen.has("--plain")) {
+          throw new Error(
+            t(
+              "--mouse cannot be used with --no-mouse or --plain",
+              "--mouse 不能与 --no-mouse 或 --plain 同时使用",
+            ),
+          );
+        }
+        mouse = true;
+        break;
+      case "--no-mouse":
+        mark(arg);
+        if (seen.has("--mouse")) {
+          throw new Error(
+            t(
+              "--mouse cannot be used with --no-mouse or --plain",
+              "--mouse 不能与 --no-mouse 或 --plain 同时使用",
+            ),
+          );
+        }
+        mouse = false;
+        break;
+      case "--no-alt-screen":
+        mark(arg);
+        noAltScreen = true;
+        break;
+      case "--plain":
+        mark(arg);
+        if (seen.has("--mouse")) {
+          throw new Error(
+            t(
+              "--mouse cannot be used with --no-mouse or --plain",
+              "--mouse 不能与 --no-mouse 或 --plain 同时使用",
+            ),
+          );
+        }
+        plain = true;
+        noColor = true;
+        mouse = false;
+        noAltScreen = true;
+        break;
       case "--list-providers":
         mark(arg);
         showProviders = true;
@@ -356,6 +529,10 @@ export function parseArgs(argv: string[]): CliArgs {
     listModels: showModels,
     ...(debugLog ? { debugLog } : {}),
     traceContent,
+    noColor,
+    mouse,
+    noAltScreen,
+    plain,
   };
 }
 
@@ -363,6 +540,10 @@ export function helpText(): string {
   return (
     `${DISPLAY_NAME} ${CLI_VERSION}\n\n` +
     t(`Usage: anicode [options]\n\n`, `用法: anicode [选项]\n\n`) +
+    t(
+      `Default: standalone local process with embedded SQLite; no AniCode backend/server or external database required.\n\n`,
+      `默认：本地单进程 + 内置 SQLite，无需 AniCode 后端服务或外部数据库。\n\n`,
+    ) +
     t(
       `  --demo                    Use the zero-key deterministic debug model\n`,
       `  --demo                    使用零 Key 的确定性调试模型\n`,
@@ -416,6 +597,26 @@ export function helpText(): string {
       `  --trace-content           调试日志包含提示/工具内容（可能敏感）\n`,
     ) +
     t(
+      `  --plain                   Primary screen, no color and no mouse tracking\n`,
+      `  --plain                   主屏纯文本模式，不使用颜色和鼠标跟踪\n`,
+    ) +
+    t(
+      `  --no-color                Disable ANSI colors (also honors NO_COLOR)\n`,
+      `  --no-color                关闭 ANSI 颜色（同时遵循 NO_COLOR）\n`,
+    ) +
+    t(
+      `  --mouse                   Enable click/wheel tracking (off by default so text can be selected)\n`,
+      `  --mouse                   开启点击/滚轮跟踪（默认关闭，以便直接框选文本）\n`,
+    ) +
+    t(
+      `  --no-mouse                Keep native terminal selection/copy (default; compatibility flag)\n`,
+      `  --no-mouse                保留终端原生框选/复制（默认；兼容旧脚本）\n`,
+    ) +
+    t(
+      `  --no-alt-screen           Keep the TUI in the primary screen buffer\n`,
+      `  --no-alt-screen           在主屏缓冲区运行 TUI\n`,
+    ) +
+    t(
       `  --list-providers          List available providers\n`,
       `  --list-providers          列出可用 provider\n`,
     ) +
@@ -426,6 +627,10 @@ export function helpText(): string {
     t(`  -h, --help                Show help\n`, `  -h, --help                显示帮助\n`) +
     t(`  -v, --version             Show version\n\n`, `  -v, --version             显示版本\n\n`) +
     t(`Subcommands:\n`, `子命令:\n`) +
+    t(
+      `  exec --prompt <text>      Run one prompt headlessly (JSONL by default)\n`,
+      `  exec --prompt <text>      无头执行一条提示词（默认 JSONL）\n`,
+    ) +
     t(
       `  auth login [provider]     Log in with a Claude subscription (default anthropic), no API key needed\n`,
       `  auth login [provider]     用 Claude 订阅登录（默认 anthropic），免 API key\n`,
@@ -859,6 +1064,262 @@ function tryOpenBrowser(url: string): void {
   }
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export interface ExecCommandOptions {
+  args: CliArgs;
+  prompt?: string;
+  jsonl: boolean;
+  timeoutMs: number;
+  help: boolean;
+}
+
+export function parseExecArgs(argv: string[]): ExecCommandOptions {
+  const base: string[] = [];
+  let prompt: string | undefined;
+  let jsonl = true;
+  let timeoutMs = 30 * 60_000;
+  let help = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--") {
+      prompt = argv.slice(i + 1).join(" ");
+      break;
+    }
+    if (arg === "--prompt") {
+      prompt = requiredValue(argv, i, arg);
+      i++;
+      continue;
+    }
+    if (arg === "--jsonl") {
+      jsonl = true;
+      continue;
+    }
+    if (arg === "--text") {
+      jsonl = false;
+      continue;
+    }
+    if (arg === "--timeout") {
+      const raw = requiredValue(argv, i, arg);
+      timeoutMs = Number(raw);
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+        throw new Error(
+          t("--timeout must be a positive number of milliseconds", "--timeout 必须是正毫秒数"),
+        );
+      i++;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      help = true;
+      continue;
+    }
+    base.push(arg);
+  }
+  const args = parseArgs(base);
+  validateArgs(args);
+  return { args, ...(prompt !== undefined ? { prompt } : {}), jsonl, timeoutMs, help };
+}
+
+export function execHelpText(): string {
+  return t(
+    `Usage: anicode exec [TUI options] [--jsonl|--text] [--timeout MS] (--prompt TEXT | -- TEXT)\n\n` +
+      `Runs one prompt without a TUI. JSONL is the default. Permissions are denied unless the selected runtime policy already allows them; use --auto only in a suitably isolated workspace.\n`,
+    `用法: anicode exec [TUI 选项] [--jsonl|--text] [--timeout 毫秒] (--prompt 文本 | -- 文本)\n\n` +
+      `无 TUI 执行一条提示词，默认输出 JSONL。未被运行时策略放行的权限会被拒绝；仅应在妥善隔离的工作区使用 --auto。\n`,
+  );
+}
+
+async function readAll(input: NodeJS.ReadableStream): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of input as AsyncIterable<Buffer | string>) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+export async function runExecCommand(
+  argv: string[],
+  io: {
+    input?: NodeJS.ReadableStream;
+    output?: NodeJS.WritableStream;
+    error?: NodeJS.WritableStream;
+  } = {},
+): Promise<void> {
+  const parsed = parseExecArgs(argv);
+  const output = io.output ?? process.stdout;
+  const errorOutput = io.error ?? process.stderr;
+  if (parsed.help) {
+    output.write(execHelpText());
+    return;
+  }
+  const args = parsed.args;
+  if (args.version) {
+    output.write(`${CLI_VERSION}\n`);
+    return;
+  }
+  await loadProjectEnv({ cwd: args.cwd });
+  if (args.listProviders) {
+    output.write(
+      `${listProviderDetails()
+        .map((provider) => provider.id)
+        .join("\n")}\n`,
+    );
+    return;
+  }
+  if (args.listModels) {
+    output.write(
+      `${listModelCatalog()
+        .map((entry) => entry.spec)
+        .join("\n")}\n`,
+    );
+    return;
+  }
+  const input = io.input ?? process.stdin;
+  if (parsed.prompt === undefined && (input as NodeJS.ReadStream).isTTY) {
+    throw new Error(
+      t(
+        "exec requires --prompt, -- TEXT, or piped stdin",
+        "exec 需要 --prompt、-- 文本或管道 stdin",
+      ),
+    );
+  }
+  const prompt = parsed.prompt ?? (await readAll(input));
+  if (!prompt.trim()) throw new Error(t("exec requires a non-empty prompt", "exec 需要非空提示词"));
+
+  const emit = (type: string, properties: Record<string, unknown> = {}): void => {
+    if (parsed.jsonl) output.write(`${JSON.stringify({ type, ...properties })}\n`);
+  };
+  const warn = (message: string): void => {
+    if (parsed.jsonl) emit("warning", { message });
+    else errorOutput.write(`${message}\n`);
+  };
+
+  const { config, warnings } = await loadConfig({
+    cwd: args.cwd,
+    ...(args.profile ? { profile: args.profile } : {}),
+  });
+  for (const warning of warnings) warn(warning);
+  if (!args.modelExplicit && !args.demo) args.model = config.model ?? resolveDefaultModel();
+  if (!args.daemon && !args.http && !args.resume) assertProviderConfigured(args.model);
+
+  const runtimeStack =
+    !args.daemon && !args.http
+      ? await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir))
+      : undefined;
+  const telemetry = runtimeStack ? telemetryForLocalStack(runtimeStack) : telemetryFromEnv();
+  let mcpClients: McpClient[] = [];
+  let lspPool: LspPool | undefined;
+  let host: SessionHost | undefined;
+  try {
+    let mcpTools: Tool[] = [];
+    if (runtimeStack) {
+      const mcpConfigs = toMcpServerConfigs(config);
+      if (mcpConfigs.length > 0) {
+        try {
+          const connected = await connectMcpServers(mcpConfigs, {
+            telemetry,
+            networkProxy: runtimeStack.networkProxy,
+            credentialBroker: runtimeStack.broker,
+            executionRuntime: runtimeStack.isolatedRuntime,
+          });
+          mcpClients = connected.clients;
+          mcpTools = connected.tools;
+        } catch (error) {
+          warn(`MCP connection failed: ${errorMessage(error)}`);
+        }
+      }
+    }
+    const lspServers = args.daemon ? [] : toLspServers(config);
+    lspPool = lspServers.length > 0 ? new LspPool(args.cwd, lspServers) : undefined;
+    const deferMcp = mcpTools.length > 8;
+    const extraTools: Tool[] = [
+      ...(deferMcp ? [] : mcpTools),
+      ...(lspPool ? [createDiagnosticsTool(lspPool)] : []),
+    ];
+    const plugins = args.daemon ? undefined : await discoverPlugins(args.cwd);
+    host = await buildHost(args, {
+      config,
+      extraTools,
+      deferredTools: deferMcp ? mcpTools : [],
+      ...(plugins ? { plugins } : {}),
+      ...(runtimeStack ? { runtimeStack } : {}),
+      telemetry,
+    });
+    if (args.debugLog) {
+      const logger = new DebugLogger(args.debugLog, args.traceContent);
+      logger.log("cli.exec.start", { model: args.model, cwd: args.cwd });
+      host = withDebugLogging(host, logger);
+    }
+
+    const sessionId = await selectSessionId(host, args);
+    emit("session.started", { sessionId, model: args.model, cwd: args.cwd });
+    let wroteText = false;
+    const permissionReplies: Promise<unknown>[] = [];
+    const handle = await host.open(sessionId, (event) => {
+      if (parsed.jsonl) emit("session.event", { sessionId, event });
+      else if (event.type === "agent" && event.event.type === "text") {
+        output.write(event.event.text);
+        wroteText = true;
+      }
+      if (event.type === "permission_request") {
+        permissionReplies.push(
+          host!
+            .answerPermission(sessionId, event.permId, "deny")
+            .catch((error) => warn(`Permission denial failed: ${errorMessage(error)}`)),
+        );
+      }
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error(t("exec timed out", "exec 执行超时"))),
+        parsed.timeoutMs,
+      );
+      timeout.unref?.();
+    });
+    try {
+      await Promise.race([
+        host.send(sessionId, prompt, {
+          idempotencyKey: `exec-${process.pid}-${Date.now()}`,
+        }),
+        timedOut,
+      ]);
+      await Promise.allSettled(permissionReplies);
+    } catch (error) {
+      await host.interrupt(sessionId).catch(() => undefined);
+      emit("session.failed", { sessionId, error: errorMessage(error) });
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+    handle.close();
+    const finalHandle = await host.open(sessionId, () => {});
+    emit("session.completed", {
+      sessionId,
+      usage: finalHandle.snapshot.usage,
+      ...(finalHandle.snapshot.costUSD !== undefined
+        ? { costUSD: finalHandle.snapshot.costUSD }
+        : {}),
+    });
+    finalHandle.close();
+    if (!parsed.jsonl && wroteText) output.write("\n");
+  } finally {
+    host?.dispose();
+    lspPool?.closeAll();
+    for (const client of mcpClients) {
+      try {
+        client.close();
+      } catch {
+        // Cleanup is best-effort; preserve the command's real result.
+      }
+    }
+    await runtimeStack?.networkProxy.close().catch(() => undefined);
+    await runtimeStack?.database.close().catch(() => undefined);
+  }
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   // auth/serve 子命令在 parseArgs 之前拦截（不进会话流程）。
   if (argv[0] === "auth") {
@@ -886,6 +1347,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       process.once("SIGTERM", resolve);
     });
     await server.close();
+    return;
+  }
+  if (argv[0] === "exec") {
+    await runExecCommand(argv.slice(1));
     return;
   }
 
@@ -932,6 +1397,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         .join("\n"),
     );
     return;
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      t(
+        "Interactive TUI requires a terminal (TTY). Use --help, --list-models, or the `anicode exec` headless command.",
+        "交互式 TUI 需要终端（TTY）。可使用 --help、--list-models，或无头模式 `anicode exec`。",
+      ),
+    );
   }
 
   // 读取 anicode.json（全局+项目合并）；非法配置只提示不致命。
@@ -1095,6 +1569,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         };
 
   let host: SessionHost | undefined;
+  let debugLogger: DebugLogger | undefined;
   try {
     const baseHost = await buildHost(args, {
       config,
@@ -1114,6 +1589,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     host = baseHost;
     if (args.debugLog) {
       const logger = new DebugLogger(args.debugLog, args.traceContent);
+      debugLogger = logger;
       logger.log("cli.start", {
         model: args.model,
         cwd: args.cwd,
@@ -1127,29 +1603,84 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     // 选定会话：--resume 用已有 ID，否则新建。订阅只由 App 负责。
     const sessionId = await selectSessionId(host, args);
-    const restoreTerminalScreen = enterTerminalScreen();
+    const screenReader = process.env.INK_SCREEN_READER === "true";
+    const alternateScreen = !args.noAltScreen && !screenReader;
+    const mouse = args.mouse && !screenReader;
+    const experimentalOverlay = process.env.ANICODE_EXPERIMENTAL_TUI_OVERLAY === "1";
+    const baseTerminalOutput = args.noColor
+      ? colorlessTerminalOutput(process.stdout)
+      : process.stdout;
+    const terminalCaret = createTerminalCaretOutput(baseTerminalOutput, {
+      enabled: !screenReader && !experimentalOverlay,
+    });
+    const terminalOutput = terminalCaret.output;
+    const restoreTerminalScreen = enterTerminalScreen(terminalOutput, process.stdin, {
+      color: !args.noColor,
+      alternateScreen,
+    });
+    let instance: ReturnType<typeof render> | undefined;
+    let stopRawModeWatchdog = () => {};
+    const emergencyTerminalCleanup = () => {
+      stopRawModeWatchdog();
+      terminalCaret.controller.dispose();
+      // Unmount first so Ink cannot repaint onto the primary screen after we leave
+      // alternate-screen mode during a signal/exception shutdown.
+      instance?.unmount();
+      restoreTerminalScreen();
+    };
+    const removeTerminalExitGuard = installTerminalExitGuard(emergencyTerminalCleanup);
     try {
-      const instance = render(
-        <App
-          host={host}
-          cwd={args.cwd}
-          model={args.model}
-          sessionId={sessionId}
-          providers={listProviderDetails()}
-          catalog={listModelCatalog()}
-          commands={commands}
-          {...(mcpStatus ? { mcpStatus } : {})}
-          inspectProviderCredentials={!args.daemon}
-          version={CLI_VERSION}
-        />,
+      instance = render(
+        <TuiErrorBoundary
+          onError={(error, componentStack) =>
+            debugLogger?.log("tui.render_crash", {
+              message: error.message,
+              stack: error.stack,
+              componentStack,
+            })
+          }
+        >
+          <App
+            host={host}
+            cwd={args.cwd}
+            model={args.model}
+            sessionId={sessionId}
+            providers={listProviderDetails()}
+            catalog={listModelCatalog()}
+            commands={commands}
+            {...(mcpStatus ? { mcpStatus } : {})}
+            inspectProviderCredentials={!args.daemon}
+            version={CLI_VERSION}
+            mouse={mouse}
+            experimentalOverlay={experimentalOverlay}
+            terminalCaret={terminalCaret.controller}
+            {...(config.tui?.keybindings
+              ? {
+                  keybindings: config.tui.keybindings as Partial<
+                    Record<TuiKeybindingAction, string>
+                  >,
+                }
+              : {})}
+            terminalControl
+          />
+        </TuiErrorBoundary>,
+        {
+          stdout: terminalOutput,
+          alternateScreen,
+          incrementalRendering: !screenReader,
+          isScreenReaderEnabled: screenReader,
+          maxFps: 30,
+        },
       );
-      const stopRawModeWatchdog = startRawModeWatchdog();
+      stopRawModeWatchdog = startRawModeWatchdog();
       try {
         await instance.waitUntilExit();
       } finally {
         stopRawModeWatchdog();
       }
     } finally {
+      removeTerminalExitGuard();
+      terminalCaret.controller.dispose();
       restoreTerminalScreen();
     }
   } finally {

@@ -1,7 +1,7 @@
 {
   "name": "anicode-vscode",
   "displayName": "AniCode Zen",
-  "description": "AniCode Zen —— 在 VSCode 侧边栏里与自研 coding agent 对话（复用 @anicode/core）",
+  "description": "AniCode Zen —— 在 VSCode 侧边栏里使用通用型 Agent，软件工程能力重点强化（复用 @anicode/core）",
   "version": "0.0.1",
   "private": true,
   "publisher": "anicode",
