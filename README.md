@@ -328,7 +328,7 @@ npm run build:app
 npm run build:vscode
 ```
 
-当前覆盖 591 个离线测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端 UI 交互。
+当前覆盖 615 个测试，包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端 UI 交互。CI 在 Node 22/24 与 PostgreSQL 16 上运行完整矩阵；本地未配置 PostgreSQL URL 时，相关集成用例会明确跳过。
 
 `@anicode/eval` 还提供带自校验的真实编辑任务，可汇总通过率、轮数、token 与编辑失败率：
 
@@ -347,12 +347,16 @@ npm run eval --workspace @anicode/eval -- --model <provider/model> --json out.js
 - **后台长时命令（Claude Code 的 run_in_background/BashOutput/KillShell）**：dev server / watch 构建 / 日志跟随不再被 120s 超时打死。并**针对性规避该功能的已知坑**：读取严格增量（读过即清，不会同一段日志反复进上下文）、缓冲有界、结束即回收、上限满时淘汰已结束者（不会假装"kill 一下就能腾位"）、filter 略过的行数如实回报（不静默吞掉 dev server 打印的端口号），且**从不主动往历史塞后台提醒**。后台与前台共用同一套沙箱。见 `tools/shells.ts`。
 - **多模态 read（Claude Code）**：`read` 可直接看截图/设计稿/图表。工具经 `ctx.attachImage` 回传图片（沿用既有 emit/addUsage 回调范式，`run()` 仍返回纯文本，既有工具零改动），Agent 把图片排在本轮 tool_result 之后送入同一条 user 消息 —— 两端 provider 的映射本就支持独立 image 块，**实测无需改 provider**。魔数校验防「后缀是图但内容不是」拖垮整轮请求；无视觉能力或超限则如实降级为文本。见 `tools/fs.ts`、`tools/tool.ts`。
 
-## 安全边界与下一步
+## 生产 Runtime 与后续验收
 
-路径工具会阻止 `..` 和符号链接逃逸；shell 权限会保守解析复合命令；macOS/Linux 可开启 OS 沙箱（见上）。后续仍可补 Landlock，以及「先沙箱后询问、撞墙才升级」的双轴审批闭环。
+“建议实施路线”的仓库内能力已经完成收口：Durable Runtime、command inbox/outbox、snapshot/crash recovery、PatchSet、Context Engine 2、OpenAPI codegen、ACP conformance、持久 worker、Remote Runtime、GitHub/CI、Credential Broker、受控网络出口、Artifacts、OpenTelemetry 与 280-task real-repo catalog 均已进入代码、测试或交付清单。详细的不变量、配置和实施映射见 [Production Agent Runtime closure](docs/architecture/2026-07-30-production-runtime-closure.md)。
 
-后续优先级（据架构评审，均为需要动结构的较大项，故单独列出）：
+剩余事项属于真实基础设施验收，不能由本地单测代替：
 
-1. **双轴审批**：在现有 OS 沙箱与权限规则上补 sandbox-first / approve-on-failure，并评估 Linux Landlock。
-2. daemon 升级为 HTTP+SSE + OpenAPI 生成 SDK；结构化 headless 输出、延迟工具加载（ToolSearch）。
-3. **后台 shell 的前端呈现**：core 已具备后台 shell 能力与 `shells.list()`，可在 TUI/桌面端补一个 `/bashes` 式的运行中任务面板。
+1. 在目标 Kubernetes CNI 上执行 `deploy/remote-runtime/verify-isolation.sh`，验证 IPv4/IPv6、DNS、metadata、私网与未认证代理访问都无法绕过出口。
+2. 对生产 PostgreSQL 做 kill、网络分区、主备切换、备份恢复和 migration 演练，验证 fencing token 在故障下仍阻止 stale worker 提交。
+3. 使用组织 Vault/KMS/OIDC 演练轮换与撤销，并审计 prompt、event、Artifact、PatchSet、日志、trace 和子进程环境无明文密钥。
+4. 在真实 GitHub App、branch protection、merge queue 与 ARC runner 集群上跑 analysis/repair/merge-group 闭环，并验证短生命周期身份和工作区销毁。
+5. 替换部署中的 image digest placeholder，验证 SBOM、provenance、attestation、admission policy，并跑满 200–300 个真实 repo task 建立 SLO/成本基线。
+
+此后的结构演进主要是企业 SSO/RBAC、审计留存与地域策略、预算/配额、插件签名/兼容矩阵、A2A gateway 和跨区域调度；Landlock 等可作为 Linux 纵深防御继续增强。

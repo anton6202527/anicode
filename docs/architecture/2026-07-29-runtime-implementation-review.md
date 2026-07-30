@@ -1,5 +1,7 @@
 # Agent Runtime 架构补齐与路线复盘
 
+> 本页是 2026-07-29 的阶段差距快照；其中“仍需完成”项已由 [Production Agent Runtime closure](./2026-07-30-production-runtime-closure.md) 承接并逐项收口。
+
 复盘日期：2026-07-29
 依据：[竞品与 Agent 底层架构研究归档](./2026-07-29-agent-architecture-research.md)
 范围：本轮要求的上层、中层、下层和横向能力。

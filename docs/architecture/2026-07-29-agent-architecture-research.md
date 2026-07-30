@@ -1,5 +1,7 @@
 # AniCode 竞品与 Agent 底层架构研究归档
 
+> 本页保留最初调研与实施路线；最终落点、生产不变量和真实环境验收边界见 [Production Agent Runtime closure](./2026-07-30-production-runtime-closure.md)。
+
 归档日期：2026-07-29
 适用仓库：AniCode 0.1.x
 性质：上一轮实时调研、架构判断、差距矩阵与实施路线的仓库内版本。
