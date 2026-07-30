@@ -16,9 +16,9 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -41,17 +41,17 @@ jobs:
           ANICODE_CREDENTIAL_KEYS: ${{ vars.ANICODE_CREDENTIAL_KEYS }}
           ANICODE_NETWORK_ALLOW_DOMAINS: ${{ vars.ANICODE_EVAL_NETWORK_ALLOW_DOMAINS }}
         run: |
-          BASELINE_ARGS=""
-          if [ -f packages/eval/baseline.json ]; then
-            BASELINE_ARGS="--baseline packages/eval/baseline.json"
+          baseline_args=()
+          if [[ -f packages/eval/baseline.json ]]; then
+            baseline_args=(--baseline packages/eval/baseline.json)
           fi
           npm run eval --workspace @anicode/eval -- \
             --model "${{ vars.ANICODE_EVAL_MODEL }}" \
-            --json eval-result.json $BASELINE_ARGS
+            --json eval-result.json "${baseline_args[@]}"
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-result
           path: eval-result.json

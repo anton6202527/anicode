@@ -24,8 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -50,10 +50,12 @@ jobs:
           if [ "$SCHEDULE" = "30 18 * * 0" ]; then limit=280; fi
           if [ "$limit" -gt 80 ]; then shard_count=20; else shard_count=4; fi
           shards="$(node -e 'const n=Number(process.argv[1]);process.stdout.write(JSON.stringify(Array.from({length:n},(_,i)=>i)))' "$shard_count")"
-          echo "limit=$limit" >> "$GITHUB_OUTPUT"
-          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
-          echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "baseline=packages/eval/baselines/real-$limit.json" >> "$GITHUB_OUTPUT"
+          {
+            echo "limit=$limit"
+            echo "shard_count=$shard_count"
+            echo "shards=$shards"
+            echo "baseline=packages/eval/baselines/real-$limit.json"
+          } >> "$GITHUB_OUTPUT"
 
   # Credentials come from workload identity/Vault. The label must target an ARC ephemeral scale set
   # configured to forward runner diagnostics before Pod deletion.
@@ -70,8 +72,8 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -101,7 +103,7 @@ jobs:
           --defer-gate
           --json "real-eval-${{ matrix.shard }}.json"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: real-eval-shard-${{ matrix.shard }}
           path: real-eval-${{ matrix.shard }}.json
@@ -114,13 +116,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
       - run: npm ci
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: real-eval-shard-*
           path: real-eval-shards
@@ -132,7 +134,7 @@ jobs:
           --baseline "${{ needs.plan.outputs.baseline }}"
           --bootstrap-baseline
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: real-eval-${{ github.run_id }}
           path: |
