@@ -234,7 +234,7 @@ test("TUI 回归: 单条超长回复可按行滚动，不会把输入区推出�
     const inputRow = atBottom.split("\n").findIndex((line) => line.includes("输入你的目标"));
     assert.ok(inputRow >= 0);
 
-    view.stdin.write("\u001b[<64;10;10M".repeat(30));
+    view.stdin.write("\u001b[<64;10;10M".repeat(60));
     await tick(40);
     const atTop = view.lastFrame() ?? "";
     assert.match(atTop, /HEAD_MARK/);
@@ -244,7 +244,7 @@ test("TUI 回归: 单条超长回复可按行滚动，不会把输入区推出�
       inputRow,
     );
 
-    view.stdin.write("\u001b[<65;10;10M".repeat(30));
+    view.stdin.write("\u001b[<65;10;10M".repeat(60));
     await tick(40);
     const backAtBottom = view.lastFrame() ?? "";
     assert.match(backAtBottom, /TAIL_MARK/);
