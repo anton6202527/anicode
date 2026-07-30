@@ -2567,7 +2567,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             : []),
         ];
   const inputCluster = showInput ? (
-    <Box flexDirection="column" marginTop={1}>
+    <Box flexDirection="column" marginTop={1} flexShrink={0}>
       {inTreeMenu.length > 0 ? <CommandMenu rows={inTreeMenu} index={menuIndex} /> : null}
       <InputPanel
         panelRef={panelRef}
@@ -2810,7 +2810,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         </>
       )}
 
-      <Box justifyContent="space-between">
+      <Box justifyContent="space-between" flexShrink={0}>
         {/* 路径拿左侧剩余列（尾部优先，从头截断）；token/花费固定在右。 */}
         <Text dimColor wrap="truncate">
           {truncWidthStart(cwdLabel, termCols - dispWidth(statusRight) - 1)}
