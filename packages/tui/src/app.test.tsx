@@ -664,7 +664,7 @@ test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认",
     onPermission: (decision) => decisions.push(decision),
   });
   const view = render(<App host={host} cwd="/fallback" model="fallback" sessionId="s_offline" />);
-  await tick(80);
+  await waitFor(() => /授权请求/.test(view.lastFrame() ?? ""));
   const frame = view.lastFrame() ?? "";
   assert.match(frame, /授权请求/);
   assert.match(frame, /输入你的目标/);

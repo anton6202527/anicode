@@ -830,6 +830,11 @@ export function App({
   const inputRef = useRef("");
   // 权限请求队列：并行只读工具可能同时产生多个 ask（如 askRules 命中），逐个裁决
   const [pendings, setPendings] = useState<PendingPerm[]>([]);
+  // Ink can emit a key event in the narrow window after a newly rendered frame is visible but
+  // before useInput's effect-event closure has refreshed. Keep the visible queue available
+  // synchronously so the first key pressed on a permission dialog is never dropped.
+  const pendingsRef = useRef<PendingPerm[]>(pendings);
+  pendingsRef.current = pendings;
   const [permissionIndex, setPermissionIndex] = useState(0);
   const [confirmAlwaysFor, setConfirmAlwaysFor] = useState<string | null>(null);
   const permissionIndexRef = useRef(0);
@@ -841,7 +846,7 @@ export function App({
   const [sessions, setSessions] = useState<SessionPickerState | null>(null);
   const activePermissionId = pendings[0]?.permId;
   const activePermissionRisk = pendings[0]?.risk;
-  useEffect(() => {
+  useLayoutEffect(() => {
     setPermissionSelection(activePermissionRisk === "high" ? 3 : 0);
     setConfirmAlwaysFor(null);
   }, [activePermissionId, activePermissionRisk, setPermissionSelection]);
@@ -1915,7 +1920,8 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       return;
     }
     // 弹框/命令菜单打开时，主界面不参与回看滚动（对齐需求：弹框在，主界面不滚动）。
-    const dialogOpen = !!(picker || pendings[0] || sessions);
+    const pending = pendingsRef.current[0];
+    const dialogOpen = !!(picker || pending || sessions);
     const menuRows = dialogOpen ? [] : matchCommands(allCommands, inputRef.current);
     const menuOpen = menuRows.length > 0;
     const executeLeader = (shortcut: string): void => {
@@ -2130,10 +2136,9 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       }
       return;
     }
-    const pending = pendings[0];
     if (pending) {
       if (key.escape) {
-        const interrupted = pendings;
+        const interrupted = pendingsRef.current;
         setPendings([]);
         void host.interrupt(sessionId).catch((err) => {
           setPendings((q) => mergePendings(interrupted, q));
