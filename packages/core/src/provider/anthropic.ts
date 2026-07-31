@@ -290,13 +290,14 @@ function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ChatMessage {
 }
 
 function parseToolCall(t: { id: string; name: string; json: string }): ToolCallPart {
-  let args: Record<string, unknown> = {};
-  try {
-    args = t.json ? (JSON.parse(t.json) as Record<string, unknown>) : {};
-  } catch {
-    // 交给上层把解析失败作为 tool_result 错误回传，让模型自行修正
-    args = { __unparsed: t.json };
-  }
+  const args: Record<string, unknown> = (() => {
+    try {
+      return t.json ? (JSON.parse(t.json) as Record<string, unknown>) : {};
+    } catch {
+      // 交给上层把解析失败作为 tool_result 错误回传，让模型自行修正
+      return { __unparsed: t.json };
+    }
+  })();
   return { type: "tool_call", id: t.id, name: t.name, args };
 }
 

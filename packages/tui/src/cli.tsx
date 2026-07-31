@@ -1380,6 +1380,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           `Invalid model configuration: ${String((err as Error).message)}`,
           `模型配置无效: ${String((err as Error).message)}`,
         ),
+        { cause: err },
       );
     }
   }

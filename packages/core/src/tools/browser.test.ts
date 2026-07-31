@@ -92,13 +92,14 @@ test("browser 工具元数据：只读（自动放行）、必填 url、ruleKey 
 });
 
 // —— 真·端到端：仅在本机可解析 Chrome 时运行 ——
-let chromeAvailable = false;
-try {
-  resolveChromePath();
-  chromeAvailable = true;
-} catch {
-  chromeAvailable = false;
-}
+const chromeAvailable = (() => {
+  try {
+    resolveChromePath();
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 test(
   "browser 工具端到端：headless 打开 data: 页，抓到 console 错误并回传截图",

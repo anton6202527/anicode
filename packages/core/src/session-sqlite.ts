@@ -118,6 +118,7 @@ export class SqliteSessionStore implements ISessionStore {
       throw new Error(
         t(`Session ${meta.id} already exists`, `会话 ${meta.id} 已存在`) +
           `: ${(err as Error).message}`,
+        { cause: err },
       );
     }
     return full;

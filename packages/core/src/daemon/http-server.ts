@@ -70,7 +70,9 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 function isLoopbackHost(host: string): boolean {
   const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+  return (
+    normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized)
+  );
 }
 
 class HttpRequestError extends Error {
@@ -369,10 +371,7 @@ export class HttpDaemonServer {
     }
     rate.count++;
     if (rate.count <= this.rateMaxRequests) return true;
-    const retrySeconds = Math.max(
-      1,
-      Math.ceil((rate.startedAt + this.rateWindowMs - now) / 1_000),
-    );
+    const retrySeconds = Math.max(1, Math.ceil((rate.startedAt + this.rateWindowMs - now) / 1_000));
     res.setHeader("retry-after", String(retrySeconds));
     json(res, 429, { error: "rate limit exceeded", code: "RATE_LIMITED" });
     return false;

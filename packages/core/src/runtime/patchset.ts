@@ -645,7 +645,8 @@ export class PatchSetService {
           await fs.rm(this.lockFile, { force: true });
           continue;
         }
-        if (Date.now() >= deadline) throw new Error("PatchSet workspace lock timeout");
+        if (Date.now() >= deadline)
+          throw new Error("PatchSet workspace lock timeout", { cause: error });
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
     }

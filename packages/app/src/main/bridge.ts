@@ -194,7 +194,8 @@ export class Bridge {
     handle("host:createSession", (_event, value) => {
       const input = record(value, "session");
       const cwd = path.resolve(stringValue(input["cwd"], "session.cwd"));
-      if (cwd !== path.resolve(this.options.cwd)) throw new Error("Session cwd is outside app workspace");
+      if (cwd !== path.resolve(this.options.cwd))
+        throw new Error("Session cwd is outside app workspace");
       return this.manager.createSession({
         cwd,
         model: stringValue(input["model"], "session.model", 256),

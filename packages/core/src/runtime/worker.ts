@@ -110,7 +110,8 @@ export class FileWorkerQueueStore implements WorkerQueueStore {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const stat = await fs.stat(lock).catch(() => undefined);
         if (stat && Date.now() - stat.mtimeMs > 30_000) await fs.rm(lock, { force: true });
-        if (Date.now() >= deadline) throw new Error(`Worker queue lock timeout: ${lock}`);
+        if (Date.now() >= deadline)
+          throw new Error(`Worker queue lock timeout: ${lock}`, { cause: error });
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }

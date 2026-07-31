@@ -125,10 +125,11 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
   const file = path.join(root, "runtime.db");
   const database = new SqliteRuntimeDatabase(file);
   try {
-    const migrations = await database.run((db) =>
-      db
-        .prepare("SELECT version, checksum, description FROM schema_migrations ORDER BY version")
-        .all() as Array<Record<string, unknown>>,
+    const migrations = await database.run(
+      (db) =>
+        db
+          .prepare("SELECT version, checksum, description FROM schema_migrations ORDER BY version")
+          .all() as Array<Record<string, unknown>>,
     );
     assert.deepEqual(
       migrations.map((row) => Number(row.version)),

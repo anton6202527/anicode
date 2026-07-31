@@ -262,12 +262,13 @@ function toOpenAIMessages(system: string | undefined, messages: ChatMessage[]): 
 }
 
 function parseToolCall(t: { id: string; name: string; json: string }): ToolCallPart {
-  let args: Record<string, unknown> = {};
-  try {
-    args = t.json ? (JSON.parse(t.json) as Record<string, unknown>) : {};
-  } catch {
-    args = { __unparsed: t.json };
-  }
+  const args: Record<string, unknown> = (() => {
+    try {
+      return t.json ? (JSON.parse(t.json) as Record<string, unknown>) : {};
+    } catch {
+      return { __unparsed: t.json };
+    }
+  })();
   return { type: "tool_call", id: t.id, name: t.name, args };
 }
 

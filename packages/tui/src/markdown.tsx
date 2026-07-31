@@ -45,12 +45,11 @@ export function MarkdownText({ text }: { text: string }) {
   const lines = safe.split("\n");
   const rows: React.ReactNode[] = [];
   let fenced = false;
-  let language = "";
   for (const [index, line] of lines.entries()) {
     const fence = /^\s*```\s*([^\s`]*)/.exec(line);
     if (fence) {
       fenced = !fenced;
-      language = fenced ? (fence[1] ?? "") : "";
+      const language = fenced ? (fence[1] ?? "") : "";
       rows.push(
         <Text key={index} dimColor>
           {fenced ? `┌─ ${language || "code"}` : "└─"}

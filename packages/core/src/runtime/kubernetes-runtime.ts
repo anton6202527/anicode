@@ -266,15 +266,12 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       }).catch(() => undefined);
     const onAbort = () => void cleanup();
     request.signal?.addEventListener("abort", onAbort, { once: true });
-    let timedOut = false;
-    let exitCode: number | null = null;
-    let output = "";
     try {
       const deadline = Date.now() + Math.max(1_000, request.timeoutMs ?? 120_000);
       const status = await this.waitForCompletion(name, deadline, request.signal);
-      timedOut = status === "timeout";
-      exitCode = status === "succeeded" ? 0 : status === "failed" ? 1 : null;
-      output = await this.logs(name).catch(() => "");
+      const timedOut = status === "timeout";
+      const exitCode = status === "succeeded" ? 0 : status === "failed" ? 1 : null;
+      const output = await this.logs(name).catch(() => "");
       return {
         exitCode,
         output,

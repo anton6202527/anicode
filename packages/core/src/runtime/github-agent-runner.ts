@@ -157,6 +157,8 @@ async function main(): Promise<void> {
     const message = stack?.broker.redact(
       error instanceof Error ? (error.stack ?? error.message) : String(error),
     );
+    // Do not attach the original as cause: it may contain a credential before Broker redaction.
+    // eslint-disable-next-line preserve-caught-error
     throw new Error(message ?? "GitHub agent failed");
   } finally {
     if (telemetry?.shutdown) await telemetry.shutdown().catch(() => undefined);

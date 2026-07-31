@@ -271,6 +271,7 @@ async function main(): Promise<void> {
         }
         throw new Error(
           `Eval baseline ${args.baseline} is required and unreadable: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
       }
       if (baseline) {

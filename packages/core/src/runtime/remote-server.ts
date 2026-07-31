@@ -307,32 +307,38 @@ export class RemoteExecutionService {
       tenantId: grant.tenantId,
     };
     const queueKey = `${grant.tenantId}:${identity.actor}:${request.idempotencyKey}`;
-    const pending = this.submitTail.catch(() => undefined).then(async () => {
-      const jobs = (await this.options.queue.list()) as WorkerJob<
-        AuthorizedRemoteExecutionRequest,
-        IsolatedRunResult
-      >[];
-      const duplicate = jobs.find((job) => job.idempotencyKey === queueKey);
-      if (duplicate) return duplicate;
-      const outstanding = jobs.filter(
-        (job) =>
-          job.payload?.tenantId === grant.tenantId &&
-          (job.status === "queued" || job.status === "leased"),
-      );
-      if (outstanding.length >= this.maxOutstandingPerTenant) {
-        throw new RemoteHttpError(429, "tenant_quota_exceeded", "Tenant execution quota exceeded");
-      }
-      const actorQueued = outstanding.filter(
-        (job) => job.payload.actor === identity.actor && job.status === "queued",
-      );
-      if (actorQueued.length >= this.maxQueuedPerActor) {
-        throw new RemoteHttpError(429, "actor_queue_full", "Actor execution queue is full");
-      }
-      return this.options.queue.enqueue("remote-execution", payload, {
-        idempotencyKey: queueKey,
-        maxAttempts: retryPolicy === "safe" ? 3 : 1,
-      }) as Promise<WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult>>;
-    });
+    const pending = this.submitTail
+      .catch(() => undefined)
+      .then(async () => {
+        const jobs = (await this.options.queue.list()) as WorkerJob<
+          AuthorizedRemoteExecutionRequest,
+          IsolatedRunResult
+        >[];
+        const duplicate = jobs.find((job) => job.idempotencyKey === queueKey);
+        if (duplicate) return duplicate;
+        const outstanding = jobs.filter(
+          (job) =>
+            job.payload?.tenantId === grant.tenantId &&
+            (job.status === "queued" || job.status === "leased"),
+        );
+        if (outstanding.length >= this.maxOutstandingPerTenant) {
+          throw new RemoteHttpError(
+            429,
+            "tenant_quota_exceeded",
+            "Tenant execution quota exceeded",
+          );
+        }
+        const actorQueued = outstanding.filter(
+          (job) => job.payload.actor === identity.actor && job.status === "queued",
+        );
+        if (actorQueued.length >= this.maxQueuedPerActor) {
+          throw new RemoteHttpError(429, "actor_queue_full", "Actor execution queue is full");
+        }
+        return this.options.queue.enqueue("remote-execution", payload, {
+          idempotencyKey: queueKey,
+          maxAttempts: retryPolicy === "safe" ? 3 : 1,
+        }) as Promise<WorkerJob<AuthorizedRemoteExecutionRequest, IsolatedRunResult>>;
+      });
     this.submitTail = pending;
     return toView(await pending);
   }

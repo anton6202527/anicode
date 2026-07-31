@@ -536,6 +536,7 @@ class HttpTransport implements McpTransport {
             `MCP request timed out (${method}, ${this.timeoutMs}ms)`,
             `MCP 请求超时（${method}，${this.timeoutMs}ms）`,
           ),
+          { cause: err },
         );
       }
       throw err;

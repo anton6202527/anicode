@@ -348,10 +348,7 @@ export class SqliteRuntimeDatabase {
   }
 
   /** Explicit, transactional retention pass. User sessions/messages are never deleted here. */
-  prune(
-    policy: SqliteRetentionPolicy = {},
-    now: number = Date.now(),
-  ): Promise<SqlitePruneResult> {
+  prune(policy: SqliteRetentionPolicy = {}, now: number = Date.now()): Promise<SqlitePruneResult> {
     const days = (value: number | undefined, fallback: number): number => {
       const resolved = value ?? fallback;
       if (!Number.isInteger(resolved) || resolved < 1 || resolved > 3_650) {

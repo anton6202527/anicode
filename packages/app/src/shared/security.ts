@@ -7,7 +7,10 @@ export function trustedRendererDevUrl(value: string | undefined): string | undef
   if (!value) return undefined;
   try {
     const url = new URL(value);
-    if ((url.protocol !== "http:" && url.protocol !== "https:") || !LOOPBACK_HOSTS.has(url.hostname)) {
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      !LOOPBACK_HOSTS.has(url.hostname)
+    ) {
       return undefined;
     }
     if (url.username || url.password) return undefined;

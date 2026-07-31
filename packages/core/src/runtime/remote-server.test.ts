@@ -144,10 +144,13 @@ test("Remote Runtime server: side effects default to no retry; quotas and retry-
     assert.equal(accepted.status, 202);
     const first = (await accepted.json()) as { id: string };
     const duplicate = await submit("no-replay");
-    assert.equal((await duplicate.json() as { id: string }).id, first.id);
+    assert.equal(((await duplicate.json()) as { id: string }).id, first.id);
     const quota = await submit("queued-behind-first");
     assert.equal(quota.status, 429);
-    assert.equal(((await quota.json()) as { error: { code: string } }).error.code, "actor_queue_full");
+    assert.equal(
+      ((await quota.json()) as { error: { code: string } }).error.code,
+      "actor_queue_full",
+    );
 
     assert.equal(await server.service.runOnce(), true);
     assert.equal(await server.service.runOnce(), false);
