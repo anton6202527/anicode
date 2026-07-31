@@ -8,8 +8,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "codegen": "tsx scripts/generate.ts",
-    "codegen:check": "tsx scripts/generate.ts --check",
+    "codegen": "node --import tsx scripts/generate.ts",
+    "codegen:check": "node --import tsx scripts/generate.ts --check",
     "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },

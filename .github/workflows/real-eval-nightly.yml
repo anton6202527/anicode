@@ -48,6 +48,11 @@ jobs:
         run: |
           limit="$REQUESTED_LIMIT"
           if [ "$SCHEDULE" = "30 18 * * 0" ]; then limit=280; fi
+          case "$limit" in (*[!0-9]*|'') echo "limit must be an integer" >&2; exit 1;; esac
+          if [ "$limit" -lt 1 ] || [ "$limit" -gt 280 ]; then
+            echo "limit must be between 1 and 280" >&2
+            exit 1
+          fi
           if [ "$limit" -gt 80 ]; then shard_count=20; else shard_count=4; fi
           shards="$(node -e 'const n=Number(process.argv[1]);process.stdout.write(JSON.stringify(Array.from({length:n},(_,i)=>i)))' "$shard_count")"
           {
@@ -57,11 +62,31 @@ jobs:
             echo "baseline=packages/eval/baselines/real-$limit.json"
           } >> "$GITHUB_OUTPUT"
 
+  readiness:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require production credentials, runtime and reviewed baseline
+        env:
+          ENABLED: ${{ vars.ANICODE_REAL_EVAL_ENABLED }}
+          MODEL: ${{ vars.ANICODE_EVAL_MODEL }}
+          VAULT_ADDR: ${{ vars.ANICODE_VAULT_ADDR }}
+          VAULT_ROLE: ${{ vars.ANICODE_VAULT_ROLE }}
+          RUNTIME_IMAGE: ${{ vars.ANICODE_EVAL_RUNTIME_IMAGE }}
+          BASELINE: ${{ needs.plan.outputs.baseline }}
+        run: |
+          test "$ENABLED" = "true" || { echo "ANICODE_REAL_EVAL_ENABLED must be true" >&2; exit 1; }
+          test -n "$MODEL" || { echo "ANICODE_EVAL_MODEL is required" >&2; exit 1; }
+          test -n "$VAULT_ADDR" || { echo "ANICODE_VAULT_ADDR is required" >&2; exit 1; }
+          test -n "$VAULT_ROLE" || { echo "ANICODE_VAULT_ROLE is required" >&2; exit 1; }
+          test -n "$RUNTIME_IMAGE" || { echo "ANICODE_EVAL_RUNTIME_IMAGE is required" >&2; exit 1; }
+          test -f "$BASELINE" || { echo "Reviewed real-eval baseline is missing: $BASELINE" >&2; exit 1; }
+
   # Credentials come from workload identity/Vault. The label must target an ARC ephemeral scale set
   # configured to forward runner diagnostics before Pod deletion.
   real-eval-shard:
-    needs: [catalog-integrity, plan]
-    if: ${{ vars.ANICODE_REAL_EVAL_ENABLED == 'true' }}
+    needs: [catalog-integrity, plan, readiness]
     strategy:
       fail-fast: false
       matrix:
@@ -132,13 +157,11 @@ jobs:
           --input real-eval-shards
           --output real-eval.json
           --baseline "${{ needs.plan.outputs.baseline }}"
-          --bootstrap-baseline
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: real-eval-${{ github.run_id }}
           path: |
             real-eval.json
-            ${{ needs.plan.outputs.baseline }}
           if-no-files-found: warn
           retention-days: 90

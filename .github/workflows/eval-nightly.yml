@@ -8,9 +8,25 @@ on:
     - cron: "0 18 * * *" # 02:00 Asia/Shanghai
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require an enabled, reviewable production gate
+        env:
+          ENABLED: ${{ vars.ANICODE_EVAL_ENABLED }}
+          MODEL: ${{ vars.ANICODE_EVAL_MODEL }}
+        run: |
+          test "$ENABLED" = "true" || { echo "ANICODE_EVAL_ENABLED must be true" >&2; exit 1; }
+          test -n "$MODEL" || { echo "ANICODE_EVAL_MODEL is required" >&2; exit 1; }
+          test -f packages/eval/baseline.json || { echo "Reviewed eval baseline is missing" >&2; exit 1; }
+
   eval:
-    if: ${{ vars.ANICODE_EVAL_ENABLED == 'true' }}
+    needs: readiness
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -40,14 +56,11 @@ jobs:
           ANICODE_VAULT_PREFIX: ${{ vars.ANICODE_VAULT_PREFIX || 'anicode' }}
           ANICODE_CREDENTIAL_KEYS: ${{ vars.ANICODE_CREDENTIAL_KEYS }}
           ANICODE_NETWORK_ALLOW_DOMAINS: ${{ vars.ANICODE_EVAL_NETWORK_ALLOW_DOMAINS }}
-        run: |
-          baseline_args=()
-          if [[ -f packages/eval/baseline.json ]]; then
-            baseline_args=(--baseline packages/eval/baseline.json)
-          fi
-          npm run eval --workspace @anicode/eval -- \
-            --model "${{ vars.ANICODE_EVAL_MODEL }}" \
-            --json eval-result.json "${baseline_args[@]}"
+        run: >-
+          npm run eval --workspace @anicode/eval --
+          --model "${{ vars.ANICODE_EVAL_MODEL }}"
+          --baseline packages/eval/baseline.json
+          --json eval-result.json
 
       - name: Upload result
         if: always()

@@ -6,8 +6,14 @@
   "private": true,
   "publisher": "anicode",
   "author": "AniCode Zen",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["AI", "Chat", "Programming Languages"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
   "main": "./out/extension.js",
   "scripts": {
     "build": "node esbuild.mjs",
@@ -17,29 +23,66 @@
     "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
-  "activationEvents": ["onView:anicode.chat"],
+  "activationEvents": [
+    "onView:anicode.chat"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
-        { "id": "anicode", "title": "AniCode Zen", "icon": "media/icon.svg" }
+        {
+          "id": "anicode",
+          "title": "AniCode Zen",
+          "icon": "media/icon.svg"
+        }
       ]
     },
     "views": {
       "anicode": [
-        { "id": "anicode.chat", "name": "对话", "type": "webview" }
+        {
+          "id": "anicode.chat",
+          "name": "对话",
+          "type": "webview"
+        }
       ]
     },
     "commands": [
-      { "command": "anicode.newSession", "title": "AniCode Zen: 新对话", "icon": "$(add)" },
-      { "command": "anicode.pickModel", "title": "AniCode Zen: 选择模型", "icon": "$(list-selection)" },
-      { "command": "anicode.resume", "title": "AniCode Zen: 恢复会话", "icon": "$(history)" },
-      { "command": "anicode.focus", "title": "AniCode Zen: 打开对话面板" }
+      {
+        "command": "anicode.newSession",
+        "title": "AniCode Zen: 新对话",
+        "icon": "$(add)"
+      },
+      {
+        "command": "anicode.pickModel",
+        "title": "AniCode Zen: 选择模型",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "anicode.resume",
+        "title": "AniCode Zen: 恢复会话",
+        "icon": "$(history)"
+      },
+      {
+        "command": "anicode.focus",
+        "title": "AniCode Zen: 打开对话面板"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "anicode.newSession", "when": "view == anicode.chat", "group": "navigation@1" },
-        { "command": "anicode.pickModel", "when": "view == anicode.chat", "group": "navigation@2" },
-        { "command": "anicode.resume", "when": "view == anicode.chat", "group": "navigation@3" }
+        {
+          "command": "anicode.newSession",
+          "when": "view == anicode.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "anicode.pickModel",
+          "when": "view == anicode.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "anicode.resume",
+          "when": "view == anicode.chat",
+          "group": "navigation@3"
+        }
       ]
     }
   },
@@ -49,6 +92,7 @@
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.0"
   }
 }

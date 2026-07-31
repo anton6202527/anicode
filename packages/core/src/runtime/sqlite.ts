@@ -23,6 +23,143 @@ import type { WorkerJob, WorkerQueueStore } from "./worker.js";
 
 type Row = Record<string, unknown>;
 
+const RUNTIME_SCHEMA_V1 = `
+  CREATE TABLE IF NOT EXISTS runtime_events (
+    stream_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    correlation_id TEXT,
+    causation_id TEXT,
+    idempotency_key TEXT,
+    trace_id TEXT,
+    span_id TEXT,
+    PRIMARY KEY (stream_id, sequence)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_event_idempotency
+    ON runtime_events(stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_runtime_events_type ON runtime_events(type, timestamp);
+
+  CREATE TABLE IF NOT EXISTS runtime_snapshots (
+    stream_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    model TEXT NOT NULL,
+    title TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+  CREATE TABLE IF NOT EXISTS session_messages (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    idx INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(session_id, idx)
+  );
+
+  CREATE TABLE IF NOT EXISTS commands (
+    session_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, id),
+    UNIQUE (session_id, idempotency_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_commands_recovery
+    ON commands(session_id, status, lease_expires_at);
+
+  CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, updated_at);
+
+  CREATE TABLE IF NOT EXISTS worker_jobs (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_worker_claim
+    ON worker_jobs(type, status, lease_expires_at, created_at);
+
+  CREATE TABLE IF NOT EXISTS artifacts (
+    session_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    metadata TEXT NOT NULL,
+    data BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS runtime_audit (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    category TEXT NOT NULL,
+    action TEXT NOT NULL,
+    subject TEXT,
+    actor TEXT,
+    decision TEXT,
+    metadata TEXT NOT NULL,
+    trace_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_runtime_audit_time ON runtime_audit(category, timestamp);
+`;
+
+const RUNTIME_SCHEMA_V2 = `
+  CREATE INDEX IF NOT EXISTS idx_runtime_events_retention ON runtime_events(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_commands_retention ON commands(status, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_worker_jobs_retention ON worker_jobs(status, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_artifacts_retention ON artifacts(created_at);
+`;
+
+const SQLITE_MIGRATIONS = [
+  { version: 1, description: "initial durable runtime schema", sql: RUNTIME_SCHEMA_V1 },
+  { version: 2, description: "retention and compaction indexes", sql: RUNTIME_SCHEMA_V2 },
+] as const;
+
+export interface SqliteRetentionPolicy {
+  auditDays?: number;
+  terminalCommandDays?: number;
+  sentOutboxDays?: number;
+  terminalWorkerDays?: number;
+  snapshottedEventDays?: number;
+  artifactDays?: number;
+}
+
+export interface SqlitePruneResult {
+  audit: number;
+  commands: number;
+  outbox: number;
+  workerJobs: number;
+  events: number;
+  artifacts: number;
+}
+
 /** 同一 Node 进程打开相同文件的多个连接也共享串行队列，避免 DatabaseSync busy wait 卡住事件循环。 */
 const SQLITE_FILE_TAILS = new Map<string, Promise<unknown>>();
 
@@ -52,6 +189,75 @@ export interface RuntimeAuditRecord {
   traceId?: string;
 }
 
+function migrationChecksum(sql: string): string {
+  return createHash("sha256").update(sql).digest("hex");
+}
+
+function migrateDatabase(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL,
+      checksum TEXT,
+      description TEXT
+    );
+  `);
+  const columns = new Set(
+    db
+      .prepare("PRAGMA table_info(schema_migrations)")
+      .all()
+      .map((row) => String((row as Row).name)),
+  );
+  if (!columns.has("checksum")) db.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT");
+  if (!columns.has("description"))
+    db.exec("ALTER TABLE schema_migrations ADD COLUMN description TEXT");
+
+  const latest = SQLITE_MIGRATIONS.at(-1)!.version;
+  const future = db
+    .prepare("SELECT version FROM schema_migrations WHERE version > ? ORDER BY version LIMIT 1")
+    .get(latest) as Row | undefined;
+  if (future) {
+    throw new Error(
+      `SQLite schema version ${String(future.version)} is newer than supported version ${latest}`,
+    );
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const migration of SQLITE_MIGRATIONS) {
+      const checksum = migrationChecksum(migration.sql);
+      const applied = db
+        .prepare("SELECT checksum FROM schema_migrations WHERE version = ?")
+        .get(migration.version) as Row | undefined;
+      if (applied) {
+        const recorded = applied.checksum == null ? "" : String(applied.checksum);
+        if (recorded && recorded !== checksum) {
+          throw new Error(`SQLite migration ${migration.version} checksum mismatch`);
+        }
+        if (!recorded) {
+          db.prepare(
+            "UPDATE schema_migrations SET checksum = ?, description = ? WHERE version = ?",
+          ).run(checksum, migration.description, migration.version);
+        }
+        continue;
+      }
+      db.exec(migration.sql);
+      db.prepare(
+        `INSERT INTO schema_migrations(version, applied_at, checksum, description)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?)`,
+      ).run(migration.version, checksum, migration.description);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Preserve the migration failure.
+    }
+    throw error;
+  }
+}
+
 /** 共享连接自身就是并发边界；所有 adapter 必须通过 run/transaction 访问连接。 */
 export class SqliteRuntimeDatabase {
   readonly file: string;
@@ -67,122 +273,13 @@ export class SqliteRuntimeDatabase {
     this.db.exec("PRAGMA synchronous = FULL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 10000");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS runtime_events (
-        stream_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        id TEXT NOT NULL UNIQUE,
-        timestamp TEXT NOT NULL,
-        type TEXT NOT NULL,
-        data TEXT NOT NULL,
-        correlation_id TEXT,
-        causation_id TEXT,
-        idempotency_key TEXT,
-        trace_id TEXT,
-        span_id TEXT,
-        PRIMARY KEY (stream_id, sequence)
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_event_idempotency
-        ON runtime_events(stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_runtime_events_type ON runtime_events(type, timestamp);
-
-      CREATE TABLE IF NOT EXISTS runtime_snapshots (
-        stream_id TEXT PRIMARY KEY,
-        sequence INTEGER NOT NULL,
-        data TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        cwd TEXT NOT NULL,
-        model TEXT NOT NULL,
-        title TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
-      CREATE TABLE IF NOT EXISTS session_messages (
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        idx INTEGER NOT NULL,
-        data TEXT NOT NULL,
-        PRIMARY KEY(session_id, idx)
-      );
-
-      CREATE TABLE IF NOT EXISTS commands (
-        session_id TEXT NOT NULL,
-        id TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        status TEXT NOT NULL,
-        lease_owner TEXT,
-        lease_expires_at TEXT,
-        fencing_token INTEGER NOT NULL DEFAULT 0,
-        data TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (session_id, id),
-        UNIQUE (session_id, idempotency_key)
-      );
-      CREATE INDEX IF NOT EXISTS idx_commands_recovery
-        ON commands(session_id, status, lease_expires_at);
-
-      CREATE TABLE IF NOT EXISTS outbox (
-        id TEXT PRIMARY KEY,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL,
-        data TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, updated_at);
-
-      CREATE TABLE IF NOT EXISTS worker_jobs (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL,
-        lease_owner TEXT,
-        lease_expires_at TEXT,
-        fencing_token INTEGER NOT NULL DEFAULT 0,
-        data TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_worker_claim
-        ON worker_jobs(type, status, lease_expires_at, created_at);
-
-      CREATE TABLE IF NOT EXISTS artifacts (
-        session_id TEXT NOT NULL,
-        id TEXT NOT NULL,
-        sha256 TEXT NOT NULL,
-        metadata TEXT NOT NULL,
-        data BLOB NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (session_id, id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_artifacts_session
-        ON artifacts(session_id, created_at);
-
-      CREATE TABLE IF NOT EXISTS runtime_audit (
-        id TEXT PRIMARY KEY,
-        timestamp TEXT NOT NULL,
-        category TEXT NOT NULL,
-        action TEXT NOT NULL,
-        subject TEXT,
-        actor TEXT,
-        decision TEXT,
-        metadata TEXT NOT NULL,
-        trace_id TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_runtime_audit_time
-        ON runtime_audit(category, timestamp);
-
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      );
-      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-        VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-    `);
-    chmodSync(this.file, 0o600);
+    try {
+      migrateDatabase(this.db);
+      chmodSync(this.file, 0o600);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   run<T>(work: (db: DatabaseSync) => T | Promise<T>): Promise<T> {
@@ -248,6 +345,67 @@ export class SqliteRuntimeDatabase {
         .all(Math.max(1, limit))
         .map((row) => auditFromRow(row as Row)),
     );
+  }
+
+  /** Explicit, transactional retention pass. User sessions/messages are never deleted here. */
+  prune(
+    policy: SqliteRetentionPolicy = {},
+    now: number = Date.now(),
+  ): Promise<SqlitePruneResult> {
+    const days = (value: number | undefined, fallback: number): number => {
+      const resolved = value ?? fallback;
+      if (!Number.isInteger(resolved) || resolved < 1 || resolved > 3_650) {
+        throw new Error(`SQLite retention days must be an integer from 1 to 3650: ${resolved}`);
+      }
+      return resolved;
+    };
+    const cutoff = (value: number | undefined, fallback: number): string =>
+      new Date(now - days(value, fallback) * 86_400_000).toISOString();
+    const auditCutoff = cutoff(policy.auditDays, 90);
+    const commandCutoff = cutoff(policy.terminalCommandDays, 30);
+    const outboxCutoff = cutoff(policy.sentOutboxDays, 7);
+    const workerCutoff = cutoff(policy.terminalWorkerDays, 30);
+    const eventCutoff = cutoff(policy.snapshottedEventDays, 30);
+    const artifactCutoff = cutoff(policy.artifactDays, 90);
+    return this.transaction((db) => {
+      const changes = (result: { changes: number | bigint }): number => Number(result.changes);
+      const audit = changes(
+        db.prepare("DELETE FROM runtime_audit WHERE timestamp < ?").run(auditCutoff),
+      );
+      const commands = changes(
+        db
+          .prepare(
+            "DELETE FROM commands WHERE status IN ('completed', 'failed', 'cancelled') AND updated_at < ?",
+          )
+          .run(commandCutoff),
+      );
+      const outbox = changes(
+        db.prepare("DELETE FROM outbox WHERE status = 'sent' AND updated_at < ?").run(outboxCutoff),
+      );
+      const workerJobs = changes(
+        db
+          .prepare(
+            "DELETE FROM worker_jobs WHERE status IN ('succeeded', 'failed', 'cancelled') AND updated_at < ?",
+          )
+          .run(workerCutoff),
+      );
+      const events = changes(
+        db
+          .prepare(
+            `DELETE FROM runtime_events
+             WHERE timestamp < ? AND EXISTS (
+               SELECT 1 FROM runtime_snapshots
+               WHERE runtime_snapshots.stream_id = runtime_events.stream_id
+                 AND runtime_snapshots.sequence >= runtime_events.sequence
+             )`,
+          )
+          .run(eventCutoff),
+      );
+      const artifacts = changes(
+        db.prepare("DELETE FROM artifacts WHERE created_at < ?").run(artifactCutoff),
+      );
+      return { audit, commands, outbox, workerJobs, events, artifacts };
+    });
   }
 
   async close(): Promise<void> {

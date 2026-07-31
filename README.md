@@ -1,5 +1,8 @@
 # anicode
 
+[Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) ·
+[Production operations](docs/operations/production-readiness.md) · [MIT license](LICENSE)
+
 一个 TypeScript 编写、前端无关的通用型 AI Agent：调研、分析、写作、规划、数据与工具协作都是一等能力，软件工程是重点强化的核心长项。当前仓库包含：
 
 ```text
@@ -16,7 +19,9 @@ packages/
 Electron IPC、VSCode webview postMessage 只是同一契约的不同「传输」实现，可互换。transcript / Markdown /
 diff 等前端无关的纯逻辑集中在 `@anicode/shared`，三端共用、单独测试。
 
-当前全仓类型检查通过，离线测试 **642 项（641 通过、1 个 PostgreSQL 集成项在未配置数据库时按预期跳过）**。默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，昂贵的真实模型运行留给显式 nightly job。
+全仓类型检查与离线测试由 CI 在 Node 22/24、Linux、macOS、Windows 和 PostgreSQL 16
+矩阵中执行。默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，
+真实模型回归只允许使用已审核、已提交的基线，缺少运行环境或基线会明确失败。
 
 ## 先本地调试 TUI
 
@@ -30,7 +35,7 @@ npm run dev:tui
 启动时会自动读取项目根目录的 `.env.local` / `.env`，并使用 `anicode.json` 或
 `.anicode/anicode.json` 指定的默认模型；若没有可用云端凭证则回退到零网络的 `debug/demo`。
 
-CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite，凭证存在本机 OS Keychain，不需要 AniCode 后端服务、PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。使用云端模型时仍需对应模型 provider 的凭证或订阅；这不是 AniCode 自身的后端依赖。
+CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite，凭证存在本机 OS Keychain，不需要 AniCode 后端服务、PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。使用云端模型时仍需对应 provider 的 API key 或官方支持的企业凭证；这不是 AniCode 自身的后端依赖。
 
 开发数据隔离到：
 
@@ -353,7 +358,11 @@ npm run build:app
 npm run build:vscode
 ```
 
-当前覆盖 642 个测试（641 passed + 1 skipped），包括 provider 映射和真实本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After` 解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端 UI 交互。CI 在 Node 22/24 与 PostgreSQL 16 上运行完整矩阵；本地未配置 PostgreSQL URL 时，相关集成用例会明确跳过。
+测试覆盖 provider 映射和本地 SSE/HTTP header fixture、工具调用、重试（含 `Retry-After`
+解析）、权限与 Plan 模式、hooks、skills、并行只读子代理、compaction、类型化代码图、PatchSet、
+SQLite/PostgreSQL 契约、fencing/worker、Remote Runtime、GitHub delivery、OpenTelemetry、
+macOS/Linux 沙箱、后台 shell、多模态 read、会话竞态、daemon 多客户端、OpenAPI/SDK，以及三端
+UI 交互。本地未配置 PostgreSQL URL 时，相关集成用例会明确跳过。
 
 `@anicode/eval` 还提供带自校验的真实编辑任务，可汇总通过率、轮数、token 与编辑失败率：
 

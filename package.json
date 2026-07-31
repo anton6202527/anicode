@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.15.0 <25"
+  },
   "workspaces": [
     "packages/*"
   ],
@@ -13,11 +16,13 @@
     "dev:app": "npm run dev --workspace @anicode/app",
     "build:app": "npm run build --workspace @anicode/app",
     "build:vscode": "npm run build --workspace anicode-vscode",
+    "size:check": "node scripts/check-bundle-size.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "cross-env ANICODE_CREDENTIAL_BACKEND=memory npm run test --workspaces --if-present",
     "eval": "npm run eval --workspace @anicode/eval --",
     "codegen": "npm run codegen --workspace @anicode/sdk",
     "codegen:check": "npm run codegen:check --workspace @anicode/sdk",
+    "audit:production": "npm audit --omit=dev --audit-level=high",
     "lint": "eslint \"packages/*/src/**/*.{ts,tsx}\" --max-warnings 0",
     "lint:fix": "eslint \"packages/*/src/**/*.{ts,tsx}\" --fix",
     "format": "prettier --write \"packages/*/src/**/*.{ts,tsx}\" \"*.{json,mjs}\"",
@@ -28,15 +33,15 @@
   },
   "devDependencies": {
     "@changesets/cli": "^2.31.1",
-    "@eslint/js": "^9.39.5",
+    "@eslint/js": "10.8.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.0",
     "cross-env": "^10.1.0",
-    "eslint": "^9.39.5",
+    "eslint": "^10.8.0",
     "eslint-config-prettier": "^9.1.2",
     "eslint-plugin-react-hooks": "^5.2.0",
-    "prettier": "^3.9.5",
     "ink": "^7.1.1",
+    "prettier": "^3.9.5",
     "react": "^19.2.0",
     "react-devtools-core": "^7.0.1",
     "tsx": "^4.19.0",

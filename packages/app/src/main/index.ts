@@ -6,7 +6,15 @@
  */
 
 import * as path from "node:path";
-import { app, BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from "electron";
+import {
+  app,
+  BrowserWindow,
+  crashReporter,
+  ipcMain,
+  shell,
+  type IpcMainInvokeEvent,
+} from "electron";
+import { autoUpdater } from "electron-updater";
 import { loadConfig, loadProjectEnv, resolveDefaultModel } from "@anicode/core";
 import { Bridge } from "./bridge.js";
 import { trustedExternalUrl, trustedRendererDevUrl } from "../shared/security.js";
@@ -20,7 +28,47 @@ if (!app.isPackaged && rendererDevUrlInput && !RENDERER_DEV_URL) {
 
 let bridge: Bridge | undefined;
 let shutdownStarted = false;
+let updateTimer: NodeJS.Timeout | undefined;
 const trustedWebContentsIds = new Set<number>();
+
+// Crashpad starts before any renderer. Reports remain local unless an operator explicitly opts in
+// and supplies an HTTPS collector; this avoids silently exporting user workspace data.
+const crashSubmitUrl = process.env["ANICODE_CRASH_REPORT_URL"]?.trim();
+const crashUploadEnabled = process.env["ANICODE_CRASH_REPORT_UPLOAD"] === "1";
+const trustedCrashSubmitUrl = (() => {
+  if (!crashSubmitUrl) return undefined;
+  try {
+    const parsed = new URL(crashSubmitUrl);
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password
+      ? parsed.toString()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+})();
+if (crashUploadEnabled && !trustedCrashSubmitUrl) {
+  throw new Error("ANICODE_CRASH_REPORT_UPLOAD=1 requires an HTTPS ANICODE_CRASH_REPORT_URL");
+}
+crashReporter.start({
+  uploadToServer: crashUploadEnabled,
+  ...(trustedCrashSubmitUrl ? { submitURL: trustedCrashSubmitUrl } : {}),
+  compress: true,
+  rateLimit: true,
+});
+
+function startAutoUpdates(): void {
+  if (!app.isPackaged || process.env["ANICODE_AUTO_UPDATE"] === "0") return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on("error", (error) => console.error("anicode app: update check failed", error));
+  const check = () => void autoUpdater.checkForUpdatesAndNotify().catch(() => undefined);
+  updateTimer = setTimeout(() => {
+    check();
+    updateTimer = setInterval(check, 6 * 60 * 60 * 1000);
+    updateTimer.unref();
+  }, 15_000);
+  updateTimer.unref();
+}
 
 function trustedIpcSender(event: IpcMainInvokeEvent): boolean {
   return (
@@ -93,6 +141,7 @@ app.whenReady().then(async () => {
   // 连接已启用的 MCP 插件后再建窗；连接失败不阻塞启动（状态在市场里展示）。
   await bridge.init().catch(() => {});
   createWindow();
+  startAutoUpdates();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -107,6 +156,7 @@ app.on("will-quit", (event) => {
   if (shutdownStarted) return;
   event.preventDefault();
   shutdownStarted = true;
+  if (updateTimer) clearTimeout(updateTimer);
   const current = bridge;
   bridge = undefined;
   void (current?.dispose() ?? Promise.resolve())

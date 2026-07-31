@@ -269,7 +269,9 @@ async function main(): Promise<void> {
           console.error(`已初始化基线 ${args.baseline}；请审核后提交，再启用回归门`);
           return;
         }
-        console.error(`基线 ${args.baseline} 不存在或不可读，跳过比较`);
+        throw new Error(
+          `Eval baseline ${args.baseline} is required and unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
       if (baseline) {
         const gate = evaluateQualityGate(sum, baseline, {

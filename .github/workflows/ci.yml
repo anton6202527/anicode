@@ -8,6 +8,9 @@ on:
   merge_group:
     types: [checks_requested]
 
+permissions:
+  contents: read
+
 # 同一分支的旧运行取消，节省 CI 时间。
 concurrency:
   group: ci-${{ github.ref }}
@@ -64,6 +67,10 @@ jobs:
       - name: Production dependency audit
         if: matrix.node == '24'
         run: npm audit --omit=dev --audit-level=high
+
+      - name: Build-tool critical vulnerability audit
+        if: matrix.node == '24'
+        run: npm audit --audit-level=critical
 
       - name: Format check
         run: npm run format:check
@@ -129,3 +136,6 @@ jobs:
 
       - name: Build VSCode extension
         run: npm run build:vscode
+
+      - name: Bundle size budgets
+        run: npm run size:check

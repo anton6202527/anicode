@@ -21,4 +21,5 @@ Packages」PR（累计变更 + 更新 CHANGELOG + 升版本号）；合并该 PR
 
 VSCode 扩展（`.vsix`）与 Electron 安装包不走 npm：
 - `.vsix` 在发布 GitHub Release 时由 release 工作流构建并作为产物上传。
-- Electron 安装包用 `npm run --workspace @anicode/app dist` 本地/按需构建（多平台签名不在 CI）。
+- Electron 安装包在 GitHub Release 时由 CI 构建；macOS 强制签名与公证，Windows 强制签名，
+  缺少受保护的发布凭证会让 release job 失败。

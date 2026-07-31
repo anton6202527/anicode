@@ -887,7 +887,7 @@ export async function selectSessionId(
 }
 
 /**
- * `anicode auth <login|logout|list> [provider]` —— 订阅登录（目前 Anthropic Claude Pro/Max）。
+ * `anicode auth <login|logout|list> [provider]` —— OAuth 凭证检查/清理；生产登录入口默认禁用。
  * login 走 PKCE：打开浏览器授权 → 用户粘回 `code#state` → 换 token 存 ~/.anicode/auth.json。
  */
 /**

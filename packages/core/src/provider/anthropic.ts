@@ -41,10 +41,7 @@ export interface AnthropicProviderOptions {
   adaptiveThinking?: boolean | ((model: string) => boolean);
   /** SDK 内层重试默认关闭，由 Agent 统一处理。 */
   maxRetries?: number;
-  /**
-   * OAuth 订阅令牌源（Claude Pro/Max）。传入即走 Bearer + oauth beta 头、注入 Claude Code
-   * 身份 system 块，并在每次请求前取新 token（临期自动续期）。与 apiKey 互斥优先。
-   */
+  /** Test-only compatibility source; production construction with this option is rejected. */
   tokenSource?: TokenSource;
   /** Internal tests only. Subscription OAuth is not an authorized production integration. */
   allowUnverifiedSubscriptionOAuthForTesting?: boolean;
@@ -67,7 +64,7 @@ export class AnthropicProvider implements Provider {
     this.baseURL = opts.baseURL;
     this.maxRetries = opts.maxRetries ?? 0;
     this.client = new Anthropic({
-      // OAuth 模式先给占位 authToken，真正 token 在每次请求前按需构建/刷新。
+      // Test-only compatibility mode; construction requires the explicit test flag above.
       ...(this.tokenSource ? { authToken: "pending" } : {}),
       ...(!this.tokenSource && opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
       ...(opts.baseURL !== undefined ? { baseURL: opts.baseURL } : {}),

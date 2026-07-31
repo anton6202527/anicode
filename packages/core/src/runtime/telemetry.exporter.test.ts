@@ -33,6 +33,7 @@ test("OTLP exporter emits protobuf-JSON bytes, resource fields, status and retri
       { attempt: 2, api_token: "must-not-leak" },
       { traceId, spanId: parentSpanId, traceFlags: 1 },
     )
+    .recordException(new Error("workspace /private/project contained must-not-export"))
     .setStatus({ code: "error", message: "verification failed" })
     .end();
   await telemetry.forceFlush();
@@ -55,7 +56,10 @@ test("OTLP exporter emits protobuf-JSON bytes, resource fields, status and retri
   const spans = scopeSpans[0]?.["spans"] as Array<Record<string, unknown>>;
   assert.equal(spans[0]?.["traceId"], Buffer.from(traceId, "hex").toString("base64"));
   assert.equal(spans[0]?.["parentSpanId"], Buffer.from(parentSpanId, "hex").toString("base64"));
-  assert.deepEqual(spans[0]?.["status"], { code: 2, message: "verification failed" });
+  const serialized = JSON.stringify(spans[0]);
+  assert.equal(serialized.includes("/private/project"), false);
+  assert.equal(serialized.includes("verification failed"), false);
+  assert.match(String((spans[0]?.["status"] as Record<string, unknown>)["message"]), /^error:/);
   await telemetry.shutdown();
 });
 

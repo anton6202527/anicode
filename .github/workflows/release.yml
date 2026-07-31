@@ -6,6 +6,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -67,9 +70,12 @@ jobs:
 
       - run: npm ci
 
+      - name: Set release version
+        run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
+
       - name: Package VSCode extension
         run: >-
-          npx vsce package
+          npm exec --workspace anicode-vscode -- vsce package
           --no-dependencies
           --target "${{ matrix.target }}"
           -o "packages/vscode/anicode-${{ matrix.target }}.vsix"
@@ -78,3 +84,65 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: packages/vscode/anicode-${{ matrix.target }}.vsix
+
+  desktop:
+    if: github.event_name == 'release'
+    name: desktop (${{ matrix.platform }})
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, platform: mac, args: "--mac --arm64 --x64 -c.forceCodeSigning=true", signed: "true" }
+          - { os: windows-latest, platform: windows, args: "--win --x64 -c.forceCodeSigning=true", signed: "true" }
+          - { os: ubuntu-latest, platform: linux, args: "--linux --x64", signed: "false" }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      CSC_LINK: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_LINK || secrets.WINDOWS_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_KEY_PASSWORD || secrets.WINDOWS_CSC_KEY_PASSWORD }}
+      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Require release signing credentials
+        if: matrix.signed == 'true'
+        shell: bash
+        run: |
+          test -n "$CSC_LINK" || { echo "Missing code-signing certificate" >&2; exit 1; }
+          test -n "$CSC_KEY_PASSWORD" || { echo "Missing certificate password" >&2; exit 1; }
+          if [ "${{ matrix.platform }}" = "mac" ]; then
+            test -n "$APPLE_API_KEY_BASE64" || { echo "Missing Apple notarization API key" >&2; exit 1; }
+            test -n "$APPLE_API_KEY_ID" || { echo "Missing Apple API key ID" >&2; exit 1; }
+            test -n "$APPLE_API_ISSUER" || { echo "Missing Apple API issuer" >&2; exit 1; }
+          fi
+
+      - name: Prepare Apple notarization key
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Set release version
+        run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
+
+      - name: Build signed desktop installers
+        run: npm run dist --workspace @anicode/app -- ${{ matrix.args }} --publish never
+
+      - name: Upload desktop release assets
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          fail_on_unmatched_files: true
+          files: packages/app/release/*.{dmg,zip,exe,AppImage,yml,blockmap}

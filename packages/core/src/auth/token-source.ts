@@ -1,8 +1,7 @@
 /**
- * OAuth 令牌源 —— 给 provider 一个「随取随用、临期自动续期」的 access token。
+ * 测试隔离的 OAuth 令牌源；生产入口始终 fail closed。
  *
- * provider 每次请求前调用 getAccessToken()：若 token 距过期不足 buffer，就用 refresh_token
- * 续期并回写 AuthStore；并发请求共享同一次续期 Promise，避免重复刷新。
+ * 仅显式测试开关可验证临期续期/并发去重兼容逻辑，第三方生产客户端不得消费订阅令牌。
  */
 
 import { t } from "../i18n.js";

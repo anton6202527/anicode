@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { context as otelContext, trace as otelTrace, TraceFlags } from "@opentelemetry/api";
 import type { CredentialBroker } from "../security/credentials.js";
 
@@ -85,13 +85,16 @@ export function fromOpenTelemetry(tracer: OpenTelemetryTracerLike): Telemetry {
           return bridge;
         },
         recordException(error) {
-          span.recordException(error);
+          span.recordException({
+            name: error instanceof Error ? error.name : "Error",
+            message: diagnosticFingerprint(error),
+          });
           return bridge;
         },
         setStatus(status) {
           span.setStatus({
             code: status.code === "ok" ? 1 : status.code === "error" ? 2 : 0,
-            ...(status.message ? { message: status.message } : {}),
+            ...(status.message ? { message: diagnosticFingerprint(status.message) } : {}),
           });
           return bridge;
         },
@@ -256,6 +259,12 @@ function errorOf(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
+/** Stable grouping without exporting paths, prompts, provider bodies, commands, or credentials. */
+function diagnosticFingerprint(value: unknown): string {
+  const raw = value instanceof Error ? `${value.name}:${value.message}` : String(value);
+  return `error:${createHash("sha256").update(raw).digest("hex").slice(0, 16)}`;
+}
+
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -371,14 +380,15 @@ export class OtlpHttpTelemetry implements Telemetry {
           name: "exception",
           timeUnixNano: nanoTime(),
           attributes: {
-            "exception.message": error instanceof Error ? error.message : String(error),
+            "exception.type": error instanceof Error ? error.name : "Error",
+            "anicode.error.fingerprint": diagnosticFingerprint(error),
           },
         });
         return span;
       },
       setStatus(status) {
         record.status = status.code;
-        if (status.message) record.statusMessage = status.message;
+        if (status.message) record.statusMessage = diagnosticFingerprint(status.message);
         return span;
       },
       context: () => ({ traceId: record.traceId, spanId: record.spanId, traceFlags: 1 }),

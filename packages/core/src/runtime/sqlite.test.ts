@@ -119,3 +119,55 @@ test("SQLite runtime: JSONL 会话幂等迁移，事务追加不丢消息", asyn
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("SQLite runtime: ordered migration checksums and explicit retention", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-migrations-"));
+  const file = path.join(root, "runtime.db");
+  const database = new SqliteRuntimeDatabase(file);
+  try {
+    const migrations = await database.run((db) =>
+      db
+        .prepare("SELECT version, checksum, description FROM schema_migrations ORDER BY version")
+        .all() as Array<Record<string, unknown>>,
+    );
+    assert.deepEqual(
+      migrations.map((row) => Number(row.version)),
+      [1, 2],
+    );
+    assert.ok(migrations.every((row) => /^[a-f0-9]{64}$/.test(String(row.checksum))));
+
+    const old = "2000-01-01T00:00:00.000Z";
+    await database.run((db) => {
+      db.prepare(
+        `INSERT INTO runtime_audit
+         (id, timestamp, category, action, metadata) VALUES (?, ?, ?, ?, ?)`,
+      ).run("old-audit", old, "runtime", "old", "{}");
+      db.prepare(
+        `INSERT INTO worker_jobs
+         (id, type, idempotency_key, status, data, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run("old-job", "test", "old-job", "succeeded", "{}", old, old);
+      db.prepare(
+        `INSERT INTO runtime_events
+         (stream_id, sequence, id, timestamp, type, data) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run("compacted", 1, "old-event", old, "done", "{}");
+      db.prepare(
+        `INSERT INTO runtime_snapshots(stream_id, sequence, data, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run("compacted", 1, "{}", old);
+    });
+
+    const pruned = await database.prune({}, Date.parse("2026-01-01T00:00:00.000Z"));
+    assert.equal(pruned.audit, 1);
+    assert.equal(pruned.workerJobs, 1);
+    assert.equal(pruned.events, 1);
+
+    await database.run((db) =>
+      db.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 2").run("tampered"),
+    );
+  } finally {
+    await database.close();
+  }
+  assert.throws(() => new SqliteRuntimeDatabase(file), /migration 2 checksum mismatch/);
+  await fs.rm(root, { recursive: true, force: true });
+});

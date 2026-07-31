@@ -10,7 +10,6 @@ import { t } from "../i18n.js";
 import type { NetworkProxy } from "../runtime/network-proxy.js";
 import type { CredentialBroker } from "../security/credentials.js";
 import type { Provider } from "../types.js";
-import { AuthStore } from "../auth/store.js";
 import { DebugProvider } from "./debug.js";
 import { OpenAICompatProvider, type MaxTokensField } from "./openai-compat.js";
 
@@ -214,13 +213,6 @@ export function configureProviderCredentialBroker(
 /** 生产宿主把 provider SDK 的 fetch 也收口到同一策略化出口。 */
 export function configureProviderNetworkProxy(proxy: NetworkProxy | undefined): void {
   providerNetworkProxy = proxy;
-}
-
-/** 进程内共享的凭证存储（OAuth 等）；路径可由 ANICODE_AUTH_FILE 覆盖。 */
-let sharedAuthStore: AuthStore | null = null;
-export function defaultAuthStore(): AuthStore {
-  if (!sharedAuthStore) sharedAuthStore = new AuthStore();
-  return sharedAuthStore;
 }
 
 const cloudDefaults: ProviderCapabilities = { tools: true, reasoning: false, images: false };
