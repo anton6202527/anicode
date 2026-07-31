@@ -321,10 +321,16 @@ export function buildModelPickerOverlay(
   filter: string,
   termRows: number,
   termCols: number,
+  anchorTop?: number,
 ): Sprite {
-  const width = dialogWidth(termCols);
-  const height = fixedOverlayHeight(termRows, 22, 8);
-  const viewportHeight = Math.max(1, height - 6);
+  const anchored = anchorTop !== undefined;
+  const width = anchored ? Math.max(1, termCols) : dialogWidth(termCols);
+  const height = anchored
+    ? Math.max(1, Math.min(12, anchorTop, termRows))
+    : fixedOverlayHeight(termRows, 22, 8);
+  // 贴输入框展示时，筛选词直接显示在下方输入框中；这里只保留标题和候选项。
+  const chromeRows = anchored ? 3 : 6;
+  const viewportHeight = Math.max(1, height - chromeRows);
   const inner = width - 2 * PADX;
   const blank = () => line(width, []);
   const bodyL = (spans: Span[], baseBg: string = DLG.bg) => line(width, [PAD, ...spans], baseBg);
@@ -339,22 +345,23 @@ export function buildModelPickerOverlay(
       [{ text: "esc", fg: DLG.dim }],
     ),
   );
-  L.push(blank());
-  // 搜索行：词后跟一格橙色光标块；无词时光标块在最前、占位整段灰字（不反白盖住整个字）。
-  L.push(
-    filter
-      ? bodyL([
-          { text: filter, fg: DLG.text },
-          { text: " ", bg: DLG.accent },
-        ])
-      : bodyL([
-          { text: " ", bg: DLG.accent },
-          { text: t("Search…", "搜索…"), fg: DLG.dim },
-        ]),
-  );
-
-  L.push(blank());
-  const content: Array<{ rendered: string; modelIndex?: number }> = [];
+  if (!anchored) {
+    L.push(blank());
+    // 居中兼容模式仍自带搜索行；贴底模式把筛选词放到输入框中，避免出现第二个输入框。
+    L.push(
+      filter
+        ? bodyL([
+            { text: filter, fg: DLG.text },
+            { text: " ", bg: DLG.accent },
+          ])
+        : bodyL([
+            { text: " ", bg: DLG.accent },
+            { text: t("Search…", "搜索…"), fg: DLG.dim },
+          ]),
+    );
+    L.push(blank());
+  }
+  const content: Array<{ rendered: string; modelIndex?: number; filler?: boolean }> = [];
   if (visible.length === 0) {
     content.push({
       rendered: bodyL([{ text: t("(no matching models)", "（无匹配模型）"), fg: DLG.dim }]),
@@ -363,7 +370,7 @@ export function buildModelPickerOverlay(
     visible.forEach((row, modelIndex) => {
       const prev = visible[modelIndex - 1];
       if (modelIndex === 0 || prev?.providerName !== row.providerName) {
-        content.push({ rendered: blank() });
+        if (!anchored) content.push({ rendered: blank() });
         content.push({
           rendered: bodyL([{ text: row.providerName, fg: DLG.section, bold: true }]),
         });
@@ -392,17 +399,27 @@ export function buildModelPickerOverlay(
     0,
     content.findIndex((entry) => entry.modelIndex === index),
   );
-  const win = scrollWindow<{ rendered: string; modelIndex?: number }>(
+  const win = scrollWindow<{ rendered: string; modelIndex?: number; filler?: boolean }>(
     content,
     selectedLine,
     viewportHeight,
-    () => ({ rendered: blank() }),
+    () => ({ rendered: blank(), filler: true }),
   );
-  L.push(...win.map((entry) => entry.rendered));
+  // 向上展开的面板从底部填充：少量候选紧贴输入框，不再悬在大块空白的顶部。
+  const ordered = anchored
+    ? [...win.filter((entry) => entry.filler), ...win.filter((entry) => !entry.filler)]
+    : win;
+  L.push(...ordered.map((entry) => entry.rendered));
   L.push(blank());
   return {
-    ...place(L, width, termRows, termCols),
-    hitRows: [null, null, null, null, null, ...win.map((entry) => entry.modelIndex ?? null), null],
+    ...(anchored ? placeAbove(L, width, anchorTop, 0) : place(L, width, termRows, termCols)),
+    hitRows: [
+      null,
+      null,
+      ...(!anchored ? [null, null, null] : []),
+      ...ordered.map((entry) => entry.modelIndex ?? null),
+      null,
+    ],
   };
 }
 
@@ -620,7 +637,6 @@ export function buildPermissionOverlay(
   termCols: number,
   selected = 0,
   anchorTop?: number,
-  confirmAlways = false,
 ): Sprite {
   // 与输入面板同宽同左缘；不再居中挡住正在看的上下文。
   const width = Math.max(1, termCols);
@@ -678,7 +694,7 @@ export function buildPermissionOverlay(
     L.push(bodyL([{ text: t("Operation", "完整操作"), fg: DLG.section, bold: true }]));
   }
   for (const operationLine of wrapPermissionText(p.ruleKey, Math.max(1, inner), compact ? 2 : 4)) {
-    L.push(bodyL([{ text: operationLine, fg: DLG.text }]));
+    L.push(bodyL([{ text: operationLine, fg: DLG.text, bold: true }]));
   }
   if (!compact) {
     L.push(bodyL([{ text: t("Arguments", "参数"), fg: DLG.section, bold: true }]));
@@ -688,7 +704,7 @@ export function buildPermissionOverlay(
     Math.max(1, inner),
     compact ? 1 : 3,
   )) {
-    L.push(bodyL([{ text: inputLine, fg: DLG.dim }]));
+    L.push(bodyL([{ text: inputLine, fg: DLG.text }]));
   }
   if (!compact) {
     const preview = permissionPatchPreview(p.input, 3);
@@ -738,28 +754,24 @@ export function buildPermissionOverlay(
           {
             text: truncWidth(option.label, Math.max(1, inner - 8)),
             fg: active ? DLG.hlFg : DLG.text,
+            bold: true,
           },
         ],
         active ? DLG.hlBg : DLG.bg,
       ),
     );
   });
-  if (confirmAlways) {
-    L.push(
-      bodyL([
-        {
-          text: t("Press p/Enter again to persist this rule", "再次按 p/Enter 才会永久保存此规则"),
-          fg: DLG.err,
-          bold: true,
-        },
-      ]),
-    );
-  }
   if (!compact) L.push(blank());
   L.push(
     bodyLR(
-      [{ text: t("esc interrupt", "esc 中断"), fg: DLG.dim }],
-      [{ text: t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认"), fg: DLG.dim }],
+      [{ text: t("esc interrupt", "esc 中断"), fg: DLG.text, bold: true }],
+      [
+        {
+          text: t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认"),
+          fg: DLG.text,
+          bold: true,
+        },
+      ],
     ),
   );
   if (!compact) L.push(blank());
@@ -781,8 +793,8 @@ export interface CommandMenuRow {
 
 /**
  * 斜杠命令补全菜单精灵：钉在输入框正上方、方向朝上（对齐截图 #1）。
- * 左列命令名对齐、右侧描述灰字；高亮项整行暖橙底。菜单固定高度，超长列表在
- * 内容区域内随高亮项滚动。anchorTop 为输入框首行的整帧行号，菜单末行落在其上一行。
+ * 左列命令名对齐、右侧描述灰字；高亮项整行暖橙底。短列表按实际候选数收缩，
+ * 超长列表在最多 10 行的内容区域内随高亮项滚动。anchorTop 为输入框首行的整帧行号。
  */
 export function buildCommandMenuOverlay(
   rows: readonly CommandMenuRow[],
@@ -799,8 +811,9 @@ export function buildCommandMenuOverlay(
 
   // 命令名列宽：取最长命令名（含 `/`）但不超过 18 列，之后留 2 列间隔再接描述。
   const nameCol = Math.min(18, Math.max(1, ...rows.map((r) => dispWidth("/" + r.name)))) + 2;
-  const height = Math.max(1, Math.min(12, anchorTop, termRows));
-  const viewportHeight = Math.max(0, height - 2);
+  const desiredHeight = Math.min(10, Math.max(1, rows.length)) + 2;
+  const height = Math.max(1, Math.min(desiredHeight, anchorTop, termRows));
+  const viewportHeight = Math.max(1, height - Math.min(2, Math.max(0, height - 1)));
   const idx = Math.max(0, Math.min(index, rows.length - 1));
   const start =
     rows.length > viewportHeight
@@ -809,7 +822,8 @@ export function buildCommandMenuOverlay(
   const win = rows.slice(start, start + viewportHeight);
 
   const L: string[] = [];
-  L.push(blank());
+  if (height > 1) L.push(blank());
+  const optionStart = L.length;
   win.forEach((row, i) => {
     const gi = start + i;
     const selected = gi === idx;
@@ -835,15 +849,12 @@ export function buildCommandMenuOverlay(
       );
     }
   });
-  while (L.length < height - 1) L.push(blank());
-  if (L.length < height) L.push(blank());
+  while (L.length < height) L.push(blank());
   // 与输入框左缘对齐（列 0），末行停在输入框上一行。
   return {
     ...placeAbove(L, width, anchorTop, 0),
-    hitRows: [
-      null,
-      ...win.map((_, i) => start + i),
-      ...Array.from({ length: Math.max(0, height - win.length - 1) }, () => null),
-    ],
+    hitRows: L.map((_, row) =>
+      row >= optionStart && row < optionStart + win.length ? start + row - optionStart : null,
+    ),
   };
 }

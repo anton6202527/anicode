@@ -31,16 +31,36 @@ interface JsonRpcMessage {
 }
 
 const PROTOCOL_VERSION = "2025-06-18";
+const MAX_MCP_FRAME_BYTES = 4 * 1024 * 1024;
+const MAX_MCP_CONCURRENT_CALLS = 32;
+const MAX_MCP_RESULT_CHARS = 512 * 1024;
 
 /** 启动 stdio MCP server；返回句柄用于停止读入（不 dispose manager，归宿主管）。 */
 export function serveMcp(opts: McpServeOptions): { close(): void } {
   const input = opts.input ?? process.stdin;
   const output = opts.output ?? process.stdout;
   const info = opts.serverInfo ?? { name: "anicode", version: "0.0.0" };
-  let buffer = "";
+  let buffer = Buffer.alloc(0);
+  let activeCalls = 0;
+  let closed = false;
 
   const write = (obj: unknown): void => {
-    output.write(JSON.stringify(obj) + "\n");
+    const frame = JSON.stringify(obj) + "\n";
+    if (Buffer.byteLength(frame, "utf8") <= MAX_MCP_FRAME_BYTES) {
+      output.write(frame);
+      return;
+    }
+    const id =
+      obj && typeof obj === "object" && "id" in obj
+        ? (obj as { id?: JsonRpcMessage["id"] }).id
+        : null;
+    output.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: id ?? null,
+        error: { code: -32603, message: `response frame exceeds ${MAX_MCP_FRAME_BYTES} bytes` },
+      }) + "\n",
+    );
   };
   const reply = (id: JsonRpcMessage["id"], result: unknown): void =>
     write({ jsonrpc: "2.0", id, result });
@@ -82,23 +102,48 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
   ];
 
   async function runTool(name: string, args: Record<string, unknown>): Promise<string> {
-    const prompt = String(args["prompt"] ?? "");
-    if (!prompt) throw new Error("prompt 不能为空");
+    const prompt = args["prompt"];
+    if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 2 * 1024 * 1024) {
+      throw new Error("prompt 必须包含 1 到 2097152 个字符");
+    }
     let sessionId: string;
     if (name === "anicode") {
+      const cwd = args["cwd"];
+      const model = args["model"];
+      if (
+        cwd !== undefined &&
+        (typeof cwd !== "string" || cwd.length === 0 || cwd.length > 32768)
+      ) {
+        throw new Error("cwd 必须包含 1 到 32768 个字符");
+      }
+      if (
+        model !== undefined &&
+        (typeof model !== "string" || model.length === 0 || model.length > 512)
+      ) {
+        throw new Error("model 必须包含 1 到 512 个字符");
+      }
       const meta = await opts.manager.createSession({
-        cwd: typeof args["cwd"] === "string" ? args["cwd"] : opts.cwd,
-        model: typeof args["model"] === "string" ? args["model"] : opts.model,
+        cwd: typeof cwd === "string" ? cwd : opts.cwd,
+        model: typeof model === "string" ? model : opts.model,
       });
       sessionId = meta.id;
     } else {
-      sessionId = String(args["sessionId"] ?? "");
+      const value = args["sessionId"];
+      if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > 128 ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)
+      ) {
+        throw new Error("sessionId 非法");
+      }
+      sessionId = value;
       // 会话必须已存在；resumeSession 顺带把它拉活（跨 server 重启也能续）。
       await opts.manager.resumeSession(sessionId);
     }
     await opts.manager.send(sessionId, prompt);
     const snap = opts.manager.peek(sessionId);
-    const answer = lastAssistantText(snap?.messages ?? []);
+    const answer = lastAssistantText(snap?.messages ?? []).slice(0, MAX_MCP_RESULT_CHARS);
     return JSON.stringify({ sessionId, answer });
   }
 
@@ -126,20 +171,36 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
         return;
       case "tools/call": {
         const name = String(msg.params?.name ?? "");
-        const args = (msg.params?.arguments ?? {}) as Record<string, unknown>;
+        const rawArgs = msg.params?.arguments ?? {};
+        if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) {
+          replyError(id, -32602, "tool arguments must be an object");
+          return;
+        }
+        const args = rawArgs as Record<string, unknown>;
         if (name !== "anicode" && name !== "anicode_reply") {
           replyError(id, -32602, `unknown tool: ${name}`);
           return;
         }
+        if (activeCalls >= MAX_MCP_CONCURRENT_CALLS) {
+          replyError(
+            id,
+            -32000,
+            `too many concurrent tool calls (max ${MAX_MCP_CONCURRENT_CALLS})`,
+          );
+          return;
+        }
+        activeCalls++;
         // 异步执行，不串行阻塞后续请求；结果/错误都以 MCP tool result 形态回传。
-        void runTool(name, args).then(
-          (text) => reply(id, { content: [{ type: "text", text }], isError: false }),
-          (err: unknown) =>
-            reply(id, {
-              content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-              isError: true,
-            }),
-        );
+        void runTool(name, args)
+          .then(
+            (text) => reply(id, { content: [{ type: "text", text }], isError: false }),
+            (err: unknown) =>
+              reply(id, {
+                content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+                isError: true,
+              }),
+          )
+          .finally(() => activeCalls--);
         return;
       }
       default:
@@ -149,11 +210,18 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
   }
 
   const onData = (chunk: Buffer | string): void => {
-    buffer += chunk.toString();
+    if (closed) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    buffer = Buffer.concat([buffer, bytes]);
     let nl: number;
-    while ((nl = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, nl).replace(/\r$/, "").trim();
-      buffer = buffer.slice(nl + 1);
+    while ((nl = buffer.indexOf(0x0a)) >= 0) {
+      if (nl > MAX_MCP_FRAME_BYTES) {
+        replyError(null, -32600, `request frame exceeds ${MAX_MCP_FRAME_BYTES} bytes`);
+        closeInput();
+        return;
+      }
+      const line = buffer.subarray(0, nl).toString("utf8").replace(/\r$/, "").trim();
+      buffer = buffer.subarray(nl + 1);
       if (!line) continue;
       try {
         handle(JSON.parse(line) as JsonRpcMessage);
@@ -161,12 +229,23 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
         /* 非 JSON 行忽略 */
       }
     }
+    if (buffer.length > MAX_MCP_FRAME_BYTES) {
+      replyError(null, -32600, `request frame exceeds ${MAX_MCP_FRAME_BYTES} bytes`);
+      closeInput();
+    }
+  };
+  const closeInput = (): void => {
+    if (closed) return;
+    closed = true;
+    buffer = Buffer.alloc(0);
+    input.off("data", onData);
+    input.pause?.();
   };
   input.on("data", onData);
 
   return {
     close() {
-      input.off("data", onData);
+      closeInput();
     },
   };
 }

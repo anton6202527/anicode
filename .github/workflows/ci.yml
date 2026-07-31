@@ -17,6 +17,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
+
   workflow-contract:
     name: workflow contract
     runs-on: ubuntu-latest
@@ -33,6 +42,7 @@ jobs:
   quality:
     name: quality (node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -68,9 +78,13 @@ jobs:
         if: matrix.node == '24'
         run: npm audit --omit=dev --audit-level=high
 
-      - name: Build-tool critical vulnerability audit
+      - name: Build-tool vulnerability audit
         if: matrix.node == '24'
-        run: npm audit --audit-level=critical
+        run: npm run audit:build
+
+      - name: Registry signature and provenance audit
+        if: matrix.node == '24'
+        run: npm audit signatures
 
       - name: Format check
         run: npm run format:check
@@ -116,6 +130,7 @@ jobs:
   build:
     name: build artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -139,3 +154,6 @@ jobs:
 
       - name: Bundle size budgets
         run: npm run size:check
+
+      - name: Published CLI install smoke test
+        run: npm run smoke:cli

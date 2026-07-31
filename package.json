@@ -3,8 +3,21 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "npm@11.17.0",
   "engines": {
     "node": ">=22.15.0 <25"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.15.0 <25",
+      "onFail": "warn"
+    },
+    "packageManager": {
+      "name": "npm",
+      "version": ">=11.5.1 <12",
+      "onFail": "error"
+    }
   },
   "workspaces": [
     "packages/*"
@@ -23,6 +36,10 @@
     "codegen": "npm run codegen --workspace @anicode/sdk",
     "codegen:check": "npm run codegen:check --workspace @anicode/sdk",
     "audit:production": "npm audit --omit=dev --audit-level=high",
+    "audit:build": "node scripts/audit-build-dependencies.mjs",
+    "audit:signatures": "npm audit signatures",
+    "smoke:cli": "npm run build:cli && node scripts/smoke-cli-package.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "lint": "eslint \"packages/*/src/**/*.{ts,tsx}\" --max-warnings 0",
     "lint:fix": "eslint \"packages/*/src/**/*.{ts,tsx}\" --fix",
     "format": "prettier --write \"packages/*/src/**/*.{ts,tsx}\" \"*.{json,mjs}\"",

@@ -158,7 +158,10 @@ export interface AnicodeClient {
       opts?: { checkpointId?: string; mode?: RewindMode },
     ): Promise<{ restored: number; deleted: number; removedMessages?: number }>;
     compact(id: string): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }>;
-    fork(id: string, opts?: { title?: string; upToMessage?: number }): Promise<SessionSummary>;
+    fork(
+      id: string,
+      opts?: { title?: string; upToMessage?: number; model?: string },
+    ): Promise<SessionSummary>;
   };
   permission: {
     reply(sessionId: string, permId: string, decision: PermissionAnswer): Promise<boolean>;
@@ -525,6 +528,7 @@ export function createAnicodeClient(opts: AnicodeClientOptions): AnicodeClient {
           {
             ...(forkOpts?.title !== undefined ? { title: forkOpts.title } : {}),
             ...(forkOpts?.upToMessage !== undefined ? { upToMessage: forkOpts.upToMessage } : {}),
+            ...(forkOpts?.model !== undefined ? { model: forkOpts.model } : {}),
           },
         ),
     },

@@ -78,7 +78,9 @@ export function Marketplace({ plugins, onToggle }: Props) {
             <p className="plugin-desc">{p.description}</p>
             {p.mcpServer ? (
               <code className="plugin-cmd">
-                {p.mcpServer.command} {p.mcpServer.args.join(" ")}
+                {"url" in p.mcpServer
+                  ? p.mcpServer.url
+                  : `${p.mcpServer.command} ${(p.mcpServer.args ?? []).join(" ")}`}
               </code>
             ) : null}
             {p.toolNames && p.toolNames.length > 0 ? (

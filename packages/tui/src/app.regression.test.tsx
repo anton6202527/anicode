@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
 import type { ProviderDescriptor, SessionEvent, SessionHost } from "@anicode/core";
-import { App, parseMouseInput } from "./app.js";
+import { App, parseMouseInput, terminalMouseModeSequence } from "./app.js";
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
@@ -21,6 +21,18 @@ test("TUI 回归: SGR 左键点击解析坐标，释放事件不重复触发", (
     leftClick: { column: 20, row: 10 },
   });
   assert.deepEqual(parseMouseInput("\u001b[<0;20;10m"), { wheelDelta: 0 });
+});
+
+test("TUI 回归: 关闭鼠标协议时保留左键拖选，开启时接收滚轮", () => {
+  const selectable = terminalMouseModeSequence(false);
+  assert.match(selectable, /\?1000l/);
+  assert.match(selectable, /\?1007l/);
+  assert.doesNotMatch(selectable, /\?1000h/);
+
+  const fullTracking = terminalMouseModeSequence(true);
+  assert.match(fullTracking, /\?1007l/);
+  assert.match(fullTracking, /\?1000h/);
+  assert.match(fullTracking, /\?1006h/);
 });
 
 /** 最小离线 host：可注入历史事件与 undo/setPermissionMode 行为。 */
@@ -143,7 +155,7 @@ test("TUI 回归: Ctrl+U 删到行首只保留光标后内容", async () => {
   }
 });
 
-test("TUI 回归: PageUp/滚轮只回看结果区，不显示额外状态提示", async () => {
+test("TUI 回归: PageUp/完整鼠标滚轮只回看结果区，不显示额外状态提示", async () => {
   const events: SessionEvent[] = [];
   for (let i = 0; i < 8; i++) {
     events.push({
@@ -184,6 +196,87 @@ test("TUI 回归: PageUp/滚轮只回看结果区，不显示额外状态提示"
     view.stdin.write("\u001b[<65;10;10M".repeat(3));
     await tick(40);
     assert.doesNotMatch(view.lastFrame() ?? "", /回看历史中/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: 结果页 ↑/↓ 浏览 prompt 历史，越界时保持边界或空输入", async () => {
+  const events: SessionEvent[] = [
+    { type: "agent", event: { type: "text", text: "已有搜索结果" } },
+    { type: "state", running: false },
+  ];
+  const sent: string[] = [];
+  const host = makeHost({ eventsBeforeSnapshot: events, onSend: (text) => sent.push(text) });
+  const view = mount(host);
+  await tick(100);
+  try {
+    // 空历史时 ↑ 不显示任何内容。
+    view.stdin.write("\u001b[A");
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /输入你的目标/);
+
+    for (const ch of "第一条 prompt") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(30);
+    for (const ch of "第二条 prompt") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(30);
+    assert.deepEqual(sent, ["第一条 prompt", "第二条 prompt"]);
+
+    view.stdin.write("\u001b[A");
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /第二条 prompt/);
+    view.stdin.write("\u001b[A");
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /第一条 prompt/);
+    view.stdin.write("\u001b[A"); // 已到最旧项，继续 ↑ 不越界。
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /第一条 prompt/);
+
+    view.stdin.write("\u001b[B");
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /第二条 prompt/);
+    view.stdin.write("\u001b[B"); // 越过最新项，恢复空输入。
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /输入你的目标/);
+    view.stdin.write("\u001b[B"); // 已无更新记录，保持空白。
+    await tick(20);
+    assert.match(view.lastFrame() ?? "", /输入你的目标/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: 大量短结果可滚到完整历史顶部", async () => {
+  const events: SessionEvent[] = [];
+  for (let i = 0; i < 300; i++) {
+    events.push({
+      type: "agent",
+      event: { type: "text", text: `短结果-${String(i).padStart(3, "0")}` },
+    });
+    events.push({ type: "state", running: false });
+  }
+  const host = makeHost({ eventsBeforeSnapshot: events });
+  const view = mount(host);
+  await tick(120);
+  try {
+    const atBottom = view.lastFrame() ?? "";
+    assert.match(atBottom, /短结果-299/);
+    assert.doesNotMatch(atBottom, /短结果-000/);
+    const inputRow = atBottom.split("\n").findIndex((line) => line.includes("输入你的目标"));
+    assert.ok(inputRow >= 0);
+
+    // 一次连续的大幅上滚必须基于完整历史高度计算，不能卡在尾部渲染窗口的假顶部。
+    view.stdin.write("\u001b[<64;10;10M".repeat(300));
+    await tick(120);
+    const atTop = view.lastFrame() ?? "";
+    assert.match(atTop, /短结果-000/);
+    assert.doesNotMatch(atTop, /短结果-299/);
+    assert.equal(
+      atTop.split("\n").findIndex((line) => line.includes("输入你的目标")),
+      inputRow,
+    );
   } finally {
     view.unmount();
   }
@@ -269,6 +362,21 @@ const pickerProviders: ProviderDescriptor[] = [
     models: [],
     catalog: [],
   },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    kind: "openai-compatible",
+    protocol: "openai-chat",
+    aliases: [],
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKeyEnv: ["OPENROUTER_API_KEY"],
+    requiresApiKey: true,
+    local: false,
+    capabilities: { tools: true, reasoning: false },
+    limits: {},
+    models: [],
+    catalog: [],
+  },
 ];
 
 const pickerCatalog = [
@@ -304,6 +412,12 @@ test("TUI 回归: /model 选择器键入即过滤，Enter 选中过滤后的首�
   const view = mount(host, {
     providers: pickerProviders,
     catalog: pickerCatalog,
+    discoverModels: async (providerId: string) =>
+      providerId === "debug"
+        ? ["demo"]
+        : providerId === "openrouter"
+          ? ["meta-llama/llama-3.3-70b-instruct:free"]
+          : undefined,
     inspectProviderCredentials: true,
   });
   await tick(80);

@@ -73,6 +73,22 @@ test("route contract: path matching + strict request schema + oneOf", () => {
       (issue) => issue.keyword === "enum",
     ),
   );
+  assert.ok(
+    validateRouteRequest("POST", "/sessions/s_1/fork", { upToMessage: -1 }).some(
+      (issue) => issue.keyword === "minimum",
+    ),
+  );
+  assert.ok(
+    validateRouteRequest("POST", "/sessions/s_1/send", {
+      text: "ok",
+      idempotencyKey: "x".repeat(257),
+    }).some((issue) => issue.keyword === "maxLength"),
+  );
+  assert.ok(
+    validateRouteRequest("POST", "/sessions/s_1/permission-profile", { name: "" }).some(
+      (issue) => issue.keyword === "minLength",
+    ),
+  );
 });
 
 test("ROUTES: 路径参数命名合法，method 合法", () => {

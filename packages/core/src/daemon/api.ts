@@ -110,9 +110,9 @@ export const ROUTES: RouteDef[] = [
       type: "object",
       required: ["cwd", "model"],
       properties: {
-        cwd: { type: "string", minLength: 1 },
-        model: { type: "string", minLength: 1 },
-        title: { type: "string", minLength: 1 },
+        cwd: { type: "string", minLength: 1, maxLength: 32768 },
+        model: { type: "string", minLength: 1, maxLength: 512 },
+        title: { type: "string", minLength: 1, maxLength: 4096 },
       },
     },
     response: SESSION_SUMMARY,
@@ -139,7 +139,7 @@ export const ROUTES: RouteDef[] = [
     request: {
       type: "object",
       required: ["title"],
-      properties: { title: { type: "string", minLength: 1 } },
+      properties: { title: { type: "string", minLength: 1, maxLength: 4096 } },
     },
     response: 204,
     tag: "session",
@@ -364,8 +364,8 @@ export const ROUTES: RouteDef[] = [
       type: "object",
       required: ["text"],
       properties: {
-        text: { type: "string", minLength: 1 },
-        model: { type: "string" },
+        text: { type: "string", minLength: 1, maxLength: 2097152 },
+        model: { type: "string", minLength: 1, maxLength: 512 },
         idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
       },
     },
@@ -395,7 +395,7 @@ export const ROUTES: RouteDef[] = [
     request: {
       type: "object",
       properties: {
-        checkpointId: { type: "string" },
+        checkpointId: { type: "string", minLength: 1, maxLength: 256 },
         mode: { type: "string", enum: ["files", "conversation", "both"] },
       },
     },
@@ -430,7 +430,11 @@ export const ROUTES: RouteDef[] = [
     summary: "复制会话历史为新会话",
     request: {
       type: "object",
-      properties: { title: { type: "string" }, upToMessage: { type: "integer" } },
+      properties: {
+        title: { type: "string", minLength: 1, maxLength: 4096 },
+        upToMessage: { type: "integer", minimum: 0 },
+        model: { type: "string", minLength: 1, maxLength: 512 },
+      },
     },
     response: SESSION_SUMMARY,
     tag: "session",
@@ -443,7 +447,7 @@ export const ROUTES: RouteDef[] = [
       type: "object",
       required: ["permId", "decision"],
       properties: {
-        permId: { type: "string" },
+        permId: { type: "string", minLength: 1, maxLength: 256 },
         decision: { type: "string", enum: ["allow", "allow_remember", "allow_always", "deny"] },
       },
     },
@@ -471,7 +475,11 @@ export const ROUTES: RouteDef[] = [
     method: "post",
     path: "/sessions/{id}/permission-profile",
     summary: "切换权限档位，返回生效模式",
-    request: { type: "object", required: ["name"], properties: { name: { type: "string" } } },
+    request: {
+      type: "object",
+      required: ["name"],
+      properties: { name: { type: "string", minLength: 1, maxLength: 128 } },
+    },
     response: { type: "object", properties: { mode: { type: "string" } } },
     tag: "permission",
   },

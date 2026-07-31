@@ -10,6 +10,7 @@
  */
 
 import * as net from "node:net";
+import { promises as fs } from "node:fs";
 import { t } from "../i18n.js";
 import { SessionManager, type SessionEvent } from "../session-manager.js";
 import {
@@ -22,6 +23,7 @@ import {
   type ClientRequest,
   type ServerFrame,
 } from "./protocol.js";
+import { isWindowsNamedPipePath } from "./socket-path.js";
 
 export interface DaemonServerOptions {
   manager: SessionManager;
@@ -38,9 +40,19 @@ export class DaemonServer {
   }
 
   listen(socketPath: string): Promise<void> {
-    return new Promise((res, rej) => {
-      this.server.once("error", rej);
-      this.server.listen(socketPath, () => res());
+    return new Promise((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      this.server.once("error", onError);
+      this.server.listen(socketPath, async () => {
+        this.server.off("error", onError);
+        try {
+          // Do not depend on umask for local authorization: only the owning account may connect.
+          if (!isWindowsNamedPipePath(socketPath)) await fs.chmod(socketPath, 0o600);
+          resolve();
+        } catch (error) {
+          this.server.close(() => reject(error));
+        }
+      });
     });
   }
 
@@ -266,6 +278,7 @@ export class DaemonServer {
         return this.manager.forkSession(req.sessionId, {
           ...(req.title !== undefined ? { title: req.title } : {}),
           ...(req.upToMessage !== undefined ? { upToMessage: req.upToMessage } : {}),
+          ...(req.model !== undefined ? { model: req.model } : {}),
         });
       case "answerPermission":
         return this.manager.answerPermission(req.sessionId, req.permId, req.decision);

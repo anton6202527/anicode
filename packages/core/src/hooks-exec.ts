@@ -17,6 +17,7 @@
 
 import { spawn } from "node:child_process";
 import type { HookEventName, HookPayload, HookRegistration, HookResult } from "./hooks.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
 export interface CommandHookConfig {
   event: HookEventName;
@@ -41,6 +42,12 @@ const HOOK_EVENTS: readonly HookEventName[] = [
   "Notification",
   "Stop",
 ];
+const MAX_HOOK_OUTPUT_CHARS = 1024 * 1024;
+
+export interface CommandHookOptions {
+  /** Production hosts pass the same fail-closed OS isolation boundary used by shell/MCP. */
+  executionRuntime?: ExecutionRuntime;
+}
 
 export function isHookEventName(v: unknown): v is HookEventName {
   return typeof v === "string" && (HOOK_EVENTS as readonly string[]).includes(v);
@@ -50,13 +57,31 @@ export function isHookEventName(v: unknown): v is HookEventName {
 async function runCommandHook(
   cfg: CommandHookConfig,
   payload: HookPayload,
+  options: CommandHookOptions,
 ): Promise<HookResult | void> {
-  const timeoutMs = cfg.timeoutMs ?? 60_000;
+  const requestedTimeout = cfg.timeoutMs ?? 60_000;
+  const timeoutMs =
+    Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(Math.max(100, requestedTimeout), 300_000)
+      : 60_000;
   return new Promise<HookResult | void>((resolve) => {
     let child;
     try {
-      child = spawn("/bin/sh", ["-c", cfg.command], {
+      const prepared = options.executionRuntime?.prepare?.({
+        command: cfg.command,
         cwd: payload.cwd,
+        policy: "workspace-write",
+        network: false,
+      });
+      // A runtime without prepare() cannot support the hook's stdin protocol. Fail closed by
+      // skipping it instead of silently escaping to an unsandboxed host shell.
+      if (options.executionRuntime && !prepared) {
+        resolve(undefined);
+        return;
+      }
+      child = spawn(prepared?.file ?? "/bin/sh", prepared?.args ?? ["-c", cfg.command], {
+        cwd: prepared?.cwd ?? payload.cwd,
+        ...(prepared ? { env: prepared.env } : {}),
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch {
@@ -82,8 +107,12 @@ async function runCommandHook(
       finish(undefined); // 超时按无操作
     }, timeoutMs);
     timer.unref?.();
-    child.stdout?.on("data", (b: Buffer) => (stdout += b.toString()));
-    child.stderr?.on("data", (b: Buffer) => (stderr += b.toString()));
+    const capture = (current: string, chunk: Buffer): string => {
+      if (current.length >= MAX_HOOK_OUTPUT_CHARS) return current;
+      return current + chunk.toString().slice(0, MAX_HOOK_OUTPUT_CHARS - current.length);
+    };
+    child.stdout?.on("data", (b: Buffer) => (stdout = capture(stdout, b)));
+    child.stderr?.on("data", (b: Buffer) => (stderr = capture(stderr, b)));
     child.stdin?.on("error", () => {
       // Hook may exit before consuming stdin; close/exit still carries the result.
     });
@@ -137,16 +166,22 @@ async function runCommandHook(
 }
 
 /** 把一条配置转成 HookRegistration。 */
-export function commandHook(cfg: CommandHookConfig): HookRegistration {
+export function commandHook(
+  cfg: CommandHookConfig,
+  options: CommandHookOptions = {},
+): HookRegistration {
   return {
     event: cfg.event,
     ...(cfg.matcher !== undefined ? { matcher: cfg.matcher } : {}),
-    handler: (payload) => runCommandHook(cfg, payload),
+    handler: (payload) => runCommandHook(cfg, payload, options),
   };
 }
 
 /** 批量转换；无效条目（未知事件/空命令）静默剔除，不让一处笔误弄垮启动。 */
-export function commandHooksFromConfig(entries: unknown): HookRegistration[] {
+export function commandHooksFromConfig(
+  entries: unknown,
+  options: CommandHookOptions = {},
+): HookRegistration[] {
   if (!Array.isArray(entries)) return [];
   const out: HookRegistration[] = [];
   for (const e of entries) {
@@ -154,14 +189,17 @@ export function commandHooksFromConfig(entries: unknown): HookRegistration[] {
     if (!rec || !isHookEventName(rec.event)) continue;
     if (typeof rec.command !== "string" || !rec.command.trim()) continue;
     out.push(
-      commandHook({
-        event: rec.event,
-        command: rec.command,
-        ...(typeof rec.matcher === "string" ? { matcher: rec.matcher } : {}),
-        ...(typeof rec.timeoutMs === "number" && rec.timeoutMs > 0
-          ? { timeoutMs: rec.timeoutMs }
-          : {}),
-      }),
+      commandHook(
+        {
+          event: rec.event,
+          command: rec.command,
+          ...(typeof rec.matcher === "string" ? { matcher: rec.matcher } : {}),
+          ...(typeof rec.timeoutMs === "number" && rec.timeoutMs > 0
+            ? { timeoutMs: rec.timeoutMs }
+            : {}),
+        },
+        options,
+      ),
     );
   }
   return out;

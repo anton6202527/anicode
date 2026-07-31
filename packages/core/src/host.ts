@@ -63,7 +63,7 @@ export interface SessionHost {
    */
   forkSession?(
     sessionId: string,
-    opts?: { title?: string; upToMessage?: number },
+    opts?: { title?: string; upToMessage?: number; model?: string },
   ): Promise<SessionSummary>;
   /** 手动压缩上下文（/compact）。可选，同 forkSession 的接线边界。 */
   compact?(
@@ -124,7 +124,7 @@ export class LocalSessionHost implements SessionHost {
   }
   forkSession(
     sessionId: string,
-    opts?: { title?: string; upToMessage?: number },
+    opts?: { title?: string; upToMessage?: number; model?: string },
   ): Promise<SessionSummary> {
     return this.manager.forkSession(sessionId, opts);
   }

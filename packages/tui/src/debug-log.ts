@@ -1,12 +1,26 @@
-import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { OpenHandle, PermissionDecisionKind, SessionEvent, SessionHost } from "@anicode/core";
 
 const SECRET_PATTERNS = [
   /\b(sk-[A-Za-z0-9_-]{8,})\b/g,
-  /\b(Bearer\s+)[^\s"']+/gi,
+  /\b((?:authorization|proxy-authorization)\s*:\s*(?:Basic|Bearer|Digest|Token)?\s*)[^\s"',;]+/gi,
   /\b(api[_-]?key["']?\s*[:=]\s*["']?)[^\s,"']+/gi,
+  /\b((?:access[_-]?token|password|client[_-]?secret|cookie)["']?\s*[:=]\s*["']?)[^\s,"']+/gi,
+  /\b(?:AIza[0-9A-Za-z_-]{30,}|gh[pousr]_[0-9A-Za-z]{20,})\b/g,
 ];
+
+const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_FIELD_CHARS = 64 * 1024;
+const MAX_COLLECTION_ITEMS = 200;
+const SECRET_FIELD = /(?:api[_-]?key|authorization|password|secret|credential|cookie|token)$/i;
+
+export interface DebugLoggerOptions {
+  /** Rotate to `<file>.1` before this JSONL file would exceed the limit. */
+  maxBytes?: number;
+  /** Bound individual trace-content strings so one provider event cannot exhaust memory/disk. */
+  maxFieldChars?: number;
+}
 
 function redact(value: string): string {
   let result = value;
@@ -18,21 +32,43 @@ function redact(value: string): string {
   return result;
 }
 
-function safeValue(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (typeof value === "string") return redact(value);
+function safeValue(
+  value: unknown,
+  seen = new WeakSet<object>(),
+  key = "",
+  maxFieldChars = DEFAULT_MAX_FIELD_CHARS,
+): unknown {
+  if (typeof value === "string") {
+    if (SECRET_FIELD.test(key)) return "[REDACTED]";
+    const safe = redact(value);
+    return safe.length <= maxFieldChars
+      ? safe
+      : `${safe.slice(0, maxFieldChars)}…[truncated ${safe.length - maxFieldChars} chars]`;
+  }
   if (Array.isArray(value)) {
     if (seen.has(value)) return "[Circular]";
     seen.add(value);
-    const result = value.map((item) => safeValue(item, seen));
+    const result = value
+      .slice(0, MAX_COLLECTION_ITEMS)
+      .map((item) => safeValue(item, seen, key, maxFieldChars));
+    if (value.length > MAX_COLLECTION_ITEMS) {
+      result.push(`[truncated ${value.length - MAX_COLLECTION_ITEMS} items]`);
+    }
     seen.delete(value);
     return result;
   }
   if (value && typeof value === "object") {
     if (seen.has(value)) return "[Circular]";
     seen.add(value);
+    const entries = Object.entries(value);
     const result = Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, safeValue(item, seen)]),
+      entries
+        .slice(0, MAX_COLLECTION_ITEMS)
+        .map(([itemKey, item]) => [itemKey, safeValue(item, seen, itemKey, maxFieldChars)]),
     );
+    if (entries.length > MAX_COLLECTION_ITEMS) {
+      result["_truncatedFields"] = entries.length - MAX_COLLECTION_ITEMS;
+    }
     seen.delete(value);
     return result;
   }
@@ -42,28 +78,58 @@ function safeValue(value: unknown, seen = new WeakSet<object>()): unknown {
 export class DebugLogger {
   readonly file: string;
   private failed = false;
+  private readonly maxBytes: number;
+  private readonly maxFieldChars: number;
+  private currentBytes = 0;
 
   constructor(
     file: string,
     private readonly traceContent = false,
+    options: DebugLoggerOptions = {},
   ) {
     this.file = path.resolve(file);
+    this.maxBytes = positiveInteger(options.maxBytes ?? DEFAULT_MAX_BYTES, "maxBytes", 512);
+    this.maxFieldChars = positiveInteger(
+      options.maxFieldChars ?? DEFAULT_MAX_FIELD_CHARS,
+      "maxFieldChars",
+      32,
+    );
     mkdirSync(path.dirname(this.file), { recursive: true });
     // 启动阶段就验证路径可写；运行中的磁盘错误则降级停记，不能截断 TUI 事件。
     appendFileSync(this.file, "", { encoding: "utf8", mode: 0o600 });
     // mode 只影响新建文件；既有日志也必须收紧，尤其 trace-content 会含原文。
     chmodSync(this.file, 0o600);
+    this.currentBytes = statSync(this.file).size;
+    this.rotateIfNeeded(0);
   }
 
   log(kind: string, data: Record<string, unknown> = {}): void {
     if (this.failed) return;
     try {
-      const record = safeValue({
-        time: new Date().toISOString(),
-        kind,
-        ...data,
-      });
-      appendFileSync(this.file, `${JSON.stringify(record)}\n`, "utf8");
+      const record = safeValue(
+        {
+          ...data,
+          time: new Date().toISOString(),
+          kind,
+        },
+        new WeakSet<object>(),
+        "",
+        this.maxFieldChars,
+      );
+      let line = `${JSON.stringify(record)}\n`;
+      let bytes = Buffer.byteLength(line);
+      if (bytes > this.maxBytes) {
+        line = `${JSON.stringify({
+          time: new Date().toISOString(),
+          kind,
+          truncated: true,
+          originalBytes: bytes,
+        })}\n`;
+        bytes = Buffer.byteLength(line);
+      }
+      this.rotateIfNeeded(bytes);
+      appendFileSync(this.file, line, "utf8");
+      this.currentBytes += bytes;
     } catch {
       this.failed = true;
     }
@@ -79,6 +145,23 @@ export class DebugLogger {
   textField(name: string, value: string): Record<string, unknown> {
     return this.traceContent ? { [name]: value } : { [`${name}Chars`]: value.length };
   }
+
+  private rotateIfNeeded(incomingBytes: number): void {
+    if (this.currentBytes === 0 || this.currentBytes + incomingBytes <= this.maxBytes) return;
+    const backup = `${this.file}.1`;
+    rmSync(backup, { force: true });
+    renameSync(this.file, backup);
+    appendFileSync(this.file, "", { encoding: "utf8", mode: 0o600 });
+    chmodSync(this.file, 0o600);
+    this.currentBytes = 0;
+  }
+}
+
+function positiveInteger(value: number, name: string, minimum: number): number {
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`Debug log ${name} must be a safe integer >= ${minimum}`);
+  }
+  return value;
 }
 
 function summarizeEvent(event: SessionEvent, traceContent: boolean): Record<string, unknown> {
@@ -263,7 +346,10 @@ export function withDebugLogging(host: SessionHost, logger: DebugLogger): Sessio
       ),
     ...(host.forkSession
       ? {
-          forkSession: (sessionId: string, opts?: { title?: string; upToMessage?: number }) =>
+          forkSession: (
+            sessionId: string,
+            opts?: { title?: string; upToMessage?: number; model?: string },
+          ) =>
             timed(
               logger,
               "forkSession",

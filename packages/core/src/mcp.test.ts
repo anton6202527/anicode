@@ -196,6 +196,31 @@ test("MCP: per-request 超时（hang 工具在时限内报错，不永久挂起�
   client.close();
 });
 
+test("MCP(stdio): unterminated oversized frames fail closed instead of growing forever", async () => {
+  await assert.rejects(
+    () =>
+      McpClient.start({
+        name: "oversized",
+        command: process.execPath,
+        args: ["-e", 'process.stdout.write("x".repeat(4 * 1024 * 1024 + 1))'],
+        timeoutMs: 5_000,
+      }),
+    /MCP 帧超过 4194304 bytes/,
+  );
+});
+
+test("MCP(stdio): missing executables reject initialization without an unhandled error", async () => {
+  await assert.rejects(
+    () =>
+      McpClient.start({
+        name: "missing",
+        command: `anicode-missing-mcp-${process.pid}`,
+        timeoutMs: 1_000,
+      }),
+    /ENOENT|spawn/,
+  );
+});
+
 test("MCP: notifications/tools/list_changed → onToolsChanged 回调", async () => {
   let changed = 0;
   const client = await McpClient.start(serverCfg, { onToolsChanged: () => changed++ });

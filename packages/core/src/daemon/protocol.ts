@@ -20,6 +20,15 @@ const PERMISSION_MODES: readonly string[] = ["default", "acceptEdits", "auto", "
 
 const REWIND_MODES: readonly string[] = ["files", "conversation", "both"];
 
+const MAX_CWD_CHARS = 32_768;
+const MAX_MODEL_CHARS = 512;
+const MAX_TITLE_CHARS = 4_096;
+const MAX_TEXT_CHARS = 2 * 1024 * 1024;
+const MAX_IDEMPOTENCY_KEY_CHARS = 256;
+const MAX_TRACEPARENT_CHARS = 512;
+const MAX_PROFILE_NAME_CHARS = 128;
+const MAX_OPAQUE_ID_CHARS = 256;
+
 // ---------- 客户端 → 守护进程 ----------
 
 export type ClientRequest =
@@ -40,8 +49,15 @@ export type ClientRequest =
     }
   | { id: number; method: "interrupt"; sessionId: string }
   | { id: number; method: "undo"; sessionId: string; checkpointId?: string; mode?: RewindMode }
-  /** fork：复制会话历史成新会话（可截断到前 upToMessage 条）。 */
-  | { id: number; method: "fork"; sessionId: string; title?: string; upToMessage?: number }
+  /** fork：复制会话历史成新会话（可截断，或在保留历史时切换模型）。 */
+  | {
+      id: number;
+      method: "fork";
+      sessionId: string;
+      title?: string;
+      upToMessage?: number;
+      model?: string;
+    }
   /** 手动压缩上下文（/compact）。 */
   | { id: number; method: "compact"; sessionId: string }
   | {
@@ -121,6 +137,18 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function stringBetween(value: unknown, min: number, max: number): value is string {
+  return typeof value === "string" && value.length >= min && value.length <= max;
+}
+
+function optionalStringBetween(value: unknown, min: number, max: number): boolean {
+  return value === undefined || stringBetween(value, min, max);
+}
+
+function sessionId(value: unknown): value is string {
+  return stringBetween(value, 1, 128) && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
+}
+
 /** JSON.parse 只保证语法，不保证协议形状；在进入异步 dispatch 前做边界校验。 */
 export function isClientRequest(value: unknown): value is ClientRequest {
   const frame = objectRecord(value);
@@ -128,6 +156,7 @@ export function isClientRequest(value: unknown): value is ClientRequest {
     !frame ||
     typeof frame.id !== "number" ||
     !Number.isSafeInteger(frame.id) ||
+    frame.id < 0 ||
     typeof frame.method !== "string"
   )
     return false;
@@ -136,48 +165,53 @@ export function isClientRequest(value: unknown): value is ClientRequest {
       return true;
     case "createSession":
       return (
-        typeof frame.cwd === "string" &&
-        typeof frame.model === "string" &&
-        (frame.title === undefined || typeof frame.title === "string")
+        stringBetween(frame.cwd, 1, MAX_CWD_CHARS) &&
+        stringBetween(frame.model, 1, MAX_MODEL_CHARS) &&
+        optionalStringBetween(frame.title, 1, MAX_TITLE_CHARS)
       );
     case "open":
     case "close":
     case "interrupt":
     case "compact":
     case "listPermissionProfiles":
-      return typeof frame.sessionId === "string";
+      return sessionId(frame.sessionId);
     case "setPermissionMode":
       return (
-        typeof frame.sessionId === "string" &&
+        sessionId(frame.sessionId) &&
         typeof frame.mode === "string" &&
         PERMISSION_MODES.includes(frame.mode)
       );
     case "setPermissionProfile":
-      return typeof frame.sessionId === "string" && typeof frame.name === "string";
+      return sessionId(frame.sessionId) && stringBetween(frame.name, 1, MAX_PROFILE_NAME_CHARS);
     case "undo":
       return (
-        typeof frame.sessionId === "string" &&
-        (frame.checkpointId === undefined || typeof frame.checkpointId === "string") &&
+        sessionId(frame.sessionId) &&
+        optionalStringBetween(frame.checkpointId, 1, MAX_OPAQUE_ID_CHARS) &&
         (frame.mode === undefined ||
           (typeof frame.mode === "string" && REWIND_MODES.includes(frame.mode)))
       );
     case "fork":
       return (
-        typeof frame.sessionId === "string" &&
-        (frame.title === undefined || typeof frame.title === "string") &&
+        sessionId(frame.sessionId) &&
+        optionalStringBetween(frame.title, 1, MAX_TITLE_CHARS) &&
+        optionalStringBetween(frame.model, 1, MAX_MODEL_CHARS) &&
         (frame.upToMessage === undefined ||
-          (typeof frame.upToMessage === "number" && Number.isSafeInteger(frame.upToMessage)))
+          (typeof frame.upToMessage === "number" &&
+            Number.isSafeInteger(frame.upToMessage) &&
+            frame.upToMessage >= 0))
       );
     case "send":
       return (
-        typeof frame.sessionId === "string" &&
-        typeof frame.text === "string" &&
-        (frame.traceparent === undefined || typeof frame.traceparent === "string")
+        sessionId(frame.sessionId) &&
+        stringBetween(frame.text, 1, MAX_TEXT_CHARS) &&
+        optionalStringBetween(frame.model, 1, MAX_MODEL_CHARS) &&
+        optionalStringBetween(frame.idempotencyKey, 1, MAX_IDEMPOTENCY_KEY_CHARS) &&
+        optionalStringBetween(frame.traceparent, 1, MAX_TRACEPARENT_CHARS)
       );
     case "answerPermission":
       return (
-        typeof frame.sessionId === "string" &&
-        typeof frame.permId === "string" &&
+        sessionId(frame.sessionId) &&
+        stringBetween(frame.permId, 1, MAX_OPAQUE_ID_CHARS) &&
         (frame.decision === "allow" ||
           frame.decision === "allow_remember" ||
           frame.decision === "allow_always" ||

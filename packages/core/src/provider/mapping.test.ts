@@ -7,9 +7,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  configureProviderNetworkProxy,
   createProvider,
   defaultSmallModel,
   diagnoseProvider,
+  discoverProviderModels,
   listModelCatalog,
   listProviderDetails,
   listProviders,
@@ -17,6 +19,7 @@ import {
   textMessage,
   toolCallsOf,
 } from "../index.js";
+import { NetworkProxy } from "../runtime/network-proxy.js";
 import type { ChatMessage } from "../index.js";
 
 test("registry: 解析 provider/model 前缀", () => {
@@ -78,6 +81,61 @@ test("registry: custom/<model> 使用环境变量配置 OpenAI-compatible 端点
     if (oldBase === undefined) delete process.env["CUSTOM_OPENAI_BASE_URL"];
     else process.env["CUSTOM_OPENAI_BASE_URL"] = oldBase;
   }
+});
+
+test("registry: CLI Proxy Gemini 模型使用独立本地端点与凭证", () => {
+  const oldKey = process.env["CLIPROXY_API_KEY"];
+  const oldBase = process.env["CLIPROXY_BASE_URL"];
+  process.env["CLIPROXY_API_KEY"] = "cliproxy-test-key";
+  process.env["CLIPROXY_BASE_URL"] = "http://127.0.0.1:8317/v1";
+  try {
+    const resolved = createProvider("cliproxy/gemini-3-flash");
+    assert.equal(resolved.providerId, "cliproxy");
+    assert.equal(resolved.model, "gemini-3-flash");
+    assert.equal(resolved.descriptor.local, true);
+    assert.equal(resolved.descriptor.requiresApiKey, true);
+    assert.equal(resolved.diagnostics.baseURL, "http://127.0.0.1:8317/v1");
+    assert.equal(resolved.diagnostics.credentialEnv, "CLIPROXY_API_KEY");
+    assert.equal(resolved.diagnostics.hasCredentials, true);
+    assert.equal(JSON.stringify(resolved.diagnostics).includes("cliproxy-test-key"), false);
+
+    const catalog = listModelCatalog().filter((entry) => entry.providerId === "cliproxy");
+    assert.deepEqual(
+      new Set(catalog.map((entry) => entry.model)),
+      new Set([
+        "gemini-3.6-flash-high",
+        "gemini-3.1-pro-low",
+        "gemini-3.5-flash-low",
+        "gemini-3.5-flash-extra-low",
+        "gemini-3-flash",
+        "gemini-pro-agent",
+        "gemini-3-flash-agent",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-image",
+        "claude-opus-4-6-thinking",
+        "claude-sonnet-4-6",
+        "gpt-oss-120b-medium",
+      ]),
+    );
+  } finally {
+    if (oldKey === undefined) delete process.env["CLIPROXY_API_KEY"];
+    else process.env["CLIPROXY_API_KEY"] = oldKey;
+    if (oldBase === undefined) delete process.env["CLIPROXY_BASE_URL"];
+    else process.env["CLIPROXY_BASE_URL"] = oldBase;
+  }
+});
+
+test("registry: Gemini 目录使用当前模型并移除已下线的 2.0 Flash", () => {
+  const models = listModelCatalog()
+    .filter((entry) => entry.providerId === "gemini")
+    .map((entry) => entry.model);
+  assert.deepEqual(models, [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+  ]);
+  assert.ok(!models.includes("gemini-2.0-flash"));
 });
 
 test("registry: 内置模型目录含 DeepSeek 官方模型 + 零网络 debug/demo，spec 可直接解析", () => {
@@ -197,6 +255,92 @@ test("registry: 可注册 OpenAI-compatible profile 与 alias", () => {
   assert.equal(resolved.modelInfo.limits.maxOutputTokens, 512);
   assert.equal(resolved.diagnostics?.hasCredentials, true);
   assert.deepEqual(resolved.diagnostics?.warnings, []);
+});
+
+test("registry: local 标记被改到公网端点时仍强制经过统一网络策略", async () => {
+  const requests: Array<{ url: string; authorization: string | null }> = [];
+  const proxy = new NetworkProxy({
+    policy: { allowDomains: ["provider.example.test"], allowPorts: [443] },
+    resolver: async () => ["203.0.113.10"],
+    fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      requests.push({ url: String(input), authorization: headers.get("authorization") });
+      return new Response(
+        `data: ${JSON.stringify({
+          choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }],
+        })}\n\ndata: ${JSON.stringify({
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        })}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }) as typeof fetch,
+  });
+  configureProviderNetworkProxy(proxy);
+  registerOpenAICompatibleProvider({
+    id: "remote-marked-local-fixture",
+    baseURL: "https://provider.example.test/v1",
+    apiKey: "fixture-key",
+    local: true,
+    requiresApiKey: true,
+  });
+  try {
+    const resolved = createProvider("remote-marked-local-fixture/model");
+    assert.match(resolved.diagnostics.warnings.join("\n"), /不是回环地址|not loopback/);
+    for await (const _event of resolved.provider.stream({
+      model: resolved.model,
+      messages: [],
+    })) {
+      // consume the complete fixture stream
+    }
+    assert.deepEqual(requests, [
+      {
+        url: "https://provider.example.test/v1/chat/completions",
+        authorization: "Bearer fixture-key",
+      },
+    ]);
+  } finally {
+    configureProviderNetworkProxy(undefined);
+    await proxy.close();
+  }
+});
+
+test("registry: 云端 /models 通过统一网络策略鉴权探测并返回真实目录", async () => {
+  const keyName = "ANICODE_DISCOVER_CLOUD_FIXTURE_KEY";
+  const previousKey = process.env[keyName];
+  process.env[keyName] = "cloud-fixture-key";
+  const requests: Array<{ url: string; authorization: string | null }> = [];
+  const proxy = new NetworkProxy({
+    policy: { allowDomains: ["models.example.test"], allowPorts: [443] },
+    resolver: async () => ["203.0.113.11"],
+    fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      requests.push({ url: String(input), authorization: headers.get("authorization") });
+      return Response.json({ data: [{ id: "live-a" }, { id: "live-b" }] });
+    }) as typeof fetch,
+  });
+  configureProviderNetworkProxy(proxy);
+  registerOpenAICompatibleProvider({
+    id: "discover-cloud-fixture",
+    baseURL: "https://models.example.test/v1",
+    apiKeyEnv: keyName,
+    local: false,
+    requiresApiKey: true,
+  });
+  try {
+    assert.deepEqual(await discoverProviderModels("discover-cloud-fixture"), ["live-a", "live-b"]);
+    assert.deepEqual(requests, [
+      {
+        url: "https://models.example.test/v1/models",
+        authorization: "Bearer cloud-fixture-key",
+      },
+    ]);
+  } finally {
+    if (previousKey === undefined) delete process.env[keyName];
+    else process.env[keyName] = previousKey;
+    configureProviderNetworkProxy(undefined);
+    await proxy.close();
+  }
 });
 
 test("registry: 拒绝空或残缺 model spec", () => {

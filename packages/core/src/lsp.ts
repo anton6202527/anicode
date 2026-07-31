@@ -11,6 +11,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
 export interface LspServerConfig {
   /** 服务器可执行文件，如 "typescript-language-server" */
@@ -20,6 +21,8 @@ export interface LspServerConfig {
   extensions: string[];
   /** didOpen 用的 languageId，缺省按扩展名推断 */
   languageId?: string;
+  /** 单个 JSON-RPC 请求超时；默认 10000ms，防止损坏的 server 挂住 agent。 */
+  timeoutMs?: number;
 }
 
 export interface Diagnostic {
@@ -36,6 +39,8 @@ const SEVERITY: Record<number, Diagnostic["severity"]> = {
   3: "info",
   4: "hint",
 };
+const MAX_LSP_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_LSP_BUFFER_BYTES = MAX_LSP_FRAME_BYTES + 64 * 1024;
 
 /** 一处代码位置（跳转/引用结果）。line/column 均 1 起，path 为绝对路径。 */
 export interface LspLocation {
@@ -188,9 +193,23 @@ export class LspClient {
     this.initialized = this.handshake();
   }
 
-  static start(rootPath: string, cfg: LspServerConfig): LspClient {
-    const proc = spawn(cfg.command, cfg.args ?? [], {
+  static start(
+    rootPath: string,
+    cfg: LspServerConfig,
+    executionRuntime?: ExecutionRuntime,
+  ): LspClient {
+    const prepared = executionRuntime?.prepare?.({
+      command: shellCommand(cfg.command, cfg.args ?? []),
       cwd: rootPath,
+      policy: "read-only",
+      network: false,
+    });
+    if (executionRuntime && !prepared) {
+      throw new Error("Persistent LSP requires an execution runtime with prepare() support");
+    }
+    const proc = spawn(prepared?.file ?? cfg.command, prepared?.args ?? cfg.args ?? [], {
+      cwd: prepared?.cwd ?? rootPath,
+      ...(prepared ? { env: prepared.env } : {}),
       stdio: ["pipe", "pipe", "pipe"],
     });
     return new LspClient(proc, rootPath, cfg);
@@ -224,8 +243,32 @@ export class LspClient {
   private request(method: string, params: unknown): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.send({ jsonrpc: "2.0", id, method, params });
+      const requested = this.cfg.timeoutMs ?? 10_000;
+      const timeoutMs =
+        Number.isFinite(requested) && requested > 0
+          ? Math.min(Math.max(100, requested), 60_000)
+          : 10_000;
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) reject(new Error(`LSP request timed out: ${method}`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      try {
+        this.send({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(error);
+      }
     });
   }
 
@@ -234,6 +277,10 @@ export class LspClient {
   }
 
   private onData(chunk: Buffer): void {
+    if (this.buffer.length + chunk.length > MAX_LSP_BUFFER_BYTES) {
+      this.failProtocol(new Error("LSP receive buffer exceeded the 8 MiB frame limit"));
+      return;
+    }
     this.buffer = Buffer.concat([this.buffer, chunk]);
     for (;;) {
       const sep = this.buffer.indexOf("\r\n\r\n");
@@ -245,6 +292,10 @@ export class LspClient {
         continue;
       }
       const len = Number(m[1]);
+      if (!Number.isSafeInteger(len) || len < 0 || len > MAX_LSP_FRAME_BYTES) {
+        this.failProtocol(new Error("LSP Content-Length exceeds the 8 MiB frame limit"));
+        return;
+      }
       const start = sep + 4;
       if (this.buffer.length < start + len) return; // 等更多数据
       const body = this.buffer.subarray(start, start + len).toString("utf8");
@@ -254,6 +305,17 @@ export class LspClient {
       } catch {
         // 半包/坏包忽略
       }
+    }
+  }
+
+  private failProtocol(error: Error): void {
+    this.buffer = Buffer.alloc(0);
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    try {
+      this.proc.kill();
+    } catch {
+      // already exited
     }
   }
 
@@ -299,6 +361,9 @@ export class LspClient {
     const uri = pathToFileURL(absPath).href;
     const ext = path.extname(absPath).toLowerCase();
     const text = await fs.readFile(absPath, "utf8");
+    if (Buffer.byteLength(text, "utf8") > MAX_LSP_FRAME_BYTES) {
+      throw new Error("LSP document exceeds the 8 MiB frame limit");
+    }
     const languageId = this.cfg.languageId ?? guessLanguageId(ext);
     if (this.opened.has(uri)) {
       this.notify("textDocument/didChange", {
@@ -403,6 +468,7 @@ export class LspPool {
   constructor(
     private readonly rootPath: string,
     private readonly servers: LspServerConfig[],
+    private readonly executionRuntime?: ExecutionRuntime,
   ) {}
 
   clientFor(ext: string): LspClient | undefined {
@@ -413,7 +479,7 @@ export class LspPool {
       this.byExt.set(e, null);
       return undefined;
     }
-    const client = LspClient.start(this.rootPath, cfg);
+    const client = LspClient.start(this.rootPath, cfg, this.executionRuntime);
     this.clients.push(client);
     this.byExt.set(e, client);
     return client;
@@ -433,4 +499,8 @@ export class LspPool {
     this.clients = [];
     this.byExt.clear();
   }
+}
+
+function shellCommand(file: string, args: readonly string[]): string {
+  return [file, ...args].map((part) => `'${part.replace(/'/g, `'"'"'`)}'`).join(" ");
 }

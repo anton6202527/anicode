@@ -117,6 +117,21 @@ test("overlay: 模型选择器搜索词回显", () => {
   assert.match(text, /（无匹配模型）/);
 });
 
+test("overlay: 模型选择器贴住输入框并从底部填充候选", () => {
+  const anchorTop = 24;
+  const s = buildModelPickerOverlay(rows, 0, "", 30, 80, anchorTop);
+  assert.equal(s.width, 80);
+  assert.equal(s.lines.length, 12);
+  assert.equal(s.top + s.lines.length, anchorTop);
+  const modelLines = (s.hitRows ?? [])
+    .map((target, row) => (target === null ? -1 : row))
+    .filter((row) => row >= 0);
+  assert.ok(modelLines.length > 0);
+  assert.ok(Math.min(...modelLines) >= 6, "少量模型候选应靠近面板底部，而不是悬在顶部");
+  assert.equal(Math.max(...modelLines), s.lines.length - 2, "最后一个候选应贴近输入框上沿");
+  assert.doesNotMatch(s.lines.map(strip).join("\n"), /搜索…/, "筛选词应复用下方输入框");
+});
+
 test("overlay: 会话列表与授权弹框定宽且含关键信息", () => {
   const sess = buildSessionsOverlay(
     [{ id: "s_a", running: true, title: "会话A", model: "opus" }],
@@ -165,7 +180,7 @@ test("overlay: 命令菜单钉在锚点上方、定宽、含命令与描述与�
   ];
   const anchorTop = 20;
   const s = buildCommandMenuOverlay(cmds, 1, anchorTop, 30, 80);
-  assert.equal(s.lines.length, 12, "命令菜单应保持固定高度");
+  assert.equal(s.lines.length, 5, "三条命令只应占三行内容和两行上下背景");
   for (const l of s.lines) assert.equal(visW(l), s.width, `行宽不等于 ${s.width}`);
   // 方向朝上：末行落在锚点上一行（top + 高度 === anchorTop）。
   assert.equal(s.top + s.lines.length, anchorTop);
@@ -175,11 +190,23 @@ test("overlay: 命令菜单钉在锚点上方、定宽、含命令与描述与�
   assert.match(text, /打开内置模型选择器/);
   assert.match(text, /\/sessions/);
   assert.doesNotMatch(text, /↑\/↓|Tab 补全|Enter 执行/);
+  const optionLines = (s.hitRows ?? [])
+    .map((target, row) => (target === null ? -1 : row))
+    .filter((row) => row >= 0);
+  assert.deepEqual(optionLines, [1, 2, 3], "候选块应连续排列且不插入多余空行");
   // 高亮项（index=1）整行铺暖橙底 #f6b17a。
   assert.ok(
     s.lines.some((l) => l.includes("48;2;246;177;122")),
     "缺少高亮底色",
   );
+});
+
+test("overlay: 单条命令只占一行内容且整行带不透明背景", () => {
+  const s = buildCommandMenuOverlay([{ name: "model", description: "模型选择器" }], 0, 20, 24, 80);
+  assert.equal(s.lines.length, 3);
+  assert.deepEqual(s.hitRows, [null, 0, null]);
+  assert.equal(visW(s.lines[1]!), 80);
+  assert.match(s.lines[1]!, /48;2;246;177;122/, "选中行背景色必须铺满");
 });
 
 test("overlay: 命令菜单超长列表在固定高度内滚动", () => {

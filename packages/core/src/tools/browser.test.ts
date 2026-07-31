@@ -5,6 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { setLang, clearLangOverride } from "../i18n.js";
 import { createBrowserTool, formatReport } from "./browser.js";
 import { resolveChromePath, closeAllBrowsers, type NavigateResult } from "../browser/cdp.js";
@@ -91,6 +92,20 @@ test("browser 工具元数据：只读（自动放行）、必填 url、ruleKey 
   assert.equal(tool.ruleKey({ url: "http://localhost:3000" }), "http://localhost:3000");
 });
 
+test("browser 工具: 自动放行边界拒绝 file/data/about 等本地或内部协议", async () => {
+  const tool = createBrowserTool();
+  const ctx = { cwd: process.cwd(), signal: new AbortController().signal } as any;
+  for (const url of [
+    "file:///etc/passwd",
+    "data:text/html,secret",
+    "about:blank",
+    "chrome://settings",
+    "view-source:https://example.com",
+  ]) {
+    await assert.rejects(tool.run({ url }, ctx), /HTTP\(S\)|HTTP\(S\) URL/);
+  }
+});
+
 // —— 真·端到端：仅在本机可解析 Chrome 时运行 ——
 const chromeAvailable = (() => {
   try {
@@ -102,15 +117,20 @@ const chromeAvailable = (() => {
 })();
 
 test(
-  "browser 工具端到端：headless 打开 data: 页，抓到 console 错误并回传截图",
+  "browser 工具端到端：headless 打开 HTTP 页，抓到 console 错误并回传截图",
   { skip: chromeAvailable ? false : "no Chrome/Chromium/Edge on this machine" },
   async () => {
     const tool = createBrowserTool();
-    const html =
-      "data:text/html," +
-      encodeURIComponent(
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(
         '<title>IT Page</title><h1 id="hi">hi</h1><script>console.error("kaboom")</script>',
       );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `http://127.0.0.1:${address.port}/`;
     const images: { type: string; mediaType: string; data: string }[] = [];
     const ctx = {
       cwd: process.cwd(),
@@ -120,7 +140,7 @@ test(
     };
     setLang("en");
     try {
-      const out = await tool.run({ url: html, selector: "#hi", timeoutMs: 10_000 }, ctx as any);
+      const out = await tool.run({ url, selector: "#hi", timeoutMs: 10_000 }, ctx as any);
       assert.match(out, /IT Page/, "应抓到页面标题");
       assert.match(out, /kaboom/, "应抓到 console.error");
       assert.match(out, /✓ Selector "#hi" found/, "应等到选择器出现");
@@ -130,6 +150,9 @@ test(
     } finally {
       clearLangOverride();
       await closeAllBrowsers(); // 收尸缓存的浏览器，避免拖住测试进程句柄
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
     }
   },
 );

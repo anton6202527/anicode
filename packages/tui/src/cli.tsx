@@ -11,7 +11,7 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import { realpathSync } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import React from "react";
 import { render } from "ink";
@@ -25,6 +25,7 @@ import {
   MigratingSessionStore,
   LocalSessionHost,
   DaemonClient,
+  defaultDaemonSocketPath,
   HttpSessionHost,
   HttpDaemonServer,
   loadConfig,
@@ -39,6 +40,8 @@ import {
   toLspServers,
   browserToolOptions,
   connectMcpServers,
+  DEVELOPMENT_MCP_CATALOG,
+  findDevelopmentMcp,
   loadCommands,
   defaultTools,
   createDiagnosticsTool,
@@ -60,6 +63,7 @@ import {
   type McpClient,
   type LocalRuntimeStack,
   type Telemetry,
+  type McpServerConfig,
 } from "@anicode/core";
 import { App, type TuiKeybindingAction } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
@@ -127,6 +131,48 @@ export function colorlessTerminalOutput(output: NodeJS.WriteStream): NodeJS.Writ
   });
 }
 
+const ENTER_ALTERNATE_SCREEN = "\x1b[?1049h";
+const RESET_FULLSCREEN_VIEWPORT = "\x1b[r\x1b[2J\x1b[3J\x1b[H";
+
+/**
+ * 每次 Ink 进入/恢复备用屏时重置滚动区域并清掉备用屏自己的历史。
+ * 某些终端会为全屏帧保留可滚动轨迹；这会让固定高度首页仍出现原生滚动条。
+ */
+export function fullscreenViewportOutput(
+  output: NodeJS.WriteStream,
+  enabled: boolean,
+): NodeJS.WriteStream {
+  if (!enabled) return output;
+  const originalWrite = output.write.bind(output) as (...args: unknown[]) => boolean;
+  const write = ((chunk: unknown, ...args: unknown[]) => {
+    const decorated =
+      typeof chunk === "string"
+        ? chunk.replaceAll(
+            ENTER_ALTERNATE_SCREEN,
+            ENTER_ALTERNATE_SCREEN + RESET_FULLSCREEN_VIEWPORT,
+          )
+        : Buffer.isBuffer(chunk)
+          ? Buffer.from(
+              chunk
+                .toString("utf8")
+                .replaceAll(
+                  ENTER_ALTERNATE_SCREEN,
+                  ENTER_ALTERNATE_SCREEN + RESET_FULLSCREEN_VIEWPORT,
+                ),
+              "utf8",
+            )
+          : chunk;
+    return originalWrite(decorated, ...args);
+  }) as NodeJS.WriteStream["write"];
+  return new Proxy(output, {
+    get(target, property) {
+      if (property === "write") return write;
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 /**
  * 在 Ink 首帧之前设置可选终端配色。备用屏由 Ink 7 原生管理；这里的清理函数
  * 负责 raw mode、鼠标/粘贴状态与配色复位，并保留一次紧急备用屏退出兜底。
@@ -139,10 +185,9 @@ export function enterTerminalScreen(
   if (!output.isTTY) return () => {};
   const initialRaw = input.isRaw === true;
   const color = options.color ?? true;
-  // Start from a known selection-friendly baseline. If a previous TUI crashed while
-  // application mouse mode was active, these resets return drag events to the terminal;
-  // App will opt back in after mounting only when --mouse was requested.
-  output.write("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+  // Start from a known baseline. If a previous TUI crashed while application mouse mode
+  // was active, reset it first; App will opt back in after mounting only for --mouse.
+  output.write("\x1b[?1007l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
   if (color) {
     output.write("\x1b]11;#0a0a0a\x07");
     output.write("\x1b]17;#264f78\x07\x1b]19;#dcdcdc\x07");
@@ -159,7 +204,7 @@ export function enterTerminalScreen(
       }
     }
     output.write(
-      "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+      "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
     );
     if (color) {
       output.write("\x1b]111\x07");
@@ -274,7 +319,7 @@ export interface CliArgs {
   traceContent: boolean;
   /** Disable styling while retaining the interactive layout. */
   noColor: boolean;
-  /** Opt into xterm mouse tracking. Off by default so terminal selection/copy stays native. */
+  /** Full xterm mouse tracking; on by default so the fixed transcript viewport receives wheel input. */
   mouse: boolean;
   /** Render in the primary screen buffer. */
   noAltScreen: boolean;
@@ -296,7 +341,7 @@ export function parseArgs(argv: string[]): CliArgs {
   let cwd = process.cwd();
   let resume: string | undefined;
   let daemon = false;
-  let socket = path.join(os.tmpdir(), "anicode.sock");
+  let socket = defaultDaemonSocketPath();
   let sessionsDir = path.join(os.homedir(), ".anicode", "sessions");
   let sessionsExplicit = false;
   let demo = false;
@@ -311,7 +356,7 @@ export function parseArgs(argv: string[]): CliArgs {
   let permissionMode: CliArgs["permissionMode"] = "default";
   let profile: string | undefined;
   let noColor = "NO_COLOR" in process.env;
-  let mouse = false;
+  let mouse = true;
   let noAltScreen = false;
   let plain = false;
   const seen = new Set<string>();
@@ -601,12 +646,12 @@ export function helpText(): string {
       `  --no-color                关闭 ANSI 颜色（同时遵循 NO_COLOR）\n`,
     ) +
     t(
-      `  --mouse                   Enable click/wheel tracking (off by default so text can be selected)\n`,
-      `  --mouse                   开启点击/滚轮跟踪（默认关闭，以便直接框选文本）\n`,
+      `  --mouse                   Enable click/wheel tracking (default; Option-drag selects in iTerm2)\n`,
+      `  --mouse                   开启点击/滚轮跟踪（默认；iTerm2 按 Option 拖选文字）\n`,
     ) +
     t(
-      `  --no-mouse                Keep native terminal selection/copy (default; compatibility flag)\n`,
-      `  --no-mouse                保留终端原生框选/复制（默认；兼容旧脚本）\n`,
+      `  --no-mouse                Disable tracking for plain drag-selection; PageUp/Down scrolls\n`,
+      `  --no-mouse                关闭跟踪以直接拖选文字；PageUp/Down 回看\n`,
     ) +
     t(
       `  --no-alt-screen           Keep the TUI in the primary screen buffer\n`,
@@ -638,6 +683,22 @@ export function helpText(): string {
     t(
       `  auth list                 View logged-in credentials\n\n`,
       `  auth list                 查看已登录凭证\n\n`,
+    ) +
+    t(
+      `  mcp list                  List curated development MCP servers\n`,
+      `  mcp list                  列出内置开发编程 MCP\n`,
+    ) +
+    t(
+      `  mcp add <id> [--global]   Install an MCP for this project (or globally)\n`,
+      `  mcp add <id> [--global]   为当前项目（或全局）安装 MCP\n`,
+    ) +
+    t(
+      `  mcp remove <id>           Remove a catalog MCP from this project\n`,
+      `  mcp remove <id>           从当前项目移除目录 MCP\n`,
+    ) +
+    t(
+      `  mcp serve                 Expose AniCode itself as an MCP server over stdio\n`,
+      `  mcp serve                 通过 stdio 将 AniCode 自身暴露为 MCP server\n`,
     ) +
     t(`Local zero-config debugging: npm run dev:tui:demo`, `本地零配置调试: npm run dev:tui:demo`)
   );
@@ -805,7 +866,13 @@ export function buildManager(
     // 模型降级链：主模型限流/过载时按序切换（anicode.json 的 fallbackModels）。
     ...(config.fallbackModels?.length ? { fallbackModels: config.fallbackModels } : {}),
     // 命令式 hooks（anicode.json 的 hooks 键）：payload JSON 走 stdin，exit 2=block。
-    ...(config.hooks?.length ? { hooks: commandHooksFromConfig(config.hooks) } : {}),
+    ...(config.hooks?.length
+      ? {
+          hooks: commandHooksFromConfig(config.hooks, {
+            executionRuntime: runtimeStack.isolatedRuntime,
+          }),
+        }
+      : {}),
     autoTitle: true, // 首轮后用小模型给无标题会话起名（失败静默）
   });
   return manager;
@@ -941,6 +1008,161 @@ export async function runMcpCommand(
   };
 }
 
+type McpCatalogScope = "project" | "global";
+
+/** `anicode mcp list|add|remove` — manage the curated development MCP catalog. */
+export async function runMcpCatalogCommand(
+  argv: string[],
+  io: {
+    output?: NodeJS.WritableStream;
+    cwd?: string;
+    home?: string;
+  } = {},
+): Promise<void> {
+  const output = io.output ?? process.stdout;
+  const command = argv[0] ?? "list";
+  let cwd = path.resolve(io.cwd ?? process.cwd());
+  const home = path.resolve(io.home ?? os.homedir());
+  let scope: McpCatalogScope = "project";
+  let json = false;
+  const positional: string[] = [];
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--global") {
+      scope = "global";
+    } else if (arg === "--project") {
+      scope = "project";
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg === "--cwd") {
+      cwd = path.resolve(requiredValue(argv, i, arg));
+      i++;
+    } else if (arg.startsWith("-")) {
+      throw new Error(t(`Unknown mcp catalog option: ${arg}`, `未知 MCP 目录参数: ${arg}`));
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  if (command === "list") {
+    if (positional.length > 0) {
+      throw new Error(t("mcp list takes no id", "mcp list 不接受 id"));
+    }
+    const { config } = await loadConfig({ cwd, home });
+    const installed = new Set(Object.keys(config.mcp ?? {}));
+    const rows = DEVELOPMENT_MCP_CATALOG.map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      description: entry.description,
+      installed: installed.has(entry.server.name),
+      transport: "url" in entry.server ? "http" : "stdio",
+      requiresEnv: [...(entry.requiresEnv ?? [])],
+      version: entry.version,
+    }));
+    if (json) {
+      output.write(`${JSON.stringify(rows, null, 2)}\n`);
+      return;
+    }
+    output.write(`${t("Development MCP catalog", "开发编程 MCP 目录")}\n`);
+    for (const row of rows) {
+      const credential =
+        row.requiresEnv.length > 0
+          ? t(` · credential ${row.requiresEnv.join("/")}`, ` · 凭证 ${row.requiresEnv.join("/")}`)
+          : "";
+      output.write(
+        `${row.installed ? "✓" : "○"} ${row.id.padEnd(18)} ${row.name} · ${row.transport} · ${row.version}${credential}\n`,
+      );
+      output.write(`  ${row.description}\n`);
+    }
+    output.write(
+      t(
+        "Use `anicode mcp add <id>` for this project, or append `--global` for all projects.\n",
+        "使用 `anicode mcp add <id>` 安装到当前项目，追加 `--global` 则全局安装。\n",
+      ),
+    );
+    return;
+  }
+
+  if (command !== "add" && command !== "remove") {
+    throw new Error(
+      t(
+        `Unknown mcp command: ${command} (expected list/add/remove/serve)`,
+        `未知 mcp 命令: ${command}（可用 list/add/remove/serve）`,
+      ),
+    );
+  }
+  if (positional.length !== 1) {
+    throw new Error(
+      t(`mcp ${command} requires exactly one id`, `mcp ${command} 需要且仅需要一个 id`),
+    );
+  }
+  const entry = findDevelopmentMcp(positional[0]!);
+  if (!entry) {
+    throw new Error(
+      t(
+        `Unknown development MCP: ${positional[0]} (run anicode mcp list)`,
+        `未知开发 MCP: ${positional[0]}（请运行 anicode mcp list）`,
+      ),
+    );
+  }
+  const file =
+    scope === "global"
+      ? path.join(home, ".config", "anicode", "anicode.json")
+      : path.join(cwd, ".anicode", "settings.local.json");
+  const serverName = entry.server.name;
+  await mutateMcpSettings(file, serverName, command === "add" ? entry.server : undefined);
+  output.write(
+    command === "add"
+      ? t(
+          `Installed ${entry.name} in ${file}. It will connect on the next AniCode start.${entry.requiresEnv?.length ? ` Set ${entry.requiresEnv.join(" or ")} first.` : ""}\n`,
+          `已将 ${entry.name} 安装到 ${file}，下次启动 AniCode 时连接。${entry.requiresEnv?.length ? ` 请先设置 ${entry.requiresEnv.join(" 或 ")}。` : ""}\n`,
+        )
+      : t(`Removed ${entry.name} from ${file}.\n`, `已从 ${file} 移除 ${entry.name}。\n`),
+  );
+}
+
+async function mutateMcpSettings(
+  file: string,
+  serverName: string,
+  server: McpServerConfig | undefined,
+): Promise<void> {
+  let root: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(await fs.readFile(file, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${file}: top level must be an object`);
+    }
+    root = parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const previous = root["mcp"];
+  if (
+    previous !== undefined &&
+    (!previous || typeof previous !== "object" || Array.isArray(previous))
+  ) {
+    throw new Error(`${file}: mcp must be an object`);
+  }
+  const mcp = { ...((previous as Record<string, unknown> | undefined) ?? {}) };
+  if (server) {
+    const { name: _name, ...config } = server;
+    mcp[serverName] = config;
+  } else {
+    delete mcp[serverName];
+  }
+  if (Object.keys(mcp).length > 0) root["mcp"] = mcp;
+  else delete root["mcp"];
+
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(root, null, 2)}\n`, { mode: 0o600 });
+    await fs.rename(temporary, file);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
 export async function runAuthCommand(
   argv: string[],
   io: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {},
@@ -1068,10 +1290,23 @@ export function execHelpText(): string {
   );
 }
 
+const MAX_EXEC_STDIN_BYTES = 4 * 1024 * 1024;
+
 async function readAll(input: NodeJS.ReadableStream): Promise<string> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of input as AsyncIterable<Buffer | string>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > MAX_EXEC_STDIN_BYTES) {
+      throw new Error(
+        t(
+          `exec stdin exceeds ${MAX_EXEC_STDIN_BYTES} bytes`,
+          `exec stdin 超过 ${MAX_EXEC_STDIN_BYTES} bytes`,
+        ),
+      );
+    }
+    chunks.push(bytes);
   }
   return Buffer.concat(chunks).toString("utf8");
 }
@@ -1124,6 +1359,14 @@ export async function runExecCommand(
   }
   const prompt = parsed.prompt ?? (await readAll(input));
   if (!prompt.trim()) throw new Error(t("exec requires a non-empty prompt", "exec 需要非空提示词"));
+  if (Buffer.byteLength(prompt, "utf8") > MAX_EXEC_STDIN_BYTES) {
+    throw new Error(
+      t(
+        `exec prompt exceeds ${MAX_EXEC_STDIN_BYTES} bytes`,
+        `exec 提示词超过 ${MAX_EXEC_STDIN_BYTES} bytes`,
+      ),
+    );
+  }
 
   const emit = (type: string, properties: Record<string, unknown> = {}): void => {
     if (parsed.jsonl) output.write(`${JSON.stringify({ type, ...properties })}\n`);
@@ -1169,7 +1412,10 @@ export async function runExecCommand(
       }
     }
     const lspServers = args.daemon ? [] : toLspServers(config);
-    lspPool = lspServers.length > 0 ? new LspPool(args.cwd, lspServers) : undefined;
+    lspPool =
+      lspServers.length > 0
+        ? new LspPool(args.cwd, lspServers, runtimeStack?.isolatedRuntime)
+        : undefined;
     const deferMcp = mcpTools.length > 8;
     const extraTools: Tool[] = [
       ...(deferMcp ? [] : mcpTools),
@@ -1265,7 +1511,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   if (argv[0] === "mcp") {
     await loadProjectEnv({ cwd: process.cwd() });
-    const server = await runMcpCommand(argv.slice(1));
+    const subcommand = argv[1];
+    if (subcommand === "list" || subcommand === "add" || subcommand === "remove") {
+      await runMcpCatalogCommand(argv.slice(1));
+      return;
+    }
+    const server = await runMcpCommand(subcommand === "serve" ? argv.slice(2) : argv.slice(1));
     // stdio server 常驻直到 stdin 关闭（客户端断开）或收到信号。
     await new Promise<void>((resolve) => {
       process.stdin.once("end", resolve);
@@ -1418,7 +1669,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   // 配置了 LSP 服务器则建池，并暴露 diagnostics 工具（惰性按扩展名启动服务器）。
   const lspServers = args.daemon ? [] : toLspServers(config);
-  const lspPool = lspServers.length > 0 ? new LspPool(args.cwd, lspServers) : undefined;
+  const lspPool =
+    lspServers.length > 0
+      ? new LspPool(args.cwd, lspServers, localRuntimeStack?.isolatedRuntime)
+      : undefined;
   // MCP 工具超过阈值时转 deferred（延迟暴露）：schema 不占每次请求，
   // 模型经 tool_search 按需检索激活——对齐 Codex 的 MCP tool search 默认行为。
   const DEFER_MCP_THRESHOLD = 8;
@@ -1548,7 +1802,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const baseTerminalOutput = args.noColor
       ? colorlessTerminalOutput(process.stdout)
       : process.stdout;
-    const terminalCaret = createTerminalCaretOutput(baseTerminalOutput, {
+    const fullscreenOutput = fullscreenViewportOutput(baseTerminalOutput, alternateScreen);
+    const terminalCaret = createTerminalCaretOutput(fullscreenOutput, {
       enabled: !screenReader && !experimentalOverlay,
     });
     const terminalOutput = terminalCaret.output;

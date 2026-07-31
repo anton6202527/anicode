@@ -34,6 +34,17 @@ interface ClientSubscription {
   resolveClosed: (error: Error | undefined) => void;
 }
 
+export interface DaemonClientOptions {
+  /** Time allowed to establish the local IPC connection. Default: 5 seconds. */
+  connectTimeoutMs?: number;
+  /** Time allowed for one daemon request. Default: 30 minutes. */
+  requestTimeoutMs?: number;
+}
+
+const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60_000;
+const MAX_PENDING_REQUESTS = 256;
+
 export class DaemonClient implements SessionHost {
   private sock: net.Socket;
   private buffer = "";
@@ -45,15 +56,18 @@ export class DaemonClient implements SessionHost {
       reject: (e: Error) => void;
       chunks?: string[];
       chunkBytes?: number;
+      timeout: NodeJS.Timeout;
     }
   >();
   private listeners = new Map<string, ClientSubscription>();
   /** 同一 session 的远端 open/close 必须按序确认，避免旧世代事件混入新 snapshot。 */
   private subscriptionOps = new Map<string, Promise<void>>();
   private terminalError: Error | undefined;
+  private requestTimeoutMs: number;
 
-  private constructor(sock: net.Socket) {
+  private constructor(sock: net.Socket, requestTimeoutMs: number) {
     this.sock = sock;
+    this.requestTimeoutMs = requestTimeoutMs;
     // 使用 socket 内建 StringDecoder，避免中文等 UTF-8 字符跨网络 chunk 时损坏。
     sock.setEncoding("utf8");
     sock.on("data", (chunk) => this.onData(chunk as unknown as string));
@@ -63,10 +77,51 @@ export class DaemonClient implements SessionHost {
     });
   }
 
-  static connect(socketPath: string): Promise<DaemonClient> {
-    return new Promise((res, rej) => {
-      const sock = net.createConnection(socketPath, () => res(new DaemonClient(sock)));
-      sock.once("error", rej);
+  static connect(socketPath: string, options: DaemonClientOptions = {}): Promise<DaemonClient> {
+    const connectTimeoutMs = positiveTimeout(
+      options.connectTimeoutMs,
+      DEFAULT_CONNECT_TIMEOUT_MS,
+      "connectTimeoutMs",
+    );
+    const requestTimeoutMs = positiveTimeout(
+      options.requestTimeoutMs,
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      "requestTimeoutMs",
+    );
+    return new Promise((resolve, reject) => {
+      const sock = net.createConnection(socketPath);
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        sock.off("error", onError);
+        sock.off("connect", onConnect);
+      };
+      const onError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        sock.destroy();
+        reject(error);
+      };
+      const onConnect = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(new DaemonClient(sock, requestTimeoutMs));
+      };
+      const timeout = setTimeout(() => {
+        onError(
+          new Error(
+            t(
+              `daemon connection timed out after ${connectTimeoutMs} ms`,
+              `daemon 连接在 ${connectTimeoutMs} ms 后超时`,
+            ),
+          ),
+        );
+      }, connectTimeoutMs);
+      timeout.unref();
+      sock.once("error", onError);
+      sock.once("connect", onConnect);
     });
   }
 
@@ -93,7 +148,10 @@ export class DaemonClient implements SessionHost {
   }
 
   private failPending(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
     this.pending.clear();
   }
 
@@ -123,6 +181,7 @@ export class DaemonClient implements SessionHost {
       const p = this.pending.get(frame.id);
       if (!p) return;
       this.pending.delete(frame.id);
+      clearTimeout(p.timeout);
       if (frame.ok) p.resolve(frame.data);
       else p.reject(new Error(frame.error));
     } else if (frame.type === "result_chunk") {
@@ -133,6 +192,7 @@ export class DaemonClient implements SessionHost {
       // daemon 是本机受信进程，但仍给损坏/恶意 peer 一个总结果硬上限。
       if (pending.chunkBytes > MAX_RESULT_BYTES) {
         this.pending.delete(frame.id);
+        clearTimeout(pending.timeout);
         pending.reject(
           new Error(
             t(
@@ -152,6 +212,7 @@ export class DaemonClient implements SessionHost {
       pending.chunks.push(frame.chunk);
       if (frame.done) {
         this.pending.delete(frame.id);
+        clearTimeout(pending.timeout);
         try {
           pending.resolve(JSON.parse(pending.chunks.join("")) as unknown);
         } catch {
@@ -178,9 +239,33 @@ export class DaemonClient implements SessionHost {
         this.terminalError ?? new Error(t("daemon connection closed", "daemon 连接已关闭")),
       );
     }
+    if (this.pending.size >= MAX_PENDING_REQUESTS) {
+      return Promise.reject(
+        new Error(
+          t(
+            `daemon client has ${MAX_PENDING_REQUESTS} requests in flight`,
+            `daemon 客户端已有 ${MAX_PENDING_REQUESTS} 个请求在处理中`,
+          ),
+        ),
+      );
+    }
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      const timeout = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        pending.reject(
+          new Error(
+            t(
+              `daemon request timed out after ${this.requestTimeoutMs} ms`,
+              `daemon 请求在 ${this.requestTimeoutMs} ms 后超时`,
+            ),
+          ),
+        );
+      }, this.requestTimeoutMs);
+      timeout.unref();
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timeout });
       this.sock.write(encodeFrame(build(id)));
     });
   }
@@ -348,7 +433,7 @@ export class DaemonClient implements SessionHost {
 
   async forkSession(
     sessionId: string,
-    opts?: { title?: string; upToMessage?: number },
+    opts?: { title?: string; upToMessage?: number; model?: string },
   ): Promise<SessionSummary> {
     const data = await this.request((id) => ({
       id,
@@ -356,6 +441,7 @@ export class DaemonClient implements SessionHost {
       sessionId,
       ...(opts?.title !== undefined ? { title: opts.title } : {}),
       ...(opts?.upToMessage !== undefined ? { upToMessage: opts.upToMessage } : {}),
+      ...(opts?.model !== undefined ? { model: opts.model } : {}),
     }));
     return data as SessionSummary;
   }
@@ -392,4 +478,12 @@ export class DaemonClient implements SessionHost {
     // socket 挂住进程退出。dispose 是终态，直接销毁双向连接。
     this.sock.destroy();
   }
+}
+
+function positiveTimeout(value: number | undefined, fallback: number, name: string): number {
+  const timeout = value ?? fallback;
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+    throw new TypeError(`${name} must be a positive integer`);
+  }
+  return timeout;
 }

@@ -3,6 +3,9 @@
 [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) ·
 [Production operations](docs/operations/production-readiness.md) · [MIT license](LICENSE)
 
+最新的 Core/TUI 生产审查、已落地控制与外部验收边界见
+[2026-07-31 production-readiness audit](docs/architecture/2026-07-31-core-tui-production-audit.md)。
+
 一个 TypeScript 编写、前端无关的通用型 AI Agent：调研、分析、写作、规划、数据与工具协作都是一等能力，软件工程是重点强化的核心长项。当前仓库包含：
 
 ```text
@@ -97,7 +100,7 @@ TUI 内可用命令：
 
 运行中按 Enter 可追加 steering 指令，按 Esc 中断。Shift/Ctrl+Enter 插入换行；bracketed paste
 保留多行且绝不自动提交。授权卡片固定在输入框上方，支持方向键/Enter、`y/a/p/n`，高风险默认选中拒绝，
-永久授权需二次确认。默认不接管终端鼠标，搜索结果与回答可直接拖拽框选/复制；若需点击和滚轮导航，用 `--mouse` 启动或在 TUI 中执行 `/mouse on`，用 `/mouse off` 随时恢复原生框选。快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
+永久授权只需一次确认。默认关闭终端鼠标协议，可直接拖拽选择和复制文字；使用 `PageUp`/`PageDown` 回看固定输入框上方的结果。只有需要鼠标点击弹框或滚轮回看时才用 `--mouse` 或 `/mouse on` 开启完整跟踪；`/mouse off` 随时恢复原生框选。输入框聚焦时，`↑`/`↓` 浏览已提交的 prompt 历史。快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
 
 安装 workspace 后也可以直接检查 CLI：
 
@@ -105,6 +108,26 @@ TUI 内可用命令：
 npm exec -- anicode --version
 npm exec -- anicode --list-providers
 ```
+
+### 开发编程 MCP
+
+AniCode 内置一组经过筛选的开发 MCP 目录，默认全部关闭，按项目安装到被 gitignore 的
+`.anicode/settings.local.json`；也可以用 `--global` 写入 `~/.config/anicode/anicode.json`：
+
+```bash
+anicode mcp list
+anicode mcp add context7
+anicode mcp add github --global       # 需 GITHUB_TOKEN
+anicode mcp add playwright
+anicode mcp add chrome-devtools
+anicode mcp add sentry                # 需 SENTRY_ACCESS_TOKEN
+anicode mcp add firebase
+anicode mcp remove context7
+```
+
+本地 npm MCP 使用目录中审核过的精确版本；GitHub、Context7、Sentry 使用各厂商官方 Streamable HTTP
+端点。敏感凭证只保存为 Credential Broker 引用，不写入 JSON。安装后重启 AniCode，通过 `/mcp` 查看连接、
+工具、资源与 prompts。`anicode mcp serve`（兼容旧的无参数 `anicode mcp`）则把 AniCode 自身暴露为 MCP server。
 
 ## 桌面应用（Electron）
 
@@ -131,7 +154,7 @@ npm run build:app    # 打包 main/preload/renderer 到 packages/app/out
 - **会话管理**：侧边栏悬停即可删除会话（删除当前会话会自动切到最近一个或新建）。
 
 **插件市场 → 真实工具链**：插件统一抽象为可挂到 agent 的能力来源——内建工具（文件 / Bash / 任务清单）、
-MCP 服务（Web 搜索 / GitHub / Playwright）、技能。开关会真正改变 agent 拿到的工具集：停用内建工具组会
+MCP 服务（Context7 / GitHub / Playwright / Chrome DevTools / Sentry / Firebase）、技能。开关会真正改变 agent 拿到的工具集：停用内建工具组会
 从工具集移除对应工具；启用 MCP 且 Broker 凭证就绪时连接 server 并注入其工具（`<name>__<tool>`），stdio 插件进程由隔离运行时启动，联网插件强制复用策略代理，市场卡片显示连接
 状态。改动对新建会话生效，状态持久化到 `userData/plugins.json`。
 
@@ -166,6 +189,7 @@ Tree-sitter 与 OS Keychain 含原生 N-API 模块，本地 `.vsix` 对应当前
 ## Provider 与模型
 
 anicode 现在使用数据驱动 registry，模型字符串格式为 `provider/model`。首个 `/` 后面的内容会完整保留，因此 OpenRouter 这类带组织前缀的模型 id 可以直接使用。
+打开 `/model` 时，已配置的本地 OpenAI-compatible provider 会实时读取鉴权后的 `/models`：服务端已删除的模型会从选择器隐藏，新模型会自动补入；无法探测时才回退到内置目录。已就绪 provider 优先展示，缺凭证的备用 provider 排在后面。
 
 内置 canonical provider：
 
@@ -176,6 +200,7 @@ anicode 现在使用数据驱动 registry，模型字符串格式为 `provider/m
 | `openrouter` | OpenAI-compatible             | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`             |
 | `deepseek`   | OpenAI-compatible             | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`                 |
 | `gemini`     | Gemini OpenAI compatibility   | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
+| `cliproxy`   | 本地 CLI Proxy API            | `CLIPROXY_API_KEY`, `CLIPROXY_BASE_URL`                 |
 | `xai`        | OpenAI-compatible             | `XAI_API_KEY`, `XAI_BASE_URL`                           |
 | `groq`       | OpenAI-compatible             | `GROQ_API_KEY`, `GROQ_BASE_URL`                         |
 | `mistral`    | OpenAI-compatible             | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL`                   |
@@ -288,7 +313,7 @@ registerOpenAICompatibleProvider({
 - 两级 compaction：先清理旧工具输出，再在安全边界生成摘要，保持 tool call/result 配对。
 - SQLite WAL 会话持久化、resume、最近活跃排序、悬空工具调用自愈；旧 JSONL 首次访问时幂等迁移，数据库较新时不回灌。
 - `SessionHost` 抽象与 daemon pub/sub：本地 TUI 和远程客户端使用同一接口，多客户端可观察、接管和裁决权限。
-- MCP：stdio（规范的换行分隔 JSON-RPC）+ Streamable HTTP 客户端；HTTP 强制受控出口，敏感 header/env 只能由 Credential Broker 短租约注入；stdio 可由同一 OS 隔离运行时启动。`anicode mcp` 也可把自身暴露为 MCP server。
+- MCP：stdio（规范的换行分隔 JSON-RPC）+ Streamable HTTP 客户端；HTTP 强制受控出口，敏感 header/env 只能由 Credential Broker 短租约注入；stdio 可由同一 OS 隔离运行时启动。`anicode mcp serve` 可把自身暴露为 MCP server。
 - Notification hook（turn_done / permission_request）+ TUI 授权响铃：配合 anicode.json 命令 hook 可外接桌面通知（对齐 Codex notify）。
 - 插件目录：`~/.anicode/plugins/<name>/` 与项目 `.anicode/plugins/<name>/` 下的 agents/skills/commands 子目录自动并入发现器（Claude Code plugins 的精简形态）。
 - TUI：`/diff`（工作区改动）、`/review`（uncommitted/branch/commit/自定义 四模式审查）、`/tasks`（后台任务一览）、`/status` 显示上下文占用（tokens/窗口/百分比）。

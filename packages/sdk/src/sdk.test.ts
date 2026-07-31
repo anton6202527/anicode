@@ -161,8 +161,9 @@ test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
       (error: unknown) => error instanceof AnicodeApiError && error.status === 400,
     );
 
-    const fork = await client.session.fork(meta.id, { title: "分叉" });
+    const fork = await client.session.fork(meta.id, { title: "分叉", model: "debug/alternate" });
     assert.notEqual(fork.id, meta.id);
+    assert.equal(fork.model, "debug/alternate");
 
     await client.session.delete(meta.id);
     assert.ok(!(await client.session.list()).some((s) => s.id === meta.id));

@@ -118,3 +118,23 @@ test("serveMcp: 握手/工具列表/跑任务/续会话（换行分隔 JSON-RPC�
   manager.dispose();
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("serveMcp: oversized unterminated input is rejected and reading stops", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-srv-limit-"));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: makeProvider(), model: "p" }),
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let response = "";
+  output.on("data", (chunk: Buffer) => (response += chunk.toString("utf8")));
+  const server = serveMcp({ manager, model: "p", cwd: dir, input, output });
+  input.write(Buffer.alloc(4 * 1024 * 1024 + 1, 0x78));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(response, /request frame exceeds 4194304 bytes/);
+  assert.equal(input.isPaused(), true);
+  server.close();
+  manager.dispose();
+  await fs.rm(dir, { recursive: true, force: true });
+});

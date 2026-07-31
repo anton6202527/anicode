@@ -1,16 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { registerOpenAICompatibleProvider, type SessionHost } from "@anicode/core";
 import {
   colorlessTerminalOutput,
   enterTerminalScreen,
+  fullscreenViewportOutput,
   helpText,
   installTerminalExitGuard,
   parseArgs,
   parseExecArgs,
   resolveConfiguredProvider,
   resolveDefaultModel,
+  runMcpCatalogCommand,
   runExecCommand,
   selectSessionId,
   startRawModeWatchdog,
@@ -36,6 +42,7 @@ test("CLI: Ink 管理备用屏，清理器只做一次紧急恢复", () => {
     },
     { alternateScreen: true },
   );
+  assert.match(chunks[0] ?? "", /\?1007l/);
   assert.match(chunks[0] ?? "", /\?1006l/);
   assert.match(chunks[0] ?? "", /\?1000l/);
   assert.doesNotMatch(chunks.join(""), /\?1049h/);
@@ -44,6 +51,7 @@ test("CLI: Ink 管理备用屏，清理器只做一次紧急恢复", () => {
   restore();
   restore();
   assert.equal(chunks.filter((chunk) => chunk.includes("\u001b[?1049l")).length, 1);
+  assert.ok(chunks.join("").includes("\u001b[?1007l"));
   assert.ok(chunks.join("").includes("\u001b[?1006l"));
   assert.ok(chunks.join("").includes("\u001b[?1000l"));
   assert.ok(chunks.join("").includes("\u001b[?2004l"));
@@ -70,12 +78,72 @@ test("CLI: --plain 关闭颜色、鼠标与备用屏，颜色适配器保留光�
   assert.equal(chunks.join(""), "red\u001b[2J");
 });
 
-test("CLI: 默认保留终端原生框选，--mouse 才显式开启跟踪", () => {
-  assert.equal(parseArgs([]).mouse, false);
+test("CLI: 备用屏每次进入时重置固定视口并清除滚动历史", () => {
+  const chunks: string[] = [];
+  const raw = {
+    isTTY: true,
+    write(chunk: string | Buffer) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
+      return true;
+    },
+  } as unknown as NodeJS.WriteStream;
+  const output = fullscreenViewportOutput(raw, true);
+  output.write("before\x1b[?1049hafter");
+  assert.equal(chunks.join(""), "before\x1b[?1049h\x1b[r\x1b[2J\x1b[3J\x1b[Hafter");
+
+  const passthrough = fullscreenViewportOutput(raw, false);
+  assert.equal(passthrough, raw);
+});
+
+test("CLI: 默认开启滚轮跟踪，--no-mouse 可恢复无修饰键原生框选", () => {
+  assert.equal(parseArgs([]).mouse, true);
   assert.equal(parseArgs(["--no-mouse"]).mouse, false);
   assert.equal(parseArgs(["--mouse"]).mouse, true);
+  assert.equal(parseArgs(["--plain"]).mouse, false);
   assert.throws(() => parseArgs(["--mouse", "--no-mouse"]), /不能与|cannot be used with/);
   assert.throws(() => parseArgs(["--plain", "--mouse"]), /不能与|cannot be used with/);
+});
+
+test("CLI: MCP 开发目录可列出，并按项目或全局原子安装/移除", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-catalog-"));
+  const cwd = path.join(root, "project");
+  const home = path.join(root, "home");
+  await fs.mkdir(cwd, { recursive: true });
+  const chunks: string[] = [];
+  const output = {
+    write: (chunk: string) => void chunks.push(chunk),
+  } as unknown as NodeJS.WritableStream;
+  try {
+    await runMcpCatalogCommand(["list"], { cwd, home, output });
+    assert.match(chunks.join(""), /context7/);
+    assert.match(chunks.join(""), /chrome-devtools/);
+
+    await runMcpCatalogCommand(["add", "context7"], { cwd, home, output });
+    const projectFile = path.join(cwd, ".anicode", "settings.local.json");
+    const project = JSON.parse(await fs.readFile(projectFile, "utf8")) as {
+      mcp: Record<string, { url?: string }>;
+    };
+    assert.equal(project.mcp.context7?.url, "https://mcp.context7.com/mcp");
+
+    await runMcpCatalogCommand(["add", "github", "--global"], { cwd, home, output });
+    const globalFile = path.join(home, ".config", "anicode", "anicode.json");
+    const globalRaw = await fs.readFile(globalFile, "utf8");
+    const global = JSON.parse(globalRaw) as {
+      mcp: Record<string, { credential?: { id?: string } }>;
+    };
+    assert.equal(global.mcp.github?.credential?.id, "env:GITHUB_TOKEN");
+    assert.doesNotMatch(globalRaw, /ghp_|github_pat_/);
+
+    await runMcpCatalogCommand(["remove", "context7"], { cwd, home, output });
+    const removed = JSON.parse(await fs.readFile(projectFile, "utf8")) as Record<string, unknown>;
+    assert.equal(removed["mcp"], undefined);
+    await assert.rejects(
+      () => runMcpCatalogCommand(["add", "unknown"], { cwd, home, output }),
+      /未知开发 MCP|Unknown development MCP/,
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("CLI: 收到 SIGTERM 时先幂等恢复终端再重发原信号", () => {
@@ -329,6 +397,15 @@ test("CLI exec: 参数严格解析，默认 JSONL", () => {
   assert.equal(parsed.jsonl, true);
   assert.equal(parsed.timeoutMs, 5000);
   assert.throws(() => parseExecArgs(["--demo", "--timeout", "nope", "--prompt", "x"]), /正毫秒数/);
+});
+
+test("CLI exec: piped stdin has a hard memory boundary", async () => {
+  const input = Readable.from([Buffer.alloc(4 * 1024 * 1024 + 1, 0x78)]);
+  Object.defineProperty(input, "isTTY", { value: false });
+  await assert.rejects(
+    runExecCommand(["--demo"], { input: input as unknown as NodeJS.ReadableStream }),
+    /exec stdin 超过 4194304 bytes/,
+  );
 });
 
 test("CLI exec: demo 模型无 TTY 完成一次 JSONL 会话", async () => {

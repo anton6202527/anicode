@@ -48,6 +48,9 @@ async function startDaemon(dir: string, provider: Provider) {
   });
   const server = new DaemonServer({ manager });
   await server.listen(sockPath);
+  if (process.platform !== "win32") {
+    assert.equal((await fs.stat(sockPath)).mode & 0o777, 0o600);
+  }
   return { server, sockPath };
 }
 
@@ -231,6 +234,31 @@ test("daemon client: dispose 立即拒绝 pending 并销毁半开 socket", async
   accepted.destroy();
   await new Promise<void>((resolve) => fake.close(() => resolve()));
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("daemon client: request timeout bounds a connected peer that never responds", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-timeout-"));
+  const sockPath = path.join(dir, "stalled.sock");
+  const sockets = new Set<net.Socket>();
+  const fake = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", () => {});
+  });
+  await new Promise<void>((resolve, reject) => {
+    fake.once("error", reject);
+    fake.listen(sockPath, resolve);
+  });
+  const client = await DaemonClient.connect(sockPath, { requestTimeoutMs: 25 });
+  try {
+    await assert.rejects(client.listSessions(), /请求在 25 ms 后超时/);
+    assert.equal((client as unknown as { pending: Map<number, unknown> }).pending.size, 0);
+  } finally {
+    client.dispose();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => fake.close(() => resolve()));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("daemon: 同一客户端并发 open 同一冷会话不会重复订阅事件", async () => {
@@ -523,6 +551,12 @@ test("daemon: fork 复制会话历史成新会话（经 socket 往返）", async
     const early = await client.forkSession!(s.id, { upToMessage: 1 });
     const openedEarly = await client.open(early.id, () => {});
     assert.equal(openedEarly.snapshot.messages.length, 1);
+
+    const switched = await client.forkSession!(s.id, { model: "alt/fast" });
+    const openedSwitched = await client.open(switched.id, () => {});
+    assert.equal(switched.model, "alt/fast");
+    assert.equal(openedSwitched.snapshot.meta.model, "alt/fast");
+    assert.equal(openedSwitched.snapshot.messages.length, 2);
   } finally {
     client.dispose();
     await server.close();

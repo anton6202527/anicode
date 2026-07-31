@@ -29,8 +29,8 @@ import {
   type Key,
 } from "ink";
 import {
+  discoverProviderModels,
   diagnoseProvider,
-  probeLocalProviders,
   discoverSkills,
   expandCommand,
   t,
@@ -260,7 +260,9 @@ function reducer(s: State, a: Action): State {
       return { ...s, subagentActivity };
     }
     case "running":
-      return { ...s, running: a.v };
+      // 任务清单是当前 turn 的瞬时进度，不属于已完成结果；空闲后立即丢弃，
+      // 避免下一条 prompt 开始时短暂闪回上一轮清单。
+      return a.v ? { ...s, running: true } : { ...s, running: false, todos: [] };
     case "usage":
       return { ...s, usage: a.u, ...(a.costUSD !== undefined ? { costUSD: a.costUSD } : {}) };
     case "title":
@@ -317,6 +319,27 @@ export function terminalDisplayText(text: string, max = MAX_RENDERED_ITEM_CHARS)
   if (safe.length <= max) return safe;
   const start = nextGraphemeIndex(safe, safe.length - max);
   return `… ${t("older display content omitted", "较早的显示内容已省略")} …\n${safe.slice(start)}`;
+}
+
+/** Extract user-authored prompts from a persisted conversation for composer history. */
+export function promptHistoryFromMessages(messages: readonly ChatMessage[], max = 200): string[] {
+  if (max <= 0) return [];
+  const history: string[] = [];
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    const text = message.content
+      .filter(
+        (part): part is Extract<(typeof message.content)[number], { type: "text" }> =>
+          part.type === "text" && !part.internal,
+      )
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+    if (!text || history[history.length - 1] === text) continue;
+    history.push(text);
+    if (history.length > max) history.shift();
+  }
+  return history;
 }
 
 export function lineStart(text: string, cursor: number): number {
@@ -397,8 +420,8 @@ function builtinCommands(): CommandMenuRow[] {
     {
       name: "mouse",
       description: t(
-        "Toggle mouse tracking; off keeps native text selection",
-        "切换鼠标跟踪；关闭时可原生框选文本",
+        "Toggle full mouse tracking; off keeps native text selection",
+        "切换完整鼠标跟踪；关闭时保留终端原生框选",
       ),
     },
     {
@@ -682,6 +705,13 @@ function useTerminalSize(): { rows: number; cols: number } {
   };
 }
 
+const TERMINAL_MOUSE_MODES_OFF = "\x1b[?1007l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+/** 完整跟踪用于点击和滚轮；关闭模式保留无修饰键的终端原生框选。 */
+export function terminalMouseModeSequence(fullTracking: boolean): string {
+  return fullTracking ? "\x1b[?1007l\x1b[?1000h\x1b[?1006h" : TERMINAL_MOUSE_MODES_OFF;
+}
+
 type PendingPerm = PendingPermission;
 
 interface SessionPickerState {
@@ -699,6 +729,8 @@ export interface AppProps {
   providers?: readonly ProviderDescriptor[];
   /** 内置可选模型目录（含免费/开源模型），供 /model 选择器使用。 */
   catalog?: readonly ModelCatalogEntry[];
+  /** 测试/远端宿主可注入服务端模型探测；缺省使用当前进程的 provider registry。 */
+  discoverModels?: (providerId: string) => Promise<readonly string[] | undefined>;
   /** 仅本地 host 可安全读取当前进程 env；daemon 的凭证属于服务端进程。 */
   inspectProviderCredentials?: boolean;
   /** 自定义斜杠命令（.anicode/command/*.md）。 */
@@ -707,7 +739,7 @@ export interface AppProps {
   mcpStatus?: () => Promise<string>;
   /** CLI 版本号，显示在底部状态栏。 */
   version?: string;
-  /** 是否启用 xterm 鼠标跟踪；默认关闭，保留终端原生框选/复制。 */
+  /** 是否启用完整 xterm 鼠标跟踪；默认关闭，保留终端原生框选。 */
   mouse?: boolean;
   /** 旧 stdout 帧合成器仅保留为显式实验开关，生产默认走 Ink 原生渲染。 */
   experimentalOverlay?: boolean;
@@ -766,6 +798,7 @@ export function App({
   sessionId: initialId,
   providers = [],
   catalog = [],
+  discoverModels = discoverProviderModels,
   inspectProviderCredentials = false,
   commands = [],
   mcpStatus,
@@ -826,6 +859,13 @@ export function App({
   // 已提交行的历史，供 ↑/↓ 回溯（最新在末尾）。histRef 为当前浏览位置（null=不在浏览）。
   const historyRef = useRef<string[]>([]);
   const histPosRef = useRef<number | null>(null);
+  const recordPromptHistory = useCallback((raw: string): void => {
+    const text = raw.trim();
+    if (!text) return;
+    const history = historyRef.current;
+    if (history[history.length - 1] !== text) history.push(text);
+    if (history.length > 200) history.shift();
+  }, []);
   // 同一 tick 内的分块输入必须基于最新值，而不是 React 上一帧的闭包。
   const inputRef = useRef("");
   // 权限请求队列：并行只读工具可能同时产生多个 ask（如 askRules 命中），逐个裁决
@@ -836,7 +876,6 @@ export function App({
   const pendingsRef = useRef<PendingPerm[]>(pendings);
   pendingsRef.current = pendings;
   const [permissionIndex, setPermissionIndex] = useState(0);
-  const [confirmAlwaysFor, setConfirmAlwaysFor] = useState<string | null>(null);
   const permissionIndexRef = useRef(0);
   const setPermissionSelection = useCallback((index: number) => {
     const value = ((index % 4) + 4) % 4;
@@ -848,7 +887,6 @@ export function App({
   const activePermissionRisk = pendings[0]?.risk;
   useLayoutEffect(() => {
     setPermissionSelection(activePermissionRisk === "high" ? 3 : 0);
-    setConfirmAlwaysFor(null);
   }, [activePermissionId, activePermissionRisk, setPermissionSelection]);
   useEffect(() => {
     if (activePermissionId && terminalControl && stdout.isTTY) stdout.write("\x07");
@@ -921,15 +959,19 @@ export function App({
     },
     [],
   );
-  // 鼠标跟踪是显式 opt-in：默认让终端处理拖拽框选/复制，避免搜索结果和长回答
-  // 被 application mouse mode 拦截。开启后才接管点击/滚轮，键盘导航在两种模式下都可用。
+  // 交互式 CLI 默认启用完整鼠标协议，使备用屏中的滚轮能进入固定 transcript 视口。
+  // iTerm2 可按住 Option 临时绕过 mouse reporting 选字；/mouse off 则恢复普通拖选。
   useEffect(() => {
-    if (!terminalControl || !stdout.isTTY || !mouseTracking) return;
-    stdout.write("\x1b[?1000h\x1b[?1006h");
+    if (!terminalControl || !stdout.isTTY) return;
+    stdout.write(terminalMouseModeSequence(mouseTracking));
     return () => {
-      stdout.write("\x1b[?1006l\x1b[?1000l");
+      stdout.write(TERMINAL_MOUSE_MODES_OFF);
     };
   }, [mouseTracking, stdout, terminalControl]);
+  const conversationEmpty =
+    !state.items.some((i) => i.kind === "user" || i.kind === "assistant" || i.kind === "tool") &&
+    !state.liveText &&
+    state.activeTools.size === 0;
   // 回看滚动偏移：0=贴底看最新，>0=结果视口向上回看的终端行数。
   const [scrollOffset, setScrollOffset] = useState(0);
   const transcriptViewportRef = useRef<DOMElement | null>(null);
@@ -945,6 +987,9 @@ export function App({
     },
     [maxTranscriptScroll],
   );
+  const resetTranscriptScroll = useCallback((): void => {
+    setScrollOffset(0);
+  }, []);
   const closeRef = useRef<(() => void) | null>(null);
   const flushRef = useRef<(() => void) | null>(null);
   // 流式生成指示：running 期间以 ~120ms 步进推进 spinner 帧并刷新计时。
@@ -1014,14 +1059,21 @@ export function App({
           },
         });
       }
-      // 模型是会话持久化元数据；始终新建会话，不在原会话上热改。
-      // provider/model 的最终校验由 host（本地或 daemon）作为唯一事实源。
-      const meta = await host.createSession({ cwd: state.meta.cwd, model: spec });
+      // 已有结果时通过 fork 复制完整历史并切换模型。这样 provider/model 仍由 host
+      // 持久化校验，又不会把用户从当前结果页送回一个空白欢迎页。空会话和不支持
+      // fork 的第三方 host 保留兼容路径，仍创建一个正常的新会话。
+      const meta =
+        !conversationEmpty && host.forkSession
+          ? await host.forkSession(sessionId, {
+              model: spec,
+              ...(state.meta.title ? { title: state.meta.title } : {}),
+            })
+          : await host.createSession({ cwd: state.meta.cwd, model: spec });
       setSessions(null);
       setPicker(null);
       setSessionId(meta.id);
     },
-    [host, state.meta.cwd],
+    [conversationEmpty, host, sessionId, state.meta.cwd, state.meta.title],
   );
 
   const openSessionPicker = useCallback(async (): Promise<void> => {
@@ -1115,6 +1167,8 @@ export function App({
           const snap = handle.snapshot;
           const restored = restoreTranscript(snap.messages);
           const initialItems: Row[] = [sessionBoundary(snap.meta), ...restored.items];
+          historyRef.current = promptHistoryFromMessages(snap.messages);
+          histPosRef.current = null;
           dispatch({
             t: "reset",
             items: initialItems,
@@ -1122,7 +1176,8 @@ export function App({
             usage: snap.usage,
             ...(snap.costUSD !== undefined ? { costUSD: snap.costUSD } : {}),
             running: snap.running,
-            todos: todosFromMessages(snap.messages),
+            // 只为仍在运行的恢复会话还原清单；空闲会话中的 todo 属于旧结果。
+            todos: snap.running ? todosFromMessages(snap.messages) : [],
             meta: {
               id: snap.meta.id,
               cwd: snap.meta.cwd,
@@ -1131,7 +1186,7 @@ export function App({
             },
           });
           setPendings(snap.pendingPermissions);
-          setScrollOffset(0);
+          resetTranscriptScroll();
           ready = true;
           for (const ev of buffered) handleEvent(ev, dispatch, setPendings);
           if (attempt > 0) {
@@ -1159,7 +1214,7 @@ export function App({
       activeClose?.();
       closeRef.current = null;
     };
-  }, [host, reconnectGeneration, sessionId]);
+  }, [host, reconnectGeneration, resetTranscriptScroll, sessionId]);
 
   const toggleToolDetail = useCallback(
     (requestedId?: string): boolean => {
@@ -1336,12 +1391,12 @@ export function App({
             kind: "info",
             text: enabled
               ? t(
-                  "Mouse tracking enabled; use /mouse off for native text selection",
-                  "已开启鼠标跟踪；用 /mouse off 恢复终端原生框选",
+                  "Mouse wheel tracking enabled; Option-drag selects in iTerm2, or use /mouse off",
+                  "已开启鼠标滚轮跟踪；iTerm2 按住 Option 可拖选，或用 /mouse off",
                 )
               : t(
-                  "Mouse tracking disabled; drag to select and copy text normally",
-                  "已关闭鼠标跟踪；现在可直接拖拽框选并复制文本",
+                  "Native text selection enabled; use PageUp/PageDown to scroll results",
+                  "已恢复终端原生框选；使用 PageUp/PageDown 回看结果",
                 ),
           },
         });
@@ -1362,18 +1417,18 @@ export function App({
       if (cmd === "model") {
         const spec = rest[0];
         if (!spec) {
-          // 不带参数：打开内置模型选择器（含免费/开源模型）。本地 provider 先探测存活，
-          // 免得把没启动的 Ollama/LM Studio 标成就绪、选中后 Connection error。
-          const liveLocal = inspectProviderCredentials ? await probeLive(providers) : undefined;
-          const rows = buildPickerRows(catalog, providers, inspectProviderCredentials, liveLocal);
+          // 不带参数：并发读取每个 provider 的鉴权 `/models`。只有端点实际响应且
+          // 返回了该模型，才允许进入选择器；仅有静态目录或 API Key 不算可用。
+          const live = await probeLive(providers, discoverModels);
+          const rows = buildPickerRows(catalog, providers, inspectProviderCredentials, live);
           if (rows.length === 0) {
             dispatch({
               t: "push",
               item: {
                 kind: "error",
                 text: t(
-                  "The built-in model catalog is empty; use /model <provider/model> to specify",
-                  "内置模型目录为空；用 /model <provider/model> 指定",
+                  "No model endpoint responded successfully; check provider credentials, network, and local services",
+                  "没有模型端点探测成功；请检查 provider 凭证、网络和本地服务",
                 ),
               },
             });
@@ -1778,6 +1833,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       host,
       providers,
       catalog,
+      discoverModels,
       inspectProviderCredentials,
       selectModel,
       openSessionPicker,
@@ -1813,13 +1869,9 @@ Requirements: read the actual diff and surrounding code before judging; verify e
 
   const submitLine = useCallback(
     (raw: string): void => {
-      setScrollOffset(0); // 提交后回到底部跟随最新
+      resetTranscriptScroll(); // 提交后回到底部跟随最新
       const text = raw.trim();
-      if (text) {
-        const h = historyRef.current;
-        if (h[h.length - 1] !== text) h.push(text);
-        if (h.length > 200) h.shift();
-      }
+      recordPromptHistory(text);
       histPosRef.current = null;
       if (!text) return;
       if (text.startsWith("/")) {
@@ -1855,7 +1907,15 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
         });
     },
-    [host, runSlash, sessionId, state.meta.cwd, nextModel],
+    [
+      host,
+      nextModel,
+      recordPromptHistory,
+      resetTranscriptScroll,
+      runSlash,
+      sessionId,
+      state.meta.cwd,
+    ],
   );
 
   // shift+tab 轮盘：在 default → acceptEdits → plan → bypass 间循环，一次切换免去逐次授权。
@@ -1984,8 +2044,16 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             };
           });
         } else if (mouse.leftClick) {
+          const anchor = panelRef.current ? absoluteTop(panelRef.current) : undefined;
           const sprite = windowHorizontally(
-            buildModelPickerOverlay(visible, picker.index, picker.filter, termRows, termCols),
+            buildModelPickerOverlay(
+              visible,
+              picker.index,
+              picker.filter,
+              termRows,
+              termCols,
+              anchor,
+            ),
             termCols,
             hoffRef.current,
           );
@@ -2196,12 +2264,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
                   ? "deny"
                   : null;
       if (!kind) return; // 方向键/误触等不应被当成拒绝
-      if (kind === "allow_always" && confirmAlwaysFor !== pending.permId) {
-        setConfirmAlwaysFor(pending.permId);
-        return;
-      }
       setPermissionSelection(0);
-      setConfirmAlwaysFor(null);
       setPendings((q) => q.slice(1));
       void host
         .answerPermission(sessionId, pending.permId, kind)
@@ -2406,9 +2469,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     }
   });
 
+  // 模型选择器复用底部输入框显示筛选词；授权与会话列表仍会接管输入并隐藏光标。
+  const composerText = picker?.filter ?? input;
+  const composerCursor = picker ? picker.filter.length : cursor;
   // CLI 输出层按绝对 CUP 坐标停放真实光标，避开 Ink 全屏相对坐标在不同终端上的偏移。
-  // 弹框接管键盘时把光标归还底部并隐藏，避免 IME 候选框盖住弹框。
-  const caretHidden = !!(picker || pendings[0] || sessions);
+  const caretHidden = !!(pendings[0] || sessions);
   useLayoutEffect(() => {
     if (!absoluteCaretEnabled || caretHidden) {
       terminalCaret?.setTarget(null);
@@ -2419,14 +2484,23 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     const maxInputRows = Math.max(1, Math.min(5, termRows - 10));
     const position = composerCaretPosition({
       panelTop: absoluteTop(panel),
-      text: input,
-      cursor,
+      text: composerText,
+      cursor: composerCursor,
       width: termCols,
       maxInputRows,
       terminalRows: termRows,
     });
     terminalCaret.setTarget({ row: position.y + 1, col: position.x + 1 });
-  }, [absoluteCaretEnabled, caretHidden, termRows, input, cursor, termCols, state, terminalCaret]);
+  }, [
+    absoluteCaretEnabled,
+    caretHidden,
+    termRows,
+    composerText,
+    composerCursor,
+    termCols,
+    state,
+    terminalCaret,
+  ]);
   useEffect(() => () => terminalCaret?.setTarget(null), [terminalCaret]);
 
   // 实验帧合成器保留自己的 stdout 停放逻辑；生产默认只走上面的窄作用域输出适配器。
@@ -2437,8 +2511,8 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     if (!panel) return setCaret(null);
     const position = composerCaretPosition({
       panelTop: absoluteTop(panel),
-      text: input,
-      cursor,
+      text: composerText,
+      cursor: composerCursor,
       width: termCols,
       maxInputRows: Math.max(1, Math.min(5, termRows - 10)),
       terminalRows: termRows,
@@ -2460,22 +2534,14 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     const show = (s: Sprite) => setOverlay(windowHorizontally(s, termCols, hoff));
     if (picker) {
       const visible = filterPickerRows(picker.rows, picker.filter);
+      const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
       return show(
-        buildModelPickerOverlay(visible, picker.index, picker.filter, termRows, termCols),
+        buildModelPickerOverlay(visible, picker.index, picker.filter, termRows, termCols, anchor),
       );
     }
     if (pendings[0]) {
       const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
-      return show(
-        buildPermissionOverlay(
-          pendings,
-          termRows,
-          termCols,
-          permissionIndex,
-          anchor,
-          confirmAlwaysFor === pendings[0].permId,
-        ),
-      );
+      return show(buildPermissionOverlay(pendings, termRows, termCols, permissionIndex, anchor));
     }
     if (sessions) {
       const visible = filterSessionRows(sessions.rows, sessions.filter);
@@ -2501,7 +2567,6 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     picker,
     pendings,
     permissionIndex,
-    confirmAlwaysFor,
     sessions,
     sessionId,
     input,
@@ -2515,19 +2580,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
   ]);
 
   const u = state.usage;
-  const conversationEmpty =
-    !state.items.some((i) => i.kind === "user" || i.kind === "assistant" || i.kind === "tool") &&
-    !state.liveText &&
-    state.activeTools.size === 0;
-
-  // 只渲染尾部的动态窗口，避免无限历史拖慢 Yoga；向上滚动时逐步把更早条目纳入。
-  // scrollOffset 是终端行数，真正的移动由结果内容容器的负底边距完成，因此单条超长回复
-  // 也能逐行回看，不再只能按整条消息跳动。
-  const WIN = termRows * 2 + 16;
-  const renderedItemCount = WIN + Math.ceil(scrollOffset / 2);
-  const winStart = Math.max(0, state.items.length - renderedItemCount);
-  const visibleItems = conversationEmpty ? state.items : state.items.slice(winStart);
-  const baseKey = conversationEmpty ? 0 : winStart;
+  // 在 MAX_TRANSCRIPT_ROWS 硬上限内保留完整渲染树，外层视口只裁剪不可见行。
+  // 这样 Yoga 计算的内容高度始终覆盖完整历史，不会因尾部虚拟窗口形成假顶部；
+  // scrollOffset 是终端行数，单条超长回复也可以逐行回看。
+  const visibleItems = state.items;
+  const baseKey = 0;
 
   const spinner = state.running ? SPINNER[spin % SPINNER.length]! : "●";
   const elapsedS =
@@ -2535,26 +2592,10 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       ? Math.floor((Date.now() - runStartRef.current) / 1000)
       : 0;
 
-  // /model 选择器：非浮层模式（测试）下以居中弹框接管整屏；浮层模式改由写入层合成盖屏。
-  if (picker && !overlayMode) {
-    return (
-      <Box height={termRows} flexDirection="column" justifyContent="center" alignItems="center">
-        <ModelPicker
-          rows={picker.rows}
-          index={picker.index}
-          filter={picker.filter}
-          width={Math.min(Math.max(48, termCols - 8), 80)}
-          maxRows={termRows}
-        />
-      </Box>
-    );
-  }
-
-  // 浮层模式下背景常驻可见（对齐 opencode），故弹框打开时仍渲染输入框；
-  // 非浮层模式沿用旧行为：被授权弹窗/选择器接管时不渲染输入框。
-  const showInput = overlayMode || (!picker && !sessions);
+  // 模型选择器与命令菜单都属于输入框的向上补全面板，不再居中接管整屏。
+  const showInput = overlayMode || !sessions;
   // 非浮层模式（测试）下命令菜单改由 in-tree 渲染在输入框上方；浮层模式由写入层合成盖屏。
-  const inTreeMenu = !overlayMode ? matchCommands(allCommands, input) : [];
+  const inTreeMenu = !overlayMode && !picker ? matchCommands(allCommands, input) : [];
   // 提示行仅在需要时出现（对齐 opencode 的极简）：运行中显示中断/追加；
   // 计划模式或临时模型激活时提示其状态；否则空闲态不显示常规导航提示。
   const hintItems = leaderPending
@@ -2572,18 +2613,43 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             ? [t(`↳ next: ${nextModel} (once)`, `↳ 下一条: ${nextModel}（仅一次）`)]
             : []),
         ];
+  const inlinePickerHeight = Math.max(8, Math.min(12, termRows - 8));
+  const inlineMenuHeight = Math.min(10, inTreeMenu.length) + 2;
   const inputCluster = showInput ? (
     <Box flexDirection="column" marginTop={1} flexShrink={0}>
-      {inTreeMenu.length > 0 ? <CommandMenu rows={inTreeMenu} index={menuIndex} /> : null}
+      {/*
+       * Ink/Yoga 没有 absolute positioning。零高容器 + 负上边距把候选层画到输入框
+       * 上方，但不计入 controls 高度：菜单开关时输入框、首页与状态栏都不会位移。
+       */}
+      {picker && !overlayMode ? (
+        <Box height={0} flexShrink={0}>
+          <Box marginTop={-inlinePickerHeight}>
+            <ModelPicker
+              rows={picker.rows}
+              index={picker.index}
+              filter={picker.filter}
+              width={termCols}
+              maxRows={inlinePickerHeight}
+            />
+          </Box>
+        </Box>
+      ) : inTreeMenu.length > 0 ? (
+        <Box height={0} width={termCols} flexShrink={0}>
+          <Box marginTop={-inlineMenuHeight} width={termCols}>
+            <CommandMenu rows={inTreeMenu} index={menuIndex} width={termCols} />
+          </Box>
+        </Box>
+      ) : null}
       <InputPanel
         panelRef={panelRef}
-        text={input}
-        cursor={cursor}
+        text={composerText}
+        cursor={composerCursor}
         model={state.meta.model}
         running={state.running}
         spinner={spinner}
         width={termCols}
         maxInputRows={Math.max(1, Math.min(5, termRows - 10))}
+        placeholder={picker ? t("Search models…", "搜索模型…") : undefined}
       />
       {hintItems.length > 0 ? (
         <Box justifyContent="flex-end">
@@ -2592,7 +2658,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           </Text>
         </Box>
       ) : null}
-      {conversationEmpty && termRows >= 22 && !picker && !pendings[0] && !sessions ? (
+      {conversationEmpty && termRows >= 22 && !pendings[0] && !sessions ? (
         <WelcomeTip width={termCols} />
       ) : null}
     </Box>
@@ -2623,7 +2689,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       {!overlayMode && pendings[0] ? (
         <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
           <Box>
-            <Text color="yellow">
+            <Text color="yellow" bold>
               {`${t("⚠ Permission request: ", "⚠ 授权请求: ")}${sanitizeTerminalText(
                 pendings[0].toolName,
               )} · ${(pendings[0].risk ?? "medium").toUpperCase()}${
@@ -2638,14 +2704,14 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           </Box>
           {pendings[0].cwd ? (
             <Box>
-              <Text dimColor>{`cwd: ${sanitizeTerminalText(pendings[0].cwd)}`}</Text>
+              <Text>{`cwd: ${sanitizeTerminalText(pendings[0].cwd)}`}</Text>
             </Box>
           ) : null}
           <Box>
-            <Text>{sanitizeTerminalText(pendings[0].ruleKey)}</Text>
+            <Text bold>{sanitizeTerminalText(pendings[0].ruleKey)}</Text>
           </Box>
           <Box>
-            <Text dimColor>{permissionInputPreview(pendings[0].input)}</Text>
+            <Text>{permissionInputPreview(pendings[0].input)}</Text>
           </Box>
           {termRows >= 18
             ? permissionPatchPreview(pendings[0].input, 6).map((line, index) => (
@@ -2679,21 +2745,14 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             { keyName: "n", label: t("Deny", "拒绝"), color: "red" },
           ].map(({ keyName, label, color }, index) => (
             <Box key={keyName}>
-              <Text inverse={index === permissionIndex} bold={index === permissionIndex}>
+              <Text inverse={index === permissionIndex} bold>
                 {index === permissionIndex ? "› " : "  "}[<Text color={color}>{keyName}</Text>]{" "}
                 {label}
               </Text>
             </Box>
           ))}
-          {confirmAlwaysFor === pendings[0].permId ? (
-            <Box>
-              <Text color="red" bold>
-                {t("Press p/Enter again to persist this rule", "再次按 p/Enter 才会永久保存此规则")}
-              </Text>
-            </Box>
-          ) : null}
           <Box>
-            <Text dimColor>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
+            <Text>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
           </Box>
         </Box>
       ) : null}
@@ -2808,7 +2867,9 @@ Requirements: read the actual diff and surrounding code before judging; verify e
                 );
               })}
 
-              {state.todos.length > 0 ? <TodoList todos={state.todos} /> : null}
+              {state.running && state.todos.some((todo) => todo.status !== "completed") ? (
+                <TodoList todos={state.todos} />
+              ) : null}
             </Box>
           </Box>
 
@@ -3047,8 +3108,8 @@ function helpText(): string {
       "/sessions             搜索并切换会话（也可用 /resume、/continue）",
     ),
     t(
-      "/mouse [on|off]       Mouse tracking; off allows native drag-selection/copy",
-      "/mouse [on|off]       鼠标跟踪；off 可直接拖拽框选/复制",
+      "/mouse [on|off]       Full tracking; off keeps native selection (PageUp/Down scrolls)",
+      "/mouse [on|off]       完整鼠标跟踪；off 原生框选（PageUp/Down 回看）",
     ),
     t(
       "/resume <sessionId>   Load directly; without an id, open the picker",
@@ -3161,6 +3222,7 @@ function skillsText(skills: readonly SkillMeta[]): string {
 }
 
 interface PickerRow {
+  providerId: string;
   spec: string;
   label: string;
   providerName: string;
@@ -3200,20 +3262,34 @@ export function buildPickerRows(
   catalog: readonly ModelCatalogEntry[],
   providers: readonly ProviderDescriptor[],
   inspectCredentials: boolean,
-  liveLocal?: { probed: Set<string>; live: Set<string> },
+  liveProbe?: ProviderProbe,
 ): PickerRow[] {
   const byId = new Map(providers.map((p) => [p.id, p]));
-  const rows = catalog.map((entry): PickerRow => {
+  const currentCatalog = syncDiscoveredModels(catalog, providers, liveProbe?.models).filter(
+    (entry) => !liveProbe || liveProbe.live.has(entry.providerId),
+  );
+  const rows = currentCatalog.map((entry): PickerRow => {
     const descriptor = byId.get(entry.providerId);
     const apiKeyEnv = descriptor?.apiKeyEnv ?? [];
     let ready: boolean | undefined;
     let readyHint: string;
-    if (liveLocal?.probed.has(entry.providerId)) {
-      // 有本地端点的 provider：以存活探测为准，未启动就别标成就绪（否则选了必然 Connection error）。
-      ready = liveLocal.live.has(entry.providerId);
-      readyHint = ready
-        ? t(`${entry.providerName} ready`, `${entry.providerName} 已就绪`)
-        : t(`Start ${entry.providerName} first`, `需先启动 ${entry.providerName}`);
+    if (liveProbe?.probed.has(entry.providerId)) {
+      // 只有鉴权 `/models` 返回成功才会进入 currentCatalog；凭证状态仅用于提示，
+      // 不会让“有 Key 但请求失败”的模型重新出现。
+      const endpointReady = liveProbe.live.has(entry.providerId);
+      const credentialState =
+        entry.requiresApiKey && inspectCredentials && descriptor
+          ? inspectProviderCredential(descriptor, entry.spec)
+          : undefined;
+      ready = endpointReady && (credentialState?.ready ?? !entry.requiresApiKey);
+      readyHint = !endpointReady
+        ? t(`Start ${entry.providerName} first`, `需先启动 ${entry.providerName}`)
+        : credentialState && !credentialState.ready
+          ? t(
+              `Missing ${apiKeyEnv.join("/") || "API key"}`,
+              `缺 ${apiKeyEnv.join("/") || "API key"}`,
+            )
+          : t(`${entry.providerName} ready`, `${entry.providerName} 已就绪`);
     } else if (!entry.requiresApiKey) {
       ready = true;
       readyHint = entry.local ? t("local/no key", "本地/免 key") : t("no key", "免 key");
@@ -3236,6 +3312,7 @@ export function buildPickerRows(
           );
     }
     return {
+      providerId: entry.providerId,
       spec: entry.spec,
       label: entry.label ?? entry.model,
       providerName: entry.providerName,
@@ -3248,8 +3325,71 @@ export function buildPickerRows(
       readyHint,
     };
   });
-  // 保留目录顺序（已按 provider 聚合），便于选择器按 provider 分组展示。
-  return rows;
+  // 已就绪 provider 优先，未配置凭证的旧/备用 provider 下沉；稳定排序保留各 provider
+  // 与其模型的原始顺序，分组不会被拆散。
+  const rank = (row: PickerRow) => (row.ready === true ? 0 : row.ready === undefined ? 1 : 2);
+  return rows.sort((a, b) => rank(a) - rank(b));
+}
+
+interface ProviderProbe {
+  probed: Set<string>;
+  live: Set<string>;
+  /** 成功读取鉴权 `/models` 的 provider 才出现在 map 中。 */
+  models: Map<string, readonly string[]>;
+}
+
+/** 用实时 `/models` 清理静态目录，并把服务新增的模型立即补进选择器。 */
+function syncDiscoveredModels(
+  catalog: readonly ModelCatalogEntry[],
+  providers: readonly ProviderDescriptor[],
+  discovered: ReadonlyMap<string, readonly string[]> | undefined,
+): ModelCatalogEntry[] {
+  if (!discovered || discovered.size === 0) return [...catalog];
+  const byProvider = new Map<string, ModelCatalogEntry[]>();
+  for (const entry of catalog) {
+    const rows = byProvider.get(entry.providerId) ?? [];
+    rows.push(entry);
+    byProvider.set(entry.providerId, rows);
+  }
+  const providerById = new Map(providers.map((provider) => [provider.id, provider]));
+  const order = [
+    ...new Set([
+      ...providers.map((provider) => provider.id),
+      ...catalog.map((entry) => entry.providerId),
+      ...discovered.keys(),
+    ]),
+  ];
+  const result: ModelCatalogEntry[] = [];
+  for (const providerId of order) {
+    const staticRows = byProvider.get(providerId) ?? [];
+    const liveModels = discovered.get(providerId);
+    if (!liveModels) {
+      result.push(...staticRows);
+      continue;
+    }
+    const live = new Set(liveModels);
+    const known = new Set<string>();
+    for (const entry of staticRows) {
+      if (!live.has(entry.model)) continue;
+      result.push(entry);
+      known.add(entry.model);
+    }
+    const provider = providerById.get(providerId);
+    if (!provider) continue;
+    for (const model of liveModels) {
+      if (known.has(model)) continue;
+      result.push({
+        model,
+        label: model,
+        providerId,
+        providerName: provider.name,
+        spec: `${providerId}/${model}`,
+        local: provider.local,
+        requiresApiKey: provider.requiresApiKey,
+      });
+    }
+  }
+  return result;
 }
 
 /** 按搜索词过滤选择器行（匹配 label / spec / provider）。 */
@@ -3264,19 +3404,31 @@ export function filterPickerRows(rows: readonly PickerRow[], filter: string): Pi
   );
 }
 
-/** 探测本地 provider 存活，返回 {有端点的, 确实在跑的} 两个集合供就绪判定。 */
+/** 并发探测所有 provider；只有鉴权 `/models` 成功的模型才进入 `/model`。 */
 async function probeLive(
   providers: readonly ProviderDescriptor[],
-): Promise<{ probed: Set<string>; live: Set<string> }> {
-  const probed = new Set(
-    providers.filter((p) => p.local && (p.baseURL || p.baseURLEnv)).map((p) => p.id),
+  discover: (providerId: string) => Promise<readonly string[] | undefined>,
+): Promise<ProviderProbe> {
+  const probed = new Set(providers.map((provider) => provider.id));
+  const discovered = await Promise.all(
+    providers.map(async (provider) => {
+      const models = await discover(provider.id).catch(() => undefined);
+      return [provider.id, models] as const;
+    }),
   );
-  const live = await probeLocalProviders(providers);
-  return { probed, live };
+  const live = new Set<string>();
+  const models = new Map<string, readonly string[]>();
+  for (const [providerId, ids] of discovered) {
+    if (ids === undefined) continue;
+    live.add(providerId);
+    models.set(providerId, ids);
+  }
+  return { probed, live, models };
 }
 
 // opencode 同款选择器高亮色（暖橙）。
 const PICKER_HL = "#f6b17a";
+const PICKER_BG = "#1c1c1c";
 
 /** 同 truncWidth，但保留尾部、省略号放在头部（路径的尾巴比头部有信息量）。 */
 function truncWidthStart(s: string, max: number): string {
@@ -3315,56 +3467,94 @@ function ModelPicker({
   maxRows?: number;
 }) {
   const visible = filterPickerRows(rows, filter);
-  const height = Math.min(maxRows, Math.min(22, Math.max(8, maxRows - 4)));
-  const inner = Math.max(24, width - 6); // 扣掉边框(2) + 左右内边距(4)
-  // 列表开窗：让高亮项始终可见，超长目录只画一段。
-  const maxItems = Math.max(1, height - 6);
-  let start = 0;
-  if (visible.length > maxItems) {
-    start = Math.min(Math.max(0, index - Math.floor(maxItems / 2)), visible.length - maxItems);
-  }
-  const windowRows = visible.slice(start, start + maxItems);
+  const height = Math.max(8, Math.min(12, maxRows));
+  const inner = Math.max(1, width - 2); // 仅扣除左右边框；内容背景必须贴边铺满
+  type Entry =
+    | { kind: "provider"; name: string }
+    | { kind: "model"; row: PickerRow; index: number }
+    | { kind: "empty" }
+    | { kind: "no-match" };
+  const entries: Entry[] = [];
+  visible.forEach((row, rowIndex) => {
+    if (rowIndex === 0 || visible[rowIndex - 1]?.providerName !== row.providerName) {
+      entries.push({ kind: "provider", name: row.providerName });
+    }
+    entries.push({ kind: "model", row, index: rowIndex });
+  });
+  // 标题占 1 行、边框占 2 行；其余候选围绕高亮项开窗并在面板底部对齐。
+  const maxEntries = Math.max(1, height - 3);
+  const selectedLine = Math.max(
+    0,
+    entries.findIndex((entry) => entry.kind === "model" && entry.index === index),
+  );
+  const start =
+    entries.length > maxEntries
+      ? Math.min(
+          Math.max(0, selectedLine - Math.floor(maxEntries / 2)),
+          entries.length - maxEntries,
+        )
+      : 0;
+  const windowEntries: Entry[] =
+    visible.length === 0 ? [{ kind: "no-match" }] : entries.slice(start, start + maxEntries);
+  // 负边距让选择器覆盖 transcript。每一行必须真正写满背景色，否则终端上一帧的
+  // 字符会从“空白”处透出；候选不足时在顶部补不透明空行，使内容仍贴着输入框。
+  const paintedEntries: Entry[] = [
+    ...Array.from({ length: Math.max(0, maxEntries - windowEntries.length) }, () => ({
+      kind: "empty" as const,
+    })),
+    ...windowEntries,
+  ];
+  const fill = (used: number) => " ".repeat(Math.max(0, inner - used));
+  const title = t("Select model", "选择模型");
+  const titleGap = Math.max(1, inner - dispWidth(title) - dispWidth("esc"));
 
   return (
     <Box
       flexDirection="column"
       borderStyle="round"
       borderColor="gray"
-      paddingX={2}
-      paddingY={1}
       width={width}
       height={height}
     >
-      <Box justifyContent="space-between">
-        <Text bold>{t("Select model", "选择模型")}</Text>
+      <Text backgroundColor={PICKER_BG} wrap="truncate">
+        <Text bold>{title}</Text>
+        {" ".repeat(titleGap)}
         <Text dimColor>esc</Text>
-      </Box>
-      <Box marginTop={1}>
-        {filter ? (
-          <Text>
-            {filter}
-            <Text backgroundColor={PICKER_HL}> </Text>
-          </Text>
-        ) : (
-          <Text dimColor>
-            <Text backgroundColor={PICKER_HL}> </Text>
-            {t("Search…", "搜索…")}
-          </Text>
-        )}
-      </Box>
-
-      {visible.length === 0 ? (
-        <Box marginTop={1}>
-          <Text dimColor>{t("(no matching models)", "（无匹配模型）")}</Text>
-        </Box>
-      ) : null}
-
-      <Box flexDirection="column" marginTop={1} flexGrow={1} overflow="hidden">
-        {windowRows.map((row, i) => {
-          const globalIdx = start + i;
+      </Text>
+      <Box flexDirection="column" flexGrow={1} overflow="hidden">
+        {paintedEntries.map((entry, i) => {
+          if (entry.kind === "empty") {
+            return (
+              <Text key={`empty:${i}`} backgroundColor={PICKER_BG} wrap="truncate">
+                {" ".repeat(inner)}
+              </Text>
+            );
+          }
+          if (entry.kind === "no-match") {
+            const label = t("(no matching models)", "（无匹配模型）");
+            return (
+              <Text key="no-match" backgroundColor={PICKER_BG} dimColor wrap="truncate">
+                {label}
+                {fill(dispWidth(label))}
+              </Text>
+            );
+          }
+          if (entry.kind === "provider") {
+            return (
+              <Text
+                key={`provider:${start + i}:${entry.name}`}
+                backgroundColor={PICKER_BG}
+                color="magenta"
+                bold
+                wrap="truncate"
+              >
+                {entry.name}
+                {fill(dispWidth(entry.name))}
+              </Text>
+            );
+          }
+          const { row, index: globalIdx } = entry;
           const selected = globalIdx === index;
-          const prev = windowRows[i - 1];
-          const showHeader = i === 0 || prev?.providerName !== row.providerName;
           const rightTag = row.free ? "Free" : row.ready === false ? row.readyHint : "";
           // 选中行画成整行暖橙底、深色字（对齐 opencode）。
           if (selected) {
@@ -3372,40 +3562,27 @@ function ModelPicker({
             const left = truncWidth(`● ${row.label}`, inner - rightW - 1);
             const pad = Math.max(1, inner - dispWidth(left) - rightW);
             return (
-              <React.Fragment key={row.spec}>
-                {showHeader ? <ProviderHeader name={row.providerName} /> : null}
-                <Text backgroundColor={PICKER_HL} color="black">
-                  {left}
-                  {" ".repeat(pad)}
-                  {rightTag}
-                </Text>
-              </React.Fragment>
+              <Text key={row.spec} backgroundColor={PICKER_HL} color="black">
+                {left}
+                {" ".repeat(pad)}
+                {rightTag}
+              </Text>
             );
           }
           return (
-            <React.Fragment key={row.spec}>
-              {showHeader ? <ProviderHeader name={row.providerName} /> : null}
-              <Box justifyContent="space-between">
-                <Text>
-                  {"  "}
-                  {row.label}
-                </Text>
-                <Text dimColor>{rightTag}</Text>
-              </Box>
-            </React.Fragment>
+            <Text key={row.spec} backgroundColor={PICKER_BG} wrap="truncate">
+              {"  "}
+              {truncWidth(row.label, Math.max(1, inner - dispWidth(rightTag) - 3))}
+              {fill(
+                2 +
+                  dispWidth(truncWidth(row.label, Math.max(1, inner - dispWidth(rightTag) - 3))) +
+                  dispWidth(rightTag),
+              )}
+              <Text dimColor>{rightTag}</Text>
+            </Text>
           );
         })}
       </Box>
-    </Box>
-  );
-}
-
-function ProviderHeader({ name }: { name: string }) {
-  return (
-    <Box marginTop={1}>
-      <Text color="magenta" bold>
-        {name}
-      </Text>
     </Box>
   );
 }
@@ -3595,40 +3772,55 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
 }
 
 /** 斜杠命令补全菜单（in-tree 版，用于非浮层模式/测试）；高亮项暖橙底。 */
-function CommandMenu({ rows, index }: { rows: CommandMenuRow[]; index: number }) {
+function CommandMenu({
+  rows,
+  index,
+  width,
+}: {
+  rows: CommandMenuRow[];
+  index: number;
+  width: number;
+}) {
   const idx = Math.max(0, Math.min(index, rows.length - 1));
-  const viewportHeight = 10;
+  const viewportHeight = Math.max(1, Math.min(10, rows.length));
+  const panelHeight = viewportHeight + 2;
   const start =
     rows.length > viewportHeight
       ? Math.min(Math.max(0, idx - Math.floor(viewportHeight / 2)), rows.length - viewportHeight)
       : 0;
   const visible = rows.slice(start, start + viewportHeight);
   const nameCol = Math.min(18, Math.max(1, ...rows.map((r) => dispWidth("/" + r.name)))) + 2;
+  const inner = Math.max(1, width - 2);
+  const fill = (used: number) => " ".repeat(Math.max(0, inner - used));
   return (
     <Box
       flexDirection="column"
       borderStyle="round"
       borderColor="gray"
-      paddingX={1}
-      height={12}
+      width={width}
+      height={panelHeight}
       overflow="hidden"
     >
       {visible.map((r, i) => {
         const globalIndex = start + i;
         const name = "/" + r.name;
         const namePad = name + " ".repeat(Math.max(1, nameCol - dispWidth(name)));
+        const description = truncWidth(r.description, Math.max(1, inner - dispWidth(namePad)));
+        const trailing = fill(dispWidth(namePad) + dispWidth(description));
         if (globalIndex === idx) {
           return (
-            <Text key={r.name} backgroundColor={PICKER_HL} color="black">
-              {namePad}
-              {r.description}
+            <Text key={r.name} backgroundColor={PICKER_HL} color="black" wrap="truncate">
+              <Text bold>{namePad}</Text>
+              {description}
+              {trailing}
             </Text>
           );
         }
         return (
-          <Text key={r.name}>
+          <Text key={r.name} backgroundColor={PICKER_BG} wrap="truncate">
             <Text color="#f6b17a">{namePad}</Text>
-            <Text dimColor>{r.description}</Text>
+            <Text dimColor>{description}</Text>
+            {trailing}
           </Text>
         );
       })}
@@ -3868,6 +4060,7 @@ export function InputPanel({
   spinner,
   width,
   maxInputRows = 5,
+  placeholder,
 }: {
   panelRef?: React.Ref<DOMElement>;
   text: string;
@@ -3877,6 +4070,7 @@ export function InputPanel({
   spinner: string;
   width: number;
   maxInputRows?: number;
+  placeholder?: string | undefined;
 }) {
   if (width <= 3) {
     return (
@@ -3898,7 +4092,7 @@ export function InputPanel({
     const localCursor = active ? cursor - line.start : line.text.length;
     const { avail, caretX, at, endX, startX } = inputView(line.text, localCursor, width);
     if (!text && active) {
-      const ph = truncWidth(panelPlaceholder(), Math.max(0, avail - 1));
+      const ph = truncWidth(placeholder ?? panelPlaceholder(), Math.max(0, avail - 1));
       return {
         key: line.start,
         node: (

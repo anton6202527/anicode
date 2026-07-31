@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { HttpDaemonServer } from "./http-server.js";
@@ -55,6 +56,115 @@ test("sse 解析：分帧/多 data 行/心跳注释/半帧留存", () => {
   assert.deepEqual(frames[0], { event: "snapshot", data: '{"a":1}' });
   assert.deepEqual(frames[1], { event: "session", data: "line1\nline2" });
   assert.match(rest, /partial/);
+  assert.throws(() => parseSseChunk(`data: ${"x".repeat(64)}`, 32), /安全上限/);
+});
+
+test("http host: request and initial snapshot deadlines fail closed", async () => {
+  const server = createHttpServer((req, res) => {
+    if (req.url === "/sessions") return; // connected peer that never sends headers
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(": heartbeat\n\n"); // valid stream that deliberately never sends a snapshot
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") assert.fail("expected TCP test server");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const requestHost = new HttpSessionHost({ baseUrl, requestTimeoutMs: 50 });
+  const streamHost = new HttpSessionHost({ baseUrl, snapshotTimeoutMs: 50 });
+  try {
+    await assert.rejects(requestHost.listSessions(), /HTTP 请求在 50 ms 后超时/);
+    await assert.rejects(
+      streamHost.open("s_stalled", () => {}),
+      /snapshot 在 50 ms 后超时/,
+    );
+  } finally {
+    requestHost.dispose();
+    streamHost.dispose();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("http host: oversized JSON responses are rejected before parsing", async () => {
+  const payload = JSON.stringify({ value: "x".repeat(1024) });
+  const server = createHttpServer((_req, res) => {
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(payload),
+    });
+    res.end(payload);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") assert.fail("expected TCP test server");
+  const host = new HttpSessionHost({
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    maxResponseBytes: 128,
+  });
+  try {
+    await assert.rejects(host.listSessions(), /HTTP 响应超过安全上限/);
+  } finally {
+    host.dispose();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("http host: malformed SSE snapshots are rejected at the transport boundary", async () => {
+  const server = createHttpServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(
+      `data: ${JSON.stringify({ type: "session.snapshot", properties: { snapshot: {} } })}\n\n`,
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") assert.fail("expected TCP test server");
+  const host = new HttpSessionHost({ baseUrl: `http://127.0.0.1:${address.port}` });
+  try {
+    await assert.rejects(
+      host.open("s_invalid", () => {}),
+      /无效 SSE snapshot/,
+    );
+  } finally {
+    host.dispose();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("http server: bounded request contract rejects negative indexes and oversized tracing", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-contract-"));
+  const { server, baseUrl } = await startHttp(dir, scriptedProvider([]));
+  const host = new HttpSessionHost({ baseUrl });
+  try {
+    const meta = await host.createSession({ cwd: dir, model: "scripted" });
+    const fork = await fetch(`${baseUrl}/sessions/${meta.id}/fork`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ upToMessage: -1 }),
+    });
+    assert.equal(fork.status, 400);
+    const send = await fetch(`${baseUrl}/sessions/${meta.id}/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json", traceparent: "x".repeat(513) },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    assert.equal(send.status, 400);
+  } finally {
+    host.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("http host: 建会话 → SSE snapshot 先行 → send 两个客户端都收事件", async () => {

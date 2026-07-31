@@ -336,13 +336,13 @@ test("Bridge: 插件默认启用内建项，开关状态写盘并回读", async 
     const initial = (await invoke("plugins:list", sender)) as PluginEntry[];
     const bash = initial.find((p) => p.id === "core.bash");
     assert.equal(bash?.enabled, true, "内建插件应默认启用");
-    const websearch = initial.find((p) => p.id === "mcp.websearch");
-    assert.equal(websearch?.enabled, false, "非内建插件应默认停用");
+    const github = initial.find((p) => p.id === "mcp.github");
+    assert.equal(github?.enabled, false, "非内建插件应默认停用");
 
     // 启用一个 MCP 插件、停用一个内建插件，均应持久化。
-    await invoke("plugins:setEnabled", sender, "mcp.websearch", true);
+    await invoke("plugins:setEnabled", sender, "mcp.github", true);
     const after = (await invoke("plugins:setEnabled", sender, "core.bash", false)) as PluginEntry[];
-    assert.equal(after.find((p) => p.id === "mcp.websearch")?.enabled, true);
+    assert.equal(after.find((p) => p.id === "mcp.github")?.enabled, true);
     assert.equal(after.find((p) => p.id === "core.bash")?.enabled, false);
 
     // 新建 Bridge 从同一文件回读，状态应保留。
@@ -359,7 +359,7 @@ test("Bridge: 插件默认启用内建项，开关状态写盘并回读", async 
     const ipc2 = fakeIpc();
     reopened.register(ipc2.ipcMain);
     const persisted = (await ipc2.invoke("plugins:list", sender)) as PluginEntry[];
-    assert.equal(persisted.find((p) => p.id === "mcp.websearch")?.enabled, true);
+    assert.equal(persisted.find((p) => p.id === "mcp.github")?.enabled, true);
     assert.equal(persisted.find((p) => p.id === "core.bash")?.enabled, false);
     await reopened.dispose();
   } finally {

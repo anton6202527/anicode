@@ -83,6 +83,7 @@ export interface NavigateResult {
 interface Pending {
   resolve: (v: any) => void;
   reject: (e: Error) => void;
+  timeout: NodeJS.Timeout;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -113,12 +114,14 @@ export class Browser {
   private constructor(
     private readonly proc: ChildProcess,
     private readonly userDataDir: string,
+    private readonly commandTimeoutMs: number,
   ) {}
 
   static async launch(opts: {
     executablePath?: string;
     headless?: boolean;
     launchTimeoutMs?: number;
+    commandTimeoutMs?: number;
     args?: string[];
   }): Promise<Browser> {
     const bin = resolveChromePath(opts.executablePath);
@@ -153,7 +156,12 @@ export class Browser {
       await removeUserDataDir(userDataDir);
       throw e;
     }
-    const self = new Browser(proc, userDataDir);
+    const requestedCommandTimeout = opts.commandTimeoutMs ?? 30_000;
+    const commandTimeoutMs =
+      Number.isSafeInteger(requestedCommandTimeout) && requestedCommandTimeout > 0
+        ? Math.min(requestedCommandTimeout, 5 * 60_000)
+        : 30_000;
+    const self = new Browser(proc, userDataDir, commandTimeoutMs);
     self.ws = await WsClient.connect(
       wsUrl,
       {
@@ -176,11 +184,20 @@ export class Browser {
   send(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<any> {
     if (this.closePromise) return Promise.reject(new Error("Browser closed"));
     if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.pending.size >= 256) {
+      return Promise.reject(new Error("Too many Chrome DevTools commands in flight"));
+    }
     const id = this.nextId++;
     const msg: Record<string, unknown> = { id, method, params };
     if (sessionId) msg["sessionId"] = sessionId;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        if (this.pending.size === 0) this.ws.unref();
+        reject(new Error(`Chrome DevTools command timed out: ${method}`));
+      }, this.commandTimeoutMs);
+      timeout.unref();
+      this.pending.set(id, { resolve, reject, timeout });
       // The browser process and idle socket are normally unref'ed. A live command, however,
       // must keep the event loop referenced or Node 22 can cancel the awaiting test/process.
       this.ws.ref();
@@ -188,6 +205,7 @@ export class Browser {
         this.ws.send(JSON.stringify(msg));
       } catch (error) {
         this.pending.delete(id);
+        clearTimeout(timeout);
         if (this.pending.size === 0) this.ws.unref();
         reject(error instanceof Error ? error : new Error(String(error)));
       }
@@ -219,7 +237,10 @@ export class Browser {
         /* ignore */
       }
       const closed = new Error("Browser closed");
-      for (const pending of this.pending.values()) pending.reject(closed);
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timeout);
+        pending.reject(closed);
+      }
       this.pending.clear();
       this.sessionListeners.clear();
       await terminateChild(this.proc);
@@ -239,6 +260,7 @@ export class Browser {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
+      clearTimeout(p.timeout);
       if (this.pending.size === 0) this.ws.unref();
       if (msg.error) p.reject(new Error(msg.error.message ?? String(msg.error)));
       else p.resolve(msg.result);
@@ -252,7 +274,10 @@ export class Browser {
 
   private failPending(error: Error): void {
     this.terminalError ??= error;
-    for (const pending of this.pending.values()) pending.reject(this.terminalError);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(this.terminalError);
+    }
     this.pending.clear();
     this.sessionListeners.clear();
     try {

@@ -76,44 +76,46 @@ test("PluginRuntime: 启用无需凭证的 MCP 会连接并注入其工具", asy
 
 test("PluginRuntime: 缺环境变量的 MCP 不连接，状态标记缺失凭证", async () => {
   const fake = fakeConnector();
-  const rt = new PluginRuntime(fake.connect, {}); // 无 BRAVE_API_KEY
-  await rt.setState(["mcp.websearch"]);
+  const rt = new PluginRuntime(fake.connect, {}); // 无 GITHUB_TOKEN
+  await rt.setState(["mcp.github"]);
   assert.equal(fake.calls.length, 0, "缺凭证不应尝试连接");
   assert.ok(
     !rt
       .buildToolRegistry()
       .names()
-      .some((n) => n.startsWith("websearch__")),
+      .some((n) => n.startsWith("github__")),
   );
-  const status = rt.entriesWithStatus().find((e) => e.id === "mcp.websearch")?.runtime;
+  const status = rt.entriesWithStatus().find((e) => e.id === "mcp.github")?.runtime;
   assert.equal(status?.connected, false);
-  assert.match(status?.error ?? "", /BRAVE_API_KEY/);
+  assert.match(status?.error ?? "", /GITHUB_TOKEN/);
 });
 
-test("PluginRuntime: 凭证只以 Broker 引用交给 MCP 连接器", async () => {
+test("PluginRuntime: 远程 MCP 凭证只以 Broker 引用交给连接器", async () => {
   const fake = fakeConnector();
-  const env = { BRAVE_API_KEY: "x" };
+  const env = { GITHUB_TOKEN: "x" };
   const broker = credentialBrokerFromEnv(env, { remove: true });
   const rt = new PluginRuntime(fake.connect, env, broker);
-  await rt.setState(["mcp.websearch"]);
+  await rt.setState(["mcp.github"]);
   assert.equal(fake.calls.length, 1);
-  const config = fake.calls[0]![0]! as Extract<McpServerConfig, { command: string }>;
-  assert.deepEqual(config.credentialEnv, {
-    BRAVE_API_KEY: "env:BRAVE_API_KEY",
+  const config = fake.calls[0]![0]! as Extract<McpServerConfig, { url: string }>;
+  assert.deepEqual(config.credential, {
+    id: "env:GITHUB_TOKEN",
+    header: "Authorization",
+    scheme: "Bearer",
   });
-  assert.equal(config.env, undefined);
-  assert.equal(config.network, true);
-  assert.ok(rt.buildToolRegistry().names().includes("websearch__do"));
+  assert.equal(config.url, "https://api.githubcopilot.com/mcp/");
+  assert.equal(config.headers?.["X-MCP-Lockdown"], "true");
+  assert.ok(rt.buildToolRegistry().names().includes("github__do"));
 });
 
 test("PluginRuntime: 原始进程密钥不能绕过 Credential Broker", async () => {
   const fake = fakeConnector();
-  const rt = new PluginRuntime(fake.connect, { BRAVE_API_KEY: "x" });
-  await rt.setState(["mcp.websearch"]);
+  const rt = new PluginRuntime(fake.connect, { GITHUB_TOKEN: "x" });
+  await rt.setState(["mcp.github"]);
   assert.equal(fake.calls.length, 0);
   assert.match(
-    rt.entriesWithStatus().find((entry) => entry.id === "mcp.websearch")?.runtime?.error ?? "",
-    /BRAVE_API_KEY/,
+    rt.entriesWithStatus().find((entry) => entry.id === "mcp.github")?.runtime?.error ?? "",
+    /GITHUB_TOKEN/,
   );
 });
 

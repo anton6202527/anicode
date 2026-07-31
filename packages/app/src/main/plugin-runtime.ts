@@ -113,25 +113,24 @@ export class PluginRuntime {
       }
       const spec = entry.mcpServer!;
       try {
-        const scopedEnv: Record<string, string> = {};
-        const credentialEnv: Record<string, string> = {};
-        for (const name of entry.requiresEnv ?? []) {
-          if (isCredentialEnvironmentName(name)) credentialEnv[name] = `env:${name}`;
-          else scopedEnv[name] = this.env[name] ?? "";
+        let config: McpServerConfig;
+        if ("url" in spec) {
+          config = { ...spec, ...(spec.headers ? { headers: { ...spec.headers } } : {}) };
+        } else {
+          const scopedEnv: Record<string, string> = { ...spec.env };
+          const credentialEnv: Record<string, string> = { ...spec.credentialEnv };
+          for (const name of entry.requiresEnv ?? []) {
+            if (isCredentialEnvironmentName(name)) credentialEnv[name] = `env:${name}`;
+            else scopedEnv[name] = this.env[name] ?? "";
+          }
+          config = {
+            ...spec,
+            ...(spec.args ? { args: [...spec.args] } : {}),
+            ...(Object.keys(scopedEnv).length ? { env: scopedEnv } : {}),
+            ...(Object.keys(credentialEnv).length ? { credentialEnv } : {}),
+          };
         }
-        const { tools, clients } = await this.connect(
-          [
-            {
-              name: spec.name,
-              command: spec.command,
-              args: [...spec.args],
-              ...(Object.keys(scopedEnv).length ? { env: scopedEnv } : {}),
-              ...(Object.keys(credentialEnv).length ? { credentialEnv } : {}),
-              ...(spec.network ? { network: true } : {}),
-            },
-          ],
-          this.connectHandlers,
-        );
+        const { tools, clients } = await this.connect([config], this.connectHandlers);
         this.connections.set(entry.id, { clients, tools });
         this.status.set(entry.id, { connected: true, toolCount: tools.length });
       } catch (err) {

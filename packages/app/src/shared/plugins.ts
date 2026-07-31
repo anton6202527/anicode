@@ -7,19 +7,10 @@
  */
 
 import { t } from "@anicode/core/i18n";
-import type { SkillMeta } from "@anicode/core";
+import { DEVELOPMENT_MCP_CATALOG } from "@anicode/core/mcp-catalog";
+import type { McpServerConfig, SkillMeta } from "@anicode/core";
 
 export type PluginCategory = "mcp" | "skill" | "tool";
-
-/** MCP 类插件的 stdio 启动配置（对齐 core 的 McpServerConfig）。 */
-export interface McpServerSpec {
-  /** 工具前缀名，工具以 `<name>__<tool>` 暴露。 */
-  name: string;
-  command: string;
-  args: readonly string[];
-  /** 需要联网时必须由隔离运行时强制经过 AniCode Network Proxy。 */
-  network?: boolean;
-}
 
 export interface PluginManifest {
   id: string;
@@ -34,7 +25,7 @@ export interface PluginManifest {
   /** tool 类插件拥有的 core 内置工具名；停用时从工具集移除这些工具。 */
   toolNames?: readonly string[];
   /** mcp 类插件的 server 启动配置；启用且凭证就绪时连接并注入其工具。 */
-  mcpServer?: McpServerSpec;
+  mcpServer?: McpServerConfig;
   /** 需要的环境变量名（不含值）；缺失时 MCP 插件不会连接。 */
   requiresEnv?: readonly string[];
   /** skill 类插件运行所需的可执行文件（frontmatter metadata.requires.bins）。 */
@@ -107,65 +98,19 @@ export const PLUGIN_CATALOG: readonly PluginManifest[] = [
     builtin: true,
     toolNames: ["todo_write"],
   },
-  {
-    id: "mcp.websearch",
-    name: t("Web search", "Web 搜索"),
-    description: t(
-      "Search and fetch web pages over MCP to enrich answers with real-time information.",
-      "通过 MCP 联网检索与抓取网页，为回答补充实时信息。",
-    ),
+  ...DEVELOPMENT_MCP_CATALOG.map((entry): PluginManifest => ({
+    id: `mcp.${entry.id}`,
+    name: entry.name,
+    description: entry.description,
     category: "mcp",
-    author: "community",
-    icon: "🔎",
-    version: "0.3.0",
-    mcpServer: {
-      name: "websearch",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-web-search"],
-      network: true,
-    },
-    requiresEnv: ["BRAVE_API_KEY"],
-    homepage: "https://modelcontextprotocol.io",
-  },
-  {
-    id: "mcp.github",
-    name: "GitHub",
-    description: t(
-      "GitHub MCP server for reading/writing issues / PRs, searching repositories, and managing branches.",
-      "读写 issue / PR、检索仓库、管理分支的 GitHub MCP server。",
-    ),
-    category: "mcp",
-    author: "github",
-    icon: "🐙",
-    version: "0.6.0",
-    mcpServer: {
-      name: "github",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-github"],
-      network: true,
-    },
-    requiresEnv: ["GITHUB_TOKEN"],
-    homepage: "https://github.com/github/github-mcp-server",
-  },
-  {
-    id: "mcp.playwright",
-    name: t("Playwright browser", "Playwright 浏览器"),
-    description: t(
-      "Drive a real browser to click, fill forms, screenshot, and run end-to-end verification.",
-      "驱动真实浏览器做点击、填表、截图与端到端验证。",
-    ),
-    category: "mcp",
-    author: "microsoft",
-    icon: "🎭",
-    version: "0.2.0",
-    mcpServer: {
-      name: "playwright",
-      command: "npx",
-      args: ["-y", "@playwright/mcp"],
-      network: true,
-    },
-    homepage: "https://github.com/microsoft/playwright-mcp",
-  },
+    author: entry.author,
+    icon: entry.icon,
+    version: entry.version,
+    homepage: entry.homepage,
+    mcpServer: entry.server,
+    ...(entry.requiresEnv ? { requiresEnv: entry.requiresEnv } : {}),
+    ...(entry.requiresBins ? { requiresBins: entry.requiresBins } : {}),
+  })),
   {
     id: "skill.pdf",
     name: t("PDF reader", "PDF 阅读"),

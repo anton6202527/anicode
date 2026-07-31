@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LspClient, LspPool, pickLspServer } from "./lsp.js";
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.join(here, "testutil", "fake-lsp-server.mjs");
@@ -48,4 +49,47 @@ test("LSP: pickLspServer 按扩展名匹配（大小写不敏感）", () => {
   const s = pickLspServer([cfg], ".TS");
   assert.ok(s);
   assert.equal(pickLspServer([cfg], ".go"), undefined);
+});
+
+test("LSP: production runtime 以只读、断网策略 prepare 持久进程", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-isolated-"));
+  const file = path.join(dir, "a.ts");
+  await fs.writeFile(file, "bad code here\n");
+  const requests: string[] = [];
+  const runtime: ExecutionRuntime = {
+    async run() {
+      throw new Error("persistent LSP must use prepare");
+    },
+    prepare(request) {
+      requests.push(`${request.policy}:${request.network}:${request.cwd}`);
+      return {
+        file: process.execPath,
+        args: [serverPath],
+        cwd: request.cwd,
+        env: { PATH: process.env.PATH },
+        sandboxed: true,
+      };
+    },
+  };
+  const pool = new LspPool(dir, [cfg], runtime);
+  const diagnostics = await pool.clientFor(".ts")!.diagnose(file, 3000);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(requests, [`read-only:false:${dir}`]);
+  pool.closeAll();
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("LSP: 无响应 server 在请求超时后失败，不得挂住 agent", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-timeout-"));
+  const file = path.join(dir, "a.ts");
+  await fs.writeFile(file, "const x = 1\n");
+  const client = LspClient.start(dir, {
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{}, 1000)"],
+    extensions: [".ts"],
+    timeoutMs: 100,
+  });
+  await assert.rejects(client.diagnose(file), /LSP request timed out: initialize/);
+  client.close();
+  await fs.rm(dir, { recursive: true, force: true });
 });

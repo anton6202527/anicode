@@ -18,6 +18,7 @@ import {
   type Provider,
   type StreamEvent,
   type ChatMessage,
+  type ModelCatalogEntry,
   type ProviderDescriptor,
   type SessionEvent,
   type SessionHost,
@@ -33,6 +34,7 @@ import {
   inputView,
   InputPanel,
   matchesKeybinding,
+  promptHistoryFromMessages,
   subagentActivityLine,
   Welcome,
   WelcomeTip,
@@ -79,11 +81,17 @@ function offlineHost(
     id?: string;
     cwd?: string;
     model?: string;
+    messages?: ChatMessage[];
+    running?: boolean;
     eventsBeforeSnapshot?: SessionEvent[];
     pendingPermissions?: PendingPermission[];
     onInterrupt?: () => void;
     onSend?: (text: string) => void;
     onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
+    onFork?: (
+      sessionId: string,
+      opts?: { title?: string; upToMessage?: number; model?: string },
+    ) => void;
     onPermission?: (decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
   } = {},
 ): SessionHost {
@@ -100,7 +108,7 @@ function offlineHost(
         updatedAt: string;
       }
     | undefined;
-  return {
+  const host: SessionHost = {
     async listSessions() {
       return [];
     },
@@ -131,9 +139,9 @@ function offlineHost(
       return {
         snapshot: {
           meta: opened,
-          messages: [],
+          messages: options.messages ?? [],
           usage: zeroUsage,
-          running: false,
+          running: options.running ?? false,
           pendingPermissions: options.pendingPermissions ?? [],
         },
         close() {},
@@ -154,6 +162,21 @@ function offlineHost(
     },
     dispose() {},
   };
+  if (options.onFork) {
+    host.forkSession = async (sessionId, opts) => {
+      options.onFork?.(sessionId, opts);
+      created = {
+        id: "s_new",
+        cwd,
+        model: opts?.model ?? model,
+        ...(opts?.title ? { title: opts.title } : {}),
+        createdAt: "2026-07-14T00:00:00.000Z",
+        updatedAt: "2026-07-14T00:00:00.000Z",
+      };
+      return { ...created, running: false };
+    };
+  }
+  return host;
 }
 
 test("TUI: 远端事件流断开后自动重连并恢复 snapshot", async () => {
@@ -499,6 +522,98 @@ test("TUI: 键入 / 弹出命令补全菜单，Enter 直接运行高亮命令", 
   host.dispose();
 });
 
+test("TUI: 首页铺满固定视口，命令候选覆盖显示且不推动输入框", async () => {
+  const lastLineContaining = (lines: readonly string[], text: string): number => {
+    let found = -1;
+    lines.forEach((line, index) => {
+      if (line.includes(text)) found = index;
+    });
+    return found;
+  };
+  const host = offlineHost({ model: "stable/provider-model" });
+  const provider: ProviderDescriptor = {
+    id: "debug",
+    name: "Debug",
+    kind: "debug",
+    protocol: "debug",
+    aliases: [],
+    apiKeyEnv: [],
+    requiresApiKey: false,
+    local: true,
+    capabilities: { tools: true, reasoning: false },
+    limits: {},
+    models: [],
+    catalog: [],
+  };
+  const view = render(
+    <App
+      host={host}
+      cwd="/fixed-home"
+      model="stable/provider-model"
+      sessionId="s_fixed_home"
+      terminalSize={{ rows: 30, cols: 80 }}
+      providers={[provider]}
+      catalog={[
+        {
+          model: "demo",
+          label: "Debug Demo",
+          providerId: "debug",
+          providerName: "Debug",
+          spec: "debug/demo",
+          local: true,
+          requiresApiKey: false,
+        },
+      ]}
+      discoverModels={async () => ["demo"]}
+    />,
+  );
+  await tick(80);
+  const beforeLines = (view.lastFrame() ?? "").split("\n");
+  const inputMetaBefore = lastLineContaining(beforeLines, "provider-model");
+  assert.equal(beforeLines.length, 30, "首页必须严格铺满终端高度且不产生额外行");
+  assert.ok(inputMetaBefore > 0);
+
+  for (const ch of "/mcp") view.stdin.write(ch);
+  await tick(40);
+  const after = view.lastFrame() ?? "";
+  const afterLines = after.split("\n");
+  const inputMetaAfter = lastLineContaining(afterLines, "provider-model");
+  assert.match(after, /查看 MCP 服务器/);
+  assert.equal(afterLines.length, 30, "候选层不得撑高首页");
+  assert.equal(inputMetaAfter, inputMetaBefore, "候选层开关不得推动输入框");
+  const plainAfterLines = afterLines.map((line) => line.replace(SGR, ""));
+  const menuTop = plainAfterLines.findIndex((line) => line.startsWith("╭"));
+  const menuBottom = plainAfterLines.findIndex(
+    (line, index) => index > menuTop && line.startsWith("╰"),
+  );
+  const menuBorder = plainAfterLines[menuTop];
+  assert.ok(menuBorder, "命令候选应显示完整边框");
+  assert.equal(dispWidth(menuBorder), 80, "命令候选边框必须铺满整个视图宽度");
+  assert.equal(menuBottom - menuTop, 2, "单条命令只应包含一行内容，不得保留固定空白高度");
+
+  view.stdin.write("\u001b");
+  await tick(20);
+  for (const ch of "/model") view.stdin.write(ch);
+  await tick(20);
+  view.stdin.write("\r");
+  await waitFor(() => /选择模型/.test(view.lastFrame() ?? ""));
+  const modelLines = (view.lastFrame() ?? "").split("\n");
+  assert.equal(modelLines.length, 30, "模型层不得撑高首页");
+  const modelBorder = modelLines
+    .map((line) => line.replace(SGR, ""))
+    .find((line) => line.startsWith("╭"));
+  assert.ok(modelBorder, "模型候选应显示完整边框");
+  assert.equal(dispWidth(modelBorder), 80, "模型候选边框必须铺满整个视图宽度");
+  assert.equal(
+    lastLineContaining(modelLines, "provider-model"),
+    inputMetaBefore,
+    "模型层不得推动输入框",
+  );
+
+  view.unmount();
+  host.dispose();
+});
+
 test("TUI: /lang 即时切换界面语言（英文），并可切回", async () => {
   const host = offlineHost();
   const { stdin, lastFrame } = render(<App host={host} cwd="/x" model="m" sessionId="s_offline" />);
@@ -657,7 +772,7 @@ test("TUI: 模型与工具正文中的终端控制序列不能进入渲染帧", 
   view.unmount();
 });
 
-test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认", async () => {
+test("TUI: 权限层贴在输入框上方，永久允许只需一次 Enter 确认", async () => {
   const decisions: string[] = [];
   const host = offlineHost({
     pendingPermissions: [{ permId: "p-arrow", toolName: "edit", ruleKey: "src/app.ts" }],
@@ -674,10 +789,6 @@ test("TUI: 权限层贴在输入框上方，方向键选择并用 Enter 确认",
   await waitFor(() => /› \[a\]/.test(view.lastFrame() ?? ""));
   view.stdin.write("\u001b[B");
   await waitFor(() => /› \[p\]/.test(view.lastFrame() ?? ""));
-  view.stdin.write("\r");
-  await waitFor(() => /再次按 p\/Enter/.test(view.lastFrame() ?? ""));
-  assert.deepEqual(decisions, []);
-  assert.match(view.lastFrame() ?? "", /再次按 p\/Enter/);
   view.stdin.write("\r");
   await waitFor(() => decisions.length === 1);
   assert.deepEqual(decisions, ["allow_always"]);
@@ -715,12 +826,13 @@ test("TUI: /mouse 可切换跟踪，off 明确恢复原生框选/复制", async 
   for (const ch of "/mouse on") view.stdin.write(ch);
   view.stdin.write("\r");
   await tick(50);
-  assert.match(view.lastFrame() ?? "", /鼠标跟踪|Mouse tracking/);
+  assert.match(view.lastFrame() ?? "", /鼠标.*跟踪|Mouse.*tracking/);
 
   for (const ch of "/mouse off") view.stdin.write(ch);
   view.stdin.write("\r");
   await tick(50);
-  assert.match(view.lastFrame() ?? "", /拖拽框选|drag to select/);
+  assert.match(view.lastFrame() ?? "", /原生框选|Native text selection/);
+  assert.match(view.lastFrame() ?? "", /PageUp\/PageDown/);
   view.unmount();
 });
 
@@ -826,6 +938,21 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
       models: [],
       catalog: [],
     },
+    {
+      id: "openrouter",
+      name: "OpenRouter",
+      kind: "openai-compatible",
+      protocol: "openai-chat",
+      aliases: [],
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKeyEnv: ["OPENROUTER_API_KEY"],
+      requiresApiKey: true,
+      local: false,
+      capabilities: { tools: true, reasoning: false },
+      limits: {},
+      models: [],
+      catalog: [],
+    },
   ];
   const catalog = [
     {
@@ -869,6 +996,13 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
       sessionId="s_pick"
       providers={providers}
       catalog={catalog}
+      discoverModels={async (providerId) =>
+        providerId === "debug"
+          ? ["demo"]
+          : providerId === "openrouter"
+            ? ["meta-llama/llama-3.3-70b-instruct:free"]
+            : undefined
+      }
       inspectProviderCredentials
     />,
   );
@@ -886,6 +1020,7 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
     assert.match(pickerFrame, /Debug Demo/);
     assert.match(pickerFrame, /Free/); // 免费模型右侧标 Free
     assert.match(pickerFrame, /OpenRouter/); // 按 provider 分组的组标题
+    assert.match(pickerFrame, /搜索模型…/); // 选择器复用底部输入框，不再居中接管整屏
     assert.doesNotMatch(pickerFrame, /↑\/↓|Enter 确认/); // 固定视口无需额外操作提示行
     // 打开时未新建会话
     assert.equal(created, undefined);
@@ -912,6 +1047,144 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
       model: "openrouter/meta-llama/llama-3.3-70b-instruct:free",
     });
     assert.match(view.lastFrame() ?? "", /会话边界 s_new/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI: 结果页模型选择器遮住底层文字，选中后带历史切换而不返回首页", async () => {
+  const marker = "MODEL_PICKER_BACKGROUND_LEAK";
+  let created = false;
+  let forked:
+    | {
+        sessionId: string;
+        opts?: { title?: string; upToMessage?: number; model?: string };
+      }
+    | undefined;
+  const host = offlineHost({
+    id: "s_result",
+    cwd: "/result/project",
+    model: "old/model",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "问题" }] },
+      { role: "assistant", content: [{ type: "text", text: marker }] },
+    ],
+    onCreate: () => {
+      created = true;
+    },
+    onFork: (sessionId, opts) => {
+      forked = { sessionId, ...(opts ? { opts } : {}) };
+    },
+  });
+  const view = render(
+    <App
+      host={host}
+      cwd="/wrong"
+      model="wrong"
+      sessionId="s_result"
+      terminalSize={{ rows: 20, cols: 80 }}
+      providers={[
+        {
+          id: "debug",
+          name: "anicode Debug",
+          kind: "debug",
+          protocol: "debug",
+          aliases: ["demo"],
+          apiKeyEnv: [],
+          requiresApiKey: false,
+          local: true,
+          capabilities: { tools: true, reasoning: false },
+          limits: {},
+          models: [],
+          catalog: [],
+        },
+      ]}
+      catalog={[
+        {
+          model: "demo",
+          label: "Debug Demo",
+          providerId: "debug",
+          providerName: "anicode Debug",
+          spec: "debug/demo",
+          local: true,
+          requiresApiKey: false,
+        },
+      ]}
+      discoverModels={async () => ["demo"]}
+      inspectProviderCredentials
+    />,
+  );
+
+  try {
+    await waitFor(() => (view.lastFrame() ?? "").includes(marker));
+    for (const ch of "/model") view.stdin.write(ch);
+    await tick();
+    view.stdin.write("\r");
+    await waitFor(() => /选择模型/.test(view.lastFrame() ?? ""));
+    assert.doesNotMatch(view.lastFrame() ?? "", new RegExp(marker));
+    const pickerLines = (view.lastFrame() ?? "").split("\n");
+    const selectedLine = pickerLines.find((line) => line.includes("Debug Demo"));
+    assert.equal(
+      selectedLine?.length,
+      80,
+      "模型候选行应从左边框连续铺到右边框，不保留框内 padding",
+    );
+
+    view.stdin.write("\r");
+    await waitFor(() => forked !== undefined && (view.lastFrame() ?? "").includes(marker));
+    assert.equal(created, false);
+    assert.deepEqual(forked, { sessionId: "s_result", opts: { model: "debug/demo" } });
+    assert.match(view.lastFrame() ?? "", /debug\/demo|demo/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI: /model 隐藏探测失败模型，并在没有可用模型时提示排查", async () => {
+  const providers: ProviderDescriptor[] = [
+    {
+      id: "down",
+      name: "Down Provider",
+      kind: "openai-compatible",
+      protocol: "openai-chat",
+      aliases: [],
+      baseURL: "https://down.invalid/v1",
+      apiKeyEnv: ["DOWN_API_KEY"],
+      requiresApiKey: true,
+      local: false,
+      capabilities: { tools: true, reasoning: false },
+      limits: {},
+      models: [],
+      catalog: [],
+    },
+  ];
+  const catalog: ModelCatalogEntry[] = [
+    {
+      model: "ghost-model",
+      providerId: "down",
+      providerName: "Down Provider",
+      spec: "down/ghost-model",
+      local: false,
+      requiresApiKey: true,
+    },
+  ];
+  const view = render(
+    <App
+      host={offlineHost()}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_offline"
+      providers={providers}
+      catalog={catalog}
+      discoverModels={async () => undefined}
+    />,
+  );
+  await tick(80);
+  try {
+    for (const ch of "/model") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => /没有模型端点探测成功/.test(view.lastFrame() ?? ""));
+    assert.doesNotMatch(view.lastFrame() ?? "", /ghost-model|选择模型/);
   } finally {
     view.unmount();
   }
@@ -1016,6 +1289,62 @@ test("TUI transcript: 隐藏内部 context，并从最近 todo_write 恢复清�
   ]);
 });
 
+test("TUI: 任务清单只显示当前运行中的未完成任务，旧结果与结束事件会隐藏它", async () => {
+  const todoMessages = (status: "pending" | "in_progress" | "completed"): ChatMessage[] => [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          id: "todo-current",
+          name: "todo_write",
+          args: { todos: [{ content: "整理搜索结果", status }] },
+        },
+      ],
+    },
+  ];
+
+  const idle = render(
+    <App
+      host={offlineHost({ messages: todoMessages("completed"), running: false })}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_todo_idle"
+    />,
+  );
+  await tick(80);
+  assert.doesNotMatch(idle.lastFrame() ?? "", /任务清单|Task list/);
+  idle.unmount();
+
+  const active = render(
+    <App
+      host={offlineHost({ messages: todoMessages("in_progress"), running: true })}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_todo_active"
+    />,
+  );
+  await tick(80);
+  assert.match(active.lastFrame() ?? "", /任务清单|Task list/);
+  active.unmount();
+
+  const finished = render(
+    <App
+      host={offlineHost({
+        messages: todoMessages("in_progress"),
+        running: true,
+        eventsBeforeSnapshot: [{ type: "state", running: false }],
+      })}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_todo_finished"
+    />,
+  );
+  await tick(80);
+  assert.doesNotMatch(finished.lastFrame() ?? "", /任务清单|Task list/);
+  finished.unmount();
+});
+
 test("TUI transcript: 并行工具结果按 toolCallId 关联", () => {
   const items = messagesToItems([
     {
@@ -1108,6 +1437,25 @@ test("TUI: ↑/↓ 回溯已提交的输入历史", async () => {
   await tick(20);
   assert.deepEqual(sent, ["alpha"]);
   view.unmount();
+});
+
+test("TUI: 恢复会话时从持久化用户消息重建 prompt 历史", () => {
+  const messages: ChatMessage[] = [
+    { role: "user", content: [{ type: "text", text: "第一问" }] },
+    { role: "assistant", content: [{ type: "text", text: "第一答" }] },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "内部上下文", internal: true },
+        { type: "tool_result", toolCallId: "t1", toolName: "read", content: "result" },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "第二问" }] },
+    { role: "user", content: [{ type: "text", text: "第二问" }] },
+  ];
+  assert.deepEqual(promptHistoryFromMessages(messages), ["第一问", "第二问"]);
+  assert.deepEqual(promptHistoryFromMessages(messages, 1), ["第二问"]);
+  assert.deepEqual(promptHistoryFromMessages(messages, 0), []);
 });
 
 /** ink-testing-library 的帧带 ANSI 颜色，比对宽度前先剥掉 SGR。 */

@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { acceptKey, encodeTextFrame, decodeFrame } from "./ws.js";
+import { acceptKey, encodeTextFrame, decodeFrame, WsClient } from "./ws.js";
 
 const MASK = Buffer.from([0x12, 0x34, 0x56, 0x78]);
 
@@ -93,4 +93,17 @@ test("decodeFrame：分片文本（FIN=0 + 续帧 0x0）各自解出、由调用
     "hello",
     "两片重组应还原原文",
   );
+});
+
+test("decodeFrame：声明超大负载时在等待 body 前即拒绝", () => {
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeUInt32BE(0, 2);
+  header.writeUInt32BE(33 * 1024 * 1024, 6);
+  assert.throws(() => decodeFrame(header), /exceeds 33554432 bytes/);
+});
+
+test("WsClient: Chrome DevTools transport refuses non-loopback endpoints", async () => {
+  await assert.rejects(() => WsClient.connect("ws://example.com/devtools", {}), /loopback host/);
 });

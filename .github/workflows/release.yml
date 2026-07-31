@@ -19,6 +19,23 @@ jobs:
   npm:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: anicode_test
+          POSTGRES_USER: anicode
+          POSTGRES_PASSWORD: anicode-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U anicode -d anicode_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ANICODE_TEST_DATABASE_URL: postgresql://anicode:anicode-test-only@127.0.0.1:5432/anicode_test
     permissions:
       contents: write
       pull-requests: write
@@ -29,10 +46,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-          cache: npm
           registry-url: "https://registry.npmjs.org"
 
       - run: npm ci
+
+      - name: Run complete release gate
+        run: npm run verify:release
 
       - name: Create Release PR or publish
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
@@ -44,9 +63,44 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           NPM_CONFIG_PROVENANCE: "true"
 
+  # Release assets are built only after the tagged commit passes the same gate as npm publishing.
+  validate-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: anicode_test
+          POSTGRES_USER: anicode
+          POSTGRES_PASSWORD: anicode-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U anicode -d anicode_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ANICODE_TEST_DATABASE_URL: postgresql://anicode:anicode-test-only@127.0.0.1:5432/anicode_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Validate tagged release candidate
+        run: npm run verify:release
+
   # 发布 GitHub Release 时：构建 .vsix 并作为 Release 资产上传。
   vsix:
     if: github.event_name == 'release'
+    needs: validate-release
     name: vsix (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -58,8 +112,12 @@ jobs:
           - { os: macos-15-intel, target: darwin-x64 }
           - { os: windows-latest, target: win32-x64 }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -80,25 +138,53 @@ jobs:
           --target "${{ matrix.target }}"
           -o "packages/vscode/anicode-${{ matrix.target }}.vsix"
 
+      - name: Generate VSIX checksum
+        run: >-
+          node scripts/write-sha256s.mjs
+          "packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt"
+          packages/vscode .vsix
+
+      - name: Attest VSIX build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-checksums: packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt
+
       - name: Upload .vsix to release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
-          files: packages/vscode/anicode-${{ matrix.target }}.vsix
+          files: |
+            packages/vscode/anicode-${{ matrix.target }}.vsix
+            packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt
 
   desktop:
     if: github.event_name == 'release'
+    needs: validate-release
     name: desktop (${{ matrix.platform }})
     environment: release
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, platform: mac, args: "--mac --arm64 --x64 -c.forceCodeSigning=true", signed: "true" }
-          - { os: windows-latest, platform: windows, args: "--win --x64 -c.forceCodeSigning=true", signed: "true" }
+          - {
+              os: macos-latest,
+              platform: mac,
+              args: "--mac --arm64 --x64 -c.forceCodeSigning=true",
+              signed: "true",
+            }
+          - {
+              os: windows-latest,
+              platform: windows,
+              args: "--win --x64 -c.forceCodeSigning=true",
+              signed: "true",
+            }
           - { os: ubuntu-latest, platform: linux, args: "--linux --x64", signed: "false" }
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       CSC_LINK: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_LINK || secrets.WINDOWS_CSC_LINK }}
       CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_KEY_PASSWORD || secrets.WINDOWS_CSC_KEY_PASSWORD }}
@@ -141,8 +227,21 @@ jobs:
       - name: Build signed desktop installers
         run: npm run dist --workspace @anicode/app -- ${{ matrix.args }} --publish never
 
+      - name: Generate desktop checksums
+        run: >-
+          node scripts/write-sha256s.mjs
+          "packages/app/release/anicode-${{ matrix.platform }}-SHA256SUMS.txt"
+          packages/app/release .dmg .zip .exe .AppImage .yml .blockmap
+
+      - name: Attest desktop build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-checksums: packages/app/release/anicode-${{ matrix.platform }}-SHA256SUMS.txt
+
       - name: Upload desktop release assets
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           fail_on_unmatched_files: true
-          files: packages/app/release/*.{dmg,zip,exe,AppImage,yml,blockmap}
+          files: |
+            packages/app/release/*.{dmg,zip,exe,AppImage,yml,blockmap}
+            packages/app/release/anicode-${{ matrix.platform }}-SHA256SUMS.txt

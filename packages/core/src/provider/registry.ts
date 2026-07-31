@@ -11,6 +11,7 @@ import type { NetworkProxy } from "../runtime/network-proxy.js";
 import type { CredentialBroker } from "../security/credentials.js";
 import type { Provider } from "../types.js";
 import { DebugProvider } from "./debug.js";
+import { isLoopbackProviderURL, providerModelsURL } from "./local-endpoint.js";
 import { OpenAICompatProvider, type MaxTokensField } from "./openai-compat.js";
 
 export type ProviderKind = "native" | "openai-compatible" | "debug";
@@ -283,8 +284,26 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
       maxTokensField: "max_tokens",
       reasoningEffort: false,
       capabilities: { ...cloudDefaults, images: true },
-      limits: { contextWindow: 1_048_576, maxOutputTokens: 8_192 },
+      limits: { contextWindow: 1_048_576, maxOutputTokens: 65_536 },
       models: [
+        {
+          pattern: "gemini-3.6-flash*",
+          capabilities: { reasoning: true },
+          cost: { input: 1.5, output: 7.5 },
+        },
+        {
+          pattern: "gemini-3.5-flash-lite*",
+          capabilities: { reasoning: true },
+          cost: { input: 0.3, output: 2.5 },
+        },
+        {
+          pattern: "gemini-3.5-flash*",
+          capabilities: { reasoning: true },
+        },
+        {
+          pattern: "gemini-3.1-pro*",
+          capabilities: { reasoning: true },
+        },
         {
           pattern: "gemini-2.5-flash*",
           limits: { maxOutputTokens: 8_192 },
@@ -296,32 +315,112 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
           limits: { maxOutputTokens: 65_536 },
           cost: { input: 1.25, output: 10.0, cacheRead: 0.0425 },
         },
-        {
-          pattern: "gemini-2.0-flash*",
-          limits: { maxOutputTokens: 8_192 },
-          cost: { input: 0.1, output: 0.4, cacheRead: 0.0025 },
-        },
       ],
       catalog: [
         {
-          model: "gemini-2.5-flash",
-          label: "Gemini 2.5 Flash",
+          model: "gemini-3.6-flash",
+          label: "Gemini 3.6 Flash",
           recommended: true,
-          note: "快速模型，Google Gemini",
+          note: "当前 GA 主力模型，适合编码、工具调用与多模态任务",
         },
         {
-          model: "gemini-2.5-pro",
-          label: "Gemini 2.5 Pro",
-          note: "强推理模型，Google Gemini",
+          model: "gemini-3.5-flash-lite",
+          label: "Gemini 3.5 Flash-Lite",
+          note: "当前 GA 低延迟、低成本模型",
         },
         {
-          model: "gemini-2.0-flash",
-          label: "Gemini 2.0 Flash",
-          note: "上一代快速模型",
+          model: "gemini-3.5-flash",
+          label: "Gemini 3.5 Flash",
+          note: "稳定 Flash 模型",
+        },
+        {
+          model: "gemini-3.1-pro-preview",
+          label: "Gemini 3.1 Pro Preview",
+          note: "复杂推理与编码预览模型",
         },
       ],
     },
   ),
+  openAI("cliproxy", "CLI Proxy API", "http://127.0.0.1:8317/v1", "CLIPROXY_API_KEY", {
+    baseURLEnv: "CLIPROXY_BASE_URL",
+    requiresApiKey: true,
+    local: true,
+    streamUsage: false,
+    maxTokensField: "max_tokens",
+    reasoningEffort: false,
+    capabilities: { ...cloudDefaults, images: true },
+    limits: { contextWindow: 1_048_576, maxOutputTokens: 8_192 },
+    models: [
+      {
+        pattern: "gemini-*pro*",
+        capabilities: { reasoning: true },
+      },
+      {
+        pattern: "gemini-*-agent",
+        capabilities: { reasoning: true },
+      },
+      {
+        pattern: "claude-*-thinking",
+        capabilities: { reasoning: true },
+      },
+      {
+        pattern: "gpt-oss-*",
+        capabilities: { reasoning: true },
+      },
+    ],
+    catalog: [
+      {
+        model: "gemini-3.6-flash-high",
+        label: "Gemini 3.6 Flash High",
+        recommended: true,
+        note: "CLI Proxy 当前高推理档",
+      },
+      {
+        model: "gemini-3.1-pro-low",
+        label: "Gemini 3.1 Pro Low",
+      },
+      {
+        model: "gemini-3.5-flash-low",
+        label: "Gemini 3.5 Flash Low",
+      },
+      {
+        model: "gemini-3.5-flash-extra-low",
+        label: "Gemini 3.5 Flash Extra Low",
+      },
+      {
+        model: "gemini-3-flash",
+        label: "Gemini 3 Flash",
+      },
+      {
+        model: "gemini-pro-agent",
+        label: "Gemini Pro Agent",
+      },
+      {
+        model: "gemini-3-flash-agent",
+        label: "Gemini 3 Flash Agent",
+      },
+      {
+        model: "gemini-3.1-flash-lite",
+        label: "Gemini 3.1 Flash Lite",
+      },
+      {
+        model: "gemini-3.1-flash-image",
+        label: "Gemini 3.1 Flash Image",
+      },
+      {
+        model: "claude-opus-4-6-thinking",
+        label: "Claude Opus 4.6 Thinking",
+      },
+      {
+        model: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+      },
+      {
+        model: "gpt-oss-120b-medium",
+        label: "GPT-OSS 120B Medium",
+      },
+    ],
+  }),
   // 通用 OpenAI Chat Completions 兼容端点。它必须是内置项，因为 anicode.json
   // 只能选择 provider，无法在启动前调用 registerProvider；缺少此项会让文档中的
   // `model: "custom/<model>"` 在应用创建首个会话时直接报「未知 provider」。
@@ -422,13 +521,16 @@ export function registerOpenAICompatibleProvider(
     directCredential: Boolean(input.apiKey),
     factory: () => {
       const runtime = runtimeConfig(d, input.apiKey);
+      const directLoopback = Boolean(
+        d.local && runtime.baseURL && isLoopbackProviderURL(runtime.baseURL),
+      );
       return new OpenAICompatProvider({
         name: d.id,
         ...(runtime.baseURL ? { baseURL: runtime.baseURL } : {}),
         // 始终显式传入（包括空串），禁止 SDK 回退到 OPENAI_API_KEY。
         apiKey: runtime.apiKey,
         maxRetries: 0,
-        ...(!d.local && providerNetworkProxy
+        ...(!directLoopback && providerNetworkProxy
           ? {
               fetch: ((input: string | URL | Request, init?: RequestInit) =>
                 providerNetworkProxy!.fetch(
@@ -453,13 +555,15 @@ export function registerOpenAICompatibleProvider(
  */
 const SMALL_MODELS: Record<string, string> = {
   deepseek: "deepseek/deepseek-v4-flash",
-  gemini: "gemini/gemini-2.5-flash",
+  gemini: "gemini/gemini-3.6-flash",
+  cliproxy: "cliproxy/gemini-3.5-flash-extra-low",
 };
 
 /** 未显式指定模型时，按凭证就绪状态挑选云端默认模型。 */
 const DEFAULT_MODEL_PREFERENCES = [
   "deepseek/deepseek-v4-flash",
-  "gemini/gemini-2.5-flash",
+  "cliproxy/gemini-3.6-flash-high",
+  "gemini/gemini-3.6-flash",
 ] as const;
 
 export function resolveDefaultModel(): string {
@@ -508,6 +612,65 @@ export function listModelCatalog(): ModelCatalogEntry[] {
     }
   }
   return entries;
+}
+
+/**
+ * 从 OpenAI-compatible provider 的 `/models` 读取实时模型 ID。
+ * 凭证只在 registry 内部组装进请求头，不会返回给调用方；失败返回 undefined，
+ * 让 `/model` 严格隐藏该 provider。成功但列表为空则返回空数组。
+ * 云端请求复用统一 NetworkProxy；本机回环服务才允许直连。
+ */
+export async function discoverProviderModels(
+  providerId: string,
+  timeoutMs = 1_200,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string[] | undefined> {
+  const entry = providers.get(providerId);
+  if (!entry) return undefined;
+  const d = entry.descriptor;
+  if (d.kind === "debug") return d.catalog.map((model) => model.model);
+  if (d.kind !== "openai-compatible") return undefined;
+  const runtime = runtimeConfig(d);
+  if (!runtime.baseURL || (d.requiresApiKey && !runtime.apiKey)) return undefined;
+  // A descriptor marked local never gets to turn its proxy exception into cloud egress.
+  if (d.local && !isLoopbackProviderURL(runtime.baseURL)) return undefined;
+  const modelsURL = providerModelsURL(runtime.baseURL);
+  if (!modelsURL) return undefined;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const directLoopback = d.local && isLoopbackProviderURL(runtime.baseURL);
+      // Cloud discovery carries credentials and must never silently bypass the production egress
+      // boundary. Loopback discovery is the only direct-fetch exception.
+      if (!directLoopback && !providerNetworkProxy) return undefined;
+      const request = directLoopback
+        ? fetchImpl
+        : providerNetworkProxy!.fetch.bind(providerNetworkProxy);
+      const response = await request(modelsURL, {
+        signal: controller.signal,
+        redirect: "error",
+        ...(runtime.apiKey && runtime.apiKey !== "anicode-local"
+          ? { headers: { Authorization: `Bearer ${runtime.apiKey}` } }
+          : {}),
+      });
+      if (!response.ok) return undefined;
+      const payload = (await response.json()) as { data?: Array<{ id?: unknown }> };
+      if (!Array.isArray(payload.data)) return undefined;
+      return [
+        ...new Set(
+          payload.data
+            .map((model) => (typeof model.id === "string" ? model.id.trim() : ""))
+            .filter(Boolean),
+        ),
+      ].slice(0, 500);
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 export function createProvider(spec: string): CreatedModel {
@@ -623,6 +786,14 @@ function diagnosticsFor(entry: RegisteredProvider, model: string): ProviderDiagn
   }
   if (!baseURL && d.kind !== "debug")
     warnings.push(t("provider baseURL is not configured", "未配置 provider baseURL"));
+  if (d.local && baseURL && !isLoopbackProviderURL(baseURL)) {
+    warnings.push(
+      t(
+        "local provider baseURL is not loopback; automatic discovery is disabled and requests must pass the network policy",
+        "本地 provider 的 baseURL 不是回环地址；已禁用自动发现，请求必须经过网络策略",
+      ),
+    );
+  }
   return {
     providerId: d.id,
     model,

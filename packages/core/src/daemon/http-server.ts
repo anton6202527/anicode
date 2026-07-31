@@ -820,12 +820,20 @@ export class HttpDaemonServer {
     switch (action) {
       case "send": {
         const idempotencyHeader = req.headers["idempotency-key"];
+        const traceparentHeader = req.headers.traceparent;
         if (
           Array.isArray(idempotencyHeader) ||
           (typeof idempotencyHeader === "string" &&
             (!idempotencyHeader || idempotencyHeader.length > 256))
         ) {
           return json(res, 400, { error: "Idempotency-Key must contain 1 to 256 characters" });
+        }
+        if (
+          Array.isArray(traceparentHeader) ||
+          (typeof traceparentHeader === "string" &&
+            (!traceparentHeader || traceparentHeader.length > 512))
+        ) {
+          return json(res, 400, { error: "traceparent must contain 1 to 512 characters" });
         }
         const idempotencyKey =
           typeof idempotencyHeader === "string" && idempotencyHeader
@@ -840,12 +848,12 @@ export class HttpDaemonServer {
             ? {
                 ...(typeof body.model === "string" && body.model ? { model: body.model } : {}),
                 ...(idempotencyKey ? { idempotencyKey } : {}),
-                ...(typeof req.headers.traceparent === "string"
-                  ? { traceparent: req.headers.traceparent }
+                ...(typeof traceparentHeader === "string"
+                  ? { traceparent: traceparentHeader }
                   : {}),
               }
-            : typeof req.headers.traceparent === "string"
-              ? { traceparent: req.headers.traceparent }
+            : typeof traceparentHeader === "string"
+              ? { traceparent: traceparentHeader }
               : undefined,
         );
         return noContent(res);
@@ -872,6 +880,7 @@ export class HttpDaemonServer {
           await manager.forkSession(sessionId, {
             ...(typeof body.title === "string" ? { title: body.title } : {}),
             ...(typeof body.upToMessage === "number" ? { upToMessage: body.upToMessage } : {}),
+            ...(typeof body.model === "string" ? { model: body.model } : {}),
           }),
         );
       case "permission": {

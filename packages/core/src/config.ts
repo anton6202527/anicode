@@ -82,6 +82,7 @@ export interface AnicodeConfig {
         headless?: boolean;
         viewport?: { width: number; height: number };
         launchTimeoutMs?: number;
+        commandTimeoutMs?: number;
       };
   /** TUI-only preferences. Unknown action names are ignored by the frontend. */
   tui?: { keybindings?: Record<string, string> };
@@ -382,6 +383,7 @@ export function browserToolOptions(config: AnicodeConfig): BrowserToolOptions | 
   if (b.headless !== undefined) opts.headless = b.headless;
   if (b.viewport) opts.viewport = b.viewport;
   if (b.launchTimeoutMs) opts.launchTimeoutMs = b.launchTimeoutMs;
+  if (b.commandTimeoutMs) opts.commandTimeoutMs = b.commandTimeoutMs;
   return opts;
 }
 

@@ -146,3 +146,39 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
 
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("debug log: trace 模式按字段脱敏、截断超长内容并轮转", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
+  const file = path.join(dir, "trace.jsonl");
+  const logger = new DebugLogger(file, true, { maxBytes: 512, maxFieldChars: 48 });
+
+  logger.log("secret.fixture", {
+    apiKey: "short-value-that-pattern-matching-alone-would-miss",
+    nested: { authorization: "Basic hidden-basic-value" },
+    command:
+      "curl -H 'Authorization: Basic hidden-in-command' -H 'x-api-key: hidden-header' example.invalid",
+    providerKey: "AIza0123456789012345678901234567890123456789",
+    longText: "x".repeat(200),
+  });
+  const secretLog = await fs.readFile(file, "utf8");
+  assert.doesNotMatch(
+    secretLog,
+    /short-value|hidden-basic|hidden-in-command|hidden-header|AIza012345/,
+  );
+  assert.match(secretLog, /\[REDACTED\]/);
+  assert.match(secretLog, /truncated/);
+  for (let i = 0; i < 12; i++) logger.log("rotation.fixture", { i, value: "y".repeat(80) });
+
+  const current = await fs.readFile(file, "utf8");
+  const rotated = await fs.readFile(`${file}.1`, "utf8");
+  const combined = `${rotated}\n${current}`;
+  assert.match(combined, /truncated/);
+  for (const line of [...current.split("\n"), ...rotated.split("\n")].filter(Boolean)) {
+    assert.doesNotThrow(() => JSON.parse(line));
+  }
+  assert.ok((await fs.stat(file)).size <= 512);
+  assert.ok((await fs.stat(`${file}.1`)).size <= 512);
+  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+
+  await fs.rm(dir, { recursive: true, force: true });
+});

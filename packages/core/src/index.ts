@@ -29,6 +29,7 @@ export {
   listProviders,
   listProviderDetails,
   listModelCatalog,
+  discoverProviderModels,
   resolveDefaultModel,
   defaultSmallModel,
   estimateCostUSD,
@@ -91,6 +92,7 @@ export {
   commandHooksFromConfig,
   isHookEventName,
   type CommandHookConfig,
+  type CommandHookOptions,
 } from "./hooks-exec.js";
 export {
   parseFrontmatter,
@@ -170,6 +172,11 @@ export {
   type McpServerCapabilities,
   type McpClientHandlers,
 } from "./mcp.js";
+export {
+  DEVELOPMENT_MCP_CATALOG,
+  findDevelopmentMcp,
+  type DevelopmentMcpCatalogEntry,
+} from "./mcp-catalog.js";
 export {
   loadConfig,
   loadProjectEnv,

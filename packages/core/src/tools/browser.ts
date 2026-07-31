@@ -14,6 +14,7 @@ export interface BrowserToolOptions {
   executablePath?: string;
   headless?: boolean;
   launchTimeoutMs?: number;
+  commandTimeoutMs?: number;
   viewport?: { width: number; height: number };
   /** Chrome 的唯一 HTTP(S) 出口；生产宿主同时启用 requireProxy。 */
   proxyUrl?: string;
@@ -40,6 +41,7 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
         ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
         ...(opts.headless !== undefined ? { headless: opts.headless } : {}),
         ...(opts.launchTimeoutMs ? { launchTimeoutMs: opts.launchTimeoutMs } : {}),
+        ...(opts.commandTimeoutMs ? { commandTimeoutMs: opts.commandTimeoutMs } : {}),
         ...(proxy
           ? {
               args: [
@@ -78,8 +80,8 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
           url: {
             type: "string",
             description: t(
-              "URL to open (http/https/file). A bare host or path is treated as http://.",
-              "要打开的 URL（http/https/file）。只给主机或路径时按 http:// 处理。",
+              "HTTP(S) URL to open. A bare host is treated as http://. Local file/data/browser URLs are rejected.",
+              "要打开的 HTTP(S) URL。只给主机时按 http:// 处理；拒绝本地文件、data 与浏览器内部 URL。",
             ),
           },
           waitUntil: {
@@ -128,7 +130,14 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
 
     async run(input, ctx: ToolContext) {
       const url = normalizeUrl(String(input["url"] ?? "").trim());
-      if (!url) throw new ToolError(t("url is required", "url 不能为空"));
+      if (!url) {
+        throw new ToolError(
+          t(
+            "browser requires an HTTP(S) URL; local file and browser-internal schemes are blocked",
+            "browser 只允许 HTTP(S) URL；已阻止本地文件和浏览器内部协议",
+          ),
+        );
+      }
       const waitUntil = WAIT_MODES.find((m) => m === input["waitUntil"]);
       const timeoutMs = Number(input["timeoutMs"]) || 30_000;
 
@@ -206,15 +215,18 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
 }
 
 /**
- * 只给主机/路径时补 http://；已带 scheme 的原样返回。
- * 认已知无 `//` 的 scheme（data/file/about/…）与任意 `scheme://`；否则如 `localhost:3000`
- * 视作主机:端口，补 http://。
+ * 只给主机时补 http://；最终仅允许 HTTP(S)。禁止 file/data/about/chrome 等协议，避免
+ * 把自动放行的只读浏览器变成读取宿主本地文件的旁路。
  */
 function normalizeUrl(raw: string): string {
   if (!raw) return "";
-  if (/^(https?|file|data|about|chrome|view-source|ws|wss):/i.test(raw)) return raw;
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
-  return "http://" + raw;
+  const candidate = /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `http://${raw}`;
+  try {
+    const url = new URL(candidate);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : "";
+  } catch {
+    return "";
+  }
 }
 
 const ERROR_LEVELS = new Set(["error", "exception"]);

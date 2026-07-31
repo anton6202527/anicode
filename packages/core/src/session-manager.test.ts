@@ -493,6 +493,13 @@ test("SessionManager: forkSession 复制历史成新会话，原会话不动", a
   assert.equal(earlySnap.messages.length, 1);
   assert.equal(early.title, "早期分叉");
 
+  // 切换模型时仍复制完整历史；解析在写入前完成，生成的会话可直接恢复。
+  const switched = await m.forkSession(s.id, { title: "切换模型", model: "alt/fast" });
+  const switchedSnap = await m.resumeSession(switched.id);
+  assert.equal(switched.model, "alt/fast");
+  assert.equal(switchedSnap.meta.model, "alt/fast");
+  assert.equal(switchedSnap.messages.length, origSnap.messages.length);
+
   await fs.rm(dir, { recursive: true, force: true });
 });
 

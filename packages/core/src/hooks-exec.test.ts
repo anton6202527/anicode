@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { commandHook, commandHooksFromConfig, isHookEventName } from "./hooks-exec.js";
 import { HookRunner } from "./hooks.js";
+import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
 const payload = { event: "PreToolUse" as const, cwd: process.cwd(), toolName: "bash" };
 
@@ -69,4 +70,56 @@ test("commandHooksFromConfig: 无效条目剔除，合法条目生效", () => {
   assert.equal(commandHooksFromConfig(undefined).length, 0);
   assert.ok(isHookEventName("SubagentStart"));
   assert.ok(!isHookEventName("Bogus"));
+});
+
+test("命令 hook: production runtime 通过 prepare 收口命令、cwd 与脱敏环境", async () => {
+  const prepared: string[] = [];
+  const runtime: ExecutionRuntime = {
+    async run() {
+      throw new Error("hook stdin protocol must use prepare");
+    },
+    prepare(request) {
+      prepared.push(`${request.policy}:${request.network}:${request.cwd}:${request.command}`);
+      return {
+        file: process.execPath,
+        args: [
+          "-e",
+          "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>console.log(JSON.stringify({additionalContext:JSON.parse(s).event})))",
+        ],
+        cwd: request.cwd,
+        env: { PATH: process.env.PATH },
+        sandboxed: true,
+      };
+    },
+  };
+  const registration = commandHook(
+    { event: "SessionStart", command: "untrusted-project-hook" },
+    { executionRuntime: runtime },
+  );
+  const outcome = await new HookRunner([registration]).run({
+    event: "SessionStart",
+    cwd: process.cwd(),
+  });
+  assert.equal(outcome.additionalContext, "SessionStart");
+  assert.deepEqual(prepared, [`workspace-write:false:${process.cwd()}:untrusted-project-hook`]);
+});
+
+test("命令 hook: 不支持 prepare 的远程 runtime 不得回退宿主 shell", async () => {
+  let executed = false;
+  const runtime: ExecutionRuntime = {
+    async run() {
+      executed = true;
+      return { exitCode: 0, output: "", timedOut: false, sandboxed: true, durationMs: 1 };
+    },
+  };
+  const registration = commandHook(
+    { event: "SessionStart", command: "exit 2" },
+    { executionRuntime: runtime },
+  );
+  const outcome = await new HookRunner([registration]).run({
+    event: "SessionStart",
+    cwd: process.cwd(),
+  });
+  assert.equal(outcome.blocked, false);
+  assert.equal(executed, false);
 });

@@ -769,19 +769,21 @@ export class SessionManager {
    */
   async forkSession(
     sessionId: string,
-    opts?: { title?: string; upToMessage?: number },
+    opts?: { title?: string; upToMessage?: number; model?: string },
   ): Promise<SessionSummary> {
     const source = await this.ensureLive(sessionId);
     const snap = source.snapshot();
     const messages =
       opts?.upToMessage !== undefined ? snap.messages.slice(0, opts.upToMessage) : snap.messages;
-    const resolved = this.opts.resolveProvider(snap.meta.model);
+    const model = opts?.model ?? snap.meta.model;
+    // Resolve before writing anything so an invalid model cannot leave an unusable fork behind.
+    const resolved = this.opts.resolveProvider(model);
     const id = newSessionId((this.opts.now ?? Date.now)(), this.opts.rand ?? Math.random);
     const title = opts?.title ?? (snap.meta.title ? `${snap.meta.title} (fork)` : undefined);
     const meta = await this.opts.store.create({
       id,
       cwd: snap.meta.cwd,
-      model: snap.meta.model,
+      model,
       ...(title ? { title } : {}),
     });
     // 复制的历史整体落盘（rewrite 原子替换含 meta 头的整份文件）。
@@ -1243,7 +1245,7 @@ export class SessionManager {
 
   /** 为某会话 cwd 建一个 LSP 池并登记，供 dispose 统一关闭。 */
   private lspPoolFor(cwd: string): LspPool {
-    const pool = new LspPool(cwd, this.opts.lsp ?? []);
+    const pool = new LspPool(cwd, this.opts.lsp ?? [], this.opts.isolatedRuntime);
     this.lspPools.add(pool);
     return pool;
   }

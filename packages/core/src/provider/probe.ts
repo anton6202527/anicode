@@ -7,6 +7,7 @@
  */
 
 import type { ProviderDescriptor } from "./registry.js";
+import { localProviderModelsURL } from "./local-endpoint.js";
 
 /** 探测一个 OpenAI 兼容 baseURL 是否在跑；连不上/超时返回 false。 */
 export async function probeEndpoint(
@@ -14,12 +15,17 @@ export async function probeEndpoint(
   timeoutMs = 600,
   fetchImpl: typeof fetch = fetch,
 ): Promise<boolean> {
-  const root = baseURL.endsWith("/") ? baseURL : baseURL + "/";
+  const modelsURL = localProviderModelsURL(baseURL);
+  if (!modelsURL) return false;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetchImpl(new URL("models", root), { signal: controller.signal });
+      const res = await fetchImpl(modelsURL, {
+        signal: controller.signal,
+        // A loopback endpoint must not turn model discovery into an arbitrary redirect fetch.
+        redirect: "error",
+      });
       // 有任何 HTTP 响应就说明服务在跑（401/404 也算在跑,只是鉴权/路径问题）。
       return res.status > 0;
     } finally {

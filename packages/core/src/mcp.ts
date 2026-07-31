@@ -2,7 +2,7 @@
  * MCP 客户端 —— 把外部 MCP server 的工具接入 core 的 ToolRegistry。
  *
  * 两种传输：
- *   - stdio（本地进程）：JSON-RPC 2.0，Content-Length 分帧（MCP 标准帧）。
+ *   - stdio（本地进程）：JSON-RPC 2.0，换行分隔帧。
  *   - Streamable HTTP（远程 server）：POST JSON-RPC 到单一 endpoint，响应为
  *     application/json 或 text/event-stream(SSE)；用 Mcp-Session-Id 维持会话。
  * 支持 initialize / tools/list / tools/call。每个 MCP 工具包装成 core Tool
@@ -42,6 +42,8 @@ interface McpToolSpec {
 
 /** MCP 请求默认超时；挂死的 server 不该无限期占住一次工具调用。 */
 const DEFAULT_TIMEOUT_MS = 60_000;
+const MAX_MCP_STDIO_FRAME_BYTES = 4 * 1024 * 1024;
+const MAX_MCP_PENDING_REQUESTS = 256;
 
 /** server 声明的资源元数据（resources/list）。 */
 export interface McpResource {
@@ -344,9 +346,10 @@ export class McpClient {
 
 class StdioTransport implements McpTransport {
   private proc: ChildProcessWithoutNullStreams;
-  private buffer = "";
+  private buffer = Buffer.alloc(0);
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+  private terminalError: Error | undefined;
   onNotification?: (method: string, params: unknown) => void;
 
   constructor(
@@ -406,14 +409,27 @@ class StdioTransport implements McpTransport {
       ...(cwd ? { cwd } : {}),
     });
     this.proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
+    // A noisy server must not block itself on a full stderr pipe. Diagnostics belong in the
+    // explicit debug log at the host boundary; never retain unbounded third-party stderr here.
+    this.proc.stderr.on("data", () => {});
+    this.proc.on("error", (error) => this.failTransport(error, false));
     this.proc.on("exit", () => {
-      for (const p of this.pending.values())
-        p.reject(new Error(t("MCP server has exited", "MCP server 已退出")));
-      this.pending.clear();
+      this.failTransport(new Error(t("MCP server has exited", "MCP server 已退出")), false);
     });
   }
 
   request(method: string, params: unknown, _context?: SpanContext): Promise<any> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.pending.size >= MAX_MCP_PENDING_REQUESTS) {
+      return Promise.reject(
+        new Error(
+          t(
+            `MCP client has ${MAX_MCP_PENDING_REQUESTS} requests in flight`,
+            `MCP 客户端已有 ${MAX_MCP_PENDING_REQUESTS} 个请求在处理中`,
+          ),
+        ),
+      );
+    }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       // 超时：挂死的 server 不该无限期占住一次工具调用；如实告知方法与时限。
@@ -440,7 +456,13 @@ class StdioTransport implements McpTransport {
           reject(e);
         },
       });
-      this.writeFrame({ jsonrpc: "2.0", id, method, params });
+      try {
+        this.writeFrame({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(error);
+      }
     });
   }
 
@@ -449,23 +471,64 @@ class StdioTransport implements McpTransport {
   }
 
   close(): void {
+    this.failTransport(new Error(t("MCP client has closed", "MCP 客户端已关闭")), false);
     this.proc.kill();
   }
 
   private writeFrame(obj: unknown): void {
     // JSON.stringify 不会产出裸换行（字符串内换行是 \n 转义），满足单行约束。
-    this.proc.stdin.write(JSON.stringify(obj) + "\n");
+    const frame = JSON.stringify(obj) + "\n";
+    if (Buffer.byteLength(frame, "utf8") > MAX_MCP_STDIO_FRAME_BYTES) {
+      throw new Error(
+        t(
+          `MCP frame exceeds ${MAX_MCP_STDIO_FRAME_BYTES} bytes`,
+          `MCP 帧超过 ${MAX_MCP_STDIO_FRAME_BYTES} bytes`,
+        ),
+      );
+    }
+    this.proc.stdin.write(frame);
   }
 
   private onData(chunk: Buffer): void {
-    this.buffer += chunk.toString("utf8");
+    this.buffer = Buffer.concat([this.buffer, chunk]);
     let nl: number;
-    while ((nl = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, nl).replace(/\r$/, "").trim();
-      this.buffer = this.buffer.slice(nl + 1);
+    while ((nl = this.buffer.indexOf(0x0a)) >= 0) {
+      const lineBuffer = this.buffer.subarray(0, nl);
+      this.buffer = this.buffer.subarray(nl + 1);
+      if (lineBuffer.length > MAX_MCP_STDIO_FRAME_BYTES) {
+        this.failTransport(
+          new Error(
+            t(
+              `MCP frame exceeds ${MAX_MCP_STDIO_FRAME_BYTES} bytes`,
+              `MCP 帧超过 ${MAX_MCP_STDIO_FRAME_BYTES} bytes`,
+            ),
+          ),
+        );
+        return;
+      }
+      const line = lineBuffer.toString("utf8").replace(/\r$/, "").trim();
       // 非 JSON 行（server 把日志误写到 stdout）静默跳过，handleMessage 已容错。
       if (line) this.handleMessage(line);
     }
+    if (this.buffer.length > MAX_MCP_STDIO_FRAME_BYTES) {
+      this.failTransport(
+        new Error(
+          t(
+            `MCP frame exceeds ${MAX_MCP_STDIO_FRAME_BYTES} bytes`,
+            `MCP 帧超过 ${MAX_MCP_STDIO_FRAME_BYTES} bytes`,
+          ),
+        ),
+      );
+    }
+  }
+
+  private failTransport(error: Error, terminate = true): void {
+    if (this.terminalError) return;
+    this.terminalError = error;
+    this.buffer = Buffer.alloc(0);
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    if (terminate) this.proc.kill();
   }
 
   private handleMessage(body: string): void {
@@ -477,7 +540,13 @@ class StdioTransport implements McpTransport {
     }
     if (typeof msg.id !== "number") {
       // 无 id + 有 method = server 通知（如 notifications/tools/list_changed）。
-      if (typeof msg.method === "string") this.onNotification?.(msg.method, msg.params);
+      if (typeof msg.method === "string") {
+        try {
+          this.onNotification?.(msg.method, msg.params);
+        } catch {
+          // Consumer callbacks are isolation boundaries; server frame processing must continue.
+        }
+      }
       return;
     }
     if (typeof msg.method === "string") {

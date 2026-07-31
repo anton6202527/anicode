@@ -13,6 +13,7 @@ import { t } from "../i18n.js";
 import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DaemonServer } from "./server.js";
+import { defaultDaemonSocketPath, isWindowsNamedPipePath } from "./socket-path.js";
 import { SessionManager } from "../session-manager.js";
 import { MigratingSessionStore, SessionStore } from "../session.js";
 import { createProvider, diagnoseProvider } from "../provider/registry.js";
@@ -25,7 +26,7 @@ import { Verifier } from "../runtime/verifier.js";
 import { SecurityPolicyEngine } from "../security/policy.js";
 
 export function defaultSocketPath(): string {
-  return path.join(os.tmpdir(), "anicode.sock");
+  return defaultDaemonSocketPath();
 }
 
 const DAEMON_VERSION = "0.0.1";
@@ -42,7 +43,7 @@ export function daemonHelpText(): string {
   return (
     `anicode-daemon ${DAEMON_VERSION}\n\n` +
     `用法: anicode-daemon [选项]\n\n` +
-    `  --socket <path>       Unix socket 路径（默认 ${defaultSocketPath()}）\n` +
+    `  --socket <path>       IPC endpoint 路径（默认 ${defaultSocketPath()}）\n` +
     `  --sessions <dir>      会话目录（默认 ~/.anicode/sessions）\n` +
     `  --auto                自动允许工具操作\n` +
     `  --accept-edits        自动允许文件编辑，命令仍询问\n` +
@@ -75,7 +76,10 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
     switch (arg) {
       case "--socket":
         mark(arg);
-        socketPath = path.resolve(valueAfter(i, arg));
+        {
+          const value = valueAfter(i, arg);
+          socketPath = isWindowsNamedPipePath(value) ? value : path.resolve(value);
+        }
         i++;
         break;
       case "--sessions":
@@ -142,6 +146,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
+  await prepareSocketDirectory(args.socketPath, args.socketPath === defaultSocketPath());
   await removeStaleSocket(args.socketPath);
 
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir));
@@ -185,7 +190,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     } finally {
       await runtimeStack.networkProxy.close();
       await runtimeStack.database.close();
-      await fs.rm(args.socketPath, { force: true });
+      if (!isWindowsNamedPipePath(args.socketPath)) await fs.rm(args.socketPath, { force: true });
     }
     process.exit(0);
   };
@@ -194,6 +199,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 }
 
 export async function removeStaleSocket(socketPath: string): Promise<void> {
+  if (isWindowsNamedPipePath(socketPath)) {
+    if (await socketIsActive(socketPath)) {
+      throw new Error(
+        t(`daemon is already listening: ${socketPath}`, `daemon 已在监听: ${socketPath}`),
+      );
+    }
+    return;
+  }
   try {
     const stat = await fs.lstat(socketPath);
     if (!stat.isSocket()) {
@@ -213,6 +226,18 @@ export async function removeStaleSocket(socketPath: string): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+}
+
+export async function prepareSocketDirectory(
+  socketPath: string,
+  hardenExistingDirectory = false,
+): Promise<void> {
+  if (isWindowsNamedPipePath(socketPath)) return;
+  const directory = path.dirname(socketPath);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  // Only harden the application's dedicated default directory. A caller may intentionally place a
+  // custom socket in an existing shared directory; changing that directory's mode would be unsafe.
+  if (hardenExistingDirectory) await fs.chmod(directory, 0o700);
 }
 
 function socketIsActive(socketPath: string): Promise<boolean> {

@@ -135,8 +135,8 @@ export function browserUsageProvider(): ContextProvider {
     async contribute({ tools }) {
       if (!tools.get("browser")) return null;
       return t(
-        "# Verifying frontend changes\n- After writing or changing frontend/UI code, verify it actually renders and runs by opening it in the browser tool — point it at the running dev server (e.g. http://localhost:3000) or an HTML file. It reports console errors, uncaught exceptions and failed requests, and returns a screenshot. Prefer this over guessing.\n- If no dev server is running, start one with bash run_in_background first, then open the URL.\n- Treat console errors, uncaught exceptions, or a blank/error screenshot as a failure to fix, not a done state.",
-        "# 验证前端改动\n- 写完或改完前端/UI 代码后，用 browser 工具打开页面确认它真的能渲染、能跑 —— 指向正在跑的 dev server（如 http://localhost:3000）或某个 HTML 文件。它会报告 console 错误、未捕获异常与失败请求，并回传一张截图。别靠猜。\n- 若没有 dev server 在跑，先用 bash 的 run_in_background 起一个，再打开 URL。\n- 把 console 错误、未捕获异常或白屏/报错截图当成待修的失败，而不是完成态。",
+        "# Verifying frontend changes\n- After writing or changing frontend/UI code, verify it actually renders and runs by opening the HTTP(S) dev server in the browser tool (e.g. http://localhost:3000). It reports console errors, uncaught exceptions and failed requests, and returns a screenshot. Prefer this over guessing.\n- If no dev server is running, start one with bash run_in_background first, then open the URL. Local file/data/browser-internal URLs are intentionally blocked.\n- Treat console errors, uncaught exceptions, or a blank/error screenshot as a failure to fix, not a done state.",
+        "# 验证前端改动\n- 写完或改完前端/UI 代码后，用 browser 工具打开 HTTP(S) dev server（如 http://localhost:3000），确认页面真的能渲染、能跑。它会报告 console 错误、未捕获异常与失败请求，并回传截图。别靠猜。\n- 若没有 dev server 在跑，先用 bash 的 run_in_background 启动，再打开 URL。本地文件、data 与浏览器内部 URL 会被安全策略阻止。\n- 把 console 错误、未捕获异常或白屏/报错截图当成待修的失败，而不是完成态。",
       );
     },
   };

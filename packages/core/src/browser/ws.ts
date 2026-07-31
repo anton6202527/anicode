@@ -12,6 +12,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { connect, type Socket } from "node:net";
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_WS_HANDSHAKE_BYTES = 64 * 1024;
+const MAX_WS_MESSAGE_BYTES = 32 * 1024 * 1024;
 
 /** 计算握手应答 key：base64(sha1(clientKey + GUID))，用于校验服务端 101 应答。 */
 export function acceptKey(clientKey: string): string {
@@ -64,7 +66,10 @@ export interface DecodedFrame {
  * 尝试从 buffer 头部解出一个帧。数据不足返回 null（调用方续等）。
  * 服务端→客户端帧不带掩码；若带掩码也照解（宽容）。
  */
-export function decodeFrame(buf: Buffer): DecodedFrame | null {
+export function decodeFrame(
+  buf: Buffer,
+  maxPayloadBytes = MAX_WS_MESSAGE_BYTES,
+): DecodedFrame | null {
   if (buf.length < 2) return null;
   const b0 = buf[0]!;
   const b1 = buf[1]!;
@@ -83,6 +88,9 @@ export function decodeFrame(buf: Buffer): DecodedFrame | null {
     const lo = buf.readUInt32BE(offset + 4);
     len = hi * 0x100000000 + lo;
     offset += 8;
+  }
+  if (!Number.isSafeInteger(len) || len < 0 || len > maxPayloadBytes) {
+    throw new Error(`WebSocket frame exceeds ${maxPayloadBytes} bytes`);
   }
   let maskKey: Buffer | undefined;
   if (masked) {
@@ -110,6 +118,7 @@ export interface WsHandlers {
 export class WsClient {
   private buf: Buffer = Buffer.alloc(0);
   private fragments: Buffer[] = [];
+  private fragmentBytes = 0;
   private fragOpcode = 0;
   private closed = false;
 
@@ -122,7 +131,7 @@ export class WsClient {
     sock.on("data", (chunk) => this.onData(chunk));
     sock.on("close", () => this.finish());
     sock.on("error", (err) => {
-      if (!this.closed) this.handlers.onError?.(err);
+      if (!this.closed) this.reportError(err);
     });
   }
 
@@ -132,10 +141,19 @@ export class WsClient {
       return Promise.reject(new Error(`unsupported ws protocol: ${u.protocol} (only ws:// )`));
     }
     const host = u.hostname;
+    const normalizedHost = host.toLowerCase().replace(/^\[|\]$/g, "");
+    if (
+      normalizedHost !== "localhost" &&
+      normalizedHost !== "::1" &&
+      !/^127(?:\.\d{1,3}){3}$/.test(normalizedHost)
+    ) {
+      return Promise.reject(new Error("Chrome DevTools WebSocket must use a loopback host"));
+    }
     const port = Number(u.port || 80);
     const path = u.pathname + u.search;
     const key = randomBytes(16).toString("base64");
     return new Promise((resolve, reject) => {
+      let settled = false;
       const sock = connect({ host, port }, () => {
         sock.write(
           `GET ${path} HTTP/1.1\r\n` +
@@ -146,45 +164,64 @@ export class WsClient {
             `Sec-WebSocket-Version: 13\r\n\r\n`,
         );
       });
-      const timer = setTimeout(() => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        sock.off("data", onData);
+        sock.off("error", onError);
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         sock.destroy();
-        reject(new Error(`ws connect timeout after ${timeoutMs}ms`));
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        fail(new Error(`ws connect timeout after ${timeoutMs}ms`));
       }, timeoutMs);
       let handshake = Buffer.alloc(0);
       const onData = (chunk: Buffer): void => {
         handshake = Buffer.concat([handshake, chunk]);
         const sep = handshake.indexOf("\r\n\r\n");
-        if (sep === -1) return;
-        clearTimeout(timer);
-        sock.removeListener("data", onData);
+        if (sep === -1) {
+          if (handshake.length > MAX_WS_HANDSHAKE_BYTES) {
+            fail(new Error(`ws handshake exceeds ${MAX_WS_HANDSHAKE_BYTES} bytes`));
+          }
+          return;
+        }
+        if (sep > MAX_WS_HANDSHAKE_BYTES) {
+          fail(new Error(`ws handshake exceeds ${MAX_WS_HANDSHAKE_BYTES} bytes`));
+          return;
+        }
         const head = handshake.subarray(0, sep).toString("utf8");
         const status = head.split("\r\n")[0] ?? "";
         if (!/ 101 /.test(status)) {
-          sock.destroy();
-          reject(new Error(`ws handshake failed: ${status}`));
+          fail(new Error(`ws handshake failed: ${status}`));
           return;
         }
         const accept = /sec-websocket-accept:\s*(.+)/i.exec(head)?.[1]?.trim();
         if (accept !== acceptKey(key)) {
-          sock.destroy();
-          reject(new Error("ws handshake failed: bad Sec-WebSocket-Accept"));
+          fail(new Error("ws handshake failed: bad Sec-WebSocket-Accept"));
           return;
         }
+        settled = true;
+        cleanup();
         const client = new WsClient(sock, handlers);
         const rest = handshake.subarray(sep + 4);
         if (rest.length > 0) client.onData(rest);
         resolve(client);
       };
+      const onError = (error: Error) => fail(error);
       sock.on("data", onData);
-      sock.on("error", (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+      sock.on("error", onError);
     });
   }
 
   send(text: string): void {
     if (this.closed) throw new Error("WebSocket is closed");
+    if (Buffer.byteLength(text, "utf8") > MAX_WS_MESSAGE_BYTES) {
+      throw new Error(`WebSocket message exceeds ${MAX_WS_MESSAGE_BYTES} bytes`);
+    }
     this.sock.write(encodeTextFrame(text, randomBytes(4)));
   }
 
@@ -211,12 +248,23 @@ export class WsClient {
   }
 
   private onData(chunk: Buffer): void {
-    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
-    for (;;) {
-      const frame = decodeFrame(this.buf);
-      if (!frame) return;
-      this.buf = this.buf.subarray(frame.size);
-      this.handleFrame(frame);
+    try {
+      this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+      for (;;) {
+        const frame = decodeFrame(this.buf);
+        if (!frame) {
+          if (this.buf.length > MAX_WS_MESSAGE_BYTES + 14) {
+            throw new Error(`WebSocket frame exceeds ${MAX_WS_MESSAGE_BYTES} bytes`);
+          }
+          return;
+        }
+        this.buf = this.buf.subarray(frame.size);
+        this.handleFrame(frame);
+      }
+    } catch (error) {
+      this.reportError(error instanceof Error ? error : new Error(String(error)));
+      this.sock.destroy();
+      this.finish();
     }
   }
 
@@ -237,13 +285,25 @@ export class WsClient {
     if (opcode === 0x1 || opcode === 0x2) {
       this.fragOpcode = opcode;
       this.fragments = [payload];
+      this.fragmentBytes = payload.length;
     } else if (opcode === 0x0) {
       this.fragments.push(payload);
+      this.fragmentBytes += payload.length;
+      if (this.fragmentBytes > MAX_WS_MESSAGE_BYTES) {
+        throw new Error(`WebSocket message exceeds ${MAX_WS_MESSAGE_BYTES} bytes`);
+      }
     }
     if (fin) {
       const full = this.fragments.length === 1 ? this.fragments[0]! : Buffer.concat(this.fragments);
       this.fragments = [];
-      if (this.fragOpcode === 0x1) this.handlers.onMessage?.(full.toString("utf8"));
+      this.fragmentBytes = 0;
+      if (this.fragOpcode === 0x1) {
+        try {
+          this.handlers.onMessage?.(full.toString("utf8"));
+        } catch (error) {
+          this.reportError(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
     }
   }
 
@@ -253,6 +313,20 @@ export class WsClient {
     }
     const wasClosed = this.closed;
     this.closed = true;
-    if (!wasClosed) this.handlers.onClose?.();
+    if (!wasClosed) {
+      try {
+        this.handlers.onClose?.();
+      } catch {
+        // Consumer callback failures do not escape the socket event boundary.
+      }
+    }
+  }
+
+  private reportError(error: Error): void {
+    try {
+      this.handlers.onError?.(error);
+    } catch {
+      // Consumer callback failures do not escape the socket event boundary.
+    }
   }
 }
