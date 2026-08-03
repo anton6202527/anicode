@@ -5,14 +5,31 @@ This deployment runs a PostgreSQL-backed control plane and creates one short-liv
 Before applying:
 
 1. Build and sign the control-plane and runner images, then replace both `@sha256:REPLACE_WITH_DIGEST` values.
-2. Create `anicode-runtime-config` with `oidc-issuer`, `oidc-audience`, `oidc-jwks-uri`, `vault-address`, `vault-role`, `vault-prefix`, and an explicit `network-allow-domains`. Store the PostgreSQL URL under `runtime:DATABASE_URL` and a randomly generated proxy client credential (at least 192 bits) under `runtime:PROXY_CLIENT_TOKEN`. Both control plane and proxy fetch these values through workload identity; neither secret is placed in a Kubernetes `env.value` field. A KMS-backed deployment can use the same credential keys by changing the backend configuration.
+2. Create `anicode-runtime-config` with `oidc-issuer`, `oidc-audience`, `oidc-jwks-uri`, `vault-address`, `vault-role`, `vault-prefix`, an explicit `network-allow-domains`, and a credential-free HTTPS `proxy-control-url` for the independently TLS-terminated proxy control listener. Store the PostgreSQL URL under `runtime:DATABASE_URL` and a randomly generated proxy client credential (at least 192 bits) under `runtime:PROXY_CLIENT_TOKEN`. Both control plane and proxy fetch these values through workload identity; neither secret is placed in a Kubernetes `env.value` field. A KMS-backed deployment can use the same credential keys by changing the backend configuration.
 3. Provide an RWX storage class for `anicode-workspaces`, or replace the PVC with the organization’s workspace artifact hydrator.
 4. Install a NetworkPolicy-capable CNI and verify the deny policy with a direct-socket escape test before admitting workloads.
 5. Verify that the chosen CNI enforces Pod-selector egress for traffic addressed through the proxy Service ClusterIP; CNI/service-DNAT behavior is part of the deployment acceptance test.
 
+## Remote API TLS boundary
+
+The Remote Runtime refuses a non-loopback plaintext bind unless one of these explicit modes is configured:
+
+- `ANICODE_REMOTE_TLS_MODE=native` loads `runtime:REMOTE_TLS_CERT` and `runtime:REMOTE_TLS_KEY` from the configured SecretBackend (the key names can be changed with `ANICODE_REMOTE_TLS_CERT_CREDENTIAL_KEY` and `ANICODE_REMOTE_TLS_PRIVATE_KEY_CREDENTIAL_KEY`) and serves HTTPS itself.
+- `ANICODE_REMOTE_TLS_MODE=trusted-proxy` serves HTTP only as a private backend behind an independently operated TLS ingress, gateway, sidecar, or service mesh.
+
+This manifest uses `trusted-proxy`. It deliberately does not install or claim a particular ingress implementation. Before rollout, configure a gateway that accepts HTTPS, presents the organization-approved certificate, preserves the `Authorization` header to the backend, and never exposes the backend Service directly. Label the gateway namespace `anicode.dev/remote-runtime-ingress=trusted` and the gateway Pods `anicode.dev/tls-termination=true`; the included ingress NetworkPolicy rejects all other Pod sources. The in-Pod health probes use loopback so they do not require a policy exception. Treat successful TLS and NetworkPolicy acceptance tests as deployment prerequisites, not properties proven by this template alone.
+
+## Durable authorization and cancellation
+
+Every accepted execution persists the authorized actor, tenant, workspace, write/network scope, decision time, and hard grant expiry. Workers validate that envelope after claiming the job, immediately before execution, and periodically while it runs. The built-in OIDC authorizer bounds grants by both `ANICODE_REMOTE_GRANT_TTL_MS` and the token `exp`; deployments that require immediate policy revocation can provide a `RemoteRuntimeAuthorizer.authorizeExecution` implementation backed by their authoritative policy service.
+
+Migration v5 only widens the existing PostgreSQL worker-status constraint, so existing terminal and queued rows remain readable. Drain the old deployment before upgrading: legacy queued rows do not contain a bounded grant envelope and intentionally fail closed instead of executing after the upgrade.
+
+`DELETE /v1/executions/:id` cancels an unclaimed job immediately. For a leased job it durably returns `cancellation_requested`; only the fencing-token lease owner can acknowledge terminal `cancelled` after its runtime has stopped. If that acknowledgement lease expires, the queue records an indeterminate failure instead of claiming that side effects did not occur.
+
 The control plane's OTLP exporter and OIDC JWKS retrieval use a hostname/port allowlisted `NetworkProxy`; if the collector requires authentication, set `ANICODE_OTEL_CREDENTIAL_ID` to a Vault/KMS key reference instead of putting a token in `OTEL_EXPORTER_OTLP_HEADERS`.
 
-After rollout, run `./deploy/remote-runtime/verify-isolation.sh`. It fails unless images are digest-pinned, Pod Security is `restricted`, direct IPv4/IPv6, metadata and DNS egress are blocked, authenticated proxy routing works, and unrelated Pods cannot reach the proxy. NetworkPolicy YAML alone is not an acceptance test: the cluster CNI must enforce it.
+After rollout, set `ANICODE_REMOTE_PUBLIC_URL=https://…` and run `./deploy/remote-runtime/verify-isolation.sh`. It fails unless images are digest-pinned, a TLS boundary mode is explicit, the trusted-proxy Service remains ClusterIP-only with its ingress allowlist, the public health endpoint completes a verified HTTPS request, Pod Security is `restricted`, direct IPv4/IPv6, metadata and DNS egress are blocked, authenticated proxy routing works, and unrelated Pods cannot reach the proxy. Without `ANICODE_REMOTE_PUBLIC_URL`, the script reports that external certificate/routing validation was skipped. NetworkPolicy YAML alone is not an acceptance test: the cluster CNI must enforce it.
 
 The runner Job has no service-account token, runs non-root with seccomp, drops all Linux capabilities, uses a read-only root filesystem, has CPU/memory/PID/deadline limits, and is deleted after its result is collected.
 

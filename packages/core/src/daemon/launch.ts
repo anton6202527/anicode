@@ -3,7 +3,7 @@
  * 守护进程启动器 —— 起一个监听 unix socket 的 DaemonServer（内含 SessionManager）。
  * App / 多个 CLI 前端连它即可共享会话。
  *
- *   tsx src/daemon/launch.ts [--socket PATH] [--sessions DIR]
+ *   tsx src/daemon/launch.ts [--socket PATH] [--sessions DIR] [--cwd DIR]
  */
 
 import * as os from "node:os";
@@ -24,6 +24,8 @@ import {
 import { ContextCompiler } from "../runtime/context-compiler.js";
 import { Verifier } from "../runtime/verifier.js";
 import { SecurityPolicyEngine } from "../security/policy.js";
+import { WorkspaceTrustStore } from "../workspace-trust.js";
+import { generateDaemonAuthToken, provisionDaemonAuthToken } from "./auth-token.js";
 
 export function defaultSocketPath(): string {
   return defaultDaemonSocketPath();
@@ -34,6 +36,7 @@ const DAEMON_VERSION = "0.0.1";
 export interface DaemonArgs {
   socketPath: string;
   sessionsDir: string;
+  cwd: string;
   permissionMode: "default" | "acceptEdits" | "auto";
   help: boolean;
   version: boolean;
@@ -45,6 +48,7 @@ export function daemonHelpText(): string {
     `用法: anicode-daemon [选项]\n\n` +
     `  --socket <path>       IPC endpoint 路径（默认 ${defaultSocketPath()}）\n` +
     `  --sessions <dir>      会话目录（默认 ~/.anicode/sessions）\n` +
+    `  --cwd <dir>           daemon 绑定的唯一工作区（默认当前目录）\n` +
     `  --auto                自动允许工具操作\n` +
     `  --accept-edits        自动允许文件编辑，命令仍询问\n` +
     `  -h, --help            显示帮助\n` +
@@ -55,6 +59,7 @@ export function daemonHelpText(): string {
 export function parseDaemonArgs(argv: string[]): DaemonArgs {
   let socketPath = defaultSocketPath();
   let sessionsDir = path.join(os.homedir(), ".anicode", "sessions");
+  let cwd = path.resolve(process.cwd());
   let permissionMode: DaemonArgs["permissionMode"] = "default";
   let help = false;
   let version = false;
@@ -85,6 +90,11 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
       case "--sessions":
         mark(arg);
         sessionsDir = path.resolve(valueAfter(i, arg));
+        i++;
+        break;
+      case "--cwd":
+        mark(arg);
+        cwd = path.resolve(valueAfter(i, arg));
         i++;
         break;
       case "--auto":
@@ -119,7 +129,7 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
         );
     }
   }
-  return { socketPath, sessionsDir, permissionMode, help, version };
+  return { socketPath, sessionsDir, cwd, permissionMode, help, version };
 }
 
 function resolveConfiguredProvider(model: string) {
@@ -148,6 +158,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   await prepareSocketDirectory(args.socketPath, args.socketPath === defaultSocketPath());
   await removeStaleSocket(args.socketPath);
+  const workspaceScope = await fs.realpath(args.cwd);
+  if (!(await fs.stat(workspaceScope)).isDirectory()) {
+    throw new Error(`Daemon workspace is not a directory: ${args.cwd}`);
+  }
 
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir));
   const telemetry = telemetryForLocalStack(runtimeStack);
@@ -167,14 +181,32 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: { mode: args.permissionMode },
+    workspaceTrust: new WorkspaceTrustStore(),
     skills: true,
     subagents: { discover: true },
+    workspaceScope,
   });
-  const server = new DaemonServer({ manager });
+  const bearerToken = generateDaemonAuthToken();
+  const server = new DaemonServer({ manager, authToken: bearerToken });
   await server.listen(args.socketPath);
+  let tokenFile: string;
+  try {
+    ({ tokenFile } = await provisionDaemonAuthToken({
+      socketPath: args.socketPath,
+      token: bearerToken,
+    }));
+  } catch (error) {
+    await server.close();
+    await runtimeStack.artifacts.close?.();
+    await runtimeStack.networkProxy.close();
+    await runtimeStack.database.close();
+    if (!isWindowsNamedPipePath(args.socketPath)) await fs.rm(args.socketPath, { force: true });
+    throw error;
+  }
   console.log(
     `anicode daemon 监听于 ${args.socketPath}` +
-      `（会话目录 ${args.sessionsDir}，权限 ${args.permissionMode}）`,
+      `（工作区 ${workspaceScope}，会话目录 ${args.sessionsDir}，权限 ${args.permissionMode}，` +
+      `token ${tokenFile}）`,
   );
 
   let shuttingDown = false;
@@ -188,9 +220,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     } catch {
       console.error("anicode daemon: OTLP flush failed during shutdown");
     } finally {
+      await runtimeStack.artifacts.close?.();
       await runtimeStack.networkProxy.close();
       await runtimeStack.database.close();
       if (!isWindowsNamedPipePath(args.socketPath)) await fs.rm(args.socketPath, { force: true });
+      await fs.rm(tokenFile, { force: true });
     }
     process.exit(0);
   };
@@ -235,9 +269,21 @@ export async function prepareSocketDirectory(
   if (isWindowsNamedPipePath(socketPath)) return;
   const directory = path.dirname(socketPath);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  // Only harden the application's dedicated default directory. A caller may intentionally place a
-  // custom socket in an existing shared directory; changing that directory's mode would be unsafe.
-  if (hardenExistingDirectory) await fs.chmod(directory, 0o700);
+  let stat = await fs.lstat(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Daemon socket parent is not a real directory: ${directory}`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new Error(`Daemon socket parent is not owned by the current user: ${directory}`);
+  }
+  if (hardenExistingDirectory) {
+    await fs.chmod(directory, 0o700);
+    stat = await fs.lstat(directory);
+  }
+  if ((stat.mode & 0o777) !== 0o700) {
+    throw new Error(`Daemon socket parent must have mode 0700: ${directory}`);
+  }
 }
 
 function socketIsActive(socketPath: string): Promise<boolean> {

@@ -112,7 +112,19 @@ test("discoverProviderModels: 本地兼容端点返回实时模型 ID 并清理�
     assert.equal(String(input), "http://127.0.0.1:18317/v1/models");
     assert.equal(init?.redirect, "error");
     return Response.json({
-      data: [{ id: "model-new" }, { id: "model-old" }, { id: "model-new" }, { id: 42 }],
+      data: [
+        { id: "model-new" },
+        { id: "model-old" },
+        { id: "model-new" },
+        { id: "gemini-3.1-flash-image" },
+        { id: "dall-e-3" },
+        { id: "veo-3.1-generate-preview" },
+        { id: "lyria-3-pro-preview" },
+        { id: "computer-use-preview" },
+        { id: "text-embedding-3-small" },
+        { id: "unsafe\u001b[31m" },
+        { id: 42 },
+      ],
     });
   }) as unknown as typeof fetch;
 
@@ -121,6 +133,25 @@ test("discoverProviderModels: 本地兼容端点返回实时模型 ID 并清理�
     "model-old",
   ]);
   assert.equal(await discoverProviderModels("deepseek", 600, fetchImpl), undefined);
+});
+
+test("discoverProviderModels: 拒绝超大模型目录响应", async () => {
+  registerOpenAICompatibleProvider({
+    id: "discover-oversized-fixture",
+    baseURL: "http://127.0.0.1:18319/v1",
+    local: true,
+    requiresApiKey: false,
+  });
+  const fetchImpl = (async () =>
+    new Response(JSON.stringify({ data: [{ id: "x".repeat(1024 * 1024) }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+
+  assert.equal(
+    await discoverProviderModels("discover-oversized-fixture", 600, fetchImpl),
+    undefined,
+  );
 });
 
 test("discoverProviderModels: 环境变量改写到非回环地址时不会发请求或外送凭证", async () => {

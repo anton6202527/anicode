@@ -28,6 +28,14 @@ export interface CustomCommand {
   resolve?: (args: string) => Promise<string>;
 }
 
+export interface LoadCommandsOptions {
+  cwd?: string;
+  home?: string;
+  extraDirs?: string[];
+  /** Defaults to true. Set false until Workspace Trust has been granted. */
+  includeProject?: boolean;
+}
+
 function parseFrontmatter(text: string): { meta: Record<string, string>; body: string } {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
   if (!m) return { meta: {}, body: text };
@@ -60,16 +68,14 @@ async function readDir(dir: string): Promise<{ name: string; file: string }[]> {
     .map((f) => ({ name: f.replace(/\.md$/i, ""), file: path.join(dir, f) }));
 }
 
-export async function loadCommands(
-  opts: { cwd?: string; home?: string; extraDirs?: string[] } = {},
-): Promise<CustomCommand[]> {
+export async function loadCommands(opts: LoadCommandsOptions = {}): Promise<CustomCommand[]> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? os.homedir();
   // 后加入的覆盖先加入的同名项 → 全局在前、插件居中、项目在后。
   const dirs = [
     path.join(home, ".config", "anicode", "command"),
     ...(opts.extraDirs ?? []),
-    path.join(cwd, ".anicode", "command"),
+    ...(opts.includeProject === false ? [] : [path.join(cwd, ".anicode", "command")]),
   ];
   const byName = new Map<string, CustomCommand>();
   for (const dir of dirs) {

@@ -4,6 +4,12 @@ import { isClientRequest } from "./protocol.js";
 
 test("daemon protocol: accepts complete valid request shapes", () => {
   assert.equal(isClientRequest({ id: 0, method: "listSessions" }), true);
+  assert.equal(isClientRequest({ id: 0, method: "listSessions", authToken: "a".repeat(32) }), true);
+  assert.equal(isClientRequest({ id: 0, method: "listSessions", authToken: "bad\nvalue" }), false);
+  assert.equal(
+    isClientRequest({ id: 1, method: "discoverModels", providerId: "cliproxy.local-1" }),
+    true,
+  );
   assert.equal(
     isClientRequest({
       id: 1,
@@ -48,6 +54,14 @@ test("daemon protocol: rejects negative indexes, ids and unbounded metadata", ()
   assert.equal(isClientRequest({ id: 1, method: "createSession", cwd: "/tmp", model: "" }), false);
   assert.equal(
     isClientRequest({ id: 1, method: "setPermissionProfile", sessionId: "s_abc", name: "" }),
+    false,
+  );
+  assert.equal(
+    isClientRequest({ id: 1, method: "discoverModels", providerId: "../cliproxy" }),
+    false,
+  );
+  assert.equal(
+    isClientRequest({ id: 1, method: "discoverModels", providerId: "x".repeat(129) }),
     false,
   );
 });

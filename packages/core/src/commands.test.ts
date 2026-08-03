@@ -31,6 +31,13 @@ test("commands: 加载 frontmatter 描述与正文，项目同名覆盖全局", 
   assert.equal(review.template, "评审 $ARGUMENTS");
   const t = cmds.find((c) => c.name === "test")!;
   assert.equal(t.description, "跑测试"); // 无 frontmatter → 取首行
+
+  const trustedBoundary = await loadCommands({ cwd, home, includeProject: false });
+  assert.equal(trustedBoundary.find((c) => c.name === "review")?.description, "全局评审");
+  assert.equal(
+    trustedBoundary.some((c) => c.name === "test"),
+    false,
+  );
 });
 
 test("commands: 展开 $ARGUMENTS 与定位参数", () => {

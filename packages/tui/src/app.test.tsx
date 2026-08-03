@@ -35,6 +35,7 @@ import {
   InputPanel,
   matchesKeybinding,
   promptHistoryFromMessages,
+  probeLive,
   subagentActivityLine,
   Welcome,
   WelcomeTip,
@@ -61,6 +62,28 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
 }
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
+
+test("TUI model probe: provider discovery concurrency is bounded", async () => {
+  const providers = Array.from(
+    { length: 12 },
+    (_, index) => ({ id: `provider-${index}`, name: `Provider ${index}` }) as ProviderDescriptor,
+  );
+  let active = 0;
+  let peak = 0;
+  const result = await probeLive(
+    providers,
+    async (providerId) => {
+      active++;
+      peak = Math.max(peak, active);
+      await tick(5);
+      active--;
+      return [`${providerId}-model`];
+    },
+    { concurrency: 3, timeoutMs: 1_000 },
+  );
+  assert.equal(peak, 3);
+  assert.equal(result.live.size, providers.length);
+});
 
 /** 轮询等待帧内容满足条件——CI 冷启动与原生模块加载时也不依赖固定 sleep。 */
 async function waitFor(cond: () => boolean, timeoutMs = 30_000): Promise<void> {
@@ -213,6 +236,20 @@ test("TUI: transcript UI cache 有硬上限并保留会话边界", () => {
   assert.deepEqual(
     bounded.map((row) => ("text" in row ? row.text : row.kind)),
     ["boundary", "7", "8", "9"],
+  );
+
+  const byteBounded = boundTranscriptRows(
+    [
+      { kind: "info", text: "boundary" },
+      { kind: "assistant", text: "a".repeat(200) },
+      { kind: "assistant", text: "b".repeat(200) },
+    ],
+    100,
+    350,
+  );
+  assert.deepEqual(
+    byteBounded.map((row) => ("text" in row ? row.text[0] : row.kind)),
+    ["b", "b"],
   );
 });
 
@@ -751,6 +788,48 @@ test("TUI: 权限弹窗期间 Escape 可中断会话", async () => {
   view.unmount();
 });
 
+test("TUI: 受限工作区 snapshot 中的内置工具权限请求仍可批准", async () => {
+  const decisions: string[] = [];
+  const host = offlineHost({
+    pendingPermissions: [
+      { permId: "p-restricted", toolName: "apply_patch", ruleKey: "src/app.ts" },
+    ],
+    onPermission: (decision) => decisions.push(decision),
+  });
+  const view = render(
+    <App
+      host={host}
+      cwd="/fallback"
+      model="fallback"
+      sessionId="s_offline"
+      workspaceTrusted={false}
+      requireWorkspaceTrust
+    />,
+  );
+  await waitFor(() => /授权请求/.test(view.lastFrame() ?? ""));
+  const frame = view.lastFrame() ?? "";
+  assert.match(frame, /内置 write\/edit\/apply_patch\/bash[\s\S]*工具仍可逐项授权/);
+  assert.doesNotMatch(frame, /计划模式 · 只读/);
+
+  view.stdin.write("y");
+  await waitFor(() => decisions.length === 1);
+  assert.deepEqual(decisions, ["allow"]);
+  assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+  view.unmount();
+});
+
+test("TUI: 运行中断失败会显示错误且不会成为未处理 rejection", async () => {
+  const host = offlineHost({ running: true });
+  host.interrupt = async () => {
+    throw new Error("interrupt transport unavailable");
+  };
+  const view = render(<App host={host} cwd="/fallback" model="fallback" sessionId="s_offline" />);
+  await tick(80);
+  view.stdin.write("\u001b");
+  await waitFor(() => /中断失败.*interrupt transport unavailable/.test(view.lastFrame() ?? ""));
+  view.unmount();
+});
+
 test("TUI: 模型与工具正文中的终端控制序列不能进入渲染帧", async () => {
   const host = offlineHost({
     eventsBeforeSnapshot: [
@@ -793,6 +872,79 @@ test("TUI: 权限层贴在输入框上方，永久允许只需一次 Enter 确�
   await waitFor(() => decisions.length === 1);
   assert.deepEqual(decisions, ["allow_always"]);
   assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+  view.unmount();
+});
+
+test("TUI: 极矮终端的授权面板仍显示拒绝入口并保持输入框固定", async () => {
+  const host = offlineHost({
+    pendingPermissions: [{ permId: "p-small", toolName: "bash", ruleKey: "dangerous command" }],
+  });
+  const view = render(
+    <App
+      host={host}
+      cwd="/fallback"
+      model="fallback"
+      sessionId="s_offline"
+      terminalSize={{ rows: 10, cols: 48 }}
+    />,
+  );
+  await waitFor(() => /授权请求/.test(view.lastFrame() ?? ""));
+  const frame = view.lastFrame() ?? "";
+  assert.match(frame, /\[n\] 拒绝/);
+  assert.match(frame, /↑↓ 选择 · Enter 确认/);
+  assert.doesNotMatch(frame, /输入你的目标/);
+  assert.ok(frame.split("\n").length <= 10, frame);
+  view.unmount();
+
+  const ultra = render(
+    <App
+      host={offlineHost({
+        pendingPermissions: [{ permId: "p-ultra", toolName: "bash", ruleKey: "danger" }],
+      })}
+      cwd="/fallback"
+      model="fallback"
+      sessionId="s_offline"
+      terminalSize={{ rows: 4, cols: 16 }}
+    />,
+  );
+  await waitFor(() => /\[n\] 拒绝/.test(ultra.lastFrame() ?? ""));
+  assert.ok((ultra.lastFrame() ?? "").split("\n").length <= 4, ultra.lastFrame());
+  ultra.unmount();
+});
+
+test("TUI: 会话列表高亮超过前十项时会滚动窗口并清洗元数据", async () => {
+  const host = offlineHost();
+  host.listSessions = async () =>
+    Array.from({ length: 25 }, (_, index) => ({
+      id: `session-${index}`,
+      title:
+        index === 15
+          ? "\u001b[31msession-15\u001b[0m\u001b]8;;https://evil.invalid\u0007title\u001b]8;;\u0007"
+          : `session-${index}`,
+      cwd: `/work/${index}`,
+      model: index === 15 ? "\u001b[32mdebug/demo\u001b[0m" : "debug/demo",
+      createdAt: "2026-07-14T00:00:00.000Z",
+      updatedAt: "2026-07-14T00:00:00.000Z",
+      running: false,
+    }));
+  const view = render(
+    <App
+      host={host}
+      cwd="/fallback"
+      model="fallback"
+      sessionId="s_offline"
+      terminalSize={{ rows: 24, cols: 80 }}
+    />,
+  );
+  await tick(80);
+  for (const ch of "/sessions") view.stdin.write(ch);
+  view.stdin.write("\r");
+  await waitFor(() => /会话列表/.test(view.lastFrame() ?? ""));
+  for (let i = 0; i < 15; i++) view.stdin.write("\u001b[B");
+  await waitFor(() => /session-15.*title/.test(view.lastFrame() ?? ""));
+  const frame = view.lastFrame() ?? "";
+  assert.match(frame, /session-15.*title/);
+  assert.doesNotMatch(frame, /\u001b\[31m|\u001b\]8;;|evil\.invalid/);
   view.unmount();
 });
 
@@ -889,6 +1041,9 @@ test("TUI: /providers 显示安全元数据，/model 以当前 cwd 新建并切�
       sessionId="s_model"
       providers={providers}
       inspectProviderCredentials
+      discoverModels={async (providerId) =>
+        providerId === "cloud-test" ? ["org/model-v1"] : undefined
+      }
     />,
   );
 
@@ -904,6 +1059,11 @@ test("TUI: /providers 显示安全元数据，/model 以当前 cwd 新建并切�
     assert.match(providerFrame, new RegExp(`缺少 ${keyName}`));
     assert.match(providerFrame, /local-test · Local Test · openai-chat · 本地 · 无需 API key/);
 
+    for (const ch of "/model cloud-test/removed-model") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => /当前未被模型端点列为可用/.test(view.lastFrame() ?? ""));
+    assert.equal(created, undefined, "未出现在实时目录的模型不得创建会话");
+
     const spec = "cloud-test/org/model-v1";
     for (const ch of `/model ${spec}`) view.stdin.write(ch);
     await tick();
@@ -918,6 +1078,65 @@ test("TUI: /providers 显示安全元数据，/model 以当前 cwd 新建并切�
     view.unmount();
     if (previousKey === undefined) delete process.env[keyName];
     else process.env[keyName] = previousKey;
+  }
+});
+
+test("TUI: 每次打开 /model 都刷新目录，旧模型消失且新模型立即出现", async () => {
+  const providers: ProviderDescriptor[] = [
+    {
+      id: "fresh",
+      name: "Fresh Provider",
+      kind: "openai-compatible",
+      protocol: "openai-chat",
+      aliases: [],
+      baseURL: "http://127.0.0.1:18999/v1",
+      apiKeyEnv: [],
+      requiresApiKey: false,
+      local: true,
+      capabilities: { tools: true, reasoning: false },
+      limits: {},
+      models: [],
+      catalog: [],
+    },
+  ];
+  const catalog = [
+    {
+      model: "old-model",
+      label: "Old Model",
+      providerId: "fresh",
+      providerName: "Fresh Provider",
+      spec: "fresh/old-model",
+      local: true,
+      requiresApiKey: false,
+    },
+  ];
+  let calls = 0;
+  const view = render(
+    <App
+      host={offlineHost()}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_refresh_models"
+      providers={providers}
+      catalog={catalog}
+      discoverModels={async () => (++calls === 1 ? ["old-model"] : ["new-model"])}
+    />,
+  );
+  await tick(80);
+  try {
+    for (const ch of "/model") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => /Old Model/.test(view.lastFrame() ?? ""));
+    view.stdin.write("\u001b");
+    await waitFor(() => !/选择模型/.test(view.lastFrame() ?? ""));
+
+    for (const ch of "/model") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => /new-model/.test(view.lastFrame() ?? ""));
+    assert.doesNotMatch(view.lastFrame() ?? "", /Old Model|old-model/);
+    assert.equal(calls, 2);
+  } finally {
+    view.unmount();
   }
 });
 

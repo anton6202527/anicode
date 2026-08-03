@@ -30,6 +30,8 @@ export {
   listProviderDetails,
   listModelCatalog,
   discoverProviderModels,
+  sanitizeProviderId,
+  sanitizeDiscoveredModels,
   resolveDefaultModel,
   defaultSmallModel,
   estimateCostUSD,
@@ -84,9 +86,19 @@ export {
   type TaskStatus,
 } from "./subagent.js";
 export { Chan } from "./chan.js";
-export { discoverSkills, skillListPrompt, createSkillTool, type SkillMeta } from "./skills.js";
-export { discoverSubagents, parseSubagentFile } from "./agents-fs.js";
-export { discoverPlugins, type PluginDirs } from "./plugins.js";
+export {
+  discoverSkills,
+  skillListPrompt,
+  createSkillTool,
+  type SkillMeta,
+  type SkillDiscoveryOptions,
+} from "./skills.js";
+export {
+  discoverSubagents,
+  parseSubagentFile,
+  type SubagentDiscoveryOptions,
+} from "./agents-fs.js";
+export { discoverPlugins, type PluginDirs, type PluginDiscoveryOptions } from "./plugins.js";
 export {
   commandHook,
   commandHooksFromConfig,
@@ -104,6 +116,8 @@ export {
 export {
   SessionManager,
   type SessionManagerOptions,
+  type WorkspaceTrustResolver,
+  type WorkspaceTrustSource,
   type SessionEvent,
   type SessionSnapshot,
   type BackgroundTaskSummary,
@@ -179,7 +193,9 @@ export {
 } from "./mcp-catalog.js";
 export {
   loadConfig,
+  loadConfigWithWorkspaceTrust,
   loadProjectEnv,
+  isForbiddenProjectEnvName,
   toMcpServerConfigs,
   toSubagentDefinitions,
   toLspServers,
@@ -187,8 +203,23 @@ export {
   type AnicodeConfig,
   type ConfigAgent,
   type LoadedConfig,
+  type LoadConfigOptions,
+  type LoadWorkspaceConfigOptions,
   type LoadProjectEnvOptions,
 } from "./config.js";
+export {
+  WorkspaceTrustStore,
+  canonicalWorkspaceIdentity,
+  defaultWorkspaceTrustFile,
+  revalidateWorkspaceTrust,
+  workspaceExecutionConfig,
+  workspaceExecutionFingerprint,
+  type WorkspaceIdentity,
+  type WorkspaceTrustAssessment,
+  type WorkspaceTrustGrantExpectation,
+  type WorkspaceTrustReason,
+  type WorkspaceTrustStoreOptions,
+} from "./workspace-trust.js";
 export {
   LspClient,
   LspPool,
@@ -206,7 +237,12 @@ export {
   createReferencesTool,
   createSymbolsTool,
 } from "./tools/lsp-nav.js";
-export { loadCommands, expandCommand, type CustomCommand } from "./commands.js";
+export {
+  loadCommands,
+  expandCommand,
+  type CustomCommand,
+  type LoadCommandsOptions,
+} from "./commands.js";
 export {
   loadProjectMemory,
   composeSystem,
@@ -216,6 +252,7 @@ export {
   providerSummarizer,
   type CompactionConfig,
   type CompactionResult,
+  type ProjectMemoryOptions,
   type Summarizer,
 } from "./context.js";
 export {
@@ -241,6 +278,7 @@ export { ToolRegistry, ToolError, type Tool, type ToolContext } from "./tools/to
 export {
   PatchSetService,
   PatchSetConflictError,
+  PatchSetSessionOwnershipError,
   threeWayMerge,
   type PatchSet,
   type PatchSetStatus,
@@ -249,6 +287,7 @@ export {
   type PatchSetApproval,
   type PatchSetRebaseResult,
   type PatchSetServiceOptions,
+  type PatchSetWorkspaceLockInfo,
   type ThreeWayMergeResult,
 } from "./runtime/patchset.js";
 export {
@@ -268,7 +307,10 @@ export {
   WorktreeOwnership,
   type WorkerJob,
   type WorkerJobStatus,
+  type WorkerCancellationResult,
   type WorkerQueueStore,
+  type FileWorkerQueueStoreOptions,
+  type WorkerEnqueueQuota,
   type WorkerHandler,
   type WorktreeLease,
 } from "./runtime/worker.js";
@@ -413,6 +455,7 @@ export {
   RemoteExecutionService,
   createClaimRemoteRuntimeAuthorizer,
   type RemoteRuntimeServerOptions,
+  type RemoteRuntimeTransportSecurity,
   type RemoteExecutionRequest,
   type RemoteExecutionView,
   type RemoteIdentity,
@@ -427,11 +470,18 @@ export {
 export {
   NetworkProxy,
   NetworkProxyServer,
+  NetworkProxyCredentialAuthority,
+  NetworkProxyCredentialClient,
   isPrivateAddress,
   type NetworkPolicy,
   type NetworkProxyOptions,
   type NetworkAuditEvent,
   type NetworkProxyServerOptions,
+  type NetworkProxyCredentialAuthorityOptions,
+  type NetworkProxyCredentialClientOptions,
+  type ScopedProxyCredentialIssuer,
+  type ScopedProxyCredentialLease,
+  type ScopedProxyCredentialRequest,
 } from "./runtime/network-proxy.js";
 export {
   SecurityPolicyEngine,
@@ -478,6 +528,7 @@ export {
   SqliteRuntimeEventStore,
   SqliteRuntimeSnapshotStore,
   SqliteRuntimeSessionStore,
+  SqliteSessionLifecycleStore,
   SqliteCommandInboxStore,
   SqliteOutboxStore,
   SqliteWorkerQueueStore,
@@ -489,11 +540,22 @@ export {
   PostgresRuntimeEventStore,
   PostgresRuntimeSnapshotStore,
   PostgresSessionStore,
+  PostgresSessionLifecycleStore,
   PostgresCommandInboxStore,
   PostgresOutboxStore,
   PostgresWorkerQueueStore,
   PostgresArtifactStore,
 } from "./runtime/postgres.js";
+export {
+  MemorySessionLifecycleStore,
+  SessionLifecycleUnavailableError,
+  SessionLifecycleLeaseLostError,
+  type SessionLifecycleStore,
+  type SessionLifecycleState,
+  type SessionLifecycleRecord,
+  type SessionOperationLease,
+  type SessionDeletionClaim,
+} from "./runtime/session-lifecycle.js";
 export {
   TypedCodeGraph,
   extractTreeSitterSymbols,

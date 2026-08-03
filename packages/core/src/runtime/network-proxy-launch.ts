@@ -2,7 +2,11 @@
 
 import { CredentialBroker, isCredentialEnvironmentName } from "../security/credentials.js";
 import { configuredSecretBackendFromEnv } from "../security/secret-backends.js";
-import { NetworkProxy, NetworkProxyServer } from "./network-proxy.js";
+import {
+  NetworkProxy,
+  NetworkProxyCredentialAuthority,
+  NetworkProxyServer,
+} from "./network-proxy.js";
 
 function csv(value: string | undefined, fallback: string[]): string[] {
   const parsed = value
@@ -12,11 +16,11 @@ function csv(value: string | undefined, fallback: string[]): string[] {
   return parsed?.length ? parsed : fallback;
 }
 
-async function proxyClientTokenProvider(): Promise<() => Promise<string>> {
+async function proxyControlTokenProvider(): Promise<() => Promise<string>> {
   if (process.env.ANICODE_PROXY_CLIENT_TOKEN) {
     delete process.env.ANICODE_PROXY_CLIENT_TOKEN;
     throw new Error(
-      "ANICODE_PROXY_CLIENT_TOKEN is forbidden; store runtime:PROXY_CLIENT_TOKEN in Keychain/Vault/KMS",
+      "ANICODE_PROXY_CLIENT_TOKEN is forbidden; store the proxy control credential in Keychain/Vault/KMS",
     );
   }
   if (!process.env.ANICODE_CREDENTIAL_BACKEND) {
@@ -25,7 +29,7 @@ async function proxyClientTokenProvider(): Promise<() => Promise<string>> {
   const backend = await configuredSecretBackendFromEnv({ ...process.env });
   const backendKey =
     process.env.ANICODE_PROXY_CLIENT_CREDENTIAL_KEY ?? "runtime:PROXY_CLIENT_TOKEN";
-  const credentialId = "network-proxy-client";
+  const credentialId = "network-proxy-control";
   const broker = new CredentialBroker({
     onAudit: (event) => console.error(JSON.stringify({ kind: "credential.audit", ...event })),
   });
@@ -33,14 +37,14 @@ async function proxyClientTokenProvider(): Promise<() => Promise<string>> {
     id: credentialId,
     backend,
     backendKey,
-    scopes: [{ audiences: ["network-proxy-client"], tools: ["authenticate"] }],
+    scopes: [{ audiences: ["network-proxy-control"], tools: ["authenticate"] }],
   });
   const read = async () => {
     const token = await broker.trustedValueAsync(credentialId, {
-      audience: "network-proxy-client",
+      audience: "network-proxy-control",
       tool: "authenticate",
     });
-    if (token.length < 24) throw new Error("Egress proxy client credential is missing or weak");
+    if (token.length < 24) throw new Error("Egress proxy control credential is missing or weak");
     return token;
   };
   try {
@@ -54,7 +58,7 @@ async function proxyClientTokenProvider(): Promise<() => Promise<string>> {
 }
 
 async function main(): Promise<void> {
-  const clientTokenProvider = await proxyClientTokenProvider();
+  const clientTokenProvider = await proxyControlTokenProvider();
   const proxy = new NetworkProxy({
     policy: {
       // 生产出口默认 deny-all；部署必须明确列出域名，不能靠“所有公网均可达”。
@@ -68,6 +72,12 @@ async function main(): Promise<void> {
   const server = new NetworkProxyServer({
     proxy,
     clientTokenProvider,
+    credentialAuthority: new NetworkProxyCredentialAuthority({
+      maxTtlMs: Number(process.env.ANICODE_PROXY_CREDENTIAL_MAX_TTL_MS ?? 16 * 60_000),
+      maxActiveCredentials: Number(process.env.ANICODE_PROXY_MAX_ACTIVE_CREDENTIALS ?? 10_000),
+      onAudit: (event) =>
+        console.error(JSON.stringify({ kind: "proxy-credential.audit", ...event })),
+    }),
     host: process.env.HOST ?? "0.0.0.0",
     port: Number(process.env.PORT ?? 8080),
     maxRequestBytes: Number(process.env.ANICODE_PROXY_MAX_REQUEST_BYTES ?? 8 * 1024 * 1024),

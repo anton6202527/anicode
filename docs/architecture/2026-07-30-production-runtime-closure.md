@@ -73,10 +73,17 @@ ANICODE_ARTIFACT_BACKEND=s3
 ANICODE_ARTIFACT_S3_BUCKET=org-anicode-artifacts
 ANICODE_ARTIFACT_KMS_KEY_ID=alias/anicode-artifacts
 ANICODE_ARTIFACT_S3_PREFIX=anicode/artifacts/v1
+ANICODE_ARTIFACT_DELETE_RECONCILE_MS=60000
+ANICODE_ARTIFACT_S3_REQUEST_TIMEOUT_MS=120000
 AWS_REGION=ap-southeast-1
 ```
 
 使用 IRSA、EKS Pod Identity、EC2 role 或同等 workload identity。不要设置静态 AWS access key 环境变量。
+显式删除先在 `<prefix>/deletions/<session>.json` 写入不可复用的空 marker，再清理 session
+前缀。marker 让读写立即 fail closed，并驱动启动时/周期性的幂等清扫，以覆盖 producer 崩溃后 S3
+才确认旧 Put 的窗口。生产还必须用独立 maintenance workload 调用同一 reconciler、对失败告警，并授予
+`GetBucketVersioning`、`ListBucketVersions`、`DeleteObjectVersion`；版本化 bucket 不能只写普通 delete
+marker。这里承诺的是有 SLO 的持久物理收敛，不是跨数据库与对象存储的瞬时原子删除。
 
 ### OTLP
 

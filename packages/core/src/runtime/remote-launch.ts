@@ -6,10 +6,15 @@ import { configuredSecretBackendFromEnv, type SecretBackend } from "../security/
 import { ContainerIsolatedRuntime } from "./container-runtime.js";
 import { KubernetesJobRuntime } from "./kubernetes-runtime.js";
 import { PostgresRuntimeDatabase, PostgresWorkerQueueStore } from "./postgres.js";
-import { createClaimRemoteRuntimeAuthorizer, RemoteRuntimeHttpServer } from "./remote-server.js";
+import {
+  createClaimRemoteRuntimeAuthorizer,
+  RemoteRuntimeHttpServer,
+  type RemoteRuntimeTransportSecurity,
+} from "./remote-server.js";
 import { createRemoteOidcAuthenticator } from "./remote-auth.js";
 import { telemetryFromEnv } from "./telemetry.js";
-import { NetworkProxy } from "./network-proxy.js";
+import { NetworkProxy, NetworkProxyCredentialClient } from "./network-proxy.js";
+import { TransactionalExecutionRuntime } from "./transactional-runtime.js";
 import { DurableWorkerQueue } from "./worker.js";
 
 function required(name: string): string {
@@ -34,10 +39,16 @@ async function main(): Promise<void> {
     ssl: process.env.ANICODE_DATABASE_SSL === "0" ? false : undefined,
   });
   const queue = new DurableWorkerQueue(new PostgresWorkerQueueStore(postgres));
-  const proxyUrl = process.env.ANICODE_RUNTIME_PROXY_URL
-    ? authenticatedProxyUrl(process.env.ANICODE_RUNTIME_PROXY_URL, credentials.proxyToken)
-    : undefined;
-  const executionRuntime =
+  const proxyUrl = process.env.ANICODE_RUNTIME_PROXY_URL;
+  const proxyCredentialIssuer =
+    proxyUrl && credentials.proxyCredentialId && credentials.proxyControlUrl
+      ? new NetworkProxyCredentialClient({
+          broker: credentials.broker,
+          credentialId: credentials.proxyCredentialId,
+          controlUrl: credentials.proxyControlUrl,
+        })
+      : undefined;
+  const executionBackend =
     (process.env.ANICODE_REMOTE_EXECUTION ?? "kubernetes") === "kubernetes"
       ? new KubernetesJobRuntime({
           image: required("ANICODE_RUNTIME_IMAGE"),
@@ -45,6 +56,7 @@ async function main(): Promise<void> {
           workspacePvc: required("ANICODE_WORKSPACE_PVC"),
           hostWorkspaceRoot: workspaceRoot,
           ...(proxyUrl ? { proxyUrl } : {}),
+          ...(proxyCredentialIssuer ? { proxyCredentialIssuer } : {}),
           serviceAccount: process.env.ANICODE_RUNNER_SERVICE_ACCOUNT ?? "anicode-runner",
           ephemeralWorkspace: process.env.ANICODE_EPHEMERAL_WORKSPACE !== "0",
           workspaceSizeLimit: process.env.ANICODE_WORKSPACE_SIZE_LIMIT ?? "10Gi",
@@ -56,8 +68,18 @@ async function main(): Promise<void> {
             ? { internalNetwork: process.env.ANICODE_CONTAINER_NETWORK }
             : {}),
           ...(proxyUrl ? { proxyUrl } : {}),
+          ...(proxyCredentialIssuer ? { proxyCredentialIssuer } : {}),
           broker: credentials.broker,
         });
+  const executionRuntime =
+    executionBackend instanceof ContainerIsolatedRuntime
+      ? new TransactionalExecutionRuntime(executionBackend, {
+          maxFiles: Number(process.env.ANICODE_TRANSACTIONAL_SHELL_MAX_FILES ?? 200_000),
+          maxChangedBytes: Number(
+            process.env.ANICODE_TRANSACTIONAL_SHELL_MAX_CHANGED_BYTES ?? 100 * 1024 * 1024,
+          ),
+        })
+      : executionBackend;
   const authenticate = createRemoteOidcAuthenticator({
     issuer: required("ANICODE_OIDC_ISSUER"),
     audience: required("ANICODE_OIDC_AUDIENCE")
@@ -77,6 +99,7 @@ async function main(): Promise<void> {
       workspaceClaim: process.env.ANICODE_OIDC_WORKSPACE_CLAIM ?? "anicode_workspaces",
       permissionClaim: process.env.ANICODE_OIDC_PERMISSION_CLAIM ?? "anicode_permissions",
       maxTimeoutMs: Number(process.env.ANICODE_REMOTE_MAX_TIMEOUT_MS ?? 15 * 60_000),
+      grantTtlMs: Number(process.env.ANICODE_REMOTE_GRANT_TTL_MS ?? 15 * 60_000),
     }),
     readiness: async () => {
       await postgres.healthCheck();
@@ -86,6 +109,7 @@ async function main(): Promise<void> {
     telemetry,
     workerId: process.env.ANICODE_REMOTE_WORKER_ID ?? `remote-${process.pid}`,
     leaseMs: Number(process.env.ANICODE_REMOTE_LEASE_MS ?? 60_000),
+    ...(credentials.transportSecurity ? { transportSecurity: credentials.transportSecurity } : {}),
   });
   const controller = new AbortController();
   const stop = () => {
@@ -121,7 +145,9 @@ async function main(): Promise<void> {
 
 interface RemoteCredentials {
   databaseUrl: string;
-  proxyToken: string;
+  proxyCredentialId?: string;
+  proxyControlUrl?: string;
+  transportSecurity?: RemoteRuntimeTransportSecurity;
   broker: CredentialBroker;
 }
 
@@ -141,30 +167,103 @@ async function runtimeCredentials(): Promise<RemoteCredentials> {
     const databaseUrl = await backend.get(
       process.env.ANICODE_DATABASE_CREDENTIAL_KEY ?? "runtime:DATABASE_URL",
     );
-    const proxyToken = await backend.get(
-      process.env.ANICODE_PROXY_CLIENT_CREDENTIAL_KEY ?? "runtime:PROXY_CLIENT_TOKEN",
-    );
     await registerRemoteTelemetryCredential(broker, backend);
     if (!databaseUrl) throw new Error("Remote Runtime PostgreSQL credential is missing");
-    if (!proxyToken || proxyToken.length < 24) {
-      throw new Error("Remote Runtime proxy client credential is missing or weak");
+    const tlsMode = process.env.ANICODE_REMOTE_TLS_MODE?.trim();
+    let transportSecurity: RemoteRuntimeTransportSecurity | undefined;
+    if (tlsMode === "native") {
+      const [cert, key, ca] = await Promise.all([
+        backend.get(
+          process.env.ANICODE_REMOTE_TLS_CERT_CREDENTIAL_KEY ?? "runtime:REMOTE_TLS_CERT",
+        ),
+        backend.get(
+          process.env.ANICODE_REMOTE_TLS_PRIVATE_KEY_CREDENTIAL_KEY ?? "runtime:REMOTE_TLS_KEY",
+        ),
+        process.env.ANICODE_REMOTE_TLS_CA_CREDENTIAL_KEY
+          ? backend.get(process.env.ANICODE_REMOTE_TLS_CA_CREDENTIAL_KEY)
+          : undefined,
+      ]);
+      if (!cert?.includes("-----BEGIN CERTIFICATE-----") || !key?.includes("PRIVATE KEY-----")) {
+        throw new Error("Remote Runtime native TLS certificate or private key is missing");
+      }
+      transportSecurity = { mode: "tls", tls: { cert, key, ...(ca ? { ca } : {}) } };
+    } else if (tlsMode === "trusted-proxy") {
+      transportSecurity = { mode: "trusted-proxy" };
+    } else if (tlsMode) {
+      throw new Error("ANICODE_REMOTE_TLS_MODE must be native or trusted-proxy");
     }
-    return { databaseUrl, proxyToken, broker };
+    const bindHost = process.env.HOST ?? "0.0.0.0";
+    if (!transportSecurity && !isLoopbackHost(bindHost)) {
+      throw new Error(
+        "ANICODE_REMOTE_TLS_MODE is required when Remote Runtime binds a non-loopback host",
+      );
+    }
+    let proxyCredentialId: string | undefined;
+    let proxyControlUrl: string | undefined;
+    const proxyEndpoint = process.env.ANICODE_RUNTIME_PROXY_URL;
+    if (proxyEndpoint) {
+      const target = new URL(proxyEndpoint);
+      if (
+        !/^https?:$/.test(target.protocol) ||
+        target.username ||
+        target.password ||
+        target.search ||
+        target.hash ||
+        !["", "/"].includes(target.pathname)
+      ) {
+        throw new Error("ANICODE_RUNTIME_PROXY_URL must be credential-free HTTP(S)");
+      }
+      const control = new URL(required("ANICODE_RUNTIME_PROXY_CONTROL_URL"));
+      if (
+        control.protocol !== "https:" ||
+        control.username ||
+        control.password ||
+        control.search ||
+        control.hash ||
+        !["", "/"].includes(control.pathname)
+      ) {
+        throw new Error("ANICODE_RUNTIME_PROXY_CONTROL_URL must be a credential-free HTTPS origin");
+      }
+      proxyControlUrl = control.toString();
+      proxyCredentialId = "remote-network-proxy-control";
+      await broker.registerFromBackend({
+        id: proxyCredentialId,
+        backend,
+        backendKey: process.env.ANICODE_PROXY_CLIENT_CREDENTIAL_KEY ?? "runtime:PROXY_CLIENT_TOKEN",
+        scopes: [
+          {
+            audiences: ["network-proxy-control"],
+            hosts: [control.hostname],
+            tools: ["issue", "revoke"],
+            header: "authorization",
+            headerPrefix: "Bearer ",
+          },
+        ],
+      });
+      const proxyControlToken = broker.trustedValue(proxyCredentialId, {
+        audience: "network-proxy-control",
+        host: control.hostname,
+        tool: "issue",
+      });
+      if (proxyControlToken.length < 24) {
+        broker.revoke(proxyCredentialId);
+        throw new Error("Remote Runtime proxy control credential is missing or weak");
+      }
+    } else if (process.env.ANICODE_RUNTIME_PROXY_CONTROL_URL) {
+      throw new Error("ANICODE_RUNTIME_PROXY_CONTROL_URL requires ANICODE_RUNTIME_PROXY_URL");
+    }
+    return {
+      databaseUrl,
+      ...(proxyCredentialId ? { proxyCredentialId } : {}),
+      ...(proxyControlUrl ? { proxyControlUrl } : {}),
+      ...(transportSecurity ? { transportSecurity } : {}),
+      broker,
+    };
   } finally {
     for (const name of Object.keys(process.env)) {
       if (isCredentialEnvironmentName(name)) delete process.env[name];
     }
   }
-}
-
-function authenticatedProxyUrl(value: string, token: string): string {
-  const url = new URL(value);
-  if (url.username || url.password) {
-    throw new Error("ANICODE_RUNTIME_PROXY_URL must not contain inline credentials");
-  }
-  url.username = "anicode";
-  url.password = token;
-  return url.toString();
 }
 
 async function registerRemoteTelemetryCredential(
@@ -190,6 +289,15 @@ function csv(value: string | undefined, fallback: string[]): string[] {
     .map((item) => item.trim())
     .filter(Boolean);
   return parsed?.length ? parsed : fallback;
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    /^127(?:\.[0-9]{1,3}){3}$/.test(normalized)
+  );
 }
 
 /** 控制面自身的 HTTP 出口（OTLP）；runner 仍由 CNI 的 default-deny 做 OS 级强制。 */

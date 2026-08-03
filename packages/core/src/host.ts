@@ -16,6 +16,11 @@ import type {
   SessionManager,
 } from "./session-manager.js";
 import type { PermissionMode, PermissionProfile } from "./permission.js";
+import {
+  discoverProviderModels,
+  sanitizeDiscoveredModels,
+  sanitizeProviderId,
+} from "./provider/registry.js";
 
 export type PermissionDecisionKind = PermissionAnswer;
 
@@ -28,6 +33,12 @@ export interface OpenHandle {
 }
 
 export interface SessionHost {
+  /**
+   * Ask the authoritative host process for the provider's live `/models` result. Optional so
+   * third-party and older mock hosts remain source-compatible; callers must hide unavailable
+   * providers when this capability is absent or resolves to undefined.
+   */
+  discoverModels?(providerId: string): Promise<string[] | undefined>;
   listSessions(): Promise<SessionSummary[]>;
   createSession(input: { cwd: string; model: string; title?: string }): Promise<SessionSummary>;
   /** 订阅一个会话：立即拿 snapshot，之后经 listener 实时收事件 */
@@ -87,7 +98,22 @@ export interface SessionHost {
 
 /** 进程内实现：直接委托给 SessionManager */
 export class LocalSessionHost implements SessionHost {
-  constructor(private manager: SessionManager) {}
+  constructor(
+    private manager: SessionManager,
+    private readonly providerModelDiscovery: (
+      providerId: string,
+    ) => Promise<string[] | undefined> = discoverProviderModels,
+  ) {}
+
+  async discoverModels(providerId: string): Promise<string[] | undefined> {
+    const safeProviderId = sanitizeProviderId(providerId);
+    if (!safeProviderId) throw new TypeError("Invalid provider id");
+    try {
+      return sanitizeDiscoveredModels(await this.providerModelDiscovery(safeProviderId));
+    } catch {
+      return undefined;
+    }
+  }
 
   listSessions(): Promise<SessionSummary[]> {
     return this.manager.listSessions();

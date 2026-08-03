@@ -25,3 +25,19 @@ test("mentions: 无 @ 时原样返回；拒绝逃逸 cwd", async () => {
   assert.equal(r2.text, "@../../etc/hosts"); // 不追加内容
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("mentions: 拒绝通过工作区内符号链接读取外部文件", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-at-root-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-at-outside-"));
+  await fs.writeFile(path.join(outside, "secret.txt"), "outside-secret", "utf8");
+  await fs.symlink(path.join(outside, "secret.txt"), path.join(dir, "escape.txt"));
+  try {
+    const result = await expandFileMentions("inspect @escape.txt", dir);
+    assert.equal(result.text, "inspect @escape.txt");
+    assert.deepEqual(result.missing, ["escape.txt"]);
+    assert.doesNotMatch(result.text, /outside-secret/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});

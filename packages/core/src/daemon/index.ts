@@ -9,6 +9,17 @@ export { encodeFrame, decodeLines, type ClientRequest, type ServerFrame } from "
 export { HttpDaemonServer, type HttpDaemonOptions } from "./http-server.js";
 export { HttpSessionHost, parseSseChunk, type HttpSessionHostOptions } from "./http-client.js";
 export {
+  DEFAULT_HTTP_DAEMON_PORT,
+  defaultDaemonAuthTokenPath,
+  defaultHttpDaemonAuthTokenPath,
+  generateDaemonAuthToken,
+  provisionDaemonAuthToken,
+  readDaemonAuthToken,
+  validateDaemonAuthToken,
+  type ProvisionDaemonAuthTokenOptions,
+  type ProvisionedDaemonAuthToken,
+} from "./auth-token.js";
+export {
   ROUTES,
   EVENTS,
   PROTOCOL_VERSION,

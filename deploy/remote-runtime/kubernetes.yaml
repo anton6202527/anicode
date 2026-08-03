@@ -119,6 +119,10 @@ spec:
           env:
             - name: PORT
               value: "8080"
+            # The Service is an internal backend only. A trusted ingress/gateway must terminate
+            # public TLS; the NetworkPolicy below rejects every other Pod source.
+            - name: ANICODE_REMOTE_TLS_MODE
+              value: trusted-proxy
             - name: ANICODE_REMOTE_EXECUTION
               value: kubernetes
             - name: ANICODE_RUNTIME_NAMESPACE
@@ -133,6 +137,9 @@ spec:
               value: "1"
             - name: ANICODE_RUNTIME_PROXY_URL
               value: http://anicode-egress-proxy:8080
+            - name: ANICODE_RUNTIME_PROXY_CONTROL_URL
+              valueFrom:
+                secretKeyRef: { name: anicode-runtime-config, key: proxy-control-url }
             - name: ANICODE_RUNTIME_IMAGE
               value: ghcr.io/OWNER/anicode-runner@sha256:REPLACE_WITH_DIGEST
             - name: ANICODE_OIDC_ISSUER
@@ -178,16 +185,28 @@ spec:
             - name: ANICODE_CONTROL_PLANE_ALLOW_PRIVATE
               value: "1"
           readinessProbe:
-            httpGet: { path: /readyz, port: http }
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:8080/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 2
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
             periodSeconds: 10
             timeoutSeconds: 3
           startupProbe:
-            httpGet: { path: /healthz, port: http }
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
             periodSeconds: 2
             failureThreshold: 30
           lifecycle:
@@ -231,12 +250,35 @@ kind: Service
 metadata:
   name: anicode-remote-runtime
   namespace: anicode-runtime
+  annotations:
+    anicode.dev/exposure-contract: trusted-tls-termination-only
 spec:
   selector: { app: anicode-remote-runtime }
   ports:
     - name: http
       port: 80
       targetPort: http
+---
+# Public bearer tokens may enter only through a separately operated HTTPS gateway. Label both its
+# namespace and Pods as shown below after that gateway's TLS configuration has passed acceptance
+# tests. The Service must never be exposed directly by a LoadBalancer/NodePort.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: remote-runtime-ingress-from-tls-gateway-only
+  namespace: anicode-runtime
+spec:
+  podSelector:
+    matchLabels: { app: anicode-remote-runtime }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { anicode.dev/remote-runtime-ingress: trusted }
+          podSelector:
+            matchLabels: { anicode.dev/tls-termination: "true" }
+      ports:
+        - { protocol: TCP, port: 8080 }
 ---
 apiVersion: apps/v1
 kind: Deployment

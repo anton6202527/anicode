@@ -17,7 +17,7 @@ import {
   telemetryFromEnv,
   traceparent,
 } from "./telemetry.js";
-import { NetworkProxy, isPrivateAddress } from "./network-proxy.js";
+import { canonicalizeIpAddress, NetworkProxy, isPrivateAddress } from "./network-proxy.js";
 import { IsolatedRuntime } from "./isolated-runtime.js";
 import { CapabilityAuthority, SecurityPolicyEngine } from "../security/policy.js";
 import { CredentialBroker } from "../security/credentials.js";
@@ -47,7 +47,132 @@ test("runtime: artifact 内容寻址、持久化与 session 隔离", async () =>
     assert.equal((await store.list("s_one")).length, 1);
     assert.equal(Buffer.from((await store.get("s_one", a.id))!.data).toString(), "hello");
     assert.equal(await store.get("s_two", a.id), undefined);
+    const sameContentOtherSession = await store.put({
+      sessionId: "s_two",
+      kind: "report",
+      name: "same.txt",
+      data: "hello",
+    });
+    const firstPayload = path.join(
+      dir,
+      "sessions",
+      "s_one",
+      "blobs",
+      a.sha256.slice(0, 2),
+      a.sha256,
+    );
+    const secondPayload = path.join(
+      dir,
+      "sessions",
+      "s_two",
+      "blobs",
+      a.sha256.slice(0, 2),
+      a.sha256,
+    );
+    await fs.access(firstPayload);
+    await fs.access(secondPayload);
     assert.equal(await store.delete("s_one", a.id), true);
+    await assert.rejects(fs.access(firstPayload));
+    assert.equal(
+      Buffer.from((await store.get("s_two", sameContentOtherSession.id))!.data).toString(),
+      "hello",
+    );
+    await fs.access(secondPayload);
+
+    const legacy = await store.put({
+      sessionId: "s_legacy",
+      kind: "log",
+      name: "legacy.txt",
+      data: "old layout",
+    });
+    const scopedLegacyPayload = path.join(
+      dir,
+      "sessions",
+      "s_legacy",
+      "blobs",
+      legacy.sha256.slice(0, 2),
+      legacy.sha256,
+    );
+    const globalLegacyPayload = path.join(dir, "blobs", legacy.sha256.slice(0, 2), legacy.sha256);
+    await fs.mkdir(path.dirname(globalLegacyPayload), { recursive: true });
+    await fs.rename(scopedLegacyPayload, globalLegacyPayload);
+    assert.equal(
+      Buffer.from((await store.get("s_legacy", legacy.id))!.data).toString(),
+      "old layout",
+    );
+    assert.equal(await store.delete("s_legacy", legacy.id), true);
+    await fs.access(globalLegacyPayload);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runtime: FileArtifactStore deleteSession removes its namespace and retains shared v1 blobs", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-artifact-purge-"));
+  try {
+    const store = new FileArtifactStore(dir);
+    await store.put({
+      sessionId: "purge_me",
+      kind: "report",
+      name: "normal.txt",
+      data: "normal secret",
+    });
+    const purgeRoot = path.join(dir, "sessions", "purge_me");
+    await fs.writeFile(path.join(purgeRoot, "corrupt.json"), "{broken", "utf8");
+    await fs.mkdir(path.join(purgeRoot, "orphan"), { recursive: true });
+    await fs.writeFile(path.join(purgeRoot, "orphan", "payload"), "orphan secret", "utf8");
+
+    await store.deleteSession("purge_me");
+    await assert.rejects(fs.access(purgeRoot));
+    assert.deepEqual(await store.list("purge_me"), []);
+    await assert.rejects(() => store.deleteSession("../escape"), /Invalid session id/);
+
+    const first = await store.put({
+      sessionId: "legacy_first",
+      kind: "report",
+      name: "shared.txt",
+      data: "legacy shared secret",
+    });
+    await store.put({
+      sessionId: "legacy_second",
+      kind: "report",
+      name: "shared.txt",
+      data: "legacy shared secret",
+    });
+    const firstScoped = path.join(
+      dir,
+      "sessions",
+      "legacy_first",
+      "blobs",
+      first.sha256.slice(0, 2),
+      first.sha256,
+    );
+    const secondScoped = path.join(
+      dir,
+      "sessions",
+      "legacy_second",
+      "blobs",
+      first.sha256.slice(0, 2),
+      first.sha256,
+    );
+    const global = path.join(dir, "blobs", first.sha256.slice(0, 2), first.sha256);
+    await fs.mkdir(path.dirname(global), { recursive: true });
+    await fs.rename(firstScoped, global);
+    await fs.rm(secondScoped);
+
+    await store.deleteSession("legacy_first");
+    await fs.access(global);
+    await store.deleteSession("legacy_second");
+    await fs.access(global);
+
+    const outside = path.join(dir, "outside");
+    await fs.mkdir(outside);
+    const link = path.join(dir, "sessions", "linked_session");
+    await fs.symlink(outside, link, "dir");
+    await fs.writeFile(path.join(outside, "canary"), "keep", "utf8");
+    await store.deleteSession("linked_session");
+    await fs.access(path.join(outside, "canary"));
+    await assert.rejects(fs.lstat(link));
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
@@ -266,6 +391,23 @@ test("security: shell 不继承宿主密钥，credential 文件命中硬拒绝",
 test("network proxy: 默认阻断私网/回环，允许显式公网域", async () => {
   assert.equal(isPrivateAddress("127.0.0.1"), true);
   assert.equal(isPrivateAddress("8.8.8.8"), false);
+  for (const reserved of [
+    "192.0.2.1",
+    "198.18.0.1",
+    "198.51.100.2",
+    "203.0.113.3",
+    "100::1",
+    "2001:db8::1",
+    "3fff::1",
+    "::ffff:127.0.0.1",
+    "::ffff:7f00:1",
+    "64:ff9b::127.0.0.1",
+  ]) {
+    assert.equal(isPrivateAddress(reserved), true, `${reserved} must not reach the public network`);
+  }
+  assert.equal(isPrivateAddress("2606:4700:4700::1111"), false);
+  assert.equal(isPrivateAddress("::ffff:808:808"), false);
+  assert.equal(canonicalizeIpAddress("::ffff:127.0.0.1"), canonicalizeIpAddress("::ffff:7f00:1"));
   const proxy = new NetworkProxy({
     policy: { allowDomains: ["example.com"] },
     resolver: async () => ["93.184.216.34"],

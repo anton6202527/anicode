@@ -5,7 +5,7 @@
  * 本包只做 type-only 导入（运行时零依赖，仅用全局 fetch），便于将来独立发布。
  *
  * 用法：
- *   const client = createAnicodeClient({ baseUrl: "http://127.0.0.1:8317" });
+ *   const client = createAnicodeClient({ baseUrl: "http://127.0.0.1:8327" });
  *   const s = await client.session.create({ cwd, model });
  *   for await (const ev of client.event.subscribe(s.id, { signal })) { ... }
  */
@@ -132,6 +132,10 @@ export interface AnicodeClient {
     health(): Promise<{ ok: boolean; name: string; protocol: number }>;
     /** OpenAPI 3.1 文档（GET /doc）。 */
     doc(): Promise<Record<string, unknown>>;
+  };
+  provider: {
+    /** Server-side authenticated `/models` discovery; unavailable providers resolve undefined. */
+    discoverModels(providerId: string): Promise<string[] | undefined>;
   };
   session: {
     list(): Promise<SessionSummary[]>;
@@ -361,6 +365,30 @@ export function createAnicodeClient(opts: AnicodeClientOptions): AnicodeClient {
     return encoded ? `${pathname}?${encoded}` : pathname;
   }
 
+  function providerIdValue(value: string): string {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+      throw new TypeError("Invalid provider id");
+    }
+    return value;
+  }
+
+  function discoveredModels(value: unknown): string[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    const safe: string[] = [];
+    for (const model of value) {
+      if (typeof model !== "string") continue;
+      const id = model.trim();
+      if (
+        id &&
+        new TextEncoder().encode(id).byteLength <= 512 &&
+        !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(id)
+      ) {
+        safe.push(id);
+      }
+    }
+    return [...new Set(safe)].slice(0, 500);
+  }
+
   async function callWithResponse<T>(
     operationId: GeneratedOperationId,
     params: Record<string, string | number> = {},
@@ -476,6 +504,16 @@ export function createAnicodeClient(opts: AnicodeClientOptions): AnicodeClient {
     global: {
       health: () => call("getGlobalHealth"),
       doc: () => call("getDoc"),
+    },
+    provider: {
+      discoverModels: async (providerId) => {
+        const safeProviderId = providerIdValue(providerId);
+        const result = await call<{ providerId?: unknown; models?: unknown }>(
+          "getProvidersProviderIdModels",
+          { providerId: safeProviderId },
+        );
+        return result.providerId === safeProviderId ? discoveredModels(result.models) : undefined;
+      },
     },
     session: {
       list: () => call("getSessions"),

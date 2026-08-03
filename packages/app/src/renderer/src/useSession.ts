@@ -25,6 +25,7 @@ export interface ChatState {
   todos: TodoItem[];
   pendings: PendingPerm[];
   meta: SessionMeta | null;
+  workspaceTrusted?: boolean;
   opening: boolean;
 }
 
@@ -62,7 +63,8 @@ type Action =
   | { t: "todos"; todos: TodoItem[] }
   | { t: "permAdd"; perm: PendingPerm }
   | { t: "permRemove"; permId: string }
-  | { t: "permSet"; perms: PendingPerm[] };
+  | { t: "permSet"; perms: PendingPerm[] }
+  | { t: "workspaceTrust"; trusted: boolean };
 
 function reducer(s: ChatState, a: Action): ChatState {
   switch (a.t) {
@@ -123,6 +125,8 @@ function reducer(s: ChatState, a: Action): ChatState {
       return { ...s, pendings: s.pendings.filter((p) => p.permId !== a.permId) };
     case "permSet":
       return { ...s, pendings: a.perms };
+    case "workspaceTrust":
+      return { ...s, workspaceTrusted: a.trusted };
   }
 }
 
@@ -158,6 +162,10 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
   }
   if (se.type === "title") {
     // 自动命名等标题变化：App 端暂无标题栏渲染需求，仅忽略（保持事件面完整）。
+    return;
+  }
+  if (se.type === "workspace_trust") {
+    dispatch({ t: "workspaceTrust", trusted: se.assessment.trusted });
     return;
   }
   const ev = se.event;
@@ -296,6 +304,7 @@ export function useSession(sessionId: string | null): SessionController {
             running: snap.running,
             todos: todosFromMessages(snap.messages),
             meta: snap.meta,
+            ...(snap.workspaceTrust ? { workspaceTrusted: snap.workspaceTrust.trusted } : {}),
             pendings: snap.pendingPermissions,
           },
         });

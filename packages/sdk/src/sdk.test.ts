@@ -18,6 +18,8 @@ import {
 } from "@anicode/core";
 import { createAnicodeClient, AnicodeApiError, type EventEnvelope } from "./index.js";
 
+const TEST_HTTP_TOKEN = "anicode-sdk-http-test-token-32-bytes-minimum";
+
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
   return {
@@ -37,15 +39,57 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
   };
 }
 
-async function startServer(dir: string, provider: Provider, token?: string) {
+async function startServer(
+  dir: string,
+  provider: Provider,
+  token = TEST_HTTP_TOKEN,
+  discoverModels?: (providerId: string) => Promise<string[] | undefined>,
+) {
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({ provider, model: "scripted" }),
   });
-  const server = new HttpDaemonServer({ manager, ...(token ? { token } : {}) });
+  const server = new HttpDaemonServer({
+    manager,
+    token,
+    ...(discoverModels ? { discoverModels } : {}),
+  });
   await server.listen(0);
   return { server, baseUrl: `http://127.0.0.1:${server.port()}` };
 }
+
+test("sdk: authenticated provider discovery is generated and fail-closed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-models-"));
+  const calls: string[] = [];
+  const { server, baseUrl } = await startServer(
+    dir,
+    scriptedProvider([]),
+    TEST_HTTP_TOKEN,
+    async (providerId) => {
+      calls.push(providerId);
+      return providerId === "offline" ? undefined : ["live-model"];
+    },
+  );
+  try {
+    const client = createAnicodeClient({ baseUrl, token: TEST_HTTP_TOKEN });
+    assert.deepEqual(await client.provider.discoverModels("cliproxy"), ["live-model"]);
+    assert.equal(await client.provider.discoverModels("offline"), undefined);
+    assert.deepEqual(calls, ["cliproxy", "offline"]);
+    await assert.rejects(
+      () => client.provider.discoverModels("../cliproxy"),
+      /Invalid provider id/,
+    );
+
+    const anonymous = createAnicodeClient({ baseUrl, maxRetries: 0 });
+    await assert.rejects(
+      () => anonymous.provider.discoverModels("cliproxy"),
+      (error: unknown) => error instanceof AnicodeApiError && error.status === 401,
+    );
+  } finally {
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-"));
@@ -53,7 +97,7 @@ test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "SDK 回答" }] }]]),
   );
-  const client = createAnicodeClient({ baseUrl });
+  const client = createAnicodeClient({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const health = await client.global.health();
     assert.equal(health.ok, true);
@@ -180,7 +224,7 @@ test("sdk: 会话生命周期 + messages 投影 + doc/health", async () => {
 test("sdk/openapi: pagination、Artifact 原始流/摘要校验、结构化错误与客户端预检", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-contract-"));
   const { server, baseUrl } = await startServer(dir, scriptedProvider([]));
-  const client = createAnicodeClient({ baseUrl });
+  const client = createAnicodeClient({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const sessions = await Promise.all(
       ["one", "two", "three"].map((title) =>
@@ -209,7 +253,11 @@ test("sdk/openapi: pagination、Artifact 原始流/摘要校验、结构化错�
       () => client.session.create({ cwd: "", model: "scripted" }),
       (error: unknown) => error instanceof TypeError && /minLength/.test(error.message),
     );
-    const incompatible = createAnicodeClient({ baseUrl, apiVersion: 999 });
+    const incompatible = createAnicodeClient({
+      baseUrl,
+      token: TEST_HTTP_TOKEN,
+      apiVersion: 999,
+    });
     await assert.rejects(
       () => incompatible.global.health(),
       (error: unknown) =>
@@ -290,7 +338,7 @@ test("sdk: event.subscribe —— 信封序保证与 parts 投影事件", async 
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "订阅回答" }] }]]),
   );
-  const client = createAnicodeClient({ baseUrl });
+  const client = createAnicodeClient({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await client.session.create({ cwd: dir, model: "scripted" });
     const ac = new AbortController();
@@ -333,9 +381,10 @@ test("sdk: event.subscribe —— 信封序保证与 parts 投影事件", async 
 
 test("sdk: token 鉴权 —— 无凭据 401，REST/SSE 均走 Authorization header", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-"));
-  const { server, baseUrl } = await startServer(dir, scriptedProvider([]), "s3cret");
+  const token = "s".repeat(32);
+  const { server, baseUrl } = await startServer(dir, scriptedProvider([]), token);
   const anon = createAnicodeClient({ baseUrl });
-  const auth = createAnicodeClient({ baseUrl, token: "s3cret" });
+  const auth = createAnicodeClient({ baseUrl, token });
   try {
     await assert.rejects(
       () => anon.session.list(),
@@ -366,7 +415,7 @@ test("sdk: token 鉴权 —— 无凭据 401，REST/SSE 均走 Authorization hea
 test("sdk: 权限域 —— listProfiles/setProfile/setMode", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sdk-"));
   const { server, baseUrl } = await startServer(dir, scriptedProvider([]));
-  const client = createAnicodeClient({ baseUrl });
+  const client = createAnicodeClient({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await client.session.create({ cwd: dir, model: "scripted" });
     const profiles = await client.permission.listProfiles(meta.id);
@@ -386,7 +435,7 @@ test("sdk: event.subscribeAll —— 全局 firehose 跨会话", async () => {
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "全局回答" }] }]]),
   );
-  const client = createAnicodeClient({ baseUrl });
+  const client = createAnicodeClient({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await client.session.create({ cwd: dir, model: "scripted" });
     const ac = new AbortController();

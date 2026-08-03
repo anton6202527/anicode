@@ -16,6 +16,7 @@ import * as net from "node:net";
 import { DaemonServer } from "./server.js";
 import { DaemonClient } from "./client.js";
 import { MAX_FRAME_BYTES } from "./protocol.js";
+import { generateDaemonAuthToken, provisionDaemonAuthToken } from "./auth-token.js";
 import { SessionManager, type SessionEvent } from "../session-manager.js";
 import { SessionStore } from "../session.js";
 import type { SessionHost } from "../host.js";
@@ -40,19 +41,84 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
   };
 }
 
-async function startDaemon(dir: string, provider: Provider) {
+async function startDaemon(
+  dir: string,
+  provider: Provider,
+  discoverModels?: (providerId: string) => Promise<string[] | undefined>,
+) {
   const sockPath = path.join(dir, "d.sock");
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({ provider, model: "scripted" }),
   });
-  const server = new DaemonServer({ manager });
+  const server = new DaemonServer({
+    manager,
+    unsafeAllowUnauthenticatedForTests: true,
+    ...(discoverModels ? { discoverModels } : {}),
+  });
   await server.listen(sockPath);
   if (process.platform !== "win32") {
     assert.equal((await fs.stat(sockPath)).mode & 0o777, 0o600);
   }
   return { server, sockPath };
 }
+
+test("daemon socket: bearer auth is required and client discovers the private token file", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-auth-"));
+  const sockPath = path.join(dir, "d.sock");
+  const token = generateDaemonAuthToken();
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  assert.throws(() => new DaemonServer({ manager }), /requires a strong authToken/);
+  assert.throws(() => new DaemonServer({ manager, authToken: "short" }), /at least 32 bytes/);
+  const server = new DaemonServer({ manager, authToken: token });
+  await server.listen(sockPath);
+  try {
+    const unauthenticated = await DaemonClient.connect(sockPath);
+    await assert.rejects(() => unauthenticated.listSessions(), /closed|lost|断开|关闭/);
+    unauthenticated.dispose();
+
+    await provisionDaemonAuthToken({ socketPath: sockPath, token });
+    const discovered = await DaemonClient.connect(sockPath);
+    assert.deepEqual(await discovered.listSessions(), []);
+    discovered.dispose();
+
+    const wrong = await DaemonClient.connect(sockPath, { authToken: "w".repeat(32) });
+    await assert.rejects(() => wrong.listSessions(), /closed|lost|断开|关闭/);
+    wrong.dispose();
+  } finally {
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("daemon host: model discovery executes in the authoritative server and fails closed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-models-"));
+  const calls: string[] = [];
+  const { server, sockPath } = await startDaemon(dir, scriptedProvider([]), async (providerId) => {
+    calls.push(providerId);
+    if (providerId === "broken") throw new Error("secret upstream failure");
+    return ["live-model", "live-model", "\u001b[31munsafe"];
+  });
+  const client = await DaemonClient.connect(sockPath);
+  try {
+    assert.deepEqual(await client.discoverModels("cliproxy"), ["live-model"]);
+    assert.equal(await client.discoverModels("broken"), undefined);
+    assert.deepEqual(
+      calls,
+      ["cliproxy", "broken"],
+      "discovery must execute behind the socket boundary",
+    );
+    await assert.rejects(() => client.discoverModels("../cliproxy"), /Invalid provider id/);
+    assert.deepEqual(await client.listSessions(), [], "invalid input must not poison the socket");
+  } finally {
+    client.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("daemon: 两个客户端共享同一会话，一个 send 两个都收事件", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-"));
@@ -274,7 +340,7 @@ test("daemon: 同一客户端并发 open 同一冷会话不会重复订阅事件
       model: "scripted",
     }),
   });
-  const server = new DaemonServer({ manager });
+  const server = new DaemonServer({ manager, unsafeAllowUnauthenticatedForTests: true });
   const sockPath = path.join(dir, "d.sock");
   await server.listen(sockPath);
   const client = await DaemonClient.connect(sockPath);
@@ -362,7 +428,7 @@ test("daemon: open 返回 snapshot；resume 已有会话", async () => {
       model: "scripted",
     }),
   });
-  const server = new DaemonServer({ manager });
+  const server = new DaemonServer({ manager, unsafeAllowUnauthenticatedForTests: true });
   const sockPath = path.join(dir, "d.sock");
   await server.listen(sockPath);
 
@@ -510,7 +576,7 @@ test("daemon: 超过单帧上限的长会话 snapshot 可分块恢复", async ()
     store,
     resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
   });
-  const server = new DaemonServer({ manager });
+  const server = new DaemonServer({ manager, unsafeAllowUnauthenticatedForTests: true });
   const sockPath = path.join(dir, "d.sock");
   await server.listen(sockPath);
   const client = await DaemonClient.connect(sockPath);

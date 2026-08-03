@@ -20,6 +20,7 @@ import {
   SecurityPolicyEngine,
   telemetryForLocalStack,
   t,
+  type WorkspaceTrustSource,
 } from "@anicode/core";
 
 /** debug/本地 provider 免 key；云端缺 key 给出清晰错误。 */
@@ -36,7 +37,11 @@ export function resolveConfiguredProvider(model: string) {
   return createProvider(model);
 }
 
-export function buildManager(sessionsDir?: string): SessionManager {
+export function buildManager(
+  sessionsDir?: string,
+  workspaceTrust?: WorkspaceTrustSource,
+  workspaceScope?: string,
+): SessionManager {
   const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
   const runtimeStack = createLocalRuntimeStack(path.dirname(dir));
   return new SessionManager({
@@ -52,9 +57,11 @@ export function buildManager(sessionsDir?: string): SessionManager {
     securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
     telemetry: telemetryForLocalStack(runtimeStack),
     isolatedRuntime: runtimeStack.isolatedRuntime,
+    ...(workspaceScope ? { workspaceScope } : {}),
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: { mode: "default" },
+    ...(workspaceTrust ? { workspaceTrust } : {}),
     skills: true,
     subagents: true,
     smallModel: true, // 摘要等杂活自动走便宜模型

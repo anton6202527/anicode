@@ -29,6 +29,7 @@ import {
   type OpenHandle,
   type PermissionDecisionKind,
   type Telemetry,
+  type WorkspaceTrustSource,
 } from "@anicode/core";
 import { applyPluginToggle, PLUGIN_CATALOG, type PluginEntry } from "../shared/plugins.js";
 import type { AppInfo, ModelRow, UserModel } from "../shared/api.js";
@@ -47,6 +48,10 @@ export interface BridgeOptions {
   /** 可注入的 MCP 连接器与环境（测试用）；默认走 core 的真实实现与 process.env。 */
   mcpConnector?: McpConnector;
   env?: NodeJS.ProcessEnv;
+  /** Enforces restricted sessions until this cwd has an explicit Workspace Trust grant. */
+  workspaceTrust?: WorkspaceTrustSource;
+  /** Initial assessment used to avoid starting plugin processes before the first session. */
+  workspaceTrusted?: boolean;
   /** Main-frame allowlist owned by the BrowserWindow lifecycle. */
   isTrustedSender: (event: IpcMainInvokeEvent) => boolean;
 }
@@ -153,9 +158,18 @@ export class Bridge {
       securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
       telemetry,
       isolatedRuntime: runtimeStack.isolatedRuntime,
+      workspaceScope: options.cwd,
       resolveProvider: resolveConfiguredProvider,
       compaction: true,
       permission: { mode: "default" },
+      ...(options.workspaceTrust ? { workspaceTrust: options.workspaceTrust } : {}),
+      ...(options.workspaceTrust
+        ? {
+            onWorkspaceTrustChange: async ({ current }) => {
+              await this.reconcileWorkspaceTrust(current.trusted);
+            },
+          }
+        : {}),
       skills: { disabled: this.disabledSkills },
       subagents: true,
       smallModel: true, // 摘要等杂活自动走便宜模型
@@ -166,9 +180,7 @@ export class Bridge {
 
   /** 启动时发现文件系统技能、读取已保存的插件状态并连接已启用的 MCP，需在处理请求前调用。 */
   async init(): Promise<void> {
-    await this.plugins.refreshSkills(this.options.cwd);
-    await this.plugins.setState(await this.readSavedPlugins());
-    this.syncDisabledSkills();
+    await this.reconcileWorkspaceTrust(this.options.workspaceTrusted !== false);
   }
 
   /** 把「被关闭的文件系统技能」同步进传给 agent 的稳定数组（原地更新，保持引用）。 */
@@ -194,8 +206,6 @@ export class Bridge {
     handle("host:createSession", (_event, value) => {
       const input = record(value, "session");
       const cwd = path.resolve(stringValue(input["cwd"], "session.cwd"));
-      if (cwd !== path.resolve(this.options.cwd))
-        throw new Error("Session cwd is outside app workspace");
       return this.manager.createSession({
         cwd,
         model: stringValue(input["model"], "session.model", 256),
@@ -254,8 +264,12 @@ export class Bridge {
     );
 
     handle("plugins:list", () => this.listPlugins());
-    handle("plugins:setEnabled", (_event, id, enabled) => {
+    handle("plugins:setEnabled", async (_event, id, enabled) => {
       if (typeof enabled !== "boolean") throw new TypeError("enabled must be boolean");
+      if (!(await this.workspaceTrusted())) {
+        await this.plugins.setSuspended(true);
+        throw new Error("Plugins are disabled until this workspace is trusted");
+      }
       return this.setPluginEnabled(stringValue(id, "plugin id", 256), enabled);
     });
   }
@@ -430,6 +444,34 @@ export class Bridge {
     }
   }
 
+  private async workspaceTrusted(): Promise<boolean> {
+    const source = this.options.workspaceTrust;
+    if (!source) return this.options.workspaceTrusted !== false;
+    try {
+      const assessment =
+        typeof source === "function"
+          ? await source(this.options.cwd)
+          : await source.assess(this.options.cwd);
+      return assessment.trusted === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async reconcileWorkspaceTrust(trusted: boolean): Promise<void> {
+    if (!trusted) {
+      await this.plugins.setSuspended(true);
+      return;
+    }
+    // Load state while suspended, then connect. This prevents a trust transition from exposing a
+    // partially reconciled registry to the replacement Agent.
+    await this.plugins.setSuspended(true);
+    await this.plugins.refreshSkills(this.options.cwd);
+    await this.plugins.setState(await this.readSavedPlugins());
+    this.syncDisabledSkills();
+    await this.plugins.setSuspended(false);
+  }
+
   private listPlugins(): PluginEntry[] {
     return this.plugins.entriesWithStatus();
   }
@@ -476,6 +518,7 @@ export class Bridge {
         if (this.telemetry.shutdown) await this.telemetry.shutdown();
         else await this.telemetry.forceFlush?.();
       });
+      await attempt(async () => this.runtimeStack.artifacts.close?.());
       await attempt(() => this.runtimeStack.networkProxy.close());
       await attempt(() => this.runtimeStack.database.close());
 

@@ -1,4 +1,5 @@
 import { appendFileSync, chmodSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { appendFile, chmod, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { OpenHandle, PermissionDecisionKind, SessionEvent, SessionHost } from "@anicode/core";
 
@@ -12,6 +13,8 @@ const SECRET_PATTERNS = [
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_FIELD_CHARS = 64 * 1024;
+const DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
+const DEFAULT_FLUSH_INTERVAL_MS = 50;
 const MAX_COLLECTION_ITEMS = 200;
 const SECRET_FIELD = /(?:api[_-]?key|authorization|password|secret|credential|cookie|token)$/i;
 
@@ -20,6 +23,10 @@ export interface DebugLoggerOptions {
   maxBytes?: number;
   /** Bound individual trace-content strings so one provider event cannot exhaust memory/disk. */
   maxFieldChars?: number;
+  /** Bound queued records while an unusually slow filesystem is being flushed. */
+  maxPendingBytes?: number;
+  /** Batch interval; zero is useful for deterministic tests. */
+  flushIntervalMs?: number;
 }
 
 function redact(value: string): string {
@@ -78,9 +85,17 @@ function safeValue(
 export class DebugLogger {
   readonly file: string;
   private failed = false;
+  private closing = false;
   private readonly maxBytes: number;
   private readonly maxFieldChars: number;
+  private readonly maxPendingBytes: number;
+  private readonly flushIntervalMs: number;
   private currentBytes = 0;
+  private pending: string[] = [];
+  private pendingBytes = 0;
+  private droppedRecords = 0;
+  private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(
     file: string,
@@ -94,6 +109,15 @@ export class DebugLogger {
       "maxFieldChars",
       32,
     );
+    this.maxPendingBytes = positiveInteger(
+      options.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES,
+      "maxPendingBytes",
+      512,
+    );
+    this.flushIntervalMs = nonNegativeInteger(
+      options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
+      "flushIntervalMs",
+    );
     mkdirSync(path.dirname(this.file), { recursive: true });
     // 启动阶段就验证路径可写；运行中的磁盘错误则降级停记，不能截断 TUI 事件。
     appendFileSync(this.file, "", { encoding: "utf8", mode: 0o600 });
@@ -104,7 +128,7 @@ export class DebugLogger {
   }
 
   log(kind: string, data: Record<string, unknown> = {}): void {
-    if (this.failed) return;
+    if (this.failed || this.closing) return;
     try {
       const record = safeValue(
         {
@@ -127,9 +151,46 @@ export class DebugLogger {
         })}\n`;
         bytes = Buffer.byteLength(line);
       }
-      this.rotateIfNeeded(bytes);
-      appendFileSync(this.file, line, "utf8");
-      this.currentBytes += bytes;
+      if (this.pendingBytes + bytes > this.maxPendingBytes) {
+        this.droppedRecords++;
+        this.scheduleFlush();
+        return;
+      }
+      this.pending.push(line);
+      this.pendingBytes += bytes;
+      this.scheduleFlush();
+    } catch {
+      this.failed = true;
+    }
+  }
+
+  /** Flush buffered records without blocking the TUI event loop. */
+  async flush(): Promise<void> {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+    this.queueWrite();
+    await this.writeChain;
+  }
+
+  /** Normal shutdown path. Kept separate so future sinks can release handles here. */
+  async close(): Promise<void> {
+    this.closing = true;
+    await this.flush();
+  }
+
+  /** Signal/exception fallback: terminal teardown cannot await promises. */
+  flushSync(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+    const lines = this.takePending();
+    if (lines.length === 0 || this.failed) return;
+    try {
+      for (const line of lines) {
+        const bytes = Buffer.byteLength(line);
+        this.rotateIfNeeded(bytes);
+        appendFileSync(this.file, line, "utf8");
+        this.currentBytes += bytes;
+      }
     } catch {
       this.failed = true;
     }
@@ -155,11 +216,88 @@ export class DebugLogger {
     chmodSync(this.file, 0o600);
     this.currentBytes = 0;
   }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer || this.failed) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      this.queueWrite();
+    }, this.flushIntervalMs);
+    this.flushTimer.unref?.();
+  }
+
+  private takePending(): string[] {
+    const lines = this.pending;
+    this.pending = [];
+    this.pendingBytes = 0;
+    if (this.droppedRecords > 0) {
+      lines.push(
+        `${JSON.stringify({
+          time: new Date().toISOString(),
+          kind: "logger.dropped",
+          records: this.droppedRecords,
+        })}\n`,
+      );
+      this.droppedRecords = 0;
+    }
+    return lines;
+  }
+
+  private queueWrite(): void {
+    const lines = this.takePending();
+    if (lines.length === 0 || this.failed) return;
+    this.writeChain = this.writeChain
+      .then(() => this.writeBatch(lines))
+      .catch(() => {
+        this.failed = true;
+      });
+  }
+
+  private async writeBatch(lines: readonly string[]): Promise<void> {
+    let chunk = "";
+    let chunkBytes = 0;
+    const appendChunk = async (): Promise<void> => {
+      if (!chunk) return;
+      await appendFile(this.file, chunk, "utf8");
+      this.currentBytes += chunkBytes;
+      chunk = "";
+      chunkBytes = 0;
+    };
+    const rotateFile = async (): Promise<void> => {
+      await appendChunk();
+      const backup = `${this.file}.1`;
+      await rm(backup, { force: true });
+      await rename(this.file, backup);
+      await writeFile(this.file, "", { encoding: "utf8", mode: 0o600 });
+      await chmod(this.file, 0o600);
+      this.currentBytes = 0;
+    };
+
+    for (const line of lines) {
+      const bytes = Buffer.byteLength(line);
+      if (
+        this.currentBytes + chunkBytes > 0 &&
+        this.currentBytes + chunkBytes + bytes > this.maxBytes
+      ) {
+        await rotateFile();
+      }
+      chunk += line;
+      chunkBytes += bytes;
+    }
+    await appendChunk();
+  }
 }
 
 function positiveInteger(value: number, name: string, minimum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum) {
     throw new Error(`Debug log ${name} must be a safe integer >= ${minimum}`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Debug log ${name} must be a non-negative safe integer`);
   }
   return value;
 }
@@ -284,6 +422,12 @@ async function timed<T>(
 /** 给任意本地/远程 SessionHost 加同一套安全 JSONL 诊断，不改变其行为。 */
 export function withDebugLogging(host: SessionHost, logger: DebugLogger): SessionHost {
   return {
+    ...(host.discoverModels
+      ? {
+          discoverModels: (providerId: string) =>
+            timed(logger, "discoverModels", { providerId }, () => host.discoverModels!(providerId)),
+        }
+      : {}),
     listSessions: () => timed(logger, "listSessions", {}, () => host.listSessions()),
     createSession: (input) =>
       timed(
@@ -312,6 +456,7 @@ export function withDebugLogging(host: SessionHost, logger: DebugLogger): Sessio
         });
         return {
           snapshot: handle.snapshot,
+          ...(handle.closed ? { closed: handle.closed } : {}),
           close: () => {
             logger.log("host.close", { sessionId });
             handle.close();

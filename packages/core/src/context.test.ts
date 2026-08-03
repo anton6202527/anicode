@@ -30,6 +30,12 @@ test("项目记忆: 逐级向上收集 AGENTS.md，止于 .git", async () => {
   assert.match(system, /你是助手/);
   assert.match(system, /项目记忆/);
 
+  assert.equal(
+    await loadProjectMemory(sub, { includeProject: false }),
+    "",
+    "未授信宿主可显式关闭全部项目记忆",
+  );
+
   await fs.rm(root, { recursive: true, force: true });
 });
 

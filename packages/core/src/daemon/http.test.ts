@@ -8,13 +8,27 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
+import { EventEmitter } from "node:events";
 import * as os from "node:os";
 import * as path from "node:path";
-import { HttpDaemonServer } from "./http-server.js";
+import {
+  HttpDaemonServer,
+  SseBackpressureWriter,
+  waitForHttpDrain,
+  type SseWritable,
+} from "./http-server.js";
 import { HttpSessionHost, parseSseChunk } from "./http-client.js";
 import { SessionManager, type SessionEvent } from "../session-manager.js";
 import { SessionStore } from "../session.js";
 import type { ChatMessage, Provider, StreamEvent } from "../index.js";
+
+const TEST_HTTP_TOKEN = "anicode-core-http-test-token-32-bytes-minimum";
+
+function authenticatedFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("authorization", `Bearer ${TEST_HTTP_TOKEN}`);
+  return fetch(input, { ...init, headers });
+}
 
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
@@ -35,15 +49,124 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
   };
 }
 
-async function startHttp(dir: string, provider: Provider, token?: string) {
+async function startHttp(
+  dir: string,
+  provider: Provider,
+  token = TEST_HTTP_TOKEN,
+  discoverModels?: (providerId: string) => Promise<string[] | undefined>,
+) {
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({ provider, model: "scripted" }),
   });
-  const server = new HttpDaemonServer({ manager, ...(token ? { token } : {}) });
+  const server = new HttpDaemonServer({
+    manager,
+    token,
+    ...(discoverModels ? { discoverModels } : {}),
+  });
   await server.listen(0);
-  return { server, baseUrl: `http://127.0.0.1:${server.port()}` };
+  return { manager, server, baseUrl: `http://127.0.0.1:${server.port()}` };
 }
+
+test("http host: authenticated model discovery executes server-side and validates boundaries", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-models-"));
+  const calls: string[] = [];
+  const { server, baseUrl } = await startHttp(
+    dir,
+    scriptedProvider([]),
+    TEST_HTTP_TOKEN,
+    async (providerId) => {
+      calls.push(providerId);
+      if (providerId === "broken") throw new Error("secret upstream failure");
+      return ["live-a", "live-a", "\u001b[31munsafe"];
+    },
+  );
+  const auth = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
+  try {
+    const anonymous = await fetch(`${baseUrl}/providers/cliproxy/models`);
+    assert.equal(anonymous.status, 401, "model discovery must never expose server credentials");
+    assert.deepEqual(await auth.discoverModels("cliproxy"), ["live-a"]);
+    assert.equal(await auth.discoverModels("broken"), undefined);
+    assert.deepEqual(
+      calls,
+      ["cliproxy", "broken"],
+      "discovery must execute behind the HTTP boundary",
+    );
+    await assert.rejects(() => auth.discoverModels("../cliproxy"), /Invalid provider id/);
+    const encodedSlash = await authenticatedFetch(
+      `${baseUrl}/providers/${encodeURIComponent("../cliproxy")}/models`,
+    );
+    assert.equal(encodedSlash.status, 400);
+  } finally {
+    auth.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+class FakeSseWritable extends EventEmitter implements SseWritable {
+  readonly writes: string[] = [];
+  writableLength = 0;
+  accepting = false;
+
+  write(frame: string): boolean {
+    this.writes.push(frame);
+    this.writableLength += Buffer.byteLength(frame);
+    return this.accepting;
+  }
+
+  drain(): void {
+    this.writableLength = 0;
+    this.accepting = true;
+    this.emit("drain");
+  }
+}
+
+test("HTTP artifact drain wait rejects on client close and releases every listener", async () => {
+  const response = Object.assign(new EventEmitter(), {
+    destroyed: false,
+    writableEnded: false,
+  }) as unknown as Parameters<typeof waitForHttpDrain>[0];
+  const waiting = waitForHttpDrain(response);
+  response.emit("close");
+  await assert.rejects(waiting, /disconnected/);
+  assert.equal(response.listenerCount("drain"), 0);
+  assert.equal(response.listenerCount("close"), 0);
+  assert.equal(response.listenerCount("error"), 0);
+});
+
+test("SSE writer: write(false) queues in order, drain resumes, and slow clients are bounded", () => {
+  const sink = new FakeSseWritable();
+  let overflowed = 0;
+  const writer = new SseBackpressureWriter(
+    sink,
+    { maxPendingBytes: 1024, maxPendingEvents: 2 },
+    () => overflowed++,
+  );
+  assert.equal(writer.raw("first"), true);
+  assert.equal(writer.raw("second"), true);
+  assert.equal(writer.raw("third"), true);
+  assert.deepEqual(sink.writes, ["first"], "blocked writes must stay in the process queue");
+  sink.drain();
+  assert.deepEqual(sink.writes, ["first", "second", "third"]);
+  assert.equal(overflowed, 0);
+  writer.close();
+  assert.equal(sink.listenerCount("drain"), 0);
+
+  const slow = new FakeSseWritable();
+  const bounded = new SseBackpressureWriter(
+    slow,
+    { maxPendingBytes: 1024, maxPendingEvents: 1 },
+    () => overflowed++,
+  );
+  bounded.raw("blocked");
+  bounded.raw("queued");
+  assert.equal(bounded.raw("overflow"), false);
+  assert.equal(overflowed, 1);
+  assert.equal(slow.listenerCount("drain"), 0, "overflow must release the drain listener");
+  slow.drain();
+  assert.deepEqual(slow.writes, ["blocked"], "closed slow clients must never flush stale frames");
+});
 
 test("sse 解析：分帧/多 data 行/心跳注释/半帧留存", () => {
   const input =
@@ -56,7 +179,10 @@ test("sse 解析：分帧/多 data 行/心跳注释/半帧留存", () => {
   assert.deepEqual(frames[0], { event: "snapshot", data: '{"a":1}' });
   assert.deepEqual(frames[1], { event: "session", data: "line1\nline2" });
   assert.match(rest, /partial/);
-  assert.throws(() => parseSseChunk(`data: ${"x".repeat(64)}`, 32), /安全上限/);
+  assert.throws(
+    () => parseSseChunk(`data: ${"x".repeat(64)}`, 32),
+    /SSE (?:frame exceeds safety limit|帧超过安全上限)/,
+  );
 });
 
 test("http host: request and initial snapshot deadlines fail closed", async () => {
@@ -75,10 +201,13 @@ test("http host: request and initial snapshot deadlines fail closed", async () =
   const requestHost = new HttpSessionHost({ baseUrl, requestTimeoutMs: 50 });
   const streamHost = new HttpSessionHost({ baseUrl, snapshotTimeoutMs: 50 });
   try {
-    await assert.rejects(requestHost.listSessions(), /HTTP 请求在 50 ms 后超时/);
+    await assert.rejects(
+      requestHost.listSessions(),
+      /HTTP (?:request timed out after 50 ms|请求在 50 ms 后超时)/,
+    );
     await assert.rejects(
       streamHost.open("s_stalled", () => {}),
-      /snapshot 在 50 ms 后超时/,
+      /SSE snapshot (?:timed out after 50 ms|在 50 ms 后超时)/,
     );
   } finally {
     requestHost.dispose();
@@ -108,7 +237,10 @@ test("http host: oversized JSON responses are rejected before parsing", async ()
     maxResponseBytes: 128,
   });
   try {
-    await assert.rejects(host.listSessions(), /HTTP 响应超过安全上限/);
+    await assert.rejects(
+      host.listSessions(),
+      /HTTP (?:response exceeds safety limit|响应超过安全上限)/,
+    );
   } finally {
     host.dispose();
     server.closeAllConnections();
@@ -133,7 +265,7 @@ test("http host: malformed SSE snapshots are rejected at the transport boundary"
   try {
     await assert.rejects(
       host.open("s_invalid", () => {}),
-      /无效 SSE snapshot/,
+      /(?:Invalid|无效) SSE snapshot/,
     );
   } finally {
     host.dispose();
@@ -145,16 +277,16 @@ test("http host: malformed SSE snapshots are rejected at the transport boundary"
 test("http server: bounded request contract rejects negative indexes and oversized tracing", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-contract-"));
   const { server, baseUrl } = await startHttp(dir, scriptedProvider([]));
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
-    const fork = await fetch(`${baseUrl}/sessions/${meta.id}/fork`, {
+    const fork = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}/fork`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ upToMessage: -1 }),
     });
     assert.equal(fork.status, 400);
-    const send = await fetch(`${baseUrl}/sessions/${meta.id}/send`, {
+    const send = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}/send`, {
       method: "POST",
       headers: { "content-type": "application/json", traceparent: "x".repeat(513) },
       body: JSON.stringify({ text: "hello" }),
@@ -173,8 +305,8 @@ test("http host: 建会话 → SSE snapshot 先行 → send 两个客户端都�
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "HTTP 回答" }] }]]),
   );
-  const a = new HttpSessionHost({ baseUrl });
-  const b = new HttpSessionHost({ baseUrl });
+  const a = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
+  const b = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await a.createSession({ cwd: dir, model: "scripted", title: "http 会话" });
     assert.ok((await a.listSessions()).some((s) => s.id === meta.id));
@@ -210,7 +342,7 @@ test("http host: 建会话 → SSE snapshot 先行 → send 两个客户端都�
 test("http host: permission-mode / permission-profile 端到端可切", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-"));
   const { server, baseUrl } = await startHttp(dir, scriptedProvider([]));
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
     const profiles = await host.listPermissionProfiles(meta.id);
@@ -226,14 +358,27 @@ test("http host: permission-mode / permission-profile 端到端可切", async ()
   }
 });
 
-test("http host: token 只接受 Authorization header，URL 查询参数被拒绝", async () => {
+test("http host: default auth rejects anonymous REST/SSE and never accepts URL tokens", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-"));
-  const { server, baseUrl } = await startHttp(dir, scriptedProvider([]), "s3cret");
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  const server = new HttpDaemonServer({ manager });
+  await server.listen(0);
+  const baseUrl = `http://127.0.0.1:${server.port()}`;
+  const token = server.authenticationToken();
   const anon = new HttpSessionHost({ baseUrl });
-  const auth = new HttpSessionHost({ baseUrl, token: "s3cret" });
+  const auth = new HttpSessionHost({ baseUrl, token });
   try {
+    assert.match(token, /^[A-Za-z0-9_-]{43}$/);
     await assert.rejects(() => anon.listSessions(), /unauthorized|401/);
-    const leakedQuery = await fetch(`${baseUrl}/sessions?token=s3cret`);
+    assert.equal((await fetch(`${baseUrl}/events`)).status, 401);
+    assert.equal((await fetch(`${baseUrl}/sessions/missing/events`)).status, 401);
+    assert.equal((await fetch(`${baseUrl}/providers/cliproxy/models`)).status, 401);
+    assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
+    assert.equal((await fetch(`${baseUrl}/global/health`)).status, 200);
+    const leakedQuery = await fetch(`${baseUrl}/sessions?token=${encodeURIComponent(token)}`);
     assert.equal(leakedQuery.status, 401);
     const meta = await auth.createSession({ cwd: dir, model: "scripted" });
     const handle = await auth.open(meta.id, () => {});
@@ -243,6 +388,24 @@ test("http host: token 只接受 Authorization header，URL 查询参数被拒�
     anon.dispose();
     auth.dispose();
     await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("http security: configured bearer tokens enforce the shared strong-token policy", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-token-strength-"));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  try {
+    assert.throws(() => new HttpDaemonServer({ manager, token: "short" }), /at least 32 bytes/);
+    assert.throws(
+      () => new HttpDaemonServer({ manager, token: `${"x".repeat(32)}\n` }),
+      /control characters|whitespace/,
+    );
+  } finally {
+    manager.dispose();
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
@@ -285,7 +448,7 @@ test("http security: per-address rate limit returns 429 and Retry-After", async 
 test("http host: undo 无快照时报错经 HTTP 透传", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-"));
   const { server, baseUrl } = await startHttp(dir, scriptedProvider([]));
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
     await assert.rejects(() => host.undo(meta.id));
@@ -302,7 +465,7 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "投影回答" }] }]]),
   );
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const health = (await (await fetch(`${baseUrl}/global/health`)).json()) as {
       ok: boolean;
@@ -311,7 +474,7 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
     assert.equal(health.ok, true);
     assert.ok(health.protocol >= 1);
 
-    const doc = (await (await fetch(`${baseUrl}/doc`)).json()) as {
+    const doc = (await (await authenticatedFetch(`${baseUrl}/doc`)).json()) as {
       openapi: string;
       paths: Record<string, unknown>;
     };
@@ -322,7 +485,7 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
     await host.send(meta.id, "你好");
 
     // GET /sessions/:id → 快照
-    const snap = (await (await fetch(`${baseUrl}/sessions/${meta.id}`)).json()) as {
+    const snap = (await (await authenticatedFetch(`${baseUrl}/sessions/${meta.id}`)).json()) as {
       meta: { id: string };
       messages: unknown[];
       running: boolean;
@@ -331,7 +494,9 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
     assert.ok(snap.messages.length >= 2);
 
     // GET /sessions/:id/messages → Message+Parts 投影
-    const messages = (await (await fetch(`${baseUrl}/sessions/${meta.id}/messages`)).json()) as {
+    const messages = (await (
+      await authenticatedFetch(`${baseUrl}/sessions/${meta.id}/messages`)
+    ).json()) as {
       info: { role: string };
       parts: { type: string; text?: string }[];
     }[];
@@ -341,7 +506,7 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
     assert.ok(messages[1]!.parts.some((p) => p.type === "text" && p.text === "投影回答"));
 
     // PATCH 标题
-    const patch = await fetch(`${baseUrl}/sessions/${meta.id}`, {
+    const patch = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ title: "新标题" }),
@@ -351,16 +516,78 @@ test("http REST: 资源模型 —— GET/PATCH/DELETE /sessions/:id、messages�
 
     // checkpoints（未开启快照 → 空数组而非报错）
     const cps = (await (
-      await fetch(`${baseUrl}/sessions/${meta.id}/checkpoints`)
+      await authenticatedFetch(`${baseUrl}/sessions/${meta.id}/checkpoints`)
     ).json()) as unknown[];
     assert.deepEqual(cps, []);
 
     // DELETE → 列表消失，GET 404
-    const del = await fetch(`${baseUrl}/sessions/${meta.id}`, { method: "DELETE" });
+    const del = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}`, {
+      method: "DELETE",
+    });
     assert.equal(del.status, 204);
     assert.ok(!(await host.listSessions()).some((s) => s.id === meta.id));
-    assert.equal((await fetch(`${baseUrl}/sessions/${meta.id}`)).status, 404);
+    assert.equal((await authenticatedFetch(`${baseUrl}/sessions/${meta.id}`)).status, 404);
   } finally {
+    host.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("http DELETE starts the durable fence without awaiting a hung lazy SSE feed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-delete-feed-race-"));
+  const { manager, server, baseUrl } = await startHttp(dir, scriptedProvider([]));
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
+  let releaseFeed!: () => void;
+  let feedStarted!: () => void;
+  let deletionStarted!: () => void;
+  const feedGate = new Promise<void>((resolve) => {
+    releaseFeed = resolve;
+  });
+  const feedWasStarted = new Promise<void>((resolve) => {
+    feedStarted = resolve;
+  });
+  const deletionWasStarted = new Promise<void>((resolve) => {
+    deletionStarted = resolve;
+  });
+  const originalOpen = manager.open.bind(manager);
+  const originalDelete = manager.deleteSession.bind(manager);
+  manager.open = async (sessionId, listener) => {
+    feedStarted();
+    await feedGate;
+    return originalOpen(sessionId, listener);
+  };
+  manager.deleteSession = (sessionId) => {
+    deletionStarted();
+    return originalDelete(sessionId);
+  };
+
+  let eventsRequest: Promise<Response> | undefined;
+  let deletionRequest: Promise<Response> | undefined;
+  try {
+    const meta = await host.createSession({ cwd: dir, model: "scripted" });
+    eventsRequest = authenticatedFetch(`${baseUrl}/sessions/${meta.id}/events`);
+    await feedWasStarted;
+
+    deletionRequest = authenticatedFetch(`${baseUrl}/sessions/${meta.id}`, {
+      method: "DELETE",
+    });
+    const fenceWonRace = await Promise.race([
+      deletionWasStarted.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    assert.equal(fenceWonRace, true, "feedLoads must not precede the durable deletion claim");
+    const deletionFinished = await Promise.race([
+      deletionRequest.then((response) => response),
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1_500)),
+    ]);
+    assert.ok(deletionFinished, "DELETE must not wait for a hung feed load");
+    assert.equal(deletionFinished.status, 204);
+  } finally {
+    releaseFeed();
+    await deletionRequest?.catch(() => undefined);
+    const eventsResponse = await eventsRequest?.catch(() => undefined);
+    if (eventsResponse) assert.equal(eventsResponse.status, 404);
     host.dispose();
     await server.close();
     await fs.rm(dir, { recursive: true, force: true });
@@ -373,11 +600,13 @@ test("http SSE: 信封协议 —— server.connected 首帧、snapshot 次帧、
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "信封回答" }] }]]),
   );
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
     const ac = new AbortController();
-    const res = await fetch(`${baseUrl}/sessions/${meta.id}/events`, { signal: ac.signal });
+    const res = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}/events`, {
+      signal: ac.signal,
+    });
     assert.ok(res.body);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -425,8 +654,49 @@ test("http SSE: 信封协议 —— server.connected 首帧、snapshot 次帧、
   }
 });
 
+test("http SSE: snapshots larger than one frame are drained in bounded ordered chunks", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-large-snapshot-"));
+  const largeText = `begin-${"x".repeat(2 * 1024 * 1024)}-end`;
+  const { server, baseUrl } = await startHttp(
+    dir,
+    scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: largeText }] }]]),
+  );
+  const writer = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
+  const reader = new HttpSessionHost({
+    baseUrl,
+    token: TEST_HTTP_TOKEN,
+    maxSseFrameBytes: 512 * 1024,
+  });
+  const bounded = new HttpSessionHost({
+    baseUrl,
+    token: TEST_HTTP_TOKEN,
+    maxSseFrameBytes: 512 * 1024,
+    maxSseSnapshotBytes: 512 * 1024,
+  });
+  try {
+    const meta = await writer.createSession({ cwd: dir, model: "scripted" });
+    await writer.send(meta.id, "produce a long answer");
+    const handle = await reader.open(meta.id, () => {});
+    assert.equal(handle.snapshot.messages.length, 2);
+    assert.equal((handle.snapshot.messages[1]!.content[0] as { text: string }).text, largeText);
+    handle.close();
+    await assert.rejects(() => bounded.open(meta.id, () => {}), /snapshot 超过|snapshot exceeds/);
+  } finally {
+    writer.dispose();
+    reader.dispose();
+    bounded.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 type Env = { id: string; type: string; properties: Record<string, unknown> };
-const CONTROL = new Set(["server.connected", "server.heartbeat", "session.snapshot"]);
+const CONTROL = new Set([
+  "server.connected",
+  "server.heartbeat",
+  "session.snapshot",
+  "session.snapshot.chunk",
+]);
 
 /**
  * 后台 pump 读 SSE 流入数组，主循环轮询直到 predicate 满足或超时，然后中断连接。
@@ -440,7 +710,7 @@ async function collectEnvelopes(
   timeoutMs = 2000,
 ): Promise<Env[]> {
   const ac = new AbortController();
-  const res = await fetch(`${baseUrl}${pathStr}`, { signal: ac.signal });
+  const res = await authenticatedFetch(`${baseUrl}${pathStr}`, { signal: ac.signal });
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   const envs: Env[] = [];
@@ -469,7 +739,7 @@ test("http SSE: Last-Event-ID 续传 —— 增量补发且不重发快照", asy
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "续传回答" }] }]]),
   );
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
     // 边读边 send：一条连接实时采集本轮的可续传事件（feed linger 让缓冲在断开后仍存活）
@@ -514,6 +784,33 @@ test("http SSE: Last-Event-ID 续传 —— 增量补发且不重发快照", asy
       stale.some((e) => e.type === "session.snapshot"),
       "未知 id 应重同步",
     );
+
+    const activeSession = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}/events`);
+    const activeFirehose = await authenticatedFetch(`${baseUrl}/events`);
+    const sessionReader = activeSession.body!.getReader();
+    const firehoseReader = activeFirehose.body!.getReader();
+    await sessionReader.read();
+    await firehoseReader.read();
+
+    const deleted = await authenticatedFetch(`${baseUrl}/sessions/${meta.id}`, {
+      method: "DELETE",
+    });
+    assert.equal(deleted.status, 204);
+    const closesPromptly = async (reader: ReadableStreamDefaultReader<Uint8Array>) =>
+      Promise.race([
+        reader.read().then(
+          (result) => result.done,
+          () => true,
+        ),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_500)),
+      ]);
+    assert.equal(await closesPromptly(sessionReader), true, "删除必须撤销活跃会话流");
+    assert.equal(await closesPromptly(firehoseReader), true, "删除必须撤销含旧事件的 firehose");
+
+    const afterDelete = await authenticatedFetch(
+      `${baseUrl}/sessions/${meta.id}/events?lastEventId=${encodeURIComponent(cutoff)}`,
+    );
+    assert.equal(afterDelete.status, 404, "删除后旧 Last-Event-ID 不能回放会话内容");
   } finally {
     host.dispose();
     await server.close();
@@ -527,7 +824,7 @@ test("http SSE: 全局 firehose GET /events 跨会话广播，不发快照", asy
     dir,
     scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "firehose 回答" }] }]]),
   );
-  const host = new HttpSessionHost({ baseUrl });
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
   try {
     const meta = await host.createSession({ cwd: dir, model: "scripted" });
     // 先起 firehose，再 send（firehose 只覆盖订阅期间的 live 事件）
@@ -576,6 +873,7 @@ test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= �
   const fallback = mk("default");
   const server = new HttpDaemonServer({
     manager: fallback,
+    token: TEST_HTTP_TOKEN,
     resolveInstance: (d) => managers.get(d) ?? fallback,
   });
   await server.listen(0);
@@ -583,7 +881,7 @@ test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= �
   try {
     // 在实例 A 建会话（经 header）
     const created = (await (
-      await fetch(`${baseUrl}/sessions`, {
+      await authenticatedFetch(`${baseUrl}/sessions`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-anicode-directory": projectA },
         body: JSON.stringify({ cwd: projectA, model: "scripted" }),
@@ -592,7 +890,7 @@ test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= �
 
     // 实例 A 列表可见（经 query）
     const listA = (await (
-      await fetch(`${baseUrl}/sessions?directory=${encodeURIComponent(projectA)}`)
+      await authenticatedFetch(`${baseUrl}/sessions?directory=${encodeURIComponent(projectA)}`)
     ).json()) as {
       id: string;
     }[];
@@ -600,12 +898,14 @@ test("http: 目录级多实例路由 —— x-anicode-directory / ?directory= �
 
     // 实例 B 与默认实例都看不到 A 的会话
     const listB = (await (
-      await fetch(`${baseUrl}/sessions?directory=${encodeURIComponent(projectB)}`)
+      await authenticatedFetch(`${baseUrl}/sessions?directory=${encodeURIComponent(projectB)}`)
     ).json()) as {
       id: string;
     }[];
     assert.ok(!listB.some((s) => s.id === created.id));
-    const listDefault = (await (await fetch(`${baseUrl}/sessions`)).json()) as { id: string }[];
+    const listDefault = (await (await authenticatedFetch(`${baseUrl}/sessions`)).json()) as {
+      id: string;
+    }[];
     assert.ok(!listDefault.some((s) => s.id === created.id));
   } finally {
     for (const m of managers.values()) m.dispose();

@@ -1,6 +1,52 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+
+function parseVersion(value, label) {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
+  if (!match) throw new Error(`Cannot determine ${label} version from ${JSON.stringify(value)}`);
+  return match.slice(1).map(Number);
+}
+
+function versionAtLeast(version, minimum) {
+  for (let index = 0; index < minimum.length; index++) {
+    if (version[index] !== minimum[index]) return version[index] > minimum[index];
+  }
+  return true;
+}
+
+function assertReleaseToolchain() {
+  const node = parseVersion(process.versions.node, "Node.js");
+  const supportedNode =
+    (node[0] === 22 && versionAtLeast(node, [22, 15, 0])) || node[0] === 23 || node[0] === 24;
+  if (!supportedNode) {
+    throw new Error(
+      `Release gate requires Node.js >=22.15.0 <25; current version is ${process.versions.node}`,
+    );
+  }
+
+  const userAgentVersion = /(?:^|\s)npm\/(\d+\.\d+\.\d+)/.exec(
+    process.env.npm_config_user_agent ?? "",
+  )?.[1];
+  const npmProbe = userAgentVersion
+    ? undefined
+    : spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["--version"], {
+        encoding: "utf8",
+        windowsHide: true,
+      });
+  if (npmProbe && (npmProbe.error || npmProbe.status !== 0 || !npmProbe.stdout.trim())) {
+    throw new Error("Release gate requires npm >=11.5.1 <12, but npm could not be executed", {
+      cause: npmProbe?.error,
+    });
+  }
+  const npmVersion = userAgentVersion ?? npmProbe.stdout;
+  const npm = parseVersion(npmVersion, "npm");
+  if (npm[0] !== 11 || !versionAtLeast(npm, [11, 5, 1])) {
+    throw new Error(`Release gate requires npm >=11.5.1 <12; current version is ${npmVersion.trim()}`);
+  }
+}
+
+assertReleaseToolchain();
 
 const steps = [
   "format:check",

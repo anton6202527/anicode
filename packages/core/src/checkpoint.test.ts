@@ -64,7 +64,7 @@ test("checkpoint/undo: 记录快照事件并回滚本轮之后的文件改动", 
         e.type === "agent" && e.event.type === "checkpoint",
     );
     assert.ok(ckpt, "应收到 checkpoint 事件");
-    assert.equal(m.listCheckpoints(s.id).length, 1);
+    assert.equal((await m.listCheckpoints(s.id)).length, 1);
 
     // 模拟「本轮之后」的文件改动：改 f.txt、增 new.txt。
     await fs.writeFile(path.join(repo, "f.txt"), "v2-messed\n");
@@ -82,7 +82,7 @@ test("checkpoint/undo: 记录快照事件并回滚本轮之后的文件改动", 
       "本轮新增文件应被撤销删除",
     );
     // undo 后该快照被消费，列表清空；再 undo 报错。
-    assert.equal(m.listCheckpoints(s.id).length, 0);
+    assert.equal((await m.listCheckpoints(s.id)).length, 0);
     await assert.rejects(() => m.undo(s.id), /没有可撤销的快照/);
 
     const reverted = events.find((e) => e.type === "reverted");
@@ -108,7 +108,7 @@ test("checkpoint/undo: 未启用 checkpoints 的会话 undo 报错、列表为�
     const s = await m.createSession({ cwd: repo, model: "scripted" });
     await m.open(s.id, () => {});
     await m.send(s.id, "hi");
-    assert.equal(m.listCheckpoints(s.id).length, 0);
+    assert.equal((await m.listCheckpoints(s.id)).length, 0);
     await assert.rejects(() => m.undo(s.id), /未启用工作区快照/);
     m.dispose();
   } finally {
@@ -139,7 +139,7 @@ test("rewind: mode=both 同时回滚文件与对话历史；conversation 只截�
     const before = await m.resumeSession(s.id);
     assert.equal(before.messages.length, 4); // 2×(user+assistant)
 
-    const ckpts = m.listCheckpoints(s.id);
+    const ckpts = await m.listCheckpoints(s.id);
     assert.equal(ckpts.length, 2);
     assert.equal(ckpts[0]!.messageCount, 0);
     assert.equal(ckpts[1]!.messageCount, 2);

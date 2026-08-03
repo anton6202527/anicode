@@ -23,6 +23,8 @@ export interface SessionMeta {
   createdAt: string;
   updatedAt: string;
   cwd: string;
+  /** Filesystem identity at session creation; scoped hosts reject replacement directories. */
+  workspaceIdentity?: { device: string; inode: string };
   model: string;
   title?: string;
 }
@@ -45,88 +47,170 @@ export interface ISessionStore {
 }
 
 /**
- * 生产迁移门：首次访问时把旧 JSONL 会话幂等导入数据库，之后所有读写只走 primary。
- * 旧文件保留为可恢复备份；primary 已更新得更晚时不会被旧数据覆盖。
+ * 生产迁移门：只在访问某个会话正文时，才把该会话从旧 JSONL 幂等导入数据库。
+ *
+ * `list()` 故意只合并 metadata。scoped host 必须能先用 cwd + workspace identity 拒绝
+ * foreign session，不能因为列出会话就在授权前把共享 legacy store 的所有 prompt/response
+ * 读入内存或写入 primary。旧文件保留为可恢复备份；primary 已更新得更晚时不会被覆盖。
  */
 export class MigratingSessionStore implements ISessionStore {
-  private ready: Promise<void> | undefined;
+  private readonly migrated = new Set<string>();
+  private readonly migrations = new Map<string, Promise<void>>();
 
   constructor(
     readonly primary: ISessionStore,
     readonly legacy: ISessionStore,
   ) {}
 
-  private ensureMigrated(): Promise<void> {
-    if (this.ready) return this.ready;
-    const migration = this.migrate();
-    this.ready = migration;
-    void migration.catch(() => {
-      if (this.ready === migration) this.ready = undefined;
+  private migrateSession(id: string): Promise<void> {
+    if (this.migrated.has(id)) return Promise.resolve();
+    const pending = this.migrations.get(id);
+    if (pending) return pending;
+    const migration = this.migrateOne(id).then(() => {
+      this.migrated.add(id);
     });
+    this.migrations.set(id, migration);
+    const cleanup = () => {
+      if (this.migrations.get(id) === migration) this.migrations.delete(id);
+    };
+    void migration.then(cleanup, cleanup);
     return migration;
   }
 
-  private async migrate(): Promise<void> {
-    const primaryIds = new Set((await this.primary.list()).map((meta) => meta.id));
-    for (const legacyMeta of await this.legacy.list()) {
-      const legacyData = await this.legacy.load(legacyMeta.id);
-      let current: SessionData | undefined;
-      let created = false;
-      if (primaryIds.has(legacyMeta.id)) {
-        current = await this.primary.load(legacyMeta.id);
-      } else {
-        try {
-          await this.primary.create({
-            id: legacyMeta.id,
-            cwd: legacyMeta.cwd,
-            model: legacyMeta.model,
-            ...(legacyMeta.title ? { title: legacyMeta.title } : {}),
-          });
-          created = true;
-          primaryIds.add(legacyMeta.id);
-        } catch {
-          // 另一进程可能刚完成相同迁移；以数据库中的提交为准继续比较。
-        }
-        current = await this.primary.load(legacyMeta.id);
+  private async migrateOne(id: string): Promise<void> {
+    const [primaryMeta, legacyMeta] = await Promise.all([
+      this.findMeta(this.primary, id),
+      this.findMeta(this.legacy, id),
+    ]);
+    if (!legacyMeta) return;
+
+    // A same-id record from another workspace is not a migration source for the primary record.
+    // Keeping primary authoritative also prevents an untrusted legacy collision from disclosing or
+    // overwriting a valid transcript.
+    if (primaryMeta && !sameStoredWorkspace(primaryMeta, legacyMeta)) return;
+
+    let current: SessionData | undefined;
+    let legacyData: SessionData | undefined;
+    let created = false;
+    if (primaryMeta) {
+      current = await this.primary.load(id);
+    } else {
+      // This is the first operation which reads the legacy body. SessionManager.loadSession has
+      // already authorized the metadata returned by list() for scoped hosts.
+      legacyData = await this.legacy.load(id);
+      assertStableMigrationMetadata(legacyMeta, legacyData);
+      try {
+        await this.primary.create({
+          id: legacyMeta.id,
+          cwd: legacyMeta.cwd,
+          ...(legacyMeta.workspaceIdentity
+            ? { workspaceIdentity: legacyMeta.workspaceIdentity }
+            : {}),
+          model: legacyMeta.model,
+          ...(legacyMeta.title ? { title: legacyMeta.title } : {}),
+        });
+        created = true;
+      } catch {
+        // 另一进程可能刚完成相同迁移；以数据库中的提交为准继续比较。
       }
-      const legacyNewer = Date.parse(legacyMeta.updatedAt) > Date.parse(current.updatedAt);
-      const interruptedImport = current.messages.length === 0 && legacyData.messages.length > 0;
-      if (created || legacyNewer || interruptedImport) {
-        await this.primary.rewrite({ ...legacyMeta }, legacyData.messages);
+      current = await this.primary.load(id);
+      if (!sameStoredWorkspace(current, legacyMeta)) return;
+    }
+
+    const legacyNewer = Date.parse(legacyMeta.updatedAt) > Date.parse(current.updatedAt);
+    if (created || legacyNewer || current.messages.length === 0) {
+      legacyData ??= await this.legacy.load(id);
+      assertStableMigrationMetadata(legacyMeta, legacyData);
+      if (
+        created ||
+        legacyNewer ||
+        (current.messages.length === 0 && legacyData.messages.length > 0)
+      ) {
+        const { messages, ...loadedMeta } = legacyData;
+        await this.primary.rewrite(loadedMeta, messages);
       }
     }
   }
 
+  private async findMeta(store: ISessionStore, id: string): Promise<SessionMeta | undefined> {
+    return (await store.list()).find((meta) => meta.id === id);
+  }
+
   async create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
-    await this.ensureMigrated();
+    // Preserve create-exclusive semantics without reading a colliding legacy transcript. This is
+    // important for scoped hosts: a generated id collision must not turn an authorized create in
+    // one workspace into an implicit read of another workspace's legacy body.
+    if (await this.findMeta(this.legacy, meta.id)) {
+      throw new Error(`Session ${meta.id} already exists in the legacy store`);
+    }
     return this.primary.create(meta);
   }
 
   async append(id: string, message: ChatMessage): Promise<void> {
-    await this.ensureMigrated();
+    await this.migrateSession(id);
     return this.primary.append(id, message);
   }
 
   async rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
-    await this.ensureMigrated();
+    await this.migrateSession(meta.id);
     return this.primary.rewrite(meta, messages);
   }
 
   async load(id: string): Promise<SessionData> {
-    await this.ensureMigrated();
+    await this.migrateSession(id);
     return this.primary.load(id);
   }
 
   async list(): Promise<SessionMeta[]> {
-    await this.ensureMigrated();
-    return this.primary.list();
+    const [primary, legacy] = await Promise.all([this.primary.list(), this.legacy.list()]);
+    const merged = new Map(primary.map((meta) => [meta.id, meta]));
+    for (const legacyMeta of legacy) {
+      const current = merged.get(legacyMeta.id);
+      if (
+        !current ||
+        (sameStoredWorkspace(current, legacyMeta) &&
+          Date.parse(legacyMeta.updatedAt) > Date.parse(current.updatedAt))
+      ) {
+        merged.set(legacyMeta.id, legacyMeta);
+      }
+    }
+    return [...merged.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
   async delete(id: string): Promise<void> {
-    await this.ensureMigrated();
+    // Deletion must never import the content it is about to erase.
+    const [primaryMeta, legacyMeta] = await Promise.all([
+      this.findMeta(this.primary, id),
+      this.findMeta(this.legacy, id),
+    ]);
     await this.primary.delete(id);
     // 删除语义必须同时清理迁移源，否则下次进程启动会把已删除会话重新导入。
-    await this.legacy.delete(id);
+    // A colliding record owned by a different workspace is not this primary session's backup and
+    // must not be erased through the primary session's authorization.
+    if (!primaryMeta || !legacyMeta || sameStoredWorkspace(primaryMeta, legacyMeta)) {
+      await this.legacy.delete(id);
+    }
+    this.migrated.add(id);
+  }
+}
+
+function sameStoredWorkspace(left: SessionMeta, right: SessionMeta): boolean {
+  if (left.workspaceIdentity || right.workspaceIdentity) {
+    return (
+      left.workspaceIdentity?.device === right.workspaceIdentity?.device &&
+      left.workspaceIdentity?.inode === right.workspaceIdentity?.inode
+    );
+  }
+  return path.resolve(left.cwd) === path.resolve(right.cwd);
+}
+
+function assertStableMigrationMetadata(expected: SessionMeta, loaded: SessionData): void {
+  if (
+    loaded.id !== expected.id ||
+    !sameStoredWorkspace(expected, loaded) ||
+    loaded.model !== expected.model
+  ) {
+    throw new Error(`Session ${expected.id} metadata changed while legacy migration was running`);
   }
 }
 

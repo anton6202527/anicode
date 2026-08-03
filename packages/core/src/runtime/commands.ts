@@ -70,6 +70,7 @@ export interface CommandInboxStore {
   ): Promise<void>;
   getCommand?(sessionId: string, commandId: string): Promise<DurableCommand | undefined>;
   recoverableCommands?(sessionId: string, now: number): Promise<DurableCommand[]>;
+  deleteSession?(sessionId: string): Promise<void>;
 }
 
 function assertId(value: string, label: string): void {
@@ -95,6 +96,11 @@ export class MemoryCommandInboxStore implements CommandInboxStore {
 
   async listSessions(): Promise<string[]> {
     return [...this.sessions.keys()].sort();
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    assertId(sessionId, "command session id");
+    this.sessions.delete(sessionId);
   }
 }
 
@@ -168,6 +174,19 @@ export class FileCommandInboxStore implements CommandInboxStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
+    }
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const previous = this.tails.get(sessionId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => fs.rm(this.file(sessionId), { force: true }));
+    this.tails.set(sessionId, current);
+    try {
+      await current;
+    } finally {
+      if (this.tails.get(sessionId) === current) this.tails.delete(sessionId);
     }
   }
 }
@@ -320,6 +339,17 @@ export class CommandInbox {
         (command.status === "running" &&
           (!command.leaseExpiresAt || Date.parse(command.leaseExpiresAt) <= now)),
     );
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    assertId(sessionId, "command session id");
+    if (this.store.deleteSession) {
+      await this.store.deleteSession(sessionId);
+      return;
+    }
+    await this.transact(sessionId, async (commands) => {
+      commands.length = 0;
+    });
   }
 }
 
@@ -510,5 +540,13 @@ export class DurableOutbox {
   async pending(): Promise<OutboxMessage[]> {
     if (this.store.pendingMessages) return this.store.pendingMessages();
     return (await this.store.read()).filter((message) => message.status === "pending");
+  }
+
+  async deleteStream(streamId: string): Promise<void> {
+    await this.transact(async (messages) => {
+      for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index]!.event.streamId === streamId) messages.splice(index, 1);
+      }
+    });
   }
 }

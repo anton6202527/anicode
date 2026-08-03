@@ -18,6 +18,7 @@ import type {
 } from "../session-manager.js";
 import type { OpenHandle, PermissionDecisionKind, SessionHost } from "../host.js";
 import type { PermissionMode, PermissionProfile } from "../permission.js";
+import { sanitizeDiscoveredModels, sanitizeProviderId } from "../provider/registry.js";
 
 export interface HttpSessionHostOptions {
   /** 回环可用 http；非回环必须使用 https。 */
@@ -31,12 +32,15 @@ export interface HttpSessionHostOptions {
   maxResponseBytes?: number;
   /** Maximum individual SSE frame. Default: 4 MiB. */
   maxSseFrameBytes?: number;
+  /** Maximum decoded session snapshot, inline or chunked. Default: 256 MiB. */
+  maxSseSnapshotBytes?: number;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_SNAPSHOT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_SSE_FRAME_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_SSE_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
 
 export function secureHttpBaseUrl(input: string): string {
@@ -103,6 +107,7 @@ export class HttpSessionHost implements SessionHost {
   private snapshotTimeoutMs: number;
   private maxResponseBytes: number;
   private maxSseFrameBytes: number;
+  private maxSseSnapshotBytes: number;
 
   constructor(opts: HttpSessionHostOptions) {
     this.baseUrl = secureHttpBaseUrl(opts.baseUrl);
@@ -126,6 +131,11 @@ export class HttpSessionHost implements SessionHost {
       opts.maxSseFrameBytes,
       DEFAULT_MAX_SSE_FRAME_BYTES,
       "maxSseFrameBytes",
+    );
+    this.maxSseSnapshotBytes = positiveInteger(
+      opts.maxSseSnapshotBytes,
+      DEFAULT_MAX_SSE_SNAPSHOT_BYTES,
+      "maxSseSnapshotBytes",
     );
   }
 
@@ -192,6 +202,17 @@ export class HttpSessionHost implements SessionHost {
     }
   }
 
+  async discoverModels(providerId: string): Promise<string[] | undefined> {
+    const safeProviderId = sanitizeProviderId(providerId);
+    if (!safeProviderId) throw new TypeError("Invalid provider id");
+    const response = await this.call<{ providerId?: unknown; models?: unknown }>(
+      "GET",
+      `/providers/${encodeURIComponent(safeProviderId)}/models`,
+    );
+    if (response.providerId !== safeProviderId) return undefined;
+    return sanitizeDiscoveredModels(response.models);
+  }
+
   listSessions(): Promise<SessionSummary[]> {
     return this.call("GET", "/sessions");
   }
@@ -248,6 +269,8 @@ export class HttpSessionHost implements SessionHost {
       snapshotReject = reject;
     });
     let gotSnapshot = false;
+    let snapshotTransfer:
+      { transferId: string; nextIndex: number; chunks: string[]; bytes: number } | undefined;
     let intentionalClose = false;
     let streamError: Error | undefined;
     let closedResolve!: (error: Error | undefined) => void;
@@ -266,13 +289,89 @@ export class HttpSessionHost implements SessionHost {
           for (const frame of frames) {
             const env = parseSseEnvelope(frame.data);
             if (env.type === "session.snapshot") {
-              if (!sessionSnapshotValue(env.properties.snapshot)) {
+              if (snapshotTransfer || gotSnapshot) {
+                throw new Error(t("Mixed SSE snapshot encodings", "SSE snapshot 编码混用"));
+              }
+              if (
+                env.properties.sessionId !== sessionId ||
+                !sessionSnapshotValue(env.properties.snapshot)
+              ) {
                 throw new Error(t("Invalid SSE snapshot", "无效 SSE snapshot"));
+              }
+              if (
+                Buffer.byteLength(JSON.stringify(env.properties.snapshot), "utf8") >
+                this.maxSseSnapshotBytes
+              ) {
+                throw new Error(
+                  t(
+                    `SSE snapshot exceeds ${this.maxSseSnapshotBytes} bytes`,
+                    `SSE snapshot 超过 ${this.maxSseSnapshotBytes} bytes`,
+                  ),
+                );
               }
               if (!gotSnapshot) {
                 gotSnapshot = true;
                 clearTimeout(snapshotTimeout);
                 snapshotResolve(env.properties.snapshot);
+              }
+            } else if (env.type === "session.snapshot.chunk") {
+              if (gotSnapshot) {
+                throw new Error(t("Unexpected SSE snapshot chunk", "收到意外的 SSE snapshot 分块"));
+              }
+              const transferId = env.properties.transferId;
+              const index = env.properties.index;
+              const data = env.properties.data;
+              const done = env.properties.done;
+              if (
+                env.properties.sessionId !== sessionId ||
+                typeof transferId !== "string" ||
+                transferId.length < 1 ||
+                transferId.length > 128 ||
+                typeof index !== "number" ||
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                typeof data !== "string" ||
+                typeof done !== "boolean"
+              ) {
+                throw new Error(t("Invalid SSE snapshot chunk", "无效 SSE snapshot 分块"));
+              }
+              if (!snapshotTransfer) {
+                if (index !== 0) {
+                  throw new Error(t("Out-of-order SSE snapshot chunk", "SSE snapshot 分块乱序"));
+                }
+                snapshotTransfer = { transferId, nextIndex: 0, chunks: [], bytes: 0 };
+              }
+              if (
+                snapshotTransfer.transferId !== transferId ||
+                snapshotTransfer.nextIndex !== index
+              ) {
+                throw new Error(t("Out-of-order SSE snapshot chunk", "SSE snapshot 分块乱序"));
+              }
+              snapshotTransfer.bytes += Buffer.byteLength(data, "utf8");
+              if (snapshotTransfer.bytes > this.maxSseSnapshotBytes) {
+                throw new Error(
+                  t(
+                    `SSE snapshot exceeds ${this.maxSseSnapshotBytes} bytes`,
+                    `SSE snapshot 超过 ${this.maxSseSnapshotBytes} bytes`,
+                  ),
+                );
+              }
+              snapshotTransfer.chunks.push(data);
+              snapshotTransfer.nextIndex++;
+              if (done) {
+                let parsed: unknown;
+                try {
+                  parsed = JSON.parse(snapshotTransfer.chunks.join(""));
+                } catch {
+                  throw new Error(t("Invalid chunked SSE snapshot", "无效的分块 SSE snapshot"));
+                }
+                if (!sessionSnapshotValue(parsed)) {
+                  throw new Error(t("Invalid SSE snapshot", "无效 SSE snapshot"));
+                }
+                gotSnapshot = true;
+                snapshotTransfer = undefined;
+                clearTimeout(snapshotTimeout);
+                snapshotResolve(parsed);
               }
             } else if (env.type === "session.event") {
               if (!sessionEventValue(env.properties.event)) {

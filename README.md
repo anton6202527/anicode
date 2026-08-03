@@ -35,8 +35,9 @@ npm install
 npm run dev:tui
 ```
 
-启动时会自动读取项目根目录的 `.env.local` / `.env`，并使用 `anicode.json` 或
-`.anicode/anicode.json` 指定的默认模型；若没有可用云端凭证则回退到零网络的 `debug/demo`。
+启动时会先评估 Workspace Trust。已信任工作区会读取项目根目录的 `.env.local` / `.env` 和
+`anicode.json` / `.anicode/anicode.json`；未信任工作区不加载项目环境或可执行配置，只保留模型与
+TUI 偏好。若没有可用云端凭证则回退到零网络的 `debug/demo`。
 
 CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite，凭证存在本机 OS Keychain，不需要 AniCode 后端服务、PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。使用云端模型时仍需对应 provider 的 API key 或官方支持的企业凭证；这不是 AniCode 自身的后端依赖。
 
@@ -63,6 +64,33 @@ CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一�
 ```bash
 npm run dev:tui:demo
 ```
+
+### 工作区信任与默认权限
+
+首次打开、工作区目录被替换或项目执行配置发生变化时，AniCode 会进入 restricted mode。在交互式
+`default` 入口中，这不是“只读模式”，也不会强制切到 `plan`：内置
+`read / glob / grep / write / edit / apply_patch / bash / todo_write` 以及后台 shell 生命周期工具
+`bash_output / write_stdin / list_shells / kill_shell` 仍会提供给 Agent。每次写入、启动命令或向后台进程
+写 stdin 都必须由用户明确授权；受限 `bash` 固定使用 workspace-write sandbox，且没有联网参数。
+
+如果原因是 `inspection-failed`（例如 trust store、realpath 或执行面检查失败），AniCode 无法证明上述边界，
+因此会进一步 fail closed：只保留 plan 模式下的 `read / glob / grep`，不提供写入或 shell。应先修复检查错误，
+再重新评估工作区，而不是把检查失败当成普通的“尚未授信”。
+
+restricted mode 仍会禁用项目环境与执行配置、MCP、hooks、skills、联网扩展，以及会话级
+PatchSet prepare/apply/recovery 工作流；这里的内置 `apply_patch` 是受逐项权限控制的文件修改工具，
+不是对会话级 PatchSet 工作流的绕过。`--auto`、`--accept-edits` 或运行时权限模式切换都不能扩大这条
+未信任边界；非 `default` 的高权限请求会退回严格只读工具面。无头入口没有授权 UI，会对未决权限请求
+fail closed。
+
+```bash
+anicode trust status --cwd "$PWD"          # 查看真实路径、原因与执行来源；可加 --json
+anicode trust grant --cwd "$PWD"           # 交互式逐字确认 canonical path
+anicode trust revoke --cwd "$PWD"
+```
+
+授信只允许加载已审查的项目能力，不代表自动批准工具，也不会放宽权限引擎、sandbox、网络策略或
+workspace scope。
 
 高安全联网模式先启动本地出口，再把 browser/联网命令绑定到它；provider 与 HTTP MCP 本身会直接复用同一策略代理：
 
@@ -100,7 +128,9 @@ TUI 内可用命令：
 
 运行中按 Enter 可追加 steering 指令，按 Esc 中断。Shift/Ctrl+Enter 插入换行；bracketed paste
 保留多行且绝不自动提交。授权卡片固定在输入框上方，支持方向键/Enter、`y/a/p/n`，高风险默认选中拒绝，
-永久授权只需一次确认。默认关闭终端鼠标协议，可直接拖拽选择和复制文字；使用 `PageUp`/`PageDown` 回看固定输入框上方的结果。只有需要鼠标点击弹框或滚轮回看时才用 `--mouse` 或 `/mouse on` 开启完整跟踪；`/mouse off` 随时恢复原生框选。输入框聚焦时，`↑`/`↓` 浏览已提交的 prompt 历史。快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
+永久授权只需一次确认。默认关闭完整鼠标跟踪，可直接拖拽选择和复制文字；备用屏滚轮以及 `PageUp`/`PageDown` 都能回看固定输入框上方的结果。只有需要鼠标点击弹框时才用 `--mouse` 或 `/mouse on` 开启完整跟踪；`/mouse off` 随时恢复原生框选。短会话或输入框已有内容时，`↑`/`↓` 浏览已提交的 prompt 历史；长会话的空输入框中，方向键与滚轮一起回看结果。POSIX 终端中 `Ctrl+Z` 会正确挂起并在 `fg` 后恢复，默认 `Ctrl+Q` 退出；快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
+
+每次打开 `/model` 都会重新读取各 provider 的鉴权模型目录：本次未返回的旧模型会隐藏，服务端新增模型会立即加入；embedding、图像生成、音频/实时等当前 Agent 适配器无法调用的专用模型不会展示。`/model <provider/model>` 与 `once` 同样必须通过最新目录校验。目录刷新不发送批量推理请求，避免额外费用、配额消耗和限流；临时的 429、5xx 或超时也不会被误判为永久下线。
 
 安装 workspace 后也可以直接检查 CLI：
 
@@ -127,7 +157,8 @@ anicode mcp remove context7
 
 本地 npm MCP 使用目录中审核过的精确版本；GitHub、Context7、Sentry 使用各厂商官方 Streamable HTTP
 端点。敏感凭证只保存为 Credential Broker 引用，不写入 JSON。安装后重启 AniCode，通过 `/mcp` 查看连接、
-工具、资源与 prompts。`anicode mcp serve`（兼容旧的无参数 `anicode mcp`）则把 AniCode 自身暴露为 MCP server。
+工具、资源与 prompts。`anicode mcp serve`（兼容旧的无参数 `anicode mcp`）则把 AniCode 自身暴露为 MCP server；
+无交互 MCP 入口在未信任工作区不会获得隐式写权限，需要确认的写入或命令会 fail closed。
 
 ## 桌面应用（Electron）
 
@@ -188,43 +219,20 @@ Tree-sitter 与 OS Keychain 含原生 N-API 模块，本地 `.vsix` 对应当前
 
 ## Provider 与模型
 
-anicode 现在使用数据驱动 registry，模型字符串格式为 `provider/model`。首个 `/` 后面的内容会完整保留，因此 OpenRouter 这类带组织前缀的模型 id 可以直接使用。
-打开 `/model` 时，已配置的本地 OpenAI-compatible provider 会实时读取鉴权后的 `/models`：服务端已删除的模型会从选择器隐藏，新模型会自动补入；无法探测时才回退到内置目录。已就绪 provider 优先展示，缺凭证的备用 provider 排在后面。
+anicode 使用数据驱动 registry，模型字符串格式为 `provider/model`；首个 `/` 后面的模型 id 会完整保留。
+打开 `/model` 时，TUI 会向当前权威 host 请求各 provider 鉴权后的实时 `/models` 目录。只有本次成功返回、且兼容文本/工具调用的模型会进入选择器；探测失败时严格隐藏，不回退到可能过期的静态目录。服务端删除或新增模型会在下次打开选择器时同步反映。
 
 内置 canonical provider：
 
-| Provider     | 协议/用途                     | 凭证或端点变量                                          |
-| ------------ | ----------------------------- | ------------------------------------------------------- |
-| `anthropic`  | Anthropic Messages            | `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`               |
-| `openai`     | OpenAI Chat Completions       | `OPENAI_API_KEY`, `OPENAI_BASE_URL`                     |
-| `openrouter` | OpenAI-compatible             | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`             |
-| `deepseek`   | OpenAI-compatible             | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`                 |
-| `gemini`     | Gemini OpenAI compatibility   | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
-| `cliproxy`   | 本地 CLI Proxy API            | `CLIPROXY_API_KEY`, `CLIPROXY_BASE_URL`                 |
-| `xai`        | OpenAI-compatible             | `XAI_API_KEY`, `XAI_BASE_URL`                           |
-| `groq`       | OpenAI-compatible             | `GROQ_API_KEY`, `GROQ_BASE_URL`                         |
-| `mistral`    | OpenAI-compatible             | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL`                   |
-| `together`   | OpenAI-compatible             | `TOGETHER_API_KEY`, `TOGETHER_BASE_URL`                 |
-| `fireworks`  | OpenAI-compatible             | `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`               |
-| `cerebras`   | OpenAI-compatible             | `CEREBRAS_API_KEY`, `CEREBRAS_BASE_URL`                 |
-| `ollama`     | 本地 OpenAI compatibility     | `OLLAMA_BASE_URL`，默认 `127.0.0.1:11434/v1`            |
-| `lmstudio`   | 本地 OpenAI compatibility     | `LMSTUDIO_BASE_URL`，默认 `127.0.0.1:1234/v1`           |
-| `vllm`       | 本地 OpenAI compatibility     | `VLLM_BASE_URL`，默认 `127.0.0.1:8000/v1`               |
-| `llamacpp`   | 本地 OpenAI compatibility     | `LLAMACPP_BASE_URL`，默认 `127.0.0.1:8080/v1`           |
-| `custom`     | 自定义 OpenAI-compatible 服务 | `CUSTOM_OPENAI_BASE_URL`, `CUSTOM_OPENAI_API_KEY`       |
-| `debug`      | 零网络调试                    | 无                                                      |
+| Provider   | 协议/用途                     | 凭证或端点变量                                          |
+| ---------- | ----------------------------- | ------------------------------------------------------- |
+| `deepseek` | OpenAI-compatible             | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`                 |
+| `gemini`   | Gemini OpenAI compatibility   | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
+| `cliproxy` | 本地 CLI Proxy API            | `CLIPROXY_API_KEY`, `CLIPROXY_BASE_URL`                 |
+| `custom`   | 自定义 OpenAI-compatible 服务 | `CUSTOM_OPENAI_BASE_URL`, `CUSTOM_OPENAI_API_KEY`       |
+| `debug`    | 零网络调试                    | 无；别名 `demo`                                         |
 
-别名包括 `demo`、`lm-studio`、`llama.cpp`。
-
-### 内置免费 / 开源模型（供调试）
-
-registry 自带一份可直接选用的模型目录，重点收录**免费额度或本地推理的开放权重模型**，
-方便零成本调试 agent loop。在 TUI 里输入 `/model`（不带参数）即弹出选择器：可用（本地/免 key/已配置凭证）的排在前面并标 `✔`，缺凭证的标 `✖` 并提示需要设置的环境变量。
-
-- **零网络**：`debug/demo` —— 永远可用，离线流式 echo，支持 `!todo/!write/!bash/!parallel` 驱动真实工具链路。
-- **免费云端额度**：Google AI 免费层（Gemini 3.5 Flash、3.1 Flash-Lite、2.5 Flash-Lite）、OpenRouter `:free` 变体（DeepSeek R1、Llama 3.3 70B、Qwen2.5 72B、Gemma 2、Mistral 7B）、Groq（Llama 3.3 70B / 3.1 8B、DeepSeek R1 Distill、Gemma 2）、Cerebras（Llama 3.3 70B / 3.1 8B）。
-- **本地推理**：Ollama（`qwen2.5-coder`、`llama3.2`、`deepseek-r1`，需先 `ollama pull`）。
-- **开放权重直连**：DeepSeek 官方（`deepseek-v4-flash` / `deepseek-v4-pro`，API 按量计费，赠送余额优先抵扣）。
+`debug/demo` 永远可用，适合离线验证 agent loop。`--list-models` 只输出随版本发布的静态诊断目录，不代表模型当前在线；交互选择和直接执行仍以 host 的实时目录校验为准。
 
 命令行查看完整目录：
 
@@ -241,16 +249,13 @@ npm run start --workspace @anicode/tui -- --list-providers
 真实模型示例：
 
 ```bash
-# Anthropic
-export ANTHROPIC_API_KEY=...
-npm run start --workspace @anicode/tui -- --model anthropic/<model-id>
+# Gemini
+export GEMINI_API_KEY=...
+npm run start --workspace @anicode/tui -- --model gemini/<model-id>
 
-# OpenRouter：model id 中的 slash 会保留
-export OPENROUTER_API_KEY=...
-npm run start --workspace @anicode/tui -- --model openrouter/anthropic/<model-id>
-
-# Ollama
-npm run start --workspace @anicode/tui -- --model ollama/qwen3
+# 本机 CLI Proxy API
+export CLIPROXY_API_KEY=...
+npm run start --workspace @anicode/tui -- --model cliproxy/<model-id>
 
 # 任意自建 OpenAI-compatible endpoint
 export CUSTOM_OPENAI_BASE_URL=http://127.0.0.1:9000/v1
@@ -258,7 +263,7 @@ export CUSTOM_OPENAI_API_KEY=...
 npm run start --workspace @anicode/tui -- --model custom/<model-id>
 ```
 
-云端 provider 缺少自己的 key 时会在进入 TUI 前给出明确诊断。第三方兼容端点不会回退或继承 OpenAI SDK 的 API/admin key、组织、项目及环境自定义 header。
+云端 provider 缺少自己的 key 时会在进入 TUI 前给出明确诊断。第三方兼容端点不会回退或继承其他 provider 的 key、组织、项目及环境自定义 header。
 
 ### 自定义兼容 Provider
 
@@ -283,7 +288,7 @@ registerOpenAICompatibleProvider({
 
 ### 与 OpenCode 的范围差异
 
-当前架构已经能接入原生 Anthropic、主流 OpenAI-compatible 云端和本地模型，并可继续注册自定义端点；但还不是 OpenCode 所使用的完整 AI SDK + Models.dev 生态。自动模型目录、动态能力发现、OpenAI Responses API，以及少数 provider 的专有协议仍属于后续阶段。参考：[OpenCode Providers](https://opencode.ai/docs/providers/)、[Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai)、[OpenRouter API](https://openrouter.ai/docs/api/reference/overview)。
+当前内置适配器聚焦 DeepSeek、Gemini、CLI Proxy 和自定义 OpenAI-compatible 端点，并支持由宿主实时发现其模型目录；但还不是 OpenCode 所使用的完整 AI SDK + Models.dev 生态。跨协议能力发现、OpenAI Responses API，以及更多 provider 的专有协议仍属于后续阶段。参考：[OpenCode Providers](https://opencode.ai/docs/providers/)、[Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai)。
 
 ## Core 已具备的能力
 
@@ -293,7 +298,7 @@ registerOpenAICompatibleProvider({
 - **环境接地**：会话开始时快照 `<env>`（cwd/平台/系统/日期/是否 git 仓库/当前分支）+ `<git-status>`（工作区改动与最近提交）注入 system，缓存友好，让模型不再盲飞。见 `env.ts`。
 - 模型能力驱动请求：按 profile 控制 tools、reasoning、输出上限和 compaction 阈值；未知兼容模型不会被强塞 16k 输出参数。
 - 子 agent 的 `provider/model` override 会重新解析 provider，不再错误复用父 provider。
-- 默认工具：`read / write / edit / apply_patch / glob / grep / bash / bash_output / kill_shell / webfetch / todo_write / task / skill`；配置 LSP 后追加 `diagnostics`。
+- 默认工具：`read / write / edit / apply_patch / glob / grep / bash / bash_output / write_stdin / list_shells / kill_shell / webfetch / todo_write / task / skill`；配置 LSP 后追加 `diagnostics`。
 - **多 agent 编排**（对齐 Claude Code 的 Agent/SendMessage/TaskOutput/TaskStop 收敛形态）：
   - `task` 委派子任务（内置 `general`/`explore` + 文件/配置自定义类型）；只读型可并行 fan-out；`orchestrator` 型可嵌套下派（深度硬顶）。
   - `task(background=true)` 后台运行：立即返回任务 id，父 agent 继续干活；完成时 `<task-notification>` 在 turn 边界注入（运行中）或由 SessionManager 自动发起一次 drive（空闲时）——主 agent 不用轮询。
@@ -303,7 +308,7 @@ registerOpenAICompatibleProvider({
 - **后台长时命令**：`bash(run_in_background)` 立即返回 shell id 不阻塞，`bash_output` 增量读取新输出（可选正则 filter），`kill_shell` 停止 —— dev server / watch 构建 / 日志跟随不再被 120s 超时打死。增量读取（读过即清）、有界缓冲、自动回收、宿主退出收尸，且**不主动往上下文塞提醒**，规避 Claude Code 后台任务刷爆上下文的已知坑。后台与前台共用同一套 OS 沙箱，绝非绕过通道。见 `tools/shells.ts`。
 - **多模态 read**：`read` 可读图片（png/jpg/gif/webp），模型支持视觉时经 `ctx.attachImage` 把图片本体附在本轮 tool_result 之后送入同一条 user 消息；不支持视觉/超 3.7MB 时如实降级为文本说明。两端 provider 映射（Anthropic `image` 块 / OpenAI `image_url`）已实测通过，无需改 provider。见 `tools/fs.ts`、`tools/tool.ts` 的 `ToolContext.attachImage`。
 - **类型化 repo map**：Tree-sitter/ast-grep 覆盖 JS/TS/Python/Go/Rust/Java，可选 LSP enrich，维护增量 symbol/reference graph，并以 lexical + graph + SQLite/pgvector 混合检索减少盲目定位。
-- **事务化 PatchSet**：`write` / `edit` / `apply_patch` 统一走预览、base hash 冲突检测、审批、原子 journal、崩溃恢复与回滚；支持 rename、binary 和三方 merge。
+- **事务化 PatchSet**：会话级 prepare/approve/apply 流程提供 base hash 冲突检测、原子 journal、崩溃恢复与回滚，支持 rename、binary 和三方 merge。内置 `write` / `edit` / `apply_patch` 是独立的权限受控开发工具；未信任工作区可逐项批准这些工具，但不会启用会话级 PatchSet API 或 journal 恢复。
 - **ripgrep 后端检索**：检测到 `rg` 时 grep/glob 走 ripgrep（尊重 .gitignore、跳过二进制、按 mtime 排序），无 rg 自动回退纯 JS。grep 支持 `output_mode`（content/files_with_matches/count）、`ignore_case`、`context` 前后行、`path`/`glob` 限定。
 - **read 加固**：NUL 字节识别二进制（不返回乱码）、超长单行截断（防炸上下文）。
 - **重试尊重 `Retry-After`**：429/503 带该头时按服务端节流等待（与指数退避取较大值，封顶 60s）。
@@ -349,12 +354,15 @@ anicode exec --model openai/<model> --auto --jsonl --prompt "run tests and fix f
 printf 'review the current diff' | anicode exec --text
 ```
 
+未信任工作区中的 `anicode exec` 仍隐藏项目能力；由于无头模式无法显示授权卡片，写入和命令权限会被
+拒绝，显式 `--auto` / `--accept-edits` 也不能绕过 Workspace Trust。
+
 `NO_COLOR`、`INK_SCREEN_READER=true` 与非备用屏模式均受支持。交互命令在 stdin/stdout 不是 TTY 时会明确失败，
 避免把 ANSI 控制序列写入管道；管道/CI 应使用 `anicode exec`。
 
 参数解析是严格的：未知参数、缺值、重复和互斥组合会直接报错。`--sessions` 与权限模式属于本地进程，daemon 客户端不能覆盖 daemon 的配置。
 
-`--debug-log` 写权限为 `0600` 的 JSONL 文件，不向 stdout 输出日志以免破坏 Ink。默认只记录事件类型、耗时和内容长度，不记录 prompt、工具参数、错误原文或输出；只有显式传 `--trace-content` 才记录内容，凭证样式仍会脱敏。
+`--debug-log` 写权限为 `0600` 的 JSONL 文件，不向 stdout 输出日志以免破坏 Ink。日志在后台批量写入并限制待写队列，慢磁盘不会阻塞按键/流式渲染。默认只记录事件类型、耗时和内容长度，不记录 prompt、工具参数、错误原文或输出；只有显式传 `--trace-content` 才记录内容，凭证样式仍会脱敏。
 
 ## Daemon
 

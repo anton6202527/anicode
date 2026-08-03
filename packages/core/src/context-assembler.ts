@@ -22,7 +22,14 @@ import { gatherRepoMap, type RepoMapOptions } from "./repomap.js";
 import { discoverSkills, skillListPrompt, createSkillTool } from "./skills.js";
 
 /** 与 AgentOptions.skills 同形（结构兼容）。 */
-export type SkillsOption = boolean | { dirs?: string[]; disabled?: string[] };
+export type SkillsOption =
+  | boolean
+  | {
+      dirs?: string[];
+      disabled?: string[];
+      /** Defaults to true. Set false until Workspace Trust has been granted. */
+      includeProject?: boolean;
+    };
 
 export interface ContextProviderCtx {
   cwd: string;
@@ -80,11 +87,11 @@ export function envProvider(): ContextProvider {
 }
 
 /** 项目记忆：向上发现 AGENTS.md / CLAUDE.md，止于 .git 边界。 */
-export function projectMemoryProvider(): ContextProvider {
+export function projectMemoryProvider(includeProject = true): ContextProvider {
   return {
     id: "project-memory",
     async contribute({ cwd }) {
-      const memory = await loadProjectMemory(cwd);
+      const memory = await loadProjectMemory(cwd, { includeProject });
       return memory || null;
     },
   };
@@ -117,7 +124,9 @@ export function skillsProvider(opt: SkillsOption): ContextProvider {
       const o = typeof opt === "object" ? opt : {};
       const extraDirs = o.dirs ?? [];
       const disabled = new Set(o.disabled ?? []);
-      const discovered = await discoverSkills(cwd, extraDirs);
+      const discovered = await discoverSkills(cwd, extraDirs, {
+        ...(o.includeProject !== undefined ? { includeProject: o.includeProject } : {}),
+      });
       const skills = disabled.size ? discovered.filter((s) => !disabled.has(s.name)) : discovered;
       if (skills.length === 0) return null;
       const skillTool = createSkillTool(skills);

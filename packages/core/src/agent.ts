@@ -151,13 +151,19 @@ export interface AgentOptions {
   subagents?:
     | boolean
     | SubagentDefinition[]
-    | { definitions?: SubagentDefinition[]; discover?: boolean; dirs?: string[] };
+    | {
+        definitions?: SubagentDefinition[];
+        discover?: boolean;
+        dirs?: string[];
+        /** Defaults to true. Set false until Workspace Trust has been granted. */
+        includeProject?: boolean;
+      };
   /**
    * 启用 skills 渐进加载：扫描 .claude/skills（项目级+用户级）与全局技能根，
    * 清单注入 system 提示（L1），正文经 skill 工具按需加载（L2）。
    * 传对象可追加扫描目录（dirs）或按名排除技能（disabled，供 UI 开关）。默认关。
    */
-  skills?: boolean | { dirs?: string[]; disabled?: string[] };
+  skills?: boolean | { dirs?: string[]; disabled?: string[]; includeProject?: boolean };
   /**
    * 后台子 agent 任务在 Agent 空闲时完成的通知出口：宿主（如 SessionManager）
    * 用它自动发起一次 drive 把通知交给模型处理。不设时通知积压在 Agent 内部，
@@ -347,6 +353,7 @@ export class Agent {
     definitions: SubagentDefinition[];
     discover: boolean;
     dirs: string[];
+    includeProject: boolean;
   } | null = null;
   private readonly modelInfoOpt: AgentModelInfo | undefined;
   private readonly permissionOpt: PermissionConfig | undefined;
@@ -486,6 +493,8 @@ export class Agent {
         definitions,
         discover: typeof sub === "object" && !Array.isArray(sub) && sub.discover === true,
         dirs: (typeof sub === "object" && !Array.isArray(sub) && sub.dirs) || [],
+        includeProject:
+          typeof sub !== "object" || Array.isArray(sub) || sub.includeProject !== false,
       };
       if (!this.subagentsOpt.discover) this.registerTaskTool(definitions);
     }
@@ -1173,7 +1182,9 @@ export class Agent {
       if (this.subagentsOpt?.discover) {
         let discovered: SubagentDefinition[] = [];
         try {
-          discovered = await discoverSubagents(this.cwd, this.subagentsOpt.dirs);
+          discovered = await discoverSubagents(this.cwd, this.subagentsOpt.dirs, {
+            includeProject: this.subagentsOpt.includeProject,
+          });
         } catch {
           /* 发现失败不影响主流程；仍注册内置类型 */
         }

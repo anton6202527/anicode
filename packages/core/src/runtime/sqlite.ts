@@ -20,6 +20,17 @@ import type {
   RuntimeSnapshotStore,
 } from "./durable.js";
 import type { WorkerJob, WorkerQueueStore } from "./worker.js";
+import {
+  SessionLifecycleUnavailableError,
+  assertLifecycleId,
+  assertLifecycleTtl,
+  type AcquireSessionOperationInput,
+  type ClaimSessionDeletionInput,
+  type SessionDeletionClaim,
+  type SessionLifecycleRecord,
+  type SessionLifecycleStore,
+  type SessionOperationLease,
+} from "./session-lifecycle.js";
 
 type Row = Record<string, unknown>;
 
@@ -137,9 +148,45 @@ const RUNTIME_SCHEMA_V2 = `
   CREATE INDEX IF NOT EXISTS idx_artifacts_retention ON artifacts(created_at);
 `;
 
+const RUNTIME_SCHEMA_V3 = `
+  ALTER TABLE sessions ADD COLUMN workspace_device TEXT;
+  ALTER TABLE sessions ADD COLUMN workspace_inode TEXT;
+
+  CREATE TABLE session_lifecycle (
+    session_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('active', 'deleting', 'deleted')),
+    epoch INTEGER NOT NULL DEFAULT 0,
+    workspace TEXT,
+    workspace_device TEXT,
+    workspace_inode TEXT,
+    delete_owner TEXT,
+    delete_token TEXT,
+    delete_lease_expires_at TEXT,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_session_lifecycle_state
+    ON session_lifecycle(state, delete_lease_expires_at);
+
+  CREATE TABLE session_operation_leases (
+    lease_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_session_operation_leases_session
+    ON session_operation_leases(session_id, expires_at);
+`;
+
 const SQLITE_MIGRATIONS = [
   { version: 1, description: "initial durable runtime schema", sql: RUNTIME_SCHEMA_V1 },
   { version: 2, description: "retention and compaction indexes", sql: RUNTIME_SCHEMA_V2 },
+  {
+    version: 3,
+    description: "durable session lifecycle leases and workspace identity",
+    sql: RUNTIME_SCHEMA_V3,
+  },
 ] as const;
 
 export interface SqliteRetentionPolicy {
@@ -431,6 +478,359 @@ function auditFromRow(row: Row): RuntimeAuditRecord {
   };
 }
 
+function sqliteLifecycleRecord(row: Row, activeLeases: number): SessionLifecycleRecord {
+  return {
+    sessionId: String(row.session_id),
+    state: String(row.state) as SessionLifecycleRecord["state"],
+    epoch: Number(row.epoch),
+    activeLeases,
+    ...(row.workspace != null ? { workspace: String(row.workspace) } : {}),
+    ...(row.workspace_device != null && row.workspace_inode != null
+      ? {
+          workspaceIdentity: {
+            device: String(row.workspace_device),
+            inode: String(row.workspace_inode),
+          },
+        }
+      : {}),
+    ...(row.delete_owner != null ? { deleteOwner: String(row.delete_owner) } : {}),
+    ...(row.delete_token != null ? { deleteToken: String(row.delete_token) } : {}),
+    ...(row.delete_lease_expires_at != null
+      ? { deleteLeaseExpiresAt: String(row.delete_lease_expires_at) }
+      : {}),
+  };
+}
+
+/** SQLite durable lifecycle adapter. BEGIN IMMEDIATE serializes acquire/delete transitions. */
+export class SqliteSessionLifecycleStore implements SessionLifecycleStore {
+  constructor(readonly database: SqliteRuntimeDatabase) {}
+
+  get(sessionId: string): Promise<SessionLifecycleRecord | undefined> {
+    assertIdentifier(sessionId, "session lifecycle id");
+    return this.database.transaction((db) => {
+      const now = new Date().toISOString();
+      db.prepare(
+        "DELETE FROM session_operation_leases WHERE session_id = ? AND expires_at <= ?",
+      ).run(sessionId, now);
+      const row = db
+        .prepare("SELECT * FROM session_lifecycle WHERE session_id = ?")
+        .get(sessionId) as Row | undefined;
+      if (!row) return undefined;
+      return sqliteLifecycleRecord(row, this.activeLeaseCount(db, sessionId, now));
+    });
+  }
+
+  listDeleted(input: {
+    limit: number;
+    afterSessionId?: string;
+    workspace?: string;
+  }): Promise<SessionLifecycleRecord[]> {
+    this.validateListInput(input);
+    return this.database.run((db) => {
+      const rows = db
+        .prepare(
+          `SELECT * FROM session_lifecycle
+           WHERE state = 'deleted'
+             AND (? IS NULL OR session_id > ?)
+             AND (? IS NULL OR workspace = ?)
+           ORDER BY session_id
+           LIMIT ?`,
+        )
+        .all(
+          input.afterSessionId ?? null,
+          input.afterSessionId ?? null,
+          input.workspace ?? null,
+          input.workspace ?? null,
+          input.limit,
+        ) as Row[];
+      return rows.map((row) => sqliteLifecycleRecord(row, 0));
+    });
+  }
+
+  acquireOperation(input: AcquireSessionOperationInput): Promise<SessionOperationLease> {
+    this.validateInput(input);
+    return this.database.transaction((db) => {
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      db.prepare(
+        "DELETE FROM session_operation_leases WHERE session_id = ? AND expires_at <= ?",
+      ).run(input.sessionId, now);
+      db.prepare(
+        `INSERT INTO session_lifecycle
+         (session_id, state, epoch, workspace, workspace_device, workspace_inode, updated_at)
+         VALUES (?, 'active', 0, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO NOTHING`,
+      ).run(
+        input.sessionId,
+        input.workspace ?? null,
+        input.workspaceIdentity?.device ?? null,
+        input.workspaceIdentity?.inode ?? null,
+        now,
+      );
+      const row = db
+        .prepare("SELECT * FROM session_lifecycle WHERE session_id = ?")
+        .get(input.sessionId) as Row;
+      const state = String(row.state) as SessionLifecycleRecord["state"];
+      if (state !== "active") throw new SessionLifecycleUnavailableError(input.sessionId, state);
+      this.assertWorkspace(row, input.workspace, input.workspaceIdentity);
+      if (row.workspace == null && input.workspace) {
+        db.prepare(
+          "UPDATE session_lifecycle SET workspace = ?, updated_at = ? WHERE session_id = ?",
+        ).run(input.workspace, now, input.sessionId);
+      }
+      if (row.workspace_device == null && row.workspace_inode == null && input.workspaceIdentity) {
+        db.prepare(
+          `UPDATE session_lifecycle SET workspace_device = ?, workspace_inode = ?, updated_at = ?
+           WHERE session_id = ?`,
+        ).run(input.workspaceIdentity.device, input.workspaceIdentity.inode, now, input.sessionId);
+      }
+      const lease: SessionOperationLease = {
+        sessionId: input.sessionId,
+        leaseId: `sop_${randomUUID()}`,
+        owner: input.owner,
+        epoch: Number(row.epoch),
+        expiresAt: new Date(nowMs + input.ttlMs).toISOString(),
+      };
+      db.prepare(
+        `INSERT INTO session_operation_leases
+         (lease_id, session_id, owner, epoch, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(lease.leaseId, lease.sessionId, lease.owner, lease.epoch, lease.expiresAt, now);
+      return lease;
+    });
+  }
+
+  renewOperation(lease: SessionOperationLease, ttlMs: number): Promise<boolean> {
+    this.validateLease(lease);
+    assertLifecycleTtl(ttlMs);
+    return this.database.transaction((db) => {
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      const result = db
+        .prepare(
+          `UPDATE session_operation_leases SET expires_at = ?
+           WHERE lease_id = ? AND session_id = ? AND owner = ? AND epoch = ? AND expires_at > ?`,
+        )
+        .run(
+          new Date(nowMs + ttlMs).toISOString(),
+          lease.leaseId,
+          lease.sessionId,
+          lease.owner,
+          lease.epoch,
+          now,
+        );
+      return Number(result.changes) === 1;
+    });
+  }
+
+  releaseOperation(lease: SessionOperationLease): Promise<void> {
+    this.validateLease(lease);
+    return this.database.run((db) => {
+      db.prepare(
+        `DELETE FROM session_operation_leases
+         WHERE lease_id = ? AND session_id = ? AND owner = ? AND epoch = ?`,
+      ).run(lease.leaseId, lease.sessionId, lease.owner, lease.epoch);
+    });
+  }
+
+  claimDeletion(input: ClaimSessionDeletionInput): Promise<SessionDeletionClaim> {
+    this.validateInput(input);
+    return this.database.transaction((db) => {
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      db.prepare(
+        "DELETE FROM session_operation_leases WHERE session_id = ? AND expires_at <= ?",
+      ).run(input.sessionId, now);
+      db.prepare(
+        `INSERT INTO session_lifecycle
+         (session_id, state, epoch, workspace, workspace_device, workspace_inode, updated_at)
+         VALUES (?, 'active', 0, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO NOTHING`,
+      ).run(
+        input.sessionId,
+        input.workspace ?? null,
+        input.workspaceIdentity?.device ?? null,
+        input.workspaceIdentity?.inode ?? null,
+        now,
+      );
+      let row = db
+        .prepare("SELECT * FROM session_lifecycle WHERE session_id = ?")
+        .get(input.sessionId) as Row;
+      this.assertWorkspace(row, input.workspace, input.workspaceIdentity);
+      if (row.workspace == null && input.workspace) {
+        db.prepare("UPDATE session_lifecycle SET workspace = ? WHERE session_id = ?").run(
+          input.workspace,
+          input.sessionId,
+        );
+        row.workspace = input.workspace;
+      }
+      if (row.workspace_device == null && row.workspace_inode == null && input.workspaceIdentity) {
+        db.prepare(
+          `UPDATE session_lifecycle SET workspace_device = ?, workspace_inode = ?
+           WHERE session_id = ?`,
+        ).run(input.workspaceIdentity.device, input.workspaceIdentity.inode, input.sessionId);
+        row.workspace_device = input.workspaceIdentity.device;
+        row.workspace_inode = input.workspaceIdentity.inode;
+      }
+      if (row.state === "deleted") {
+        return {
+          ...sqliteLifecycleRecord(row, this.activeLeaseCount(db, input.sessionId, now)),
+          claimed: false,
+        };
+      }
+      if (row.state === "active") {
+        db.prepare(
+          `UPDATE session_lifecycle SET state = 'deleting', epoch = epoch + 1,
+           delete_owner = NULL, delete_token = NULL, delete_lease_expires_at = NULL,
+           updated_at = ? WHERE session_id = ?`,
+        ).run(now, input.sessionId);
+        row = db
+          .prepare("SELECT * FROM session_lifecycle WHERE session_id = ?")
+          .get(input.sessionId) as Row;
+      }
+      const claimExpired =
+        row.delete_lease_expires_at == null || String(row.delete_lease_expires_at) <= now;
+      const reentrant = row.delete_owner === input.owner && !claimExpired;
+      let claimed = false;
+      if (claimExpired || reentrant) {
+        const token = reentrant ? String(row.delete_token) : `sdel_${randomUUID()}`;
+        const expiresAt = new Date(nowMs + input.ttlMs).toISOString();
+        db.prepare(
+          `UPDATE session_lifecycle SET delete_owner = ?, delete_token = ?,
+           delete_lease_expires_at = ?, updated_at = ? WHERE session_id = ?`,
+        ).run(input.owner, token, expiresAt, now, input.sessionId);
+        row.delete_owner = input.owner;
+        row.delete_token = token;
+        row.delete_lease_expires_at = expiresAt;
+        claimed = true;
+      }
+      return {
+        ...sqliteLifecycleRecord(row, this.activeLeaseCount(db, input.sessionId, now)),
+        claimed,
+      };
+    });
+  }
+
+  renewDeletion(claim: SessionDeletionClaim, ttlMs: number): Promise<boolean> {
+    this.validateClaim(claim);
+    assertLifecycleTtl(ttlMs);
+    return this.database.transaction((db) => {
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      const result = db
+        .prepare(
+          `UPDATE session_lifecycle SET delete_lease_expires_at = ?, updated_at = ?
+           WHERE session_id = ? AND state = 'deleting' AND delete_owner = ?
+             AND delete_token = ? AND delete_lease_expires_at > ?`,
+        )
+        .run(
+          new Date(nowMs + ttlMs).toISOString(),
+          now,
+          claim.sessionId,
+          claim.deleteOwner!,
+          claim.deleteToken!,
+          now,
+        );
+      return Number(result.changes) === 1;
+    });
+  }
+
+  completeDeletion(claim: SessionDeletionClaim): Promise<boolean> {
+    this.validateClaim(claim);
+    return this.database.transaction((db) => {
+      const now = new Date().toISOString();
+      db.prepare(
+        "DELETE FROM session_operation_leases WHERE session_id = ? AND expires_at <= ?",
+      ).run(claim.sessionId, now);
+      if (this.activeLeaseCount(db, claim.sessionId, now) !== 0) return false;
+      const result = db
+        .prepare(
+          `UPDATE session_lifecycle SET state = 'deleted',
+           delete_owner = NULL, delete_token = NULL, delete_lease_expires_at = NULL,
+           updated_at = ?
+           WHERE session_id = ? AND state = 'deleting' AND delete_owner = ?
+             AND delete_token = ? AND delete_lease_expires_at > ?`,
+        )
+        .run(now, claim.sessionId, claim.deleteOwner!, claim.deleteToken!, now);
+      return Number(result.changes) === 1;
+    });
+  }
+
+  private activeLeaseCount(db: DatabaseSync, sessionId: string, now: string): number {
+    const row = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM session_operation_leases WHERE session_id = ? AND expires_at > ?",
+      )
+      .get(sessionId, now) as Row;
+    return Number(row.count);
+  }
+
+  private assertWorkspace(
+    row: Row,
+    workspace: string | undefined,
+    identity: { device: string; inode: string } | undefined,
+  ): void {
+    if (row.workspace != null && String(row.workspace) !== workspace) {
+      throw new Error(`Session ${String(row.session_id)} workspace lifecycle mismatch`);
+    }
+    if (
+      row.workspace_device != null &&
+      row.workspace_inode != null &&
+      (!identity ||
+        String(row.workspace_device) !== identity.device ||
+        String(row.workspace_inode) !== identity.inode)
+    ) {
+      throw new Error(`Session ${String(row.session_id)} workspace identity lifecycle mismatch`);
+    }
+  }
+
+  private validateInput(input: AcquireSessionOperationInput | ClaimSessionDeletionInput): void {
+    assertIdentifier(input.sessionId, "session lifecycle id");
+    assertLifecycleId(input.owner, "session lifecycle owner");
+    assertLifecycleTtl(input.ttlMs);
+    if (input.workspace !== undefined && input.workspace.length === 0) {
+      throw new Error("Session lifecycle workspace must not be empty");
+    }
+    if (
+      input.workspaceIdentity &&
+      (!input.workspaceIdentity.device || !input.workspaceIdentity.inode)
+    ) {
+      throw new Error("Session lifecycle workspace identity must include device and inode");
+    }
+  }
+
+  private validateListInput(input: {
+    limit: number;
+    afterSessionId?: string;
+    workspace?: string;
+  }): void {
+    if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+      throw new Error("Session lifecycle list limit must be an integer from 1 to 1000");
+    }
+    if (input.afterSessionId !== undefined) {
+      assertIdentifier(input.afterSessionId, "session lifecycle cursor");
+    }
+    if (input.workspace !== undefined && input.workspace.length === 0) {
+      throw new Error("Session lifecycle workspace must not be empty");
+    }
+  }
+
+  private validateLease(lease: SessionOperationLease): void {
+    assertIdentifier(lease.sessionId, "session lifecycle id");
+    assertLifecycleId(lease.leaseId, "session operation lease id");
+    assertLifecycleId(lease.owner, "session lifecycle owner");
+  }
+
+  private validateClaim(claim: SessionDeletionClaim): void {
+    assertIdentifier(claim.sessionId, "session lifecycle id");
+    if (!claim.deleteOwner || !claim.deleteToken) {
+      throw new Error("Session deletion claim is missing its owner or token");
+    }
+    assertLifecycleId(claim.deleteOwner, "session lifecycle owner");
+    assertLifecycleId(claim.deleteToken, "session deletion token");
+  }
+}
+
 function eventFromRow<T = unknown>(row: Row): RuntimeEvent<T> {
   return {
     id: String(row.id),
@@ -449,7 +849,11 @@ function eventFromRow<T = unknown>(row: Row): RuntimeEvent<T> {
 }
 
 export class SqliteRuntimeEventStore implements RuntimeEventStore {
-  constructor(readonly database: SqliteRuntimeDatabase) {}
+  readonly lifecycle: SessionLifecycleStore;
+
+  constructor(readonly database: SqliteRuntimeDatabase) {
+    this.lifecycle = new SqliteSessionLifecycleStore(database);
+  }
 
   append<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
     assertIdentifier(input.streamId, "runtime stream id");
@@ -525,6 +929,13 @@ export class SqliteRuntimeEventStore implements RuntimeEventStore {
         .map((row) => String((row as Row).stream_id)),
     );
   }
+
+  async delete(streamId: string): Promise<void> {
+    assertIdentifier(streamId, "runtime stream id");
+    await this.database.transaction((db) => {
+      db.prepare("DELETE FROM runtime_events WHERE stream_id = ?").run(streamId);
+    });
+  }
 }
 
 export class SqliteRuntimeSnapshotStore implements RuntimeSnapshotStore {
@@ -570,6 +981,14 @@ function sessionMetaFromRow(row: Row): SessionMeta {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     cwd: String(row.cwd),
+    ...(row.workspace_device != null && row.workspace_inode != null
+      ? {
+          workspaceIdentity: {
+            device: String(row.workspace_device),
+            inode: String(row.workspace_inode),
+          },
+        }
+      : {}),
     model: String(row.model),
     ...(row.title != null ? { title: String(row.title) } : {}),
   };
@@ -588,9 +1007,19 @@ export class SqliteRuntimeSessionStore implements ISessionStore {
       const now = new Date().toISOString();
       const full: SessionMeta = { ...meta, createdAt: now, updatedAt: now };
       db.prepare(
-        `INSERT INTO sessions(id, created_at, updated_at, cwd, model, title)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(full.id, full.createdAt, full.updatedAt, full.cwd, full.model, full.title ?? null);
+        `INSERT INTO sessions
+         (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        full.id,
+        full.createdAt,
+        full.updatedAt,
+        full.cwd,
+        full.workspaceIdentity?.device ?? null,
+        full.workspaceIdentity?.inode ?? null,
+        full.model,
+        full.title ?? null,
+      );
       return full;
     });
   }
@@ -622,15 +1051,27 @@ export class SqliteRuntimeSessionStore implements ISessionStore {
     return this.database.transaction((db) => {
       const updatedAt = new Date().toISOString();
       db.prepare(
-        `INSERT INTO sessions(id, created_at, updated_at, cwd, model, title)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO sessions
+         (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            created_at = excluded.created_at,
            updated_at = excluded.updated_at,
            cwd = excluded.cwd,
+           workspace_device = excluded.workspace_device,
+           workspace_inode = excluded.workspace_inode,
            model = excluded.model,
            title = excluded.title`,
-      ).run(meta.id, meta.createdAt, updatedAt, meta.cwd, meta.model, meta.title ?? null);
+      ).run(
+        meta.id,
+        meta.createdAt,
+        updatedAt,
+        meta.cwd,
+        meta.workspaceIdentity?.device ?? null,
+        meta.workspaceIdentity?.inode ?? null,
+        meta.model,
+        meta.title ?? null,
+      );
       db.prepare("DELETE FROM session_messages WHERE session_id = ?").run(meta.id);
       const insert = db.prepare(
         "INSERT INTO session_messages(session_id, idx, data) VALUES (?, ?, ?)",
@@ -702,6 +1143,13 @@ export class SqliteCommandInboxStore implements CommandInboxStore {
         .all()
         .map((row) => String((row as Row).session_id)),
     );
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    assertIdentifier(sessionId, "command session id");
+    await this.database.transaction((db) => {
+      db.prepare("DELETE FROM commands WHERE session_id = ?").run(sessionId);
+    });
   }
 
   private readDirect(db: DatabaseSync, sessionId: string): DurableCommand[] {
@@ -897,6 +1345,13 @@ export class SqliteArtifactStore implements ArtifactStore {
         .prepare("DELETE FROM artifacts WHERE session_id = ? AND id = ?")
         .run(sessionId, artifactId);
       return Number(result.changes) > 0;
+    });
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    assertIdentifier(sessionId, "session id");
+    await this.database.transaction((db) => {
+      db.prepare("DELETE FROM artifacts WHERE session_id = ?").run(sessionId);
     });
   }
 }

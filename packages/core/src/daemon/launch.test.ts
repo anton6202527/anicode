@@ -62,16 +62,43 @@ test("daemon socket: dedicated runtime directory is mode 0700", async () => {
   }
 });
 
+test("daemon socket: custom shared or symlink parents fail closed", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX ownership and mode semantics");
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-private-parent-"));
+  const shared = path.join(root, "shared");
+  const actual = path.join(root, "actual");
+  const linked = path.join(root, "linked");
+  try {
+    await fs.mkdir(shared, { mode: 0o755 });
+    await fs.chmod(shared, 0o755);
+    await assert.rejects(
+      prepareSocketDirectory(path.join(shared, "daemon.sock")),
+      /must have mode 0700/,
+    );
+    await fs.mkdir(actual, { mode: 0o700 });
+    await fs.symlink(actual, linked);
+    await assert.rejects(
+      prepareSocketDirectory(path.join(linked, "daemon.sock")),
+      /not a real directory/,
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("daemon CLI: 严格解析路径、权限与帮助参数", () => {
   const args = parseDaemonArgs([
     "--socket",
     "./tmp/anicode.sock",
     "--sessions",
     "./tmp/sessions",
+    "--cwd",
+    "./workspace",
     "--accept-edits",
   ]);
   assert.match(args.socketPath, /tmp\/anicode\.sock$/);
   assert.match(args.sessionsDir, /tmp\/sessions$/);
+  assert.equal(args.cwd, path.resolve("./workspace"));
   assert.equal(args.permissionMode, "acceptEdits");
   assert.match(daemonHelpText(), /anicode-daemon 0\.0\.1/);
 
@@ -79,6 +106,8 @@ test("daemon CLI: 严格解析路径、权限与帮助参数", () => {
   assert.throws(() => parseDaemonArgs(["--wat"]), /未知参数/);
   assert.throws(() => parseDaemonArgs(["--auto", "--accept-edits"]), /不能同时使用/);
   assert.throws(() => parseDaemonArgs(["--sessions", "one", "--sessions", "two"]), /不能重复/);
+  assert.throws(() => parseDaemonArgs(["--cwd", "one", "--cwd", "two"]), /不能重复/);
+  assert.equal(parseDaemonArgs([]).cwd, path.resolve(process.cwd()));
   assert.equal(
     parseDaemonArgs(["--socket", "\\\\.\\pipe\\anicode-test"]).socketPath,
     "\\\\.\\pipe\\anicode-test",

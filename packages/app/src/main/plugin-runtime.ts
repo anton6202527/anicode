@@ -45,6 +45,7 @@ export class PluginRuntime {
   private skills: SkillMeta[] = [];
   private readonly connections = new Map<string, Connection>();
   private readonly status = new Map<string, PluginRuntimeStatus>();
+  private suspended = false;
 
   constructor(
     private readonly connect: McpConnector = connectMcpServers,
@@ -75,11 +76,25 @@ export class PluginRuntime {
     await this.reconcile();
   }
 
+  /** Trust revocation closes every process/network sidecar before a restricted Agent is rebuilt. */
+  async setSuspended(suspended: boolean): Promise<void> {
+    if (this.suspended === suspended) return;
+    this.suspended = suspended;
+    await this.reconcile();
+  }
+
   private entries(): PluginEntry[] {
     return [...mergePluginState(this.savedIds), ...mergeSkillState(this.savedIds, this.skills)];
   }
 
   private async reconcile(): Promise<void> {
+    if (this.suspended) {
+      for (const conn of this.connections.values())
+        conn.clients.forEach((client) => client.close());
+      this.connections.clear();
+      this.status.clear();
+      return;
+    }
     const entries = this.entries();
     const enabledMcp = entries.filter((e) => e.enabled && e.mcpServer);
     const enabledIds = new Set(enabledMcp.map((e) => e.id));
@@ -151,7 +166,7 @@ export class PluginRuntime {
     }
     const base = defaultTools();
     const registry = base.subset(base.names().filter((name) => !disabled.has(name)));
-    for (const conn of this.connections.values()) {
+    for (const conn of this.suspended ? [] : this.connections.values()) {
       for (const tool of conn.tools) registry.register(tool);
     }
     return registry;

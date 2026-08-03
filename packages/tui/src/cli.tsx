@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
 import React from "react";
 import { render } from "ink";
 import {
@@ -25,7 +26,12 @@ import {
   MigratingSessionStore,
   LocalSessionHost,
   DaemonClient,
+  DEFAULT_HTTP_DAEMON_PORT,
   defaultDaemonSocketPath,
+  defaultHttpDaemonAuthTokenPath,
+  generateDaemonAuthToken,
+  provisionDaemonAuthToken,
+  readDaemonAuthToken,
   HttpSessionHost,
   HttpDaemonServer,
   loadConfig,
@@ -55,6 +61,7 @@ import {
   telemetryFromEnv,
   telemetryForLocalStack,
   ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
+  WorkspaceTrustStore,
   t,
   type SessionHost,
   type AnicodeConfig,
@@ -64,11 +71,14 @@ import {
   type LocalRuntimeStack,
   type Telemetry,
   type McpServerConfig,
+  type WorkspaceTrustAssessment,
+  type WorkspaceTrustSource,
 } from "@anicode/core";
 import { App, type TuiKeybindingAction } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
 import { TuiErrorBoundary } from "./error-boundary.js";
 import { createTerminalCaretOutput } from "./terminal-caret.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 
 // 版本号由 build.mjs 经 esbuild define 注入（发布包 package.json 单一事实源）；
 // tsx 直跑源码（无 define）时回落到下面的常量。
@@ -78,6 +88,10 @@ const DISPLAY_NAME = "AniCode Zen";
 // 默认走 DeepSeek 开放模型；真正生效值由 resolveDefaultModel 在运行时按凭证/本地服务挑选
 // （无 DeepSeek key 时优雅回退，见 resolveDefaultModel）。
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+
+export function terminalSafe(text: unknown): string {
+  return sanitizeTerminalText(String(text));
+}
 
 export { resolveDefaultModel };
 
@@ -203,14 +217,18 @@ export function enterTerminalScreen(
         /* best effort: the TTY may already have been detached */
       }
     }
-    output.write(
-      "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
-    );
-    if (color) {
-      output.write("\x1b]111\x07");
-      output.write("\x1b]117\x07\x1b]119\x07");
+    try {
+      output.write(
+        "\x1b[0m\x1b[?25h\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+      );
+      if (color) {
+        output.write("\x1b]111\x07");
+        output.write("\x1b]117\x07\x1b]119\x07");
+      }
+      if (options.alternateScreen) output.write("\x1b[?1049l");
+    } catch {
+      // A detached PTY must not turn cleanup into a second crash.
     }
-    if (options.alternateScreen) output.write("\x1b[?1049l");
   };
 }
 
@@ -237,19 +255,35 @@ export function installTerminalExitGuard(
     target.off("unhandledRejection", onUnhandledRejection);
   };
   const terminate = (signal: GuardedSignal) => {
-    cleanup();
-    remove();
-    target.kill(target.pid, signal);
+    try {
+      cleanup();
+    } catch {
+      // Terminal teardown is best-effort; still preserve conventional signal exit.
+    } finally {
+      remove();
+      target.kill(target.pid, signal);
+    }
   };
   const handlers: Record<GuardedSignal, () => void> = {
     SIGINT: () => terminate("SIGINT"),
     SIGTERM: () => terminate("SIGTERM"),
     SIGHUP: () => terminate("SIGHUP"),
   };
-  const onExit = () => cleanup();
+  const onExit = () => {
+    try {
+      cleanup();
+    } catch {
+      // Exit handlers must never throw.
+    }
+  };
   const rethrow = (reason: unknown) => {
-    cleanup();
-    remove();
+    try {
+      cleanup();
+    } catch {
+      // Preserve the original failure rather than a secondary cleanup error.
+    } finally {
+      remove();
+    }
     queueMicrotask(() => {
       throw reason instanceof Error ? reason : new Error(String(reason));
     });
@@ -304,6 +338,8 @@ export interface CliArgs {
   /** HTTP host 模式：连一个 `anicode serve` 起的 HTTP+SSE 服务。 */
   http?: string;
   httpToken?: string;
+  /** Preferred over command-line tokens, which may be visible in shell history/process listings. */
+  httpTokenFile?: string;
   permissionMode: "default" | "acceptEdits" | "auto";
   /** 配置档名（anicode.json 的 profiles 键，对齐 Codex --profile）。 */
   profile?: string;
@@ -319,7 +355,7 @@ export interface CliArgs {
   traceContent: boolean;
   /** Disable styling while retaining the interactive layout. */
   noColor: boolean;
-  /** Full xterm mouse tracking; on by default so the fixed transcript viewport receives wheel input. */
+  /** Opt-in xterm mouse tracking; default alternate-scroll keeps native drag-selection working. */
   mouse: boolean;
   /** Render in the primary screen buffer. */
   noAltScreen: boolean;
@@ -353,10 +389,11 @@ export function parseArgs(argv: string[]): CliArgs {
   let traceContent = false;
   let http: string | undefined;
   let httpToken: string | undefined;
+  let httpTokenFile: string | undefined;
   let permissionMode: CliArgs["permissionMode"] = "default";
   let profile: string | undefined;
   let noColor = "NO_COLOR" in process.env;
-  let mouse = true;
+  let mouse = false;
   let noAltScreen = false;
   let plain = false;
   const seen = new Set<string>();
@@ -419,6 +456,11 @@ export function parseArgs(argv: string[]): CliArgs {
       case "--http-token":
         mark(arg);
         httpToken = requiredValue(argv, i, arg);
+        i++;
+        break;
+      case "--http-token-file":
+        mark(arg);
+        httpTokenFile = path.resolve(requiredValue(argv, i, arg));
         i++;
         break;
       case "--demo":
@@ -547,6 +589,28 @@ export function parseArgs(argv: string[]): CliArgs {
     throw new Error(
       t("--http and --daemon cannot be used together", "--http 与 --daemon 不能同时使用"),
     );
+  if (httpToken && httpTokenFile) {
+    throw new Error(
+      t(
+        "--http-token and --http-token-file cannot be used together",
+        "--http-token 与 --http-token-file 不能同时使用",
+      ),
+    );
+  }
+  if (!http && (httpToken || httpTokenFile)) {
+    throw new Error(
+      t(
+        "--http-token and --http-token-file require --http",
+        "--http-token 与 --http-token-file 必须与 --http 一起使用",
+      ),
+    );
+  }
+  const effectiveHttpTokenFile = http
+    ? (httpTokenFile ?? (httpToken ? undefined : process.env.ANICODE_HTTP_TOKEN_FILE))
+    : undefined;
+  const effectiveHttpToken = http
+    ? (httpToken ?? (effectiveHttpTokenFile ? undefined : process.env.ANICODE_HTTP_TOKEN))
+    : undefined;
 
   return {
     model,
@@ -555,8 +619,11 @@ export function parseArgs(argv: string[]): CliArgs {
     ...(resume ? { resume } : {}),
     daemon,
     ...(http ? { http } : {}),
-    ...((httpToken ?? process.env.ANICODE_HTTP_TOKEN)
-      ? { httpToken: httpToken ?? process.env.ANICODE_HTTP_TOKEN! }
+    ...(effectiveHttpToken ? { httpToken: effectiveHttpToken } : {}),
+    ...(effectiveHttpTokenFile
+      ? {
+          httpTokenFile: path.resolve(effectiveHttpTokenFile),
+        }
       : {}),
     permissionMode,
     ...(profile ? { profile } : {}),
@@ -610,12 +677,12 @@ export function helpText(): string {
       `  --profile <name>          应用 anicode.json 里的配置档（profiles 键）\n`,
     ) +
     t(
-      `  --auto                    Automatically allow edits and commands\n`,
-      `  --auto                    自动允许编辑与命令\n`,
+      `  --auto                    Automatically allow edits and commands after Workspace Trust checks\n`,
+      `  --auto                    通过 Workspace Trust 检查后自动允许编辑与命令\n`,
     ) +
     t(
-      `  --accept-edits            Automatically allow edits, still ask for commands\n`,
-      `  --accept-edits            自动允许编辑，命令仍询问\n`,
+      `  --accept-edits            After Workspace Trust checks, allow edits but still ask for commands\n`,
+      `  --accept-edits            通过 Workspace Trust 检查后允许编辑，命令仍询问\n`,
     ) +
     t(
       `  --daemon [socket]         Connect to shared daemon\n`,
@@ -626,8 +693,12 @@ export function helpText(): string {
       `  --http <url>              连接 anicode serve 起的 HTTP 服务（另见: anicode serve）\n`,
     ) +
     t(
-      `  --http-token <token>      Bearer token for --http (or ANICODE_HTTP_TOKEN)\n`,
-      `  --http-token <token>      --http 的 Bearer token（或 ANICODE_HTTP_TOKEN）\n`,
+      `  --http-token-file <file>  Private bearer-token file for --http (auto-discovered for local serve)\n`,
+      `  --http-token-file <file>  --http 的私有 Bearer token 文件（本地 serve 自动发现）\n`,
+    ) +
+    t(
+      `  --http-token <token>      Legacy token input (prefer a token file; or ANICODE_HTTP_TOKEN)\n`,
+      `  --http-token <token>      兼容用 token 参数（优先使用 token 文件；或 ANICODE_HTTP_TOKEN）\n`,
     ) +
     t(
       `  --debug-log [file]        Write JSONL debug log (without polluting the terminal)\n`,
@@ -646,12 +717,12 @@ export function helpText(): string {
       `  --no-color                关闭 ANSI 颜色（同时遵循 NO_COLOR）\n`,
     ) +
     t(
-      `  --mouse                   Enable click/wheel tracking (default; Option-drag selects in iTerm2)\n`,
-      `  --mouse                   开启点击/滚轮跟踪（默认；iTerm2 按 Option 拖选文字）\n`,
+      `  --mouse                   Enable click/wheel tracking (Option-drag selects in iTerm2)\n`,
+      `  --mouse                   开启点击/滚轮跟踪（iTerm2 按 Option 拖选文字）\n`,
     ) +
     t(
-      `  --no-mouse                Disable tracking for plain drag-selection; PageUp/Down scrolls\n`,
-      `  --no-mouse                关闭跟踪以直接拖选文字；PageUp/Down 回看\n`,
+      `  --no-mouse                Keep native drag-selection and alternate-screen wheel scrolling\n`,
+      `  --no-mouse                保留原生拖选和备用屏滚轮回看\n`,
     ) +
     t(
       `  --no-alt-screen           Keep the TUI in the primary screen buffer\n`,
@@ -662,8 +733,8 @@ export function helpText(): string {
       `  --list-providers          列出可用 provider\n`,
     ) +
     t(
-      `  --list-models             List the built-in model catalog (including Free/open-weight models)\n`,
-      `  --list-models             列出内置模型目录（含免费/开源模型）\n`,
+      `  --list-models             List the static built-in catalog (not a liveness result)\n`,
+      `  --list-models             列出静态内置目录（不代表模型当前在线）\n`,
     ) +
     t(`  -h, --help                Show help\n`, `  -h, --help                显示帮助\n`) +
     t(`  -v, --version             Show version\n\n`, `  -v, --version             显示版本\n\n`) +
@@ -683,6 +754,14 @@ export function helpText(): string {
     t(
       `  auth list                 View logged-in credentials\n\n`,
       `  auth list                 查看已登录凭证\n\n`,
+    ) +
+    t(
+      `  trust status|grant|revoke Inspect or change Workspace Trust for a directory\n`,
+      `  trust status|grant|revoke 查看或变更目录的 Workspace Trust\n`,
+    ) +
+    t(
+      `  serve [--cwd DIR] [--token-file FILE] Start the scoped authenticated loopback HTTP service\n\n`,
+      `  serve [--cwd DIR] [--token-file FILE] 启动限定工作区且带鉴权的回环 HTTP 服务\n\n`,
     ) +
     t(
       `  mcp list                  List curated development MCP servers\n`,
@@ -722,6 +801,14 @@ export function validateArgs(args: CliArgs): void {
       ),
     );
   }
+  if (args.httpToken && args.httpTokenFile) {
+    throw new Error(
+      t(
+        "--http-token and --http-token-file cannot be used together",
+        "--http-token 与 --http-token-file 不能同时使用",
+      ),
+    );
+  }
   if (args.daemon && args.permissionMode !== "default") {
     const flag = args.permissionMode === "auto" ? "--auto" : "--accept-edits";
     throw new Error(
@@ -756,6 +843,23 @@ export function resolveConfiguredProvider(model: string) {
   return createProvider(model);
 }
 
+function inferredHttpTokenFile(baseUrl: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch (error) {
+    throw new Error(t(`Invalid --http URL: ${baseUrl}`, `--http URL 无效: ${baseUrl}`), {
+      cause: error,
+    });
+  }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]", "::1"].includes(host)) {
+    return undefined;
+  }
+  const port = Number(url.port || 80);
+  return defaultHttpDaemonAuthTokenPath(port);
+}
+
 export async function buildHost(
   args: CliArgs,
   extras: {
@@ -765,15 +869,45 @@ export async function buildHost(
     plugins?: PluginDirs;
     runtimeStack?: LocalRuntimeStack;
     telemetry?: Telemetry;
+    workspaceTrust?: WorkspaceTrustSource;
+    onWorkspaceTrustChange?: (change: {
+      sessionId: string;
+      cwd: string;
+      previous?: WorkspaceTrustAssessment;
+      current: WorkspaceTrustAssessment;
+    }) => void | Promise<void>;
   } = {},
 ): Promise<SessionHost> {
   if (args.daemon) {
     return DaemonClient.connect(args.socket);
   }
   if (args.http) {
+    let token = args.httpToken;
+    if (!token) {
+      const tokenFile = args.httpTokenFile ?? inferredHttpTokenFile(args.http);
+      if (!tokenFile) {
+        throw new Error(
+          t(
+            "Authenticated HTTP hosts require --http-token-file (or ANICODE_HTTP_TOKEN_FILE)",
+            "HTTP 服务必须提供 --http-token-file（或 ANICODE_HTTP_TOKEN_FILE）",
+          ),
+        );
+      }
+      try {
+        token = await readDaemonAuthToken(tokenFile);
+      } catch (error) {
+        throw new Error(
+          t(
+            `Cannot read the private HTTP daemon token file: ${tokenFile}`,
+            `无法读取 HTTP daemon 私有 token 文件: ${tokenFile}`,
+          ),
+          { cause: error },
+        );
+      }
+    }
     return new HttpSessionHost({
       baseUrl: args.http,
-      ...(args.httpToken ? { token: args.httpToken } : {}),
+      token,
     });
   }
   return new LocalSessionHost(buildManager(args, extras));
@@ -781,13 +915,20 @@ export async function buildHost(
 
 /** 本地 SessionManager 构造：LocalSessionHost 与 `anicode serve` 共用同一套装配。 */
 export function buildManager(
-  args: Pick<CliArgs, "sessionsDir" | "permissionMode">,
+  args: Pick<CliArgs, "cwd" | "sessionsDir" | "permissionMode">,
   extras: {
     config?: AnicodeConfig;
     extraTools?: Tool[];
     deferredTools?: Tool[];
     runtimeStack?: LocalRuntimeStack;
     telemetry?: Telemetry;
+    workspaceTrust?: WorkspaceTrustSource;
+    onWorkspaceTrustChange?: (change: {
+      sessionId: string;
+      cwd: string;
+      previous?: WorkspaceTrustAssessment;
+      current: WorkspaceTrustAssessment;
+    }) => void | Promise<void>;
     /** 插件目录（discoverPlugins 的产物）：agents/skills 子目录并入既有发现器。 */
     plugins?: PluginDirs;
   } = {},
@@ -830,6 +971,11 @@ export function buildManager(
     securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
     telemetry: extras.telemetry ?? telemetryForLocalStack(runtimeStack),
     isolatedRuntime: runtimeStack.isolatedRuntime,
+    workspaceScope: args.cwd,
+    ...(extras.workspaceTrust ? { workspaceTrust: extras.workspaceTrust } : {}),
+    ...(extras.onWorkspaceTrustChange
+      ? { onWorkspaceTrustChange: extras.onWorkspaceTrustChange }
+      : {}),
     resolveProvider: resolveConfiguredProvider,
     compaction: true,
     permission: {
@@ -879,20 +1025,22 @@ export function buildManager(
 }
 
 /**
- * `anicode serve [--port N] [--host H] [--token T] [--sessions DIR]` ——
+ * `anicode serve [--port N] [--host H] [--token-file FILE] [--sessions DIR] [--cwd DIR]` ——
  * 起 HTTP+SSE 会话服务（server-first）：任意数量的 CLI/App/Web 客户端可用
  * `anicode --http http://H:N` 连上来共享/接管会话。默认只绑 127.0.0.1；
- * 绑非回环地址必须配 --token（或 ANICODE_HTTP_TOKEN）。
+ * 除健康检查外始终要求 Bearer token；token 只写入 0600 runtime file，不打印。
  */
 export async function runServeCommand(
   argv: string[],
   io: { output?: NodeJS.WritableStream } = {},
 ): Promise<HttpDaemonServer> {
   const out = io.output ?? process.stderr;
-  let port = 8317;
+  let port = DEFAULT_HTTP_DAEMON_PORT;
   let hostAddr = "127.0.0.1";
   let token = process.env.ANICODE_HTTP_TOKEN;
+  let tokenFile = process.env.ANICODE_HTTP_TOKEN_FILE;
   let sessionsDir = path.join(os.homedir(), ".anicode", "sessions");
+  let cwd = process.cwd();
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--port") {
@@ -904,12 +1052,21 @@ export async function runServeCommand(
     } else if (arg === "--token") {
       token = requiredValue(argv, i, arg);
       i++;
+    } else if (arg === "--token-file") {
+      tokenFile = path.resolve(requiredValue(argv, i, arg));
+      i++;
     } else if (arg === "--sessions") {
       sessionsDir = path.resolve(requiredValue(argv, i, arg));
+      i++;
+    } else if (arg === "--cwd") {
+      cwd = path.resolve(requiredValue(argv, i, arg));
       i++;
     } else {
       throw new Error(t(`Unknown serve argument: ${arg}`, `serve 未知参数: ${arg}`));
     }
+  }
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
+    throw new Error(t(`Invalid serve port: ${port}`, `serve 端口无效: ${port}`));
   }
   if (hostAddr !== "127.0.0.1" && hostAddr !== "localhost" && hostAddr !== "::1") {
     throw new Error(
@@ -919,29 +1076,63 @@ export async function runServeCommand(
       ),
     );
   }
-  const { config } = await loadConfig();
-  const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
-  const manager = buildManager(
-    { sessionsDir, permissionMode: "default" },
-    { config, runtimeStack },
-  );
-  const server = new HttpDaemonServer({
-    manager,
-    ...(token ? { token } : {}),
-    onClose: async () => {
-      manager.dispose();
-      await runtimeStack.networkProxy.close();
-      await runtimeStack.database.close();
-    },
+  const workspaceTrustStore = new WorkspaceTrustStore();
+  const initialWorkspaceTrust = await workspaceTrustStore.assess(cwd);
+  await loadProjectEnv({ cwd, workspaceTrust: initialWorkspaceTrust });
+  const { config, warnings } = await loadConfig({
+    cwd,
+    workspaceTrust: initialWorkspaceTrust,
   });
-  await server.listen(port, hostAddr);
-  out.write(
-    t(
-      `anicode serve listening on http://${hostAddr}:${server.port()} (sessions: ${sessionsDir})\n`,
-      `anicode serve 已监听 http://${hostAddr}:${server.port()}（会话目录: ${sessionsDir}）\n`,
-    ),
-  );
-  return server;
+  for (const warning of warnings) out.write(`${terminalSafe(warning)}\n`);
+  const bearerToken = token === undefined ? generateDaemonAuthToken() : token;
+  const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
+  let manager: SessionManager | undefined;
+  let server: HttpDaemonServer | undefined;
+  let resourcesClosed = false;
+  const closeResources = async (): Promise<void> => {
+    if (resourcesClosed) return;
+    resourcesClosed = true;
+    manager?.dispose();
+    await Promise.resolve(runtimeStack.artifacts.close?.()).catch(() => undefined);
+    await runtimeStack.networkProxy.close().catch(() => undefined);
+    await runtimeStack.database.close().catch(() => undefined);
+  };
+  try {
+    manager = buildManager(
+      { cwd, sessionsDir, permissionMode: "default" },
+      {
+        config,
+        runtimeStack,
+        workspaceTrust: workspaceTrustStore,
+      },
+    );
+    server = new HttpDaemonServer({
+      manager,
+      token: bearerToken,
+      onClose: closeResources,
+    });
+    // Publish the credential only after the port is successfully bound. Rotating the
+    // well-known token file before a failed EADDRINUSE would lock clients out of the
+    // still-running daemon that owns that port.
+    await server.listen(port, hostAddr);
+    const privateTokenFile = path.resolve(
+      tokenFile ?? defaultHttpDaemonAuthTokenPath(server.port()),
+    );
+    await provisionDaemonAuthToken({ tokenFile: privateTokenFile, token: bearerToken });
+    out.write(
+      terminalSafe(
+        t(
+          `anicode serve listening on http://${hostAddr}:${server.port()} (sessions: ${sessionsDir})\nHTTP auth token file: ${privateTokenFile}\n`,
+          `anicode serve 已监听 http://${hostAddr}:${server.port()}（会话目录: ${sessionsDir}）\nHTTP 鉴权 token 文件: ${privateTokenFile}\n`,
+        ),
+      ),
+    );
+    return server;
+  } catch (error) {
+    if (server) await server.close().catch(() => closeResources());
+    else await closeResources();
+    throw error;
+  }
 }
 
 /** --resume 只选定会话；真正的 open/订阅由 App 统一执行一次。 */
@@ -953,6 +1144,137 @@ export async function selectSessionId(
   return (await host.createSession({ cwd: args.cwd, model: args.model })).id;
 }
 
+export async function runTrustCommand(
+  argv: string[],
+  io: {
+    input?: NodeJS.ReadableStream & { isTTY?: boolean };
+    output?: NodeJS.WritableStream;
+    store?: WorkspaceTrustStore;
+    /** Test/embedding hook. The real CLI deliberately requires an interactive terminal. */
+    confirmGrant?: (assessment: WorkspaceTrustAssessment) => Promise<boolean>;
+  } = {},
+): Promise<WorkspaceTrustAssessment | undefined> {
+  const command = argv[0] ?? "status";
+  let cwd = process.cwd();
+  let json = false;
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--cwd") {
+      cwd = path.resolve(requiredValue(argv, i, arg));
+      i++;
+    } else if (arg === "--json") {
+      json = true;
+    } else {
+      throw new Error(t(`Unknown trust argument: ${arg}`, `trust 未知参数: ${arg}`));
+    }
+  }
+  if (!["status", "grant", "revoke"].includes(command)) {
+    throw new Error(
+      t(
+        `Unknown trust command: ${command} (expected status/grant/revoke)`,
+        `未知 trust 命令: ${command}（可用 status/grant/revoke）`,
+      ),
+    );
+  }
+
+  const output = io.output ?? process.stdout;
+  const store = io.store ?? new WorkspaceTrustStore();
+  const writeAssessment = (assessment: WorkspaceTrustAssessment): void => {
+    if (json) {
+      output.write(`${JSON.stringify(assessment, null, 2)}\n`);
+      return;
+    }
+    output.write(
+      terminalSafe(
+        [
+          `${t("Workspace", "工作区")}: ${assessment.identity?.canonicalRoot ?? path.resolve(cwd)}`,
+          `${t("Trusted", "已信任")}: ${assessment.trusted ? t("yes", "是") : t("no", "否")}`,
+          `${t("Reason", "原因")}: ${assessment.reason}`,
+          `${t("Execution sources", "执行来源")}: ${assessment.executionSources.join(", ") || t("none", "无")}`,
+          ...(assessment.error ? [`${t("Error", "错误")}: ${assessment.error}`] : []),
+        ].join("\n") + "\n",
+      ),
+    );
+  };
+
+  if (command === "revoke") {
+    const revoked = await store.revoke(cwd);
+    const assessment = await store.assess(cwd);
+    if (json) {
+      output.write(`${JSON.stringify({ revoked, assessment }, null, 2)}\n`);
+    } else {
+      output.write(
+        terminalSafe(
+          revoked
+            ? t("Workspace Trust revoked.\n", "已撤销工作区信任。\n")
+            : t("Workspace was not trusted.\n", "工作区原本未被信任。\n"),
+        ),
+      );
+      writeAssessment(assessment);
+    }
+    return assessment;
+  }
+
+  const preview = await store.assess(cwd);
+  if (command === "status") {
+    writeAssessment(preview);
+    return preview;
+  }
+  if (!preview.identity || !preview.executionHash || preview.reason === "inspection-failed") {
+    throw new Error(
+      t(
+        `Cannot inspect workspace safely: ${preview.error ?? preview.reason}`,
+        `无法安全检查工作区: ${preview.error ?? preview.reason}`,
+      ),
+    );
+  }
+  if (json) {
+    throw new Error(
+      t(
+        "trust grant is interactive and cannot be combined with --json",
+        "trust grant 需要交互确认，不能与 --json 一起使用",
+      ),
+    );
+  }
+  if (!json) writeAssessment(preview);
+  let confirmed: boolean;
+  if (io.confirmGrant) {
+    confirmed = await io.confirmGrant(preview);
+  } else {
+    const input = io.input ?? (process.stdin as NodeJS.ReadStream);
+    if (!input.isTTY || !(output as NodeJS.WriteStream).isTTY) {
+      throw new Error(
+        t(
+          "trust grant requires an interactive terminal; it cannot be piped or granted by an agent process",
+          "trust grant 需要交互式终端；不能通过管道或 Agent 进程授信",
+        ),
+      );
+    }
+    const prompt = t(
+      `Type the exact workspace path to trust it: ${preview.identity.canonicalRoot}\n> `,
+      `请输入完整工作区路径以确认信任: ${preview.identity.canonicalRoot}\n> `,
+    );
+    const readline = createInterface({ input, output, terminal: true });
+    try {
+      confirmed =
+        (await readline.question(terminalSafe(prompt))).trim() === preview.identity.canonicalRoot;
+    } finally {
+      readline.close();
+    }
+  }
+  if (!confirmed) {
+    output.write(terminalSafe(t("Workspace Trust unchanged.\n", "未变更工作区信任。\n")));
+    return preview;
+  }
+  const granted = await store.grant(cwd, {
+    identityKey: preview.identity.key,
+    executionHash: preview.executionHash,
+  });
+  if (json) output.write(`${JSON.stringify(granted, null, 2)}\n`);
+  else output.write(terminalSafe(t("Workspace Trust granted.\n", "已授予工作区信任。\n")));
+  return granted;
+}
+
 /**
  * `anicode auth <login|logout|list> [provider]` —— OAuth 凭证检查/清理；生产登录入口默认禁用。
  * login 走 PKCE：打开浏览器授权 → 用户粘回 `code#state` → 换 token 存 ~/.anicode/auth.json。
@@ -960,7 +1282,8 @@ export async function selectSessionId(
 /**
  * `anicode mcp` —— 把 anicode 作为 MCP server 暴露（对齐 `codex mcp-server`）。
  * stdio 换行分隔 JSON-RPC；工具 anicode（新会话跑任务）/ anicode_reply（续会话）。
- * 嵌入场景无人点确认框 → 权限默认 auto（可 --permission-mode 覆盖，deny 规则仍最先生效）。
+ * 已信任嵌入场景无人点确认框 → 权限默认 auto（可 --permission-mode 覆盖，deny 规则仍最先
+ * 生效）；未信任工作区仍由 core restricted policy fail closed，不把无交互入口当作写入授权。
  */
 export async function runMcpCommand(
   argv: string[],
@@ -988,22 +1311,57 @@ export async function runMcpCommand(
       throw new Error(t(`Unknown mcp argument: ${arg}`, `mcp 未知参数: ${arg}`));
     }
   }
-  const { config } = await loadConfig({ cwd });
+  if (!(["default", "acceptEdits", "auto"] as const).includes(permissionMode)) {
+    throw new Error(
+      t(`Invalid MCP permission mode: ${permissionMode}`, `MCP 权限模式无效: ${permissionMode}`),
+    );
+  }
+  const workspaceTrustStore = new WorkspaceTrustStore();
+  const initialWorkspaceTrust = await workspaceTrustStore.assess(cwd);
+  await loadProjectEnv({ cwd, workspaceTrust: initialWorkspaceTrust });
+  const { config } = await loadConfig({ cwd, workspaceTrust: initialWorkspaceTrust });
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
-  const manager = buildManager({ sessionsDir, permissionMode }, { config, runtimeStack });
-  const server = serveMcp({
-    manager,
-    model: model ?? config.model ?? resolveDefaultModel(),
-    cwd,
-    ...(io.input ? { input: io.input } : {}),
-    ...(io.output ? { output: io.output } : {}),
-    serverInfo: { name: "anicode", version: CLI_VERSION },
-  });
+  let manager: SessionManager | undefined;
+  let server: ReturnType<typeof serveMcp> | undefined;
+  try {
+    manager = buildManager(
+      { cwd, sessionsDir, permissionMode },
+      { config, runtimeStack, workspaceTrust: workspaceTrustStore },
+    );
+    server = serveMcp({
+      manager,
+      model: model ?? config.model ?? resolveDefaultModel(),
+      cwd,
+      ...(io.input ? { input: io.input } : {}),
+      ...(io.output ? { output: io.output } : {}),
+      serverInfo: { name: "anicode", version: CLI_VERSION },
+    });
+  } catch (error) {
+    try {
+      manager?.dispose();
+    } finally {
+      await Promise.resolve(runtimeStack.artifacts.close?.()).catch(() => undefined);
+      await runtimeStack.networkProxy.close().catch(() => undefined);
+      await runtimeStack.database.close().catch(() => undefined);
+    }
+    throw error;
+  }
+  let closed = false;
   return {
-    close() {
-      server.close();
-      manager.dispose();
-      void runtimeStack.networkProxy.close().then(() => runtimeStack.database.close());
+    async close() {
+      if (closed) return;
+      closed = true;
+      try {
+        server.close();
+      } finally {
+        try {
+          manager.dispose();
+        } finally {
+          await Promise.resolve(runtimeStack.artifacts.close?.()).catch(() => undefined);
+          await runtimeStack.networkProxy.close().catch(() => undefined);
+          await runtimeStack.database.close().catch(() => undefined);
+        }
+      }
     },
   };
 }
@@ -1112,12 +1470,14 @@ export async function runMcpCatalogCommand(
   const serverName = entry.server.name;
   await mutateMcpSettings(file, serverName, command === "add" ? entry.server : undefined);
   output.write(
-    command === "add"
-      ? t(
-          `Installed ${entry.name} in ${file}. It will connect on the next AniCode start.${entry.requiresEnv?.length ? ` Set ${entry.requiresEnv.join(" or ")} first.` : ""}\n`,
-          `已将 ${entry.name} 安装到 ${file}，下次启动 AniCode 时连接。${entry.requiresEnv?.length ? ` 请先设置 ${entry.requiresEnv.join(" 或 ")}。` : ""}\n`,
-        )
-      : t(`Removed ${entry.name} from ${file}.\n`, `已从 ${file} 移除 ${entry.name}。\n`),
+    terminalSafe(
+      command === "add"
+        ? t(
+            `Installed ${entry.name} in ${file}. It will connect on the next AniCode start.${entry.requiresEnv?.length ? ` Set ${entry.requiresEnv.join(" or ")} first.` : ""}\n`,
+            `已将 ${entry.name} 安装到 ${file}，下次启动 AniCode 时连接。${entry.requiresEnv?.length ? ` 请先设置 ${entry.requiresEnv.join(" 或 ")}。` : ""}\n`,
+          )
+        : t(`Removed ${entry.name} from ${file}.\n`, `已从 ${file} 移除 ${entry.name}。\n`),
+    ),
   );
 }
 
@@ -1284,9 +1644,9 @@ export function parseExecArgs(argv: string[]): ExecCommandOptions {
 export function execHelpText(): string {
   return t(
     `Usage: anicode exec [TUI options] [--jsonl|--text] [--timeout MS] (--prompt TEXT | -- TEXT)\n\n` +
-      `Runs one prompt without a TUI. JSONL is the default. Permissions are denied unless the selected runtime policy already allows them; use --auto only in a suitably isolated workspace.\n`,
+      `Runs one prompt without a TUI. JSONL is the default. Permissions are denied unless the selected runtime policy already allows them; use --auto only in a trusted, suitably isolated workspace. It never bypasses Workspace Trust.\n`,
     `用法: anicode exec [TUI 选项] [--jsonl|--text] [--timeout 毫秒] (--prompt 文本 | -- 文本)\n\n` +
-      `无 TUI 执行一条提示词，默认输出 JSONL。未被运行时策略放行的权限会被拒绝；仅应在妥善隔离的工作区使用 --auto。\n`,
+      `无 TUI 执行一条提示词，默认输出 JSONL。未被运行时策略放行的权限会被拒绝；仅应在已信任且妥善隔离的工作区使用 --auto，它不会绕过 Workspace Trust。\n`,
   );
 }
 
@@ -1331,7 +1691,6 @@ export async function runExecCommand(
     output.write(`${CLI_VERSION}\n`);
     return;
   }
-  await loadProjectEnv({ cwd: args.cwd });
   if (args.listProviders) {
     output.write(
       `${listProviderDetails()
@@ -1340,6 +1699,9 @@ export async function runExecCommand(
     );
     return;
   }
+  const workspaceTrustStore = new WorkspaceTrustStore();
+  const initialWorkspaceTrust = await workspaceTrustStore.assess(args.cwd);
+  await loadProjectEnv({ cwd: args.cwd, workspaceTrust: initialWorkspaceTrust });
   if (args.listModels) {
     output.write(
       `${listModelCatalog()
@@ -1373,14 +1735,33 @@ export async function runExecCommand(
   };
   const warn = (message: string): void => {
     if (parsed.jsonl) emit("warning", { message });
-    else errorOutput.write(`${message}\n`);
+    else errorOutput.write(`${terminalSafe(message)}\n`);
   };
 
-  const { config, warnings } = await loadConfig({
+  const {
+    config,
+    warnings,
+    workspaceTrust: loadedWorkspaceTrust,
+  } = await loadConfig({
     cwd: args.cwd,
     ...(args.profile ? { profile: args.profile } : {}),
+    workspaceTrust: initialWorkspaceTrust,
   });
   for (const warning of warnings) warn(warning);
+  const workspaceTrust = loadedWorkspaceTrust ?? initialWorkspaceTrust;
+  if (!args.daemon && !args.http && !workspaceTrust.trusted) {
+    warn(
+      workspaceTrust.reason === "inspection-failed"
+        ? t(
+            `Workspace inspection failed; AniCode is restricted to read/glob/grep in plan mode, and project-provided capabilities are disabled. This headless run remains fail-closed. Resolve the inspection error, then review Workspace Trust for ${args.cwd}.`,
+            `工作区检查失败；AniCode 已严格限制为 plan 模式下的 read/glob/grep，并禁用项目提供的能力。本次无头运行继续 fail closed。请先修复检查错误，再审查 ${args.cwd} 的 Workspace Trust。`,
+          )
+        : t(
+            `Workspace is restricted (${workspaceTrust.reason}); project environment/execution configuration, MCP, hooks, skills, network extensions, and the PatchSet workflow are disabled. Interactive default mode can approve built-in development tools one action at a time, but this headless run fails closed for permission requests; --auto/--accept-edits cannot bypass the untrusted-workspace boundary. Run anicode trust grant --cwd ${args.cwd} in an interactive terminal to review project-provided capabilities.`,
+            `工作区处于受限模式（${workspaceTrust.reason}）；项目环境/执行配置、MCP、hooks、skills、联网扩展及 PatchSet 工作流已禁用。交互式 default 模式可对内置开发工具逐项授权，但本次无头运行会拒绝权限请求；--auto/--accept-edits 不能绕过未信任工作区边界。请在交互式终端运行 anicode trust grant --cwd ${args.cwd} 以审查项目提供的能力。`,
+          ),
+    );
+  }
   if (!args.modelExplicit && !args.demo) args.model = config.model ?? resolveDefaultModel();
   if (!args.daemon && !args.http && !args.resume) assertProviderConfigured(args.model);
 
@@ -1392,9 +1773,10 @@ export async function runExecCommand(
   let mcpClients: McpClient[] = [];
   let lspPool: LspPool | undefined;
   let host: SessionHost | undefined;
+  let debugLogger: DebugLogger | undefined;
   try {
     let mcpTools: Tool[] = [];
-    if (runtimeStack) {
+    if (runtimeStack && workspaceTrust.trusted) {
       const mcpConfigs = toMcpServerConfigs(config);
       if (mcpConfigs.length > 0) {
         try {
@@ -1411,7 +1793,8 @@ export async function runExecCommand(
         }
       }
     }
-    const lspServers = args.daemon ? [] : toLspServers(config);
+    const lspServers =
+      args.daemon || args.http || !workspaceTrust.trusted ? [] : toLspServers(config);
     lspPool =
       lspServers.length > 0
         ? new LspPool(args.cwd, lspServers, runtimeStack?.isolatedRuntime)
@@ -1421,17 +1804,34 @@ export async function runExecCommand(
       ...(deferMcp ? [] : mcpTools),
       ...(lspPool ? [createDiagnosticsTool(lspPool)] : []),
     ];
-    const plugins = args.daemon ? undefined : await discoverPlugins(args.cwd);
+    const deferredTools: Tool[] = deferMcp ? [...mcpTools] : [];
+    const plugins =
+      args.daemon || args.http
+        ? undefined
+        : await discoverPlugins(args.cwd, undefined, {
+            includeProject: workspaceTrust.trusted,
+          });
     host = await buildHost(args, {
       config,
       extraTools,
-      deferredTools: deferMcp ? mcpTools : [],
+      deferredTools,
       ...(plugins ? { plugins } : {}),
       ...(runtimeStack ? { runtimeStack } : {}),
       telemetry,
+      workspaceTrust: workspaceTrustStore,
+      onWorkspaceTrustChange: async ({ current }) => {
+        if (current.trusted) return;
+        for (const client of mcpClients.splice(0)) client.close();
+        mcpTools.length = 0;
+        extraTools.length = 0;
+        deferredTools.length = 0;
+        lspPool?.closeAll();
+        lspPool = undefined;
+      },
     });
     if (args.debugLog) {
       const logger = new DebugLogger(args.debugLog, args.traceContent);
+      debugLogger = logger;
       logger.log("cli.exec.start", { model: args.model, cwd: args.cwd });
       host = withDebugLogging(host, logger);
     }
@@ -1443,7 +1843,7 @@ export async function runExecCommand(
     const handle = await host.open(sessionId, (event) => {
       if (parsed.jsonl) emit("session.event", { sessionId, event });
       else if (event.type === "agent" && event.event.type === "text") {
-        output.write(event.event.text);
+        output.write(terminalSafe(event.event.text));
         wroteText = true;
       }
       if (event.type === "permission_request") {
@@ -1489,8 +1889,17 @@ export async function runExecCommand(
     finalHandle.close();
     if (!parsed.jsonl && wroteText) output.write("\n");
   } finally {
-    host?.dispose();
-    lspPool?.closeAll();
+    try {
+      host?.dispose();
+    } catch {
+      // Continue releasing independent resources.
+    }
+    await debugLogger?.close().catch(() => undefined);
+    try {
+      lspPool?.closeAll();
+    } catch {
+      // Continue releasing independent resources.
+    }
     for (const client of mcpClients) {
       try {
         client.close();
@@ -1505,12 +1914,15 @@ export async function runExecCommand(
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   // auth/serve 子命令在 parseArgs 之前拦截（不进会话流程）。
+  if (argv[0] === "trust") {
+    await runTrustCommand(argv.slice(1));
+    return;
+  }
   if (argv[0] === "auth") {
     await runAuthCommand(argv.slice(1));
     return;
   }
   if (argv[0] === "mcp") {
-    await loadProjectEnv({ cwd: process.cwd() });
     const subcommand = argv[1];
     if (subcommand === "list" || subcommand === "add" || subcommand === "remove") {
       await runMcpCatalogCommand(argv.slice(1));
@@ -1523,11 +1935,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       process.once("SIGINT", resolve);
       process.once("SIGTERM", resolve);
     });
-    server.close();
+    await server.close();
     return;
   }
   if (argv[0] === "serve") {
-    await loadProjectEnv({ cwd: process.cwd() });
     const server = await runServeCommand(argv.slice(1));
     // 前台常驻直到 SIGINT/SIGTERM。
     await new Promise<void>((resolve) => {
@@ -1553,36 +1964,39 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(CLI_VERSION);
     return;
   }
-  await loadProjectEnv({ cwd: args.cwd });
   if (args.listProviders) {
     console.log(
-      listProviderDetails()
-        .map((provider) => {
-          const where = provider.local ? "local" : "cloud";
-          const key = provider.requiresApiKey
-            ? `key: ${provider.apiKeyEnv.join(" | ")}`
-            : "key: not required";
-          return `${provider.id}\t${provider.protocol}\t${where}\t${key}`;
-        })
-        .join("\n"),
+      terminalSafe(
+        listProviderDetails()
+          .map((provider) => {
+            const where = provider.local ? "local" : "cloud";
+            const key = provider.requiresApiKey
+              ? `key: ${provider.apiKeyEnv.join(" | ")}`
+              : "key: not required";
+            return `${provider.id}\t${provider.protocol}\t${where}\t${key}`;
+          })
+          .join("\n"),
+      ),
     );
     return;
   }
   if (args.listModels) {
     console.log(
-      listModelCatalog()
-        .map((m) => {
-          const tags = [
-            m.free ? "free" : null,
-            m.openWeight ? "open" : null,
-            m.local ? "local" : null,
-            m.recommended ? "recommended" : null,
-          ]
-            .filter(Boolean)
-            .join(",");
-          return `${m.spec}\t${tags || "-"}\t${m.note ?? m.label ?? ""}`;
-        })
-        .join("\n"),
+      terminalSafe(
+        listModelCatalog()
+          .map((m) => {
+            const tags = [
+              m.free ? "free" : null,
+              m.openWeight ? "open" : null,
+              m.local ? "local" : null,
+              m.recommended ? "recommended" : null,
+            ]
+              .filter(Boolean)
+              .join(",");
+            return `${m.spec}\t${tags || "-"}\t${m.note ?? m.label ?? ""}`;
+          })
+          .join("\n"),
+      ),
     );
     return;
   }
@@ -1596,13 +2010,40 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     );
   }
 
+  const workspaceTrustStore = new WorkspaceTrustStore();
+  const initialWorkspaceTrust = await workspaceTrustStore.assess(args.cwd);
+  await loadProjectEnv({ cwd: args.cwd, workspaceTrust: initialWorkspaceTrust });
+
   // 读取 anicode.json（全局+项目合并）；非法配置只提示不致命。
-  const { config, warnings: configWarnings } = await loadConfig({
+  const {
+    config,
+    warnings: configWarnings,
+    workspaceTrust: loadedWorkspaceTrust,
+  } = await loadConfig({
     cwd: args.cwd,
     ...(args.profile ? { profile: args.profile } : {}),
+    workspaceTrust: initialWorkspaceTrust,
   });
+  const workspaceTrust = loadedWorkspaceTrust ?? initialWorkspaceTrust;
   for (const w of configWarnings)
-    console.error(t(`${DISPLAY_NAME} config warning: ${w}`, `${DISPLAY_NAME} 配置告警: ${w}`));
+    console.error(
+      terminalSafe(t(`${DISPLAY_NAME} config warning: ${w}`, `${DISPLAY_NAME} 配置告警: ${w}`)),
+    );
+  if (!args.daemon && !args.http && !workspaceTrust.trusted) {
+    console.error(
+      terminalSafe(
+        workspaceTrust.reason === "inspection-failed"
+          ? t(
+              `${DISPLAY_NAME}: workspace inspection failed; only read/glob/grep are available in plan mode, and project-provided capabilities are disabled. Resolve the inspection error before reviewing Workspace Trust for ${args.cwd}.`,
+              `${DISPLAY_NAME}: 工作区检查失败；当前仅可在 plan 模式使用 read/glob/grep，项目提供的能力均已禁用。请先修复检查错误，再审查 ${args.cwd} 的 Workspace Trust。`,
+            )
+          : t(
+              `${DISPLAY_NAME}: restricted workspace (${workspaceTrust.reason}); project environment/execution configuration, MCP, hooks, skills, network extensions, and the PatchSet workflow are disabled. With the normal interactive default mode, built-in read/glob/grep/write/edit/apply_patch/bash, shell-lifecycle, and todo_write tools remain available and every write or command requires an explicit decision; --auto/--accept-edits cannot bypass this boundary. Run anicode trust grant --cwd ${args.cwd} to review project-provided capabilities.`,
+              `${DISPLAY_NAME}: 工作区处于受限模式（${workspaceTrust.reason}）；项目环境/执行配置、MCP、hooks、skills、联网扩展及 PatchSet 工作流已禁用。普通交互式 default 模式仍提供内置 read/glob/grep/write/edit/apply_patch/bash、shell 生命周期与 todo_write 工具，每次写入或命令都需要明确授权；--auto/--accept-edits 不能绕过此边界。请运行 anicode trust grant --cwd ${args.cwd} 以审查项目提供的能力。`,
+            ),
+      ),
+    );
+  }
 
   // 安全栈必须先于 provider/MCP 创建：环境密钥此时迁入 Broker 并从进程环境删除，
   // provider、HTTP MCP 与后续工具共用同一个策略出口和 trace exporter。
@@ -1610,159 +2051,176 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     !args.daemon && !args.http
       ? await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir))
       : undefined;
-  const telemetry = localRuntimeStack
-    ? telemetryForLocalStack(localRuntimeStack)
-    : telemetryFromEnv();
-
-  // 未显式指定模型时挑默认：配置 model → 已配置凭证的 DeepSeek → 零网络 debug/demo。
-  // 绝不因缺 DEEPSEEK_API_KEY 报错退出。
-  if (!args.modelExplicit && !args.demo) {
-    args.model = config.model ?? resolveDefaultModel();
-  }
-
-  // 校验 provider（本地模式下尽早报错）。仅当用户显式选了缺 key 的模型才会抛错。
-  if (!args.daemon && !args.resume) {
-    try {
-      // 这里只做无副作用诊断；真正创建 provider 由 createSession 唯一执行。
-      assertProviderConfigured(args.model);
-    } catch (err) {
-      throw new Error(
-        t(
-          `Invalid model configuration: ${String((err as Error).message)}`,
-          `模型配置无效: ${String((err as Error).message)}`,
-        ),
-        { cause: err },
-      );
-    }
-  }
-
-  // 连接配置里的 MCP 服务器（本地进程内模式才需要；daemon 由其自身进程负责）。
   let mcpClients: McpClient[] = [];
-  let mcpTools: Tool[] = [];
-  if (!args.daemon && !args.http) {
-    const mcpConfigs = toMcpServerConfigs(config);
-    if (mcpConfigs.length > 0) {
-      try {
-        const connected = await connectMcpServers(mcpConfigs, {
-          telemetry,
-          networkProxy: localRuntimeStack!.networkProxy,
-          credentialBroker: localRuntimeStack!.broker,
-          executionRuntime: localRuntimeStack!.isolatedRuntime,
-        });
-        mcpTools = connected.tools;
-        mcpClients = connected.clients;
-        console.error(
-          t(
-            `${DISPLAY_NAME}: connected ${mcpClients.length} MCP servers, ${mcpTools.length} tools`,
-            `${DISPLAY_NAME}: 已连接 ${mcpClients.length} 个 MCP 服务器，${mcpTools.length} 个工具`,
-          ),
-        );
-      } catch (err) {
-        console.error(
-          t(
-            `${DISPLAY_NAME}: MCP connection failed (skipped): ${(err as Error).message}`,
-            `${DISPLAY_NAME}: MCP 连接失败（已跳过）: ${(err as Error).message}`,
-          ),
-        );
-      }
-    }
-  }
-  // 配置了 LSP 服务器则建池，并暴露 diagnostics 工具（惰性按扩展名启动服务器）。
-  const lspServers = args.daemon ? [] : toLspServers(config);
-  const lspPool =
-    lspServers.length > 0
-      ? new LspPool(args.cwd, lspServers, localRuntimeStack?.isolatedRuntime)
-      : undefined;
-  // MCP 工具超过阈值时转 deferred（延迟暴露）：schema 不占每次请求，
-  // 模型经 tool_search 按需检索激活——对齐 Codex 的 MCP tool search 默认行为。
-  const DEFER_MCP_THRESHOLD = 8;
-  const deferMcp = mcpTools.length > DEFER_MCP_THRESHOLD;
-  const extraTools: Tool[] = [
-    ...(deferMcp ? [] : mcpTools),
-    ...(lspPool ? [createDiagnosticsTool(lspPool)] : []),
-  ];
-  const deferredTools: Tool[] = deferMcp ? mcpTools : [];
-
-  // 插件目录（~/.anicode/plugins + <cwd>/.anicode/plugins）：agents/skills/commands
-  // 子目录并入既有发现器（对齐 Claude Code plugins 的「目录捆绑扩展」形态）。
-  const plugins = args.daemon ? undefined : await discoverPlugins(args.cwd);
-
-  // 自定义斜杠命令（.anicode/command/*.md，全局+插件+项目）。
-  const commands: CustomCommand[] = args.daemon
-    ? []
-    : await loadCommands({
-        cwd: args.cwd,
-        ...(plugins?.commands.length ? { extraDirs: plugins.commands } : {}),
-      });
-
-  // MCP prompts → 斜杠命令 /mcp__<server>__<prompt>（对齐 Claude Code）。
-  // 定位参数按 prompt 声明的 arguments 顺序映射；渲染经 prompts/get 实时取。
-  for (const client of mcpClients) {
-    if (!client.capabilities.prompts) continue;
-    try {
-      for (const p of await client.listPrompts()) {
-        const promptDef = p;
-        commands.push({
-          name: `mcp__${client.name}__${p.name}`,
-          description:
-            p.description ??
-            t(`MCP prompt from ${client.name}`, `来自 ${client.name} 的 MCP 提示模板`),
-          template: "",
-          source: `mcp:${client.name}`,
-          resolve: async (argText: string) => {
-            const parts = argText.trim() ? argText.trim().split(/\s+/) : [];
-            const argMap: Record<string, string> = {};
-            (promptDef.arguments ?? []).forEach((a, i) => {
-              if (parts[i] !== undefined) argMap[a.name] = parts[i]!;
-            });
-            return client.getPrompt(
-              promptDef.name,
-              Object.keys(argMap).length > 0 ? argMap : undefined,
-            );
-          },
-        });
-      }
-    } catch (err) {
-      console.error(
-        t(
-          `${DISPLAY_NAME}: failed to list prompts from MCP server ${client.name}: ${(err as Error).message}`,
-          `${DISPLAY_NAME}: 拉取 MCP 服务器 ${client.name} 的 prompts 失败: ${(err as Error).message}`,
-        ),
-      );
-    }
-  }
-
-  // /mcp 状态概览：server 能力、资源、prompts（延迟查询，命令触发时才拉）。
-  const mcpStatus =
-    mcpClients.length === 0
-      ? undefined
-      : async (): Promise<string> => {
-          const lines: string[] = [];
-          for (const client of mcpClients) {
-            const caps = client.capabilities;
-            const flag = (v: boolean) => (v ? "✓" : "—");
-            lines.push(
-              `▸ ${client.name}  tools:${flag(caps.tools)} resources:${flag(caps.resources)} prompts:${flag(caps.prompts)}`,
-            );
-            try {
-              for (const r of (await client.listResources()).slice(0, 20)) {
-                lines.push(`    ${t("resource", "资源")} ${r.uri}${r.name ? `（${r.name}）` : ""}`);
-              }
-              for (const p of await client.listPrompts()) {
-                lines.push(
-                  `    ${t("prompt", "提示")} /mcp__${client.name}__${p.name}${p.description ? ` — ${p.description}` : ""}`,
-                );
-              }
-            } catch (err) {
-              lines.push(`    ${t("query failed", "查询失败")}: ${(err as Error).message}`);
-            }
-          }
-          return lines.join("\n");
-        };
-
+  let lspPool: LspPool | undefined;
   let host: SessionHost | undefined;
   let debugLogger: DebugLogger | undefined;
   try {
+    const telemetry = localRuntimeStack
+      ? telemetryForLocalStack(localRuntimeStack)
+      : telemetryFromEnv();
+
+    // 未显式指定模型时挑默认：配置 model → 已配置凭证的 DeepSeek → 零网络 debug/demo。
+    // 绝不因缺 DEEPSEEK_API_KEY 报错退出。
+    if (!args.modelExplicit && !args.demo) {
+      args.model = config.model ?? resolveDefaultModel();
+    }
+
+    // 校验 provider（本地模式下尽早报错）。仅当用户显式选了缺 key 的模型才会抛错。
+    if (!args.daemon && !args.http && !args.resume) {
+      try {
+        // 这里只做无副作用诊断；真正创建 provider 由 createSession 唯一执行。
+        assertProviderConfigured(args.model);
+      } catch (err) {
+        throw new Error(
+          t(
+            `Invalid model configuration: ${String((err as Error).message)}`,
+            `模型配置无效: ${String((err as Error).message)}`,
+          ),
+          { cause: err },
+        );
+      }
+    }
+
+    // 连接配置里的 MCP 服务器（本地进程内模式才需要；daemon 由其自身进程负责）。
+    let mcpTools: Tool[] = [];
+    if (!args.daemon && !args.http && workspaceTrust.trusted) {
+      const mcpConfigs = toMcpServerConfigs(config);
+      if (mcpConfigs.length > 0) {
+        try {
+          const connected = await connectMcpServers(mcpConfigs, {
+            telemetry,
+            networkProxy: localRuntimeStack!.networkProxy,
+            credentialBroker: localRuntimeStack!.broker,
+            executionRuntime: localRuntimeStack!.isolatedRuntime,
+          });
+          mcpTools = connected.tools;
+          mcpClients = connected.clients;
+          console.error(
+            terminalSafe(
+              t(
+                `${DISPLAY_NAME}: connected ${mcpClients.length} MCP servers, ${mcpTools.length} tools`,
+                `${DISPLAY_NAME}: 已连接 ${mcpClients.length} 个 MCP 服务器，${mcpTools.length} 个工具`,
+              ),
+            ),
+          );
+        } catch (err) {
+          console.error(
+            terminalSafe(
+              t(
+                `${DISPLAY_NAME}: MCP connection failed (skipped): ${(err as Error).message}`,
+                `${DISPLAY_NAME}: MCP 连接失败（已跳过）: ${(err as Error).message}`,
+              ),
+            ),
+          );
+        }
+      }
+    }
+    // 配置了 LSP 服务器则建池，并暴露 diagnostics 工具（惰性按扩展名启动服务器）。
+    const lspServers =
+      args.daemon || args.http || !workspaceTrust.trusted ? [] : toLspServers(config);
+    lspPool =
+      lspServers.length > 0
+        ? new LspPool(args.cwd, lspServers, localRuntimeStack?.isolatedRuntime)
+        : undefined;
+    // MCP 工具超过阈值时转 deferred（延迟暴露）：schema 不占每次请求，
+    // 模型经 tool_search 按需检索激活——对齐 Codex 的 MCP tool search 默认行为。
+    const DEFER_MCP_THRESHOLD = 8;
+    const deferMcp = mcpTools.length > DEFER_MCP_THRESHOLD;
+    const extraTools: Tool[] = [
+      ...(deferMcp ? [] : mcpTools),
+      ...(lspPool ? [createDiagnosticsTool(lspPool)] : []),
+    ];
+    const deferredTools: Tool[] = deferMcp ? mcpTools : [];
+
+    // 插件目录（~/.anicode/plugins + <cwd>/.anicode/plugins）：agents/skills/commands
+    // 子目录并入既有发现器（对齐 Claude Code plugins 的「目录捆绑扩展」形态）。
+    const plugins =
+      args.daemon || args.http
+        ? undefined
+        : await discoverPlugins(args.cwd, undefined, {
+            includeProject: workspaceTrust.trusted,
+          });
+
+    // 自定义斜杠命令（.anicode/command/*.md，全局+插件+项目）。
+    const commands: CustomCommand[] =
+      args.daemon || args.http
+        ? []
+        : await loadCommands({
+            cwd: args.cwd,
+            ...(plugins?.commands.length ? { extraDirs: plugins.commands } : {}),
+            includeProject: workspaceTrust.trusted,
+          });
+
+    // MCP prompts → 斜杠命令 /mcp__<server>__<prompt>（对齐 Claude Code）。
+    // 定位参数按 prompt 声明的 arguments 顺序映射；渲染经 prompts/get 实时取。
+    for (const client of mcpClients) {
+      if (!client.capabilities.prompts) continue;
+      try {
+        for (const p of await client.listPrompts()) {
+          const promptDef = p;
+          commands.push({
+            name: `mcp__${client.name}__${p.name}`,
+            description:
+              p.description ??
+              t(`MCP prompt from ${client.name}`, `来自 ${client.name} 的 MCP 提示模板`),
+            template: "",
+            source: `mcp:${client.name}`,
+            resolve: async (argText: string) => {
+              const parts = argText.trim() ? argText.trim().split(/\s+/) : [];
+              const argMap: Record<string, string> = {};
+              (promptDef.arguments ?? []).forEach((a, i) => {
+                if (parts[i] !== undefined) argMap[a.name] = parts[i]!;
+              });
+              return client.getPrompt(
+                promptDef.name,
+                Object.keys(argMap).length > 0 ? argMap : undefined,
+              );
+            },
+          });
+        }
+      } catch (err) {
+        console.error(
+          terminalSafe(
+            t(
+              `${DISPLAY_NAME}: failed to list prompts from MCP server ${client.name}: ${(err as Error).message}`,
+              `${DISPLAY_NAME}: 拉取 MCP 服务器 ${client.name} 的 prompts 失败: ${(err as Error).message}`,
+            ),
+          ),
+        );
+      }
+    }
+
+    // /mcp 状态概览：server 能力、资源、prompts（延迟查询，命令触发时才拉）。
+    const mcpStatus =
+      mcpClients.length === 0
+        ? undefined
+        : async (): Promise<string> => {
+            const lines: string[] = [];
+            for (const client of mcpClients) {
+              const caps = client.capabilities;
+              const flag = (v: boolean) => (v ? "✓" : "—");
+              lines.push(
+                `▸ ${client.name}  tools:${flag(caps.tools)} resources:${flag(caps.resources)} prompts:${flag(caps.prompts)}`,
+              );
+              try {
+                for (const r of (await client.listResources()).slice(0, 20)) {
+                  lines.push(
+                    `    ${t("resource", "资源")} ${r.uri}${r.name ? `（${r.name}）` : ""}`,
+                  );
+                }
+                for (const p of await client.listPrompts()) {
+                  lines.push(
+                    `    ${t("prompt", "提示")} /mcp__${client.name}__${p.name}${p.description ? ` — ${p.description}` : ""}`,
+                  );
+                }
+              } catch (err) {
+                lines.push(`    ${t("query failed", "查询失败")}: ${(err as Error).message}`);
+              }
+            }
+            return lines.join("\n");
+          };
+
     const baseHost = await buildHost(args, {
       config,
       extraTools,
@@ -1770,6 +2228,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ...(plugins ? { plugins } : {}),
       ...(localRuntimeStack ? { runtimeStack: localRuntimeStack } : {}),
       telemetry,
+      workspaceTrust: workspaceTrustStore,
+      onWorkspaceTrustChange: async ({ current }) => {
+        if (current.trusted) return;
+        for (const client of mcpClients.splice(0)) client.close();
+        mcpTools.length = 0;
+        extraTools.length = 0;
+        deferredTools.length = 0;
+        lspPool?.closeAll();
+        lspPool = undefined;
+      },
     }).catch((err) => {
       throw new Error(
         t(
@@ -1790,12 +2258,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       });
       host = withDebugLogging(baseHost, logger);
       console.error(
-        t(`${DISPLAY_NAME} debug log: ${logger.file}`, `${DISPLAY_NAME} 调试日志: ${logger.file}`),
+        terminalSafe(
+          t(
+            `${DISPLAY_NAME} debug log: ${logger.file}`,
+            `${DISPLAY_NAME} 调试日志: ${logger.file}`,
+          ),
+        ),
       );
     }
     // 选定会话：--resume 用已有 ID，否则新建。订阅只由 App 负责。
     const sessionId = await selectSessionId(host, args);
-    const screenReader = process.env.INK_SCREEN_READER === "true";
+    const screenReader = /^(?:1|true|yes|on)$/i.test(process.env.INK_SCREEN_READER?.trim() ?? "");
     const alternateScreen = !args.noAltScreen && !screenReader;
     const mouse = args.mouse && !screenReader;
     const experimentalOverlay = process.env.ANICODE_EXPERIMENTAL_TUI_OVERLAY === "1";
@@ -1814,12 +2287,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let instance: ReturnType<typeof render> | undefined;
     let stopRawModeWatchdog = () => {};
     const emergencyTerminalCleanup = () => {
-      stopRawModeWatchdog();
-      terminalCaret.controller.dispose();
+      try {
+        stopRawModeWatchdog();
+      } catch {}
+      try {
+        debugLogger?.flushSync();
+      } catch {}
+      try {
+        terminalCaret.controller.dispose();
+      } catch {}
       // Unmount first so Ink cannot repaint onto the primary screen after we leave
       // alternate-screen mode during a signal/exception shutdown.
-      instance?.unmount();
-      restoreTerminalScreen();
+      try {
+        instance?.unmount();
+      } catch {}
+      try {
+        restoreTerminalScreen();
+      } catch {}
     };
     const removeTerminalExitGuard = installTerminalExitGuard(emergencyTerminalCleanup);
     try {
@@ -1842,8 +2326,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             catalog={listModelCatalog()}
             commands={commands}
             {...(mcpStatus ? { mcpStatus } : {})}
-            inspectProviderCredentials={!args.daemon}
+            inspectProviderCredentials={!args.daemon && !args.http}
             version={CLI_VERSION}
+            workspaceTrusted={!args.daemon && !args.http && workspaceTrust.trusted}
+            requireWorkspaceTrust
+            canInspectWorkspace={!args.daemon && !args.http}
             mouse={mouse}
             experimentalOverlay={experimentalOverlay}
             terminalCaret={terminalCaret.controller}
@@ -1862,6 +2349,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           alternateScreen,
           incrementalRendering: !screenReader,
           isScreenReaderEnabled: screenReader,
+          // Ink otherwise disables input whenever CI=1, even for a real PTY.
+          interactive: process.stdin.isTTY === true,
           maxFps: 30,
         },
       );
@@ -1873,12 +2362,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
     } finally {
       removeTerminalExitGuard();
-      terminalCaret.controller.dispose();
-      restoreTerminalScreen();
+      try {
+        terminalCaret.controller.dispose();
+      } finally {
+        restoreTerminalScreen();
+      }
     }
   } finally {
-    host?.dispose();
-    lspPool?.closeAll();
+    try {
+      host?.dispose();
+    } catch {
+      // Continue releasing independent resources.
+    }
+    await debugLogger?.close().catch(() => undefined);
+    try {
+      lspPool?.closeAll();
+    } catch {
+      // Continue releasing independent resources.
+    }
     for (const c of mcpClients) {
       try {
         c.close();
@@ -1905,7 +2406,7 @@ if (
   canonicalPath(fileURLToPath(import.meta.url)) === canonicalPath(path.resolve(invokedPath))
 ) {
   main().catch((err) => {
-    console.error(String(err instanceof Error ? err.message : err));
+    console.error(terminalSafe(err instanceof Error ? err.message : err));
     process.exitCode = 1;
   });
 }

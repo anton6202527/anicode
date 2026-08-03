@@ -24,7 +24,7 @@ export interface IsolatedRunRequest {
   credentialLeases?: string[];
   traceContext?: SpanContext;
   /** 可信控制面元数据；用于 runtime ownership label，不注入命令环境。 */
-  workload?: { tenantId?: string; actor?: string; executionId?: string };
+  workload?: { tenantId?: string; actor?: string; executionId?: string; fencingToken?: number };
 }
 
 export interface IsolatedRunResult {

@@ -15,6 +15,7 @@ import type {
 } from "../session-manager.js";
 import type { SessionHost, OpenHandle, PermissionDecisionKind } from "../host.js";
 import type { PermissionMode, PermissionProfile } from "../permission.js";
+import { sanitizeDiscoveredModels, sanitizeProviderId } from "../provider/registry.js";
 import {
   decodeLines,
   encodeFrame,
@@ -23,6 +24,11 @@ import {
   type ClientRequest,
   type ServerFrame,
 } from "./protocol.js";
+import {
+  defaultDaemonAuthTokenPath,
+  readDaemonAuthToken,
+  validateDaemonAuthToken,
+} from "./auth-token.js";
 
 interface ClientSubscription {
   listener: (ev: SessionEvent) => void;
@@ -39,6 +45,10 @@ export interface DaemonClientOptions {
   connectTimeoutMs?: number;
   /** Time allowed for one daemon request. Default: 30 minutes. */
   requestTimeoutMs?: number;
+  /** Explicit bearer credential. Omit to load the private token file adjacent to the socket. */
+  authToken?: string;
+  /** Override automatic adjacent token-file discovery. */
+  tokenFile?: string;
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
@@ -64,10 +74,12 @@ export class DaemonClient implements SessionHost {
   private subscriptionOps = new Map<string, Promise<void>>();
   private terminalError: Error | undefined;
   private requestTimeoutMs: number;
+  private readonly authToken: string | undefined;
 
-  private constructor(sock: net.Socket, requestTimeoutMs: number) {
+  private constructor(sock: net.Socket, requestTimeoutMs: number, authToken?: string) {
     this.sock = sock;
     this.requestTimeoutMs = requestTimeoutMs;
+    this.authToken = authToken;
     // 使用 socket 内建 StringDecoder，避免中文等 UTF-8 字符跨网络 chunk 时损坏。
     sock.setEncoding("utf8");
     sock.on("data", (chunk) => this.onData(chunk as unknown as string));
@@ -77,7 +89,28 @@ export class DaemonClient implements SessionHost {
     });
   }
 
-  static connect(socketPath: string, options: DaemonClientOptions = {}): Promise<DaemonClient> {
+  static async connect(
+    socketPath: string,
+    options: DaemonClientOptions = {},
+  ): Promise<DaemonClient> {
+    if (options.authToken !== undefined && options.tokenFile !== undefined) {
+      throw new Error("DaemonClient accepts authToken or tokenFile, not both");
+    }
+    let authToken: string | undefined;
+    if (options.authToken !== undefined) {
+      authToken = validateDaemonAuthToken(options.authToken);
+    } else {
+      const tokenFile = options.tokenFile ?? defaultDaemonAuthTokenPath(socketPath);
+      try {
+        authToken = await readDaemonAuthToken(tokenFile);
+      } catch (error) {
+        // Embedded/test servers may deliberately run without authentication. An explicit token
+        // path is never optional; only automatic discovery tolerates an absent adjacent file.
+        if (options.tokenFile !== undefined || (error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+    }
     const connectTimeoutMs = positiveTimeout(
       options.connectTimeoutMs,
       DEFAULT_CONNECT_TIMEOUT_MS,
@@ -107,7 +140,7 @@ export class DaemonClient implements SessionHost {
         if (settled) return;
         settled = true;
         cleanup();
-        resolve(new DaemonClient(sock, requestTimeoutMs));
+        resolve(new DaemonClient(sock, requestTimeoutMs, authToken));
       };
       const timeout = setTimeout(() => {
         onError(
@@ -266,7 +299,10 @@ export class DaemonClient implements SessionHost {
       }, this.requestTimeoutMs);
       timeout.unref();
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timeout });
-      this.sock.write(encodeFrame(build(id)));
+      const request = build(id);
+      this.sock.write(
+        encodeFrame(this.authToken ? { ...request, authToken: this.authToken } : request),
+      );
     });
   }
 
@@ -285,6 +321,17 @@ export class DaemonClient implements SessionHost {
   }
 
   // ---------- SessionHost ----------
+
+  async discoverModels(providerId: string): Promise<string[] | undefined> {
+    const safeProviderId = sanitizeProviderId(providerId);
+    if (!safeProviderId) throw new TypeError("Invalid provider id");
+    const result = await this.request((id) => ({
+      id,
+      method: "discoverModels",
+      providerId: safeProviderId,
+    }));
+    return sanitizeDiscoveredModels(result);
+  }
 
   listSessions(): Promise<SessionSummary[]> {
     return this.request((id) => ({ id, method: "listSessions" }));

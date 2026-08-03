@@ -13,9 +13,17 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager, type SessionEvent } from "./session-manager.js";
-import { SessionStore } from "./session.js";
+import { MigratingSessionStore, SessionStore } from "./session.js";
+import { MemoryArtifactStore, type ArtifactStore } from "./runtime/artifacts.js";
+import { DurableRuntime, MemoryRuntimeEventStore } from "./runtime/durable.js";
+import type { IsolatedRunRequest } from "./runtime/isolated-runtime.js";
 import { PatchSetService } from "./runtime/patchset.js";
-import type { Provider, StreamEvent, ChatMessage } from "./types.js";
+import type { Provider, StreamEvent, ChatMessage, StreamRequest } from "./types.js";
+import { workspaceExecutionFingerprint } from "./workspace-trust.js";
+import {
+  RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES,
+  RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES,
+} from "./tools/index.js";
 
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
@@ -43,6 +51,25 @@ async function mgr(dir: string, provider: Provider) {
     now: () => 1_700_000_000_000,
     rand: () => 0.5,
   });
+}
+
+function deferred(): {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: () => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function sessionWorkspaceIdentity(cwd: string): Promise<{ device: string; inode: string }> {
+  const stat = await fs.lstat(await fs.realpath(cwd), { bigint: true });
+  return { device: String(stat.dev), inode: String(stat.ino) };
 }
 
 test("SessionManager: 多订阅者都收到同一批事件", async () => {
@@ -78,12 +105,1083 @@ test("SessionManager: 多订阅者都收到同一批事件", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("SessionManager: workspace scope 以 canonical cwd 隔离 list/create/load/fork", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-scope-"));
+  const workspaceA = path.join(dir, "workspace-a");
+  const workspaceB = path.join(dir, "workspace-b");
+  const aliasA = path.join(dir, "workspace-a-alias");
+  await fs.mkdir(workspaceA);
+  await fs.mkdir(workspaceB);
+  await fs.symlink(workspaceA, aliasA, process.platform === "win32" ? "junction" : "dir");
+  const store = new SessionStore(path.join(dir, "sessions"));
+  await store.create({
+    id: "scope-a",
+    cwd: workspaceA,
+    workspaceIdentity: await sessionWorkspaceIdentity(workspaceA),
+    model: "scripted",
+  });
+  await store.create({
+    id: "scope-b",
+    cwd: workspaceB,
+    workspaceIdentity: await sessionWorkspaceIdentity(workspaceB),
+    model: "scripted",
+  });
+  const loadedSessionIds: string[] = [];
+  const originalLoad = store.load.bind(store);
+  store.load = async (id) => {
+    loadedSessionIds.push(id);
+    return originalLoad(id);
+  };
+  let providerResolutions = 0;
+  const manager = new SessionManager({
+    store,
+    workspaceScope: aliasA,
+    resolveProvider: () => {
+      providerResolutions++;
+      return { provider: scriptedProvider([]), model: "scripted" };
+    },
+    recoverCommands: false,
+  });
+  try {
+    assert.deepEqual(
+      (await manager.listSessions()).map((session) => session.id),
+      ["scope-a"],
+      "foreign session metadata must not be disclosed",
+    );
+
+    const resumed = await manager.resumeSession("scope-a");
+    assert.equal(resumed.meta.cwd, await fs.realpath(workspaceA));
+    const resolutionsBeforeForeignLoad = providerResolutions;
+    await assert.rejects(() => manager.resumeSession("scope-b"), /配置范围|configured scope/);
+    assert.deepEqual(
+      loadedSessionIds,
+      ["scope-a"],
+      "foreign transcript body must not be loaded after metadata preflight rejects it",
+    );
+    assert.equal(
+      providerResolutions,
+      resolutionsBeforeForeignLoad,
+      "foreign load must be rejected before provider construction",
+    );
+
+    const countBeforeRejectedCreate = (await store.list()).length;
+    await assert.rejects(
+      () => manager.createSession({ cwd: workspaceB, model: "scripted" }),
+      /配置范围|configured scope/,
+    );
+    assert.equal((await store.list()).length, countBeforeRejectedCreate);
+    assert.equal(
+      providerResolutions,
+      resolutionsBeforeForeignLoad,
+      "foreign create must be rejected before provider construction",
+    );
+
+    const viaAlias = await manager.createSession({ cwd: aliasA, model: "scripted" });
+    assert.equal(viaAlias.cwd, await fs.realpath(workspaceA), "accepted aliases are canonicalized");
+    const fork = await manager.forkSession("scope-a", { title: "scoped fork" });
+    assert.equal(fork.cwd, await fs.realpath(workspaceA));
+    assert.deepEqual(
+      new Set((await manager.listSessions()).map((session) => session.id)),
+      new Set(["scope-a", viaAlias.id, fork.id]),
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: scoped listing authorizes legacy metadata before lazy transcript migration", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-lazy-migration-"));
+  const workspace = path.join(dir, "workspace");
+  const foreignWorkspace = path.join(dir, "foreign-workspace");
+  await fs.mkdir(workspace);
+  await fs.mkdir(foreignWorkspace);
+  const primary = new SessionStore(path.join(dir, "primary"));
+  const legacy = new SessionStore(path.join(dir, "legacy"));
+  const ownedMeta = await legacy.create({
+    id: "legacy-owned",
+    cwd: workspace,
+    workspaceIdentity: await sessionWorkspaceIdentity(workspace),
+    model: "scripted",
+  });
+  await legacy.append(ownedMeta.id, {
+    role: "user",
+    content: [{ type: "text", text: "owned transcript" }],
+  });
+  const foreignMeta = await legacy.create({
+    id: "legacy-foreign",
+    cwd: foreignWorkspace,
+    workspaceIdentity: await sessionWorkspaceIdentity(foreignWorkspace),
+    model: "scripted",
+  });
+  await legacy.append(foreignMeta.id, {
+    role: "user",
+    content: [{ type: "text", text: "foreign secret transcript" }],
+  });
+
+  const loadedLegacyIds: string[] = [];
+  const legacyLoad = legacy.load.bind(legacy);
+  legacy.load = async (id) => {
+    loadedLegacyIds.push(id);
+    return legacyLoad(id);
+  };
+  const migrating = new MigratingSessionStore(primary, legacy);
+  await assert.rejects(
+    () =>
+      migrating.create({
+        id: foreignMeta.id,
+        cwd: workspace,
+        workspaceIdentity: ownedMeta.workspaceIdentity!,
+        model: "scripted",
+      }),
+    /already exists/,
+  );
+  assert.deepEqual(loadedLegacyIds, [], "a create collision must not import the legacy body");
+
+  await primary.create({
+    id: "cross-owner-collision",
+    cwd: workspace,
+    workspaceIdentity: ownedMeta.workspaceIdentity!,
+    model: "scripted",
+  });
+  await legacy.create({
+    id: "cross-owner-collision",
+    cwd: foreignWorkspace,
+    workspaceIdentity: foreignMeta.workspaceIdentity!,
+    model: "scripted",
+  });
+  await migrating.delete("cross-owner-collision");
+  assert.ok(
+    (await legacy.list()).some((meta) => meta.id === "cross-owner-collision"),
+    "deleting a primary id must preserve a same-id legacy record owned by another workspace",
+  );
+  assert.deepEqual(loadedLegacyIds, [], "collision handling must stay metadata-only");
+  const manager = new SessionManager({
+    store: migrating,
+    workspaceScope: workspace,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  try {
+    assert.deepEqual(
+      (await manager.listSessions()).map((session) => session.id),
+      [ownedMeta.id],
+    );
+    assert.deepEqual(loadedLegacyIds, [], "list must inspect legacy metadata only");
+
+    await assert.rejects(() => manager.resumeSession(foreignMeta.id), /配置范围|configured scope/);
+    assert.deepEqual(
+      loadedLegacyIds,
+      [],
+      "foreign legacy transcript must be rejected before migration reads its body",
+    );
+    assert.deepEqual(await primary.list(), [], "foreign legacy record must not enter primary");
+
+    const resumed = await manager.resumeSession(ownedMeta.id);
+    assert.equal(resumed.messages.length, 1);
+    assert.deepEqual(loadedLegacyIds, [ownedMeta.id]);
+    assert.deepEqual(
+      (await primary.list()).map((session) => session.id),
+      [ownedMeta.id],
+      "only the authorized session is migrated",
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 同路径目录替换不能继承旧 scope 或旧会话", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-scope-identity-"));
+  const workspace = path.join(dir, "workspace");
+  const displaced = path.join(dir, "displaced-workspace");
+  const store = new SessionStore(path.join(dir, "sessions"));
+  await fs.mkdir(workspace);
+  const original = new SessionManager({
+    store,
+    workspaceScope: workspace,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  try {
+    const created = await original.createSession({ cwd: workspace, model: "scripted" });
+    assert.ok(created.workspaceIdentity);
+
+    await fs.rename(workspace, displaced);
+    await fs.mkdir(workspace);
+
+    await assert.rejects(() => original.listSessions(), /配置范围|configured scope/);
+    await assert.rejects(() => original.resumeSession(created.id), /配置范围|configured scope/);
+
+    const replacement = new SessionManager({
+      store,
+      workspaceScope: workspace,
+      resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+      recoverCommands: false,
+    });
+    try {
+      assert.deepEqual(await replacement.listSessions(), []);
+      await assert.rejects(
+        () => replacement.resumeSession(created.id),
+        /配置范围|configured scope/,
+      );
+      await assert.rejects(
+        () => replacement.deleteSession(created.id),
+        /配置范围|configured scope/,
+      );
+    } finally {
+      replacement.dispose();
+    }
+  } finally {
+    original.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: scoped artifact/runtime/delete APIs preflight ownership before side effects", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-scope-api-"));
+  const workspace = path.join(dir, "workspace");
+  const foreignWorkspace = path.join(dir, "foreign-workspace");
+  await fs.mkdir(workspace);
+  await fs.mkdir(foreignWorkspace);
+  const store = new SessionStore(path.join(dir, "sessions"));
+  await store.create({
+    id: "scope-owned",
+    cwd: workspace,
+    workspaceIdentity: await sessionWorkspaceIdentity(workspace),
+    model: "scripted",
+  });
+  await store.create({
+    id: "scope-foreign",
+    cwd: foreignWorkspace,
+    workspaceIdentity: await sessionWorkspaceIdentity(foreignWorkspace),
+    model: "scripted",
+  });
+
+  const backingArtifacts = new MemoryArtifactStore();
+  const ownedArtifact = await backingArtifacts.put({
+    sessionId: "scope-owned",
+    kind: "report",
+    name: "owned.txt",
+    data: "owned",
+  });
+  const foreignArtifact = await backingArtifacts.put({
+    sessionId: "scope-foreign",
+    kind: "report",
+    name: "foreign.txt",
+    data: "FOREIGN_ARTIFACT_CANARY",
+  });
+  const artifactCalls = { put: 0, list: 0, get: 0, delete: 0, deleteSession: 0 };
+  const artifacts: ArtifactStore = {
+    async put(input) {
+      artifactCalls.put++;
+      return backingArtifacts.put(input);
+    },
+    async list(sessionId) {
+      artifactCalls.list++;
+      return backingArtifacts.list(sessionId);
+    },
+    async get(sessionId, artifactId) {
+      artifactCalls.get++;
+      return backingArtifacts.get(sessionId, artifactId);
+    },
+    async delete(sessionId, artifactId) {
+      artifactCalls.delete++;
+      return backingArtifacts.delete(sessionId, artifactId);
+    },
+    async deleteSession(sessionId) {
+      artifactCalls.deleteSession++;
+      return backingArtifacts.deleteSession(sessionId);
+    },
+  };
+
+  const runtimeStore = new MemoryRuntimeEventStore();
+  await runtimeStore.append({
+    streamId: "scope-owned",
+    type: "owned.canary",
+    data: { visible: true },
+  });
+  await runtimeStore.append({
+    streamId: "scope-foreign",
+    type: "foreign.canary",
+    data: { secret: "FOREIGN_RUNTIME_CANARY" },
+  });
+  const runtime = new DurableRuntime(runtimeStore);
+  const runtimeCalls = { events: 0, recover: 0, deleteStream: 0, record: 0 };
+  const originalEvents = runtime.events.bind(runtime);
+  const originalRecover = runtime.recover.bind(runtime);
+  const originalDeleteStream = runtime.deleteStream.bind(runtime);
+  const originalRecord = runtime.record.bind(runtime);
+  runtime.events = (sessionId, afterSequence) => {
+    runtimeCalls.events++;
+    return originalEvents(sessionId, afterSequence);
+  };
+  runtime.recover = async (sessionId) => {
+    runtimeCalls.recover++;
+    return originalRecover(sessionId);
+  };
+  runtime.deleteStream = async (sessionId) => {
+    runtimeCalls.deleteStream++;
+    return originalDeleteStream(sessionId);
+  };
+  runtime.record = async (input) => {
+    runtimeCalls.record++;
+    return originalRecord(input);
+  };
+
+  let storeDeletes = 0;
+  const originalStoreDelete = store.delete.bind(store);
+  store.delete = async (sessionId) => {
+    storeDeletes++;
+    return originalStoreDelete(sessionId);
+  };
+  const manager = new SessionManager({
+    store,
+    workspaceScope: workspace,
+    artifacts,
+    runtime,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  try {
+    const foreignCalls: Array<() => Promise<unknown>> = [
+      () => manager.listArtifacts("scope-foreign"),
+      () => manager.getArtifact("scope-foreign", foreignArtifact.id),
+      () => manager.openArtifact("scope-foreign", foreignArtifact.id),
+      () => manager.deleteArtifact("scope-foreign", foreignArtifact.id),
+      () =>
+        manager.putArtifact({
+          sessionId: "scope-foreign",
+          kind: "report",
+          name: "must-not-write.txt",
+          data: "must not write",
+        }),
+      () => manager.runtimeEvents("scope-foreign"),
+      () => manager.recoverRuntime("scope-foreign"),
+      () => manager.deleteSession("scope-foreign"),
+    ];
+    for (const call of foreignCalls) {
+      await assert.rejects(call, /配置范围|configured scope/);
+    }
+    assert.deepEqual(
+      artifactCalls,
+      { put: 0, list: 0, get: 0, delete: 0, deleteSession: 0 },
+      "foreign artifact APIs must be rejected before touching the artifact store",
+    );
+    assert.deepEqual(
+      runtimeCalls,
+      { events: 0, recover: 0, deleteStream: 0, record: 0 },
+      "foreign runtime APIs and deletion must be rejected before touching runtime state",
+    );
+    assert.equal(storeDeletes, 0, "foreign delete must not mutate the session store");
+
+    assert.deepEqual(
+      (await manager.listArtifacts("scope-owned")).map((artifact) => artifact.id),
+      [ownedArtifact.id],
+    );
+    assert.equal(
+      Buffer.from((await manager.getArtifact("scope-owned", ownedArtifact.id))!.data).toString(),
+      "owned",
+    );
+    const opened = await manager.openArtifact("scope-owned", ownedArtifact.id);
+    assert.ok(opened);
+    const openedChunks: Uint8Array[] = [];
+    for await (const chunk of opened.data) openedChunks.push(chunk);
+    assert.equal(Buffer.concat(openedChunks).toString(), "owned");
+    assert.equal((await manager.runtimeEvents("scope-owned"))[0]?.type, "owned.canary");
+    assert.equal((await manager.recoverRuntime("scope-owned")).streamId, "scope-owned");
+
+    const releasePreflight = deferred();
+    const preflightStarted = deferred();
+    const originalStoreList = store.list.bind(store);
+    let blockNextPreflight = true;
+    store.list = async () => {
+      const listed = await originalStoreList();
+      if (blockNextPreflight) {
+        blockNextPreflight = false;
+        preflightStarted.resolve();
+        await releasePreflight.promise;
+      }
+      return listed;
+    };
+    const firstDeletion = manager.deleteSession("scope-owned");
+    const secondDeletion = manager.deleteSession("scope-owned");
+    assert.strictEqual(secondDeletion, firstDeletion, "concurrent deletes must share one task");
+    await preflightStarted.promise;
+    assert.equal(storeDeletes, 0, "deletion fence and purge must wait for scope preflight");
+    releasePreflight.resolve();
+    await Promise.all([firstDeletion, secondDeletion]);
+    assert.equal(storeDeletes, 1, "the shared deletion task must purge the session once");
+    assert.equal(runtimeCalls.deleteStream, 1);
+    assert.equal(artifactCalls.deleteSession, 1, "same-scope deletion must purge its artifacts");
+
+    const callsAfterDelete = {
+      artifact: { ...artifactCalls },
+      runtime: { ...runtimeCalls },
+      storeDeletes,
+    };
+    await manager.deleteSession("scope-owned");
+    assert.deepEqual(
+      { artifact: artifactCalls, runtime: runtimeCalls, storeDeletes },
+      callsAfterDelete,
+      "repeated authorized deletion must be idempotent after metadata is purged",
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: workspace scope realpath 检查失败时 fail closed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-scope-fail-"));
+  const workspace = path.join(dir, "workspace");
+  const missingWorkspace = path.join(dir, "missing-workspace");
+  await fs.mkdir(workspace);
+  const store = new SessionStore(path.join(dir, "sessions"));
+  await store.create({ id: "missing-cwd", cwd: missingWorkspace, model: "scripted" });
+  let providerResolutions = 0;
+  const manager = new SessionManager({
+    store,
+    workspaceScope: workspace,
+    resolveProvider: () => {
+      providerResolutions++;
+      return { provider: scriptedProvider([]), model: "scripted" };
+    },
+    recoverCommands: false,
+  });
+  const brokenScopeManager = new SessionManager({
+    store,
+    workspaceScope: path.join(dir, "missing-scope"),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  try {
+    assert.deepEqual(await manager.listSessions(), [], "uninspectable session cwd is hidden");
+    await assert.rejects(
+      () => manager.resumeSession("missing-cwd"),
+      /无法安全检查|Cannot securely inspect/,
+    );
+    await assert.rejects(
+      () => manager.createSession({ cwd: missingWorkspace, model: "scripted" }),
+      /无法安全检查|Cannot securely inspect/,
+    );
+    assert.equal(providerResolutions, 0);
+    assert.equal((await store.list()).length, 1, "rejected operations must not mutate the store");
+    await assert.rejects(
+      () => brokenScopeManager.listSessions(),
+      /无法安全检查|Cannot securely inspect/,
+    );
+  } finally {
+    manager.dispose();
+    brokenScopeManager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 未信任 cwd 的 default 模式启用受审计开发工具并封死项目执行面", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-"));
+  const workspace = path.join(dir, "workspace");
+  await fs.mkdir(workspace);
+  await fs.writeFile(path.join(workspace, "AGENTS.md"), "UNTRUSTED_MEMORY_SENTINEL");
+  let captured: StreamRequest | undefined;
+  let assessments = 0;
+  const provider: Provider = {
+    name: "capture-trust-boundary",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      captured = request;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const trust = async () => {
+    assessments++;
+    return {
+      trusted: false as const,
+      reason: "not-trusted" as const,
+      executionSources: ["AGENTS.md"],
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    };
+  };
+  const store = new SessionStore(path.join(dir, "sessions"));
+  const manager = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: trust,
+    permission: { mode: "default" },
+    permissionProfile: "full",
+    persistPermissions: true,
+    projectMemory: true,
+    checkpoints: true,
+    repoMap: true,
+    skills: true,
+    subagents: { discover: true },
+    browser: true,
+  });
+  try {
+    const session = await manager.createSession({ cwd: workspace, model: "capture" });
+    assert.equal(assessments, 1, "createSession 必须按 cwd 评估 trust");
+    assert.equal(manager.peek(session.id)?.workspaceTrust?.reason, "not-trusted");
+    await manager.send(session.id, "inspect only");
+    assert.ok(captured);
+    assert.deepEqual(
+      (captured.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES].sort(),
+    );
+    const restrictedBash = (captured.tools ?? []).find((tool) => tool.name === "bash");
+    assert.ok(restrictedBash);
+    assert.equal(
+      Object.hasOwn(
+        (restrictedBash.parameters["properties"] ?? {}) as Record<string, unknown>,
+        "network",
+      ),
+      false,
+      "restricted bash schema must not advertise network access",
+    );
+    assert.doesNotMatch(captured.system ?? "", /UNTRUSTED_MEMORY_SENTINEL/);
+    assert.deepEqual(await manager.listCheckpoints(session.id), []);
+    await manager.setPermissionMode(session.id, "plan");
+    await manager.setPermissionMode(session.id, "default");
+    for (const mode of ["acceptEdits", "auto", "bypass"] as const) {
+      await assert.rejects(
+        () => manager.setPermissionMode(session.id, mode),
+        /only support default and plan|仅支持普通与计划/,
+      );
+    }
+    await assert.rejects(
+      () => manager.setPermissionProfile(session.id, "full"),
+      /Cannot apply permission profile "full" in an untrusted workspace|未信任.*权限档位/,
+    );
+    assert.deepEqual(await manager.listPermissionProfiles(session.id), {});
+    await assert.rejects(
+      () => manager.preparePatchSet(session.id, [{ path: "owned.txt", content: "blocked" }]),
+      /PatchSet|Untrusted workspace|未信任/,
+    );
+
+    manager.dispose();
+    const assessmentsBeforeReload = assessments;
+    const reloaded = new SessionManager({
+      store,
+      resolveProvider: () => ({ provider, model: "capture" }),
+      workspaceTrust: trust,
+    });
+    await reloaded.resumeSession(session.id);
+    assert.equal(
+      assessments,
+      assessmentsBeforeReload + 1,
+      "冷会话 ensureLive 必须重新按持久化 cwd 评估 trust",
+    );
+    reloaded.dispose();
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 未信任 cwd 的非 default 启动模式退回只读 plan，避免无人授权入口逃逸", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-headless-"));
+  try {
+    for (const requestedMode of ["acceptEdits", "auto", "bypass"] as const) {
+      let captured: StreamRequest | undefined;
+      const provider: Provider = {
+        name: `capture-${requestedMode}`,
+        async *stream(request): AsyncIterable<StreamEvent> {
+          captured = request;
+          yield {
+            type: "done",
+            stopReason: "end_turn",
+            message: { role: "assistant", content: [{ type: "text", text: "restricted" }] },
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          };
+        },
+      };
+      const manager = new SessionManager({
+        store: new SessionStore(path.join(dir, `sessions-${requestedMode}`)),
+        resolveProvider: () => ({ provider, model: "capture" }),
+        workspaceTrust: async () => ({
+          trusted: false,
+          reason: "not-trusted",
+          executionSources: [],
+          storeFile: path.join(dir, "trust.json"),
+          assessedAt: new Date().toISOString(),
+        }),
+        permission: { mode: requestedMode },
+      });
+      try {
+        const session = await manager.createSession({ cwd: dir, model: "capture" });
+        await manager.send(session.id, "headless inspect");
+        assert.deepEqual(
+          (captured?.tools ?? []).map((tool) => tool.name).sort(),
+          [...RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES].sort(),
+          requestedMode,
+        );
+        await manager.setPermissionMode(session.id, "plan");
+        await assert.rejects(
+          () => manager.setPermissionMode(session.id, "default"),
+          /locked to plan mode|锁定为计划模式/,
+        );
+      } finally {
+        manager.dispose();
+      }
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 未信任 auto+ask 的只读调用不请求授权、不挂起，deny 仍优先", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-headless-ask-"));
+  await fs.writeFile(path.join(dir, "safe.txt"), "safe");
+  await fs.writeFile(path.join(dir, "secret.txt"), "secret");
+  const provider = scriptedProvider([
+    [
+      {
+        role: "assistant",
+        content: [{ type: "tool_call", id: "read-safe", name: "read", args: { path: "safe.txt" } }],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "safe read handled" }] }],
+    [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_call", id: "read-denied", name: "read", args: { path: "secret.txt" } },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "denied read handled" }] }],
+  ]);
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "scripted" }),
+    workspaceTrust: async () => ({
+      trusted: false,
+      reason: "not-trusted",
+      executionSources: [],
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+    permission: {
+      mode: "auto",
+      allowRules: ["Read(*)"],
+      askRules: ["Read(*)"],
+      denyRules: ["Read(secret.txt)"],
+    },
+  });
+  let sendPromise: Promise<void> | undefined;
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    const events: SessionEvent[] = [];
+    let reportPermission!: () => void;
+    const permissionSeen = new Promise<"permission">((resolve) => {
+      reportPermission = () => resolve("permission");
+    });
+    await manager.open(session.id, (event) => {
+      events.push(event);
+      if (event.type === "permission_request") reportPermission();
+    });
+
+    sendPromise = manager.send(session.id, "read safe without an authorization UI");
+    const outcome = await Promise.race([sendPromise.then(() => "done" as const), permissionSeen]);
+    assert.equal(outcome, "done", "auto fallback must not wait for an authorization response");
+    assert.equal(
+      events.some((event) => event.type === "permission_request"),
+      false,
+    );
+
+    await manager.send(session.id, "deny remains authoritative");
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "agent" &&
+          event.event.type === "tool_result" &&
+          event.event.id === "read-denied" &&
+          event.event.isError,
+      ),
+      "denyRules must remain active in the headless plan fallback",
+    );
+    assert.equal(
+      events.some((event) => event.type === "permission_request"),
+      false,
+    );
+  } finally {
+    manager.dispose();
+    await sendPromise?.catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 未信任 default 下 write/bash 仍请求授权，bash 强制离线沙箱且 deny 优先", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-permission-"));
+  const runtimeRequests: IsolatedRunRequest[] = [];
+  const provider = scriptedProvider([
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "write-default",
+            name: "write",
+            args: { path: "must-not-exist.txt", content: "blocked" },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "write handled" }] }],
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "write-allowed",
+            name: "write",
+            args: { path: "allowed.txt", content: "written" },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "allowed write handled" }] }],
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "bash-default",
+            name: "bash",
+            args: { command: "printf safe", network: true },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "bash handled" }] }],
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "write-plan",
+            name: "write",
+            args: { path: "plan-must-not-exist.txt", content: "blocked" },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "plan handled" }] }],
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "bash-denied",
+            name: "bash",
+            args: { command: "blocked command" },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "deny handled" }] }],
+  ]);
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "scripted" }),
+    workspaceTrust: async () => ({
+      trusted: false,
+      reason: "not-trusted",
+      executionSources: [],
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+    permission: { mode: "default", denyRules: ["Bash(blocked *)"] },
+    isolatedRuntime: {
+      async run(request) {
+        runtimeRequests.push(request);
+        return {
+          exitCode: 0,
+          output: "safe",
+          timedOut: false,
+          sandboxed: true,
+          durationMs: 1,
+        };
+      },
+    },
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    const permissions: Array<{ permId: string; toolName: string }> = [];
+    await manager.open(session.id, (event) => {
+      if (event.type !== "permission_request") return;
+      permissions.push({ permId: event.permId, toolName: event.toolName });
+      void manager.answerPermission(
+        session.id,
+        event.permId,
+        event.toolName === "bash" || event.permId === "write-allowed" ? "allow" : "deny",
+      );
+    });
+
+    await manager.send(session.id, "try write");
+    assert.equal(
+      await fs.stat(path.join(dir, "must-not-exist.txt")).catch(() => undefined),
+      undefined,
+    );
+
+    await manager.send(session.id, "allow one write");
+    assert.equal(await fs.readFile(path.join(dir, "allowed.txt"), "utf8"), "written");
+
+    await manager.send(session.id, "run bash offline");
+    assert.equal(runtimeRequests.length, 1);
+    assert.equal(runtimeRequests[0]?.network, false);
+    assert.equal(runtimeRequests[0]?.policy, "workspace-write");
+
+    await manager.setPermissionMode(session.id, "plan");
+    await manager.send(session.id, "plan cannot write");
+    assert.equal(
+      await fs.stat(path.join(dir, "plan-must-not-exist.txt")).catch(() => undefined),
+      undefined,
+    );
+
+    await manager.setPermissionMode(session.id, "default");
+    await manager.send(session.id, "configured deny wins");
+    assert.deepEqual(
+      permissions.map((permission) => permission.toolName),
+      ["write", "write", "bash"],
+      "plan denial and configured deny must not reach interactive confirmation",
+    );
+    assert.equal(runtimeRequests.length, 1, "configured deny must block bash before execution");
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: trust resolver 异常 fail closed 为最小只读；projectMemory=false 透传给 Agent", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-fail-"));
+  await fs.writeFile(path.join(dir, "AGENTS.md"), "MEMORY_MUST_NOT_LOAD");
+  let captured: StreamRequest | undefined;
+  const provider: Provider = {
+    name: "capture-trust-failure",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      captured = request;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: async () => {
+      throw new Error("trust backend unavailable");
+    },
+    projectMemory: false,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "capture" });
+    assert.equal(manager.peek(session.id)?.workspaceTrust?.reason, "inspection-failed");
+    assert.match(manager.peek(session.id)?.workspaceTrust?.error ?? "", /backend unavailable/);
+    await manager.send(session.id, "hello");
+    assert.doesNotMatch(captured?.system ?? "", /MEMORY_MUST_NOT_LOAD/);
+    assert.deepEqual(
+      (captured?.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES].sort(),
+    );
+    await assert.rejects(
+      () => manager.setPermissionMode(session.id, "default"),
+      /locked to plan mode|锁定为计划模式/,
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: live 会话在新 drive 前刷新 trust，授权/配置变化会重建安全边界", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-refresh-"));
+  await fs.writeFile(path.join(dir, "AGENTS.md"), "TRUST_REFRESH_MEMORY_SENTINEL");
+  const fingerprint = await workspaceExecutionFingerprint(dir);
+  let granted = false;
+  const requests: StreamRequest[] = [];
+  const reconciled: boolean[] = [];
+  const provider: Provider = {
+    name: "capture-trust-refresh",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      requests.push(request);
+      yield { type: "text_delta", text: `answer-${requests.length}` };
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `answer-${requests.length}` }],
+        },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: async () => ({
+      trusted: granted,
+      reason: granted ? ("trusted" as const) : ("not-trusted" as const),
+      identity: fingerprint.identity,
+      executionHash: fingerprint.executionHash,
+      executionSources: fingerprint.executionSources,
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+    onWorkspaceTrustChange: async ({ current }) => {
+      reconciled.push(current.trusted);
+    },
+    projectMemory: true,
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "capture" });
+    const observed: SessionEvent[] = [];
+    const opened = await manager.open(created.id, (event) => observed.push(event));
+
+    await manager.send(created.id, "restricted");
+    assert.deepEqual(
+      (requests[0]?.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES].sort(),
+    );
+    assert.doesNotMatch(requests[0]?.system ?? "", /TRUST_REFRESH_MEMORY_SENTINEL/);
+
+    granted = true;
+    await manager.send(created.id, "now trusted");
+    assert.deepEqual(reconciled, [true]);
+    assert.equal(manager.peek(created.id)?.workspaceTrust?.trusted, true);
+    assert.ok((requests[1]?.tools ?? []).some((tool) => tool.name === "bash"));
+    assert.match(requests[1]?.system ?? "", /TRUST_REFRESH_MEMORY_SENTINEL/);
+
+    await fs.mkdir(path.join(dir, ".anicode"));
+    await fs.writeFile(
+      path.join(dir, ".anicode", "anicode.json"),
+      JSON.stringify({ hooks: { PreToolUse: [{ command: "attacker-controlled" }] } }),
+    );
+    await manager.send(created.id, "config changed");
+    assert.deepEqual(reconciled, [true, false]);
+    assert.equal(manager.peek(created.id)?.workspaceTrust?.trusted, false);
+    assert.equal(manager.peek(created.id)?.workspaceTrust?.reason, "execution-config-changed");
+    assert.deepEqual(
+      (requests[2]?.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES].sort(),
+    );
+    assert.doesNotMatch(requests[2]?.system ?? "", /TRUST_REFRESH_MEMORY_SENTINEL/);
+    assert.deepEqual(
+      observed
+        .filter((event) => event.type === "workspace_trust")
+        .map((event) => (event.type === "workspace_trust" ? event.assessment.trusted : undefined)),
+      [true, false],
+    );
+
+    const observedText = observed
+      .filter((event) => event.type === "agent" && event.event.type === "text")
+      .map((event) =>
+        event.type === "agent" && event.event.type === "text" ? event.event.text : "",
+      )
+      .join("");
+    assert.match(observedText, /answer-1/);
+    assert.match(observedText, /answer-2/);
+    assert.match(observedText, /answer-3/);
+    const observedBeforeClose = observed.length;
+    opened.close();
+    await manager.send(created.id, "after subscriber close");
+    assert.equal(
+      observed.length,
+      observedBeforeClose,
+      "the original close handle must detach from the replacement session's shared listener set",
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 运行中 steering 也会先应用 trust 撤销", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-steering-"));
+  const fingerprint = await workspaceExecutionFingerprint(dir);
+  const firstStarted = deferred();
+  let granted = true;
+  const requests: StreamRequest[] = [];
+  const provider: Provider = {
+    name: "capture-trust-steering",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      requests.push(request);
+      if (requests.length === 1) {
+        firstStarted.resolve();
+        await new Promise<void>((resolve) => {
+          if (request.signal?.aborted) resolve();
+          else request.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw request.signal?.reason ?? new Error("first drive aborted");
+      }
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "restricted" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: async () => ({
+      trusted: granted,
+      reason: granted ? ("trusted" as const) : ("not-trusted" as const),
+      identity: fingerprint.identity,
+      executionHash: fingerprint.executionHash,
+      executionSources: fingerprint.executionSources,
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "capture" });
+    const first = manager.send(created.id, "start privileged drive");
+    await firstStarted.promise;
+    assert.equal(manager.peek(created.id)?.running, true);
+
+    granted = false;
+    await manager.send(created.id, "steering after revoke");
+    await first;
+
+    assert.equal(manager.peek(created.id)?.workspaceTrust?.trusted, false);
+    assert.deepEqual(
+      (requests[1]?.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES].sort(),
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager: 会话启动前恢复崩溃中断的 PatchSet", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-patch-recovery-"));
   const workspace = path.join(dir, "workspace");
   await fs.mkdir(workspace);
   await fs.writeFile(path.join(workspace, "a.txt"), "before");
-  const service = new PatchSetService(workspace);
+  const provider = scriptedProvider([]);
+  const creator = await mgr(dir, provider);
+  const session = await creator.createSession({ cwd: workspace, model: "scripted" });
+  creator.dispose();
+  const service = new PatchSetService(workspace, {
+    directCommit: "trusted-local",
+    sessionId: session.id,
+  });
   const patchset = await service.prepare([{ path: "a.txt", content: "after" }]);
   // 模拟进程在第一项落盘、journal 标记 applying 后被 SIGKILL。
   await fs.writeFile(path.join(workspace, "a.txt"), "after");
@@ -94,17 +1192,134 @@ test("SessionManager: 会话启动前恢复崩溃中断的 PatchSet", async () =
     JSON.stringify(patchset),
   );
 
-  const manager = await mgr(
-    dir,
-    scriptedProvider([[{ role: "assistant", content: [{ type: "text", text: "ok" }] }]]),
-  );
-  const session = await manager.createSession({ cwd: workspace, model: "scripted" });
+  const manager = await mgr(dir, provider);
+  await manager.resumeSession(session.id);
   assert.equal(await fs.readFile(path.join(workspace, "a.txt"), "utf8"), "before");
   assert.equal((await service.load(patchset.id))?.status, "rolled_back");
   assert.ok(
     (await manager.runtimeEvents(session.id)).some((event) => event.type === "patchset.recovered"),
   );
+  manager.dispose();
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: PatchSet IDs are session-bound and deletion purges only the owner", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-patch-owner-"));
+  let tick = 1_700_000_000_000;
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    now: () => tick++,
+    rand: () => 0.5,
+    recoverCommands: false,
+  });
+  try {
+    const alice = await manager.createSession({ cwd: dir, model: "scripted" });
+    const bob = await manager.createSession({ cwd: dir, model: "scripted" });
+    const alicePatch = await manager.preparePatchSet(alice.id, [
+      { path: "alice-private.txt", content: "SESSION_ALICE_PATCH_CANARY" },
+    ]);
+    const bobPatch = await manager.preparePatchSet(bob.id, [
+      { path: "bob-private.txt", content: "SESSION_BOB_PATCH_CANARY" },
+    ]);
+    assert.equal(alicePatch.patchset.sessionId, alice.id);
+    assert.equal(bobPatch.patchset.sessionId, bob.id);
+
+    const foreignOperations = [
+      () => manager.getPatchSet(bob.id, alicePatch.patchset.id),
+      () => manager.applyPatchSet(bob.id, alicePatch.patchset.id),
+      () =>
+        manager.approvePatchSet(bob.id, alicePatch.patchset.id, {
+          actor: "bob",
+          role: "reviewer",
+          decision: "approve",
+        }),
+      () => manager.rebasePatchSet(bob.id, alicePatch.patchset.id),
+      () => manager.rollbackPatchSet(bob.id, alicePatch.patchset.id),
+    ];
+    for (const operation of foreignOperations) {
+      await assert.rejects(operation, /another session/);
+    }
+
+    const journalDir = path.join(dir, ".anicode", "patchsets");
+    const aliceJournal = path.join(journalDir, `${alicePatch.patchset.id}.json`);
+    const bobJournal = path.join(journalDir, `${bobPatch.patchset.id}.json`);
+    assert.match(await fs.readFile(aliceJournal, "utf8"), /SESSION_ALICE_PATCH_CANARY/);
+    await manager.deleteSession(alice.id);
+    await assert.rejects(() => fs.access(aliceJournal));
+    assert.match(await fs.readFile(bobJournal, "utf8"), /SESSION_BOB_PATCH_CANARY/);
+    assert.equal(
+      (await manager.getPatchSet(bob.id, bobPatch.patchset.id))?.patchset.sessionId,
+      bob.id,
+    );
+    assert.doesNotMatch(
+      (
+        await Promise.all(
+          (await fs.readdir(journalDir)).map((name) =>
+            fs.readFile(path.join(journalDir, name), "utf8").catch(() => ""),
+          ),
+        )
+      ).join("\n"),
+      /SESSION_ALICE_PATCH_CANARY/,
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: deletion recovers an interrupted applying PatchSet without a manual retry", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-patch-delete-retry-"));
+  const manager = await mgr(dir, scriptedProvider([]));
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    const prepared = await manager.preparePatchSet(session.id, [
+      { path: "pending-private.txt", content: "APPLYING_PATCH_PRIVATE_CANARY" },
+    ]);
+    prepared.patchset.status = "applying";
+    prepared.patchset.appliedCount = 1;
+    const journalFile = path.join(dir, ".anicode", "patchsets", `${prepared.patchset.id}.json`);
+    await fs.writeFile(journalFile, JSON.stringify(prepared.patchset));
+
+    await manager.deleteSession(session.id);
+    await assert.rejects(() => fs.access(journalFile));
+    await assert.rejects(() => manager.send(session.id, "must remain fenced"), /删除|deleted/);
+    await assert.rejects(() => manager.resumeSession(session.id));
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: new sessions never claim or attribute legacy workspace journals", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-patch-legacy-"));
+  const file = path.join(dir, "legacy.txt");
+  await fs.writeFile(file, "before");
+  const standalone = new PatchSetService(dir, { directCommit: "trusted-local" });
+  const legacy = await standalone.prepare([{ path: "legacy.txt", content: "after" }]);
+  await fs.writeFile(file, "after");
+  legacy.status = "applying";
+  legacy.appliedCount = 1;
+  await fs.writeFile(
+    path.join(dir, ".anicode", "patchsets", `${legacy.id}.json`),
+    JSON.stringify(legacy),
+  );
+  const manager = await mgr(dir, scriptedProvider([]));
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    assert.equal(await fs.readFile(file, "utf8"), "after");
+    assert.equal(
+      (await manager.runtimeEvents(session.id)).some(
+        (event) => event.type === "patchset.recovered",
+      ),
+      false,
+    );
+    assert.equal((await standalone.recoverIncomplete())[0]?.status, "rolled_back");
+    assert.equal(await fs.readFile(file, "utf8"), "before");
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("SessionManager: 权限广播，任一订阅者可裁决", async () => {
@@ -431,13 +1646,32 @@ test("SessionManager: deleteSession 移除会话，list 不再包含，resume �
   });
   const a = await m.createSession({ cwd: dir, model: "scripted", title: "留下" });
   const b = await m.createSession({ cwd: dir, model: "scripted", title: "删掉" });
-  await m.send(b.id, "hi");
+  const canary = "PROMPT_CANARY_DELETE_ME_7f2d";
+  await m.send(b.id, canary);
+  await m.putArtifact({
+    sessionId: b.id,
+    kind: "report",
+    name: "canary.txt",
+    data: canary,
+  });
 
   assert.equal((await m.listSessions()).length, 2);
   await m.deleteSession(b.id);
   const remaining = await m.listSessions();
   assert.equal(remaining.length, 1);
   assert.equal(remaining[0]?.id, a.id);
+  assert.deepEqual(await m.commandInbox.store.read(b.id), []);
+  assert.deepEqual(await m.artifacts.list(b.id), []);
+  assert.equal(
+    (await m.outbox.store.read()).some((message) => message.event.streamId === b.id),
+    false,
+  );
+  const tombstone = await m.runtime.events(b.id);
+  assert.deepEqual(
+    tombstone.map((event) => event.type),
+    ["session.deleted"],
+  );
+  assert.doesNotMatch(JSON.stringify(tombstone), new RegExp(canary));
 
   // 删除已不存在的会话是无操作，不抛。
   await m.deleteSession(b.id);
@@ -446,6 +1680,362 @@ test("SessionManager: deleteSession 移除会话，list 不再包含，resume �
   await assert.rejects(() => m.resumeSession(b.id));
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: failed purge keeps the fence but a repeated delete resumes cleanup", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-delete-retry-"));
+  const backing = new MemoryArtifactStore();
+  let purgeAttempts = 0;
+  const artifacts: ArtifactStore = {
+    put: (input) => backing.put(input),
+    list: (sessionId) => backing.list(sessionId),
+    get: (sessionId, artifactId) => backing.get(sessionId, artifactId),
+    delete: (sessionId, artifactId) => backing.delete(sessionId, artifactId),
+    async deleteSession(sessionId) {
+      purgeAttempts++;
+      if (purgeAttempts === 1) throw new Error("artifact backend temporarily unavailable");
+      await backing.deleteSession(sessionId);
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    artifacts,
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "scripted" });
+    await manager.putArtifact({
+      sessionId: created.id,
+      kind: "report",
+      name: "retry.txt",
+      data: "purge me",
+    });
+    await assert.rejects(() => manager.deleteSession(created.id), /temporarily unavailable/);
+    await assert.rejects(() => manager.send(created.id, "must remain fenced"), /删除|deleted/);
+    await manager.deleteSession(created.id);
+    assert.equal(purgeAttempts, 2);
+    assert.deepEqual(await backing.list(created.id), []);
+    await manager.deleteSession(created.id);
+    assert.equal(purgeAttempts, 2, "completed deletion remains idempotent");
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: delete fence 等待迟到持久化，并拒绝新 load/send/artifact", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-delete-fence-"));
+  const store = new SessionStore(path.join(dir, "sessions"));
+  const appendStarted = deferred();
+  const releaseAppend = deferred();
+  const originalAppend = store.append.bind(store);
+  let blockFirstAppend = true;
+  store.append = async (id, message) => {
+    if (blockFirstAppend) {
+      blockFirstAppend = false;
+      appendStarted.resolve();
+      await releaseAppend.promise;
+    }
+    await originalAppend(id, message);
+  };
+  const manager = new SessionManager({
+    store,
+    resolveProvider: () => ({
+      provider: scriptedProvider([
+        [{ role: "assistant", content: [{ type: "text", text: "LATE_RESPONSE_CANARY" }] }],
+      ]),
+      model: "scripted",
+    }),
+    recoverCommands: false,
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "scripted" });
+    const sending = manager.send(created.id, "LATE_PROMPT_CANARY");
+    await appendStarted.promise;
+
+    let deletionSettled = false;
+    const deletion = manager.deleteSession(created.id).then(() => {
+      deletionSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(deletionSettled, false, "purge must wait for the active persistence write");
+    await assert.rejects(() => manager.send(created.id, "must reject"), /删除|deleted/);
+    await assert.rejects(() => manager.resumeSession(created.id), /删除|deleted/);
+    await assert.rejects(() => manager.recoverCommands(created.id), /删除|deleted/);
+    await assert.rejects(
+      () =>
+        manager.putArtifact({
+          sessionId: created.id,
+          kind: "report",
+          name: "must-not-exist.txt",
+          data: "artifact after delete fence",
+        }),
+      /删除|deleted/,
+    );
+
+    releaseAppend.resolve();
+    await Promise.allSettled([sending]);
+    await deletion;
+    assert.equal(deletionSettled, true);
+    await assert.rejects(() => store.load(created.id));
+    assert.deepEqual(await manager.commandInbox.store.read(created.id), []);
+    assert.deepEqual(await manager.artifacts.list(created.id), []);
+    assert.equal(
+      (await manager.outbox.store.read()).some((message) => message.event.streamId === created.id),
+      false,
+    );
+    const tombstone = await manager.runtime.events(created.id);
+    assert.deepEqual(
+      tombstone.map((event) => event.type),
+      ["session.deleted"],
+    );
+    assert.doesNotMatch(JSON.stringify(tombstone), /LATE_(?:PROMPT|RESPONSE)_CANARY/);
+  } finally {
+    releaseAppend.resolve();
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: paused artifact reader is revoked before session DELETE completes", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-delete-artifact-stream-"));
+  const backing = new MemoryArtifactStore();
+  const sourceClosed = deferred();
+  const artifacts: ArtifactStore = {
+    put: (input) => backing.put(input),
+    list: (sessionId) => backing.list(sessionId),
+    get: (sessionId, artifactId) => backing.get(sessionId, artifactId),
+    async open(sessionId, artifactId) {
+      const record = await backing.get(sessionId, artifactId);
+      if (!record) return undefined;
+      return {
+        artifact: record.artifact,
+        data: (async function* () {
+          try {
+            yield record.data.subarray(0, 5);
+            yield record.data.subarray(5);
+          } finally {
+            sourceClosed.resolve();
+          }
+        })(),
+      };
+    },
+    delete: (sessionId, artifactId) => backing.delete(sessionId, artifactId),
+    deleteSession: (sessionId) => backing.deleteSession(sessionId),
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    artifacts,
+    recoverCommands: false,
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "scripted" });
+    const artifact = await manager.putArtifact({
+      sessionId: created.id,
+      kind: "report",
+      name: "paused.txt",
+      data: "firstSECRET_AFTER_DELETE",
+    });
+    const opened = await manager.openArtifact(created.id, artifact.id);
+    assert.ok(opened);
+    const reader = opened.data[Symbol.asyncIterator]();
+    const first = await reader.next();
+    assert.equal(Buffer.from(first.value!).toString("utf8"), "first");
+    assert.equal(
+      (await manager.runtime.lifecycle.get(created.id))?.activeLeases,
+      1,
+      "the durable operation lease remains held while the iterator is paused at yield",
+    );
+
+    const deletion = manager.deleteSession(created.id);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("session DELETE waited on a paused reader")),
+        1_000,
+      );
+      timeout.unref();
+    });
+    try {
+      await Promise.race([deletion, timedOut]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+    await sourceClosed.promise;
+    await assert.rejects(() => reader.next(), /deleted|deleting|aborted/i);
+    assert.deepEqual(await backing.list(created.id), []);
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: an opened but never iterated artifact reader cannot block DELETE", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-delete-unread-artifact-"));
+  const backing = new MemoryArtifactStore();
+  const sourceClosed = deferred();
+  const artifacts: ArtifactStore = {
+    put: (input) => backing.put(input),
+    list: (sessionId) => backing.list(sessionId),
+    get: (sessionId, artifactId) => backing.get(sessionId, artifactId),
+    async open(sessionId, artifactId) {
+      const record = await backing.get(sessionId, artifactId);
+      if (!record) return undefined;
+      return {
+        artifact: record.artifact,
+        data: {
+          [Symbol.asyncIterator]() {
+            return {
+              async next() {
+                return { done: false as const, value: record.data };
+              },
+              async return() {
+                sourceClosed.resolve();
+                return { done: true as const, value: undefined };
+              },
+            };
+          },
+        },
+      };
+    },
+    delete: (sessionId, artifactId) => backing.delete(sessionId, artifactId),
+    deleteSession: (sessionId) => backing.deleteSession(sessionId),
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    artifacts,
+    recoverCommands: false,
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "scripted" });
+    const artifact = await manager.putArtifact({
+      sessionId: created.id,
+      kind: "report",
+      name: "unread.txt",
+      data: "never consumed",
+    });
+    assert.ok(await manager.openArtifact(created.id, artifact.id));
+    assert.equal((await manager.runtime.lifecycle.get(created.id))?.activeLeases, 0);
+    await manager.deleteSession(created.id);
+    await sourceClosed.promise;
+    assert.deepEqual(await backing.list(created.id), []);
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: delete fence 等待并发冷载入，不让 load 迟到重建 live 会话", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-delete-load-race-"));
+  const store = new SessionStore(path.join(dir, "sessions"));
+  const creator = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  const created = await creator.createSession({ cwd: dir, model: "scripted" });
+  creator.dispose();
+
+  const loadStarted = deferred();
+  const releaseLoad = deferred();
+  const originalLoad = store.load.bind(store);
+  let blockFirstLoad = true;
+  store.load = async (id) => {
+    if (blockFirstLoad) {
+      blockFirstLoad = false;
+      loadStarted.resolve();
+      await releaseLoad.promise;
+    }
+    return originalLoad(id);
+  };
+  const manager = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  try {
+    const resuming = manager.resumeSession(created.id);
+    await loadStarted.promise;
+    let deletionSettled = false;
+    const deletion = manager.deleteSession(created.id).then(() => {
+      deletionSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(deletionSettled, false);
+    releaseLoad.resolve();
+    await assert.rejects(resuming, /删除|deleted/);
+    await deletion;
+    assert.equal(manager.peek(created.id), undefined);
+    await assert.rejects(() => manager.resumeSession(created.id), /删除|deleted/);
+    await assert.rejects(() => originalLoad(created.id));
+  } finally {
+    releaseLoad.resolve();
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: delete fence 中断并等待 command recovery 后再 purge", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-delete-recovery-"));
+  const providerStarted = deferred();
+  const releaseProvider = deferred();
+  const provider: Provider = {
+    name: "slow-recovery",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerStarted.resolve();
+      await releaseProvider.promise;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "RECOVERY_RESPONSE_CANARY" }],
+        },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "slow" }),
+    recoverCommands: false,
+  });
+  try {
+    const created = await manager.createSession({ cwd: dir, model: "slow" });
+    await manager.commandInbox.accept({
+      sessionId: created.id,
+      text: "RECOVERY_PROMPT_CANARY",
+      messageCountBefore: 0,
+    });
+    const recovery = manager.recoverCommands(created.id);
+    await providerStarted.promise;
+    let deletionSettled = false;
+    const deletion = manager.deleteSession(created.id).then(() => {
+      deletionSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(deletionSettled, false, "purge must wait for recovery drive termination");
+    releaseProvider.resolve();
+    await Promise.allSettled([recovery]);
+    await deletion;
+    assert.deepEqual(await manager.commandInbox.store.read(created.id), []);
+    assert.equal(
+      (await manager.outbox.store.read()).some((message) => message.event.streamId === created.id),
+      false,
+    );
+    const tombstone = await manager.runtime.events(created.id);
+    assert.deepEqual(
+      tombstone.map((event) => event.type),
+      ["session.deleted"],
+    );
+    assert.doesNotMatch(JSON.stringify(tombstone), /RECOVERY_(?:PROMPT|RESPONSE)_CANARY/);
+  } finally {
+    releaseProvider.resolve();
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("SessionManager: forkSession 复制历史成新会话，原会话不动", async () => {

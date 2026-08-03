@@ -6,9 +6,18 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import React from "react";
 import { render } from "ink-testing-library";
-import type { ProviderDescriptor, SessionEvent, SessionHost } from "@anicode/core";
+import type {
+  PendingPermission,
+  ProviderDescriptor,
+  SessionEvent,
+  SessionHost,
+  WorkspaceTrustReason,
+} from "@anicode/core";
 import { App, parseMouseInput, terminalMouseModeSequence } from "./app.js";
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
@@ -26,8 +35,9 @@ test("TUI 回归: SGR 左键点击解析坐标，释放事件不重复触发", (
 test("TUI 回归: 关闭鼠标协议时保留左键拖选，开启时接收滚轮", () => {
   const selectable = terminalMouseModeSequence(false);
   assert.match(selectable, /\?1000l/);
-  assert.match(selectable, /\?1007l/);
-  assert.doesNotMatch(selectable, /\?1000h/);
+  assert.match(selectable, /\?1006l/);
+  assert.match(selectable, /\?1007h/);
+  assert.doesNotMatch(selectable, /\?1000h|\?1006h/);
 
   const fullTracking = terminalMouseModeSequence(true);
   assert.match(fullTracking, /\?1007l/);
@@ -35,12 +45,91 @@ test("TUI 回归: 关闭鼠标协议时保留左键拖选，开启时接收滚�
   assert.match(fullTracking, /\?1006h/);
 });
 
+test("TUI 安全边界: 仅本地且受信任工作区展开 @文件，远端与受限工作区原文透传", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-tui-mention-boundary-"));
+  await fs.writeFile(path.join(dir, "secret.txt"), "CLIENT_ONLY_SECRET", "utf8");
+  try {
+    const cases = [
+      { name: "trusted-local", canInspectWorkspace: true, workspaceTrusted: true, expands: true },
+      { name: "remote", canInspectWorkspace: false, workspaceTrusted: true, expands: false },
+      { name: "restricted", canInspectWorkspace: true, workspaceTrusted: false, expands: false },
+    ] as const;
+    for (const scenario of cases) {
+      const sent: string[] = [];
+      const host = makeHost({
+        cwd: dir,
+        workspaceTrusted: scenario.workspaceTrusted,
+        onSend: (text) => sent.push(text),
+      });
+      const view = mount(host, {
+        canInspectWorkspace: scenario.canInspectWorkspace,
+        requireWorkspaceTrust: true,
+      });
+      await tick(80);
+      try {
+        view.stdin.write("inspect @secret.txt");
+        view.stdin.write("\r");
+        await tick(100);
+        assert.equal(sent.length, 1, scenario.name);
+        assert.equal(sent[0]!.includes("CLIENT_ONLY_SECRET"), scenario.expands, scenario.name);
+        if (!scenario.expands) assert.equal(sent[0], "inspect @secret.txt", scenario.name);
+      } finally {
+        view.unmount();
+      }
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("TUI 安全边界: /diff 对远端与受限工作区 fail closed", async () => {
+  const cases = [
+    {
+      canInspectWorkspace: false,
+      workspaceTrusted: true,
+      expected: /无法检查宿主工作区/,
+    },
+    {
+      canInspectWorkspace: true,
+      workspaceTrusted: false,
+      expected: /受限工作区中已禁用/,
+    },
+  ] as const;
+  for (const scenario of cases) {
+    const host = makeHost({
+      cwd: "/definitely/not/a/local/repository",
+      workspaceTrusted: scenario.workspaceTrusted,
+    });
+    const view = mount(host, {
+      canInspectWorkspace: scenario.canInspectWorkspace,
+      requireWorkspaceTrust: true,
+    });
+    await tick(80);
+    try {
+      view.stdin.write("/diff");
+      view.stdin.write("\r");
+      await tick(80);
+      const frame = view.lastFrame() ?? "";
+      assert.match(frame, scenario.expected);
+      assert.doesNotMatch(frame, /not a git repository|ENOENT/);
+    } finally {
+      view.unmount();
+    }
+  }
+});
+
 /** 最小离线 host：可注入历史事件与 undo/setPermissionMode 行为。 */
 function makeHost(
   options: {
     eventsBeforeSnapshot?: SessionEvent[];
+    pendingPermissions?: PendingPermission[];
+    cwd?: string;
+    workspaceTrusted?: boolean;
+    workspaceTrustReason?: WorkspaceTrustReason;
     onSend?: (text: string) => void;
     onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
+    onOpen?: (listener: (event: SessionEvent) => void) => void;
+    onPermission?: (decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
     undo?: (sessionId: string, arg?: string) => Promise<{ restored: number; deleted: number }>;
     setPermissionMode?: (sessionId: string, mode: string) => Promise<void>;
     setPermissionProfile?: (sessionId: string, name: string) => Promise<"plan" | "default">;
@@ -48,7 +137,7 @@ function makeHost(
 ): SessionHost {
   const meta = {
     id: "s_reg",
-    cwd: "/reg/project",
+    cwd: options.cwd ?? "/reg/project",
     model: "debug/demo",
     createdAt: "2026-07-17T00:00:00.000Z",
     updatedAt: "2026-07-17T00:00:00.000Z",
@@ -71,6 +160,7 @@ function makeHost(
       };
     },
     async open(_sessionId, listener) {
+      options.onOpen?.(listener);
       for (const event of options.eventsBeforeSnapshot ?? []) listener(event);
       return {
         snapshot: {
@@ -78,7 +168,20 @@ function makeHost(
           messages: [],
           usage: zeroUsage,
           running: false,
-          pendingPermissions: [],
+          pendingPermissions: options.pendingPermissions ?? [],
+          ...(options.workspaceTrusted === undefined
+            ? {}
+            : {
+                workspaceTrust: {
+                  trusted: options.workspaceTrusted,
+                  reason:
+                    options.workspaceTrustReason ??
+                    (options.workspaceTrusted ? ("trusted" as const) : ("not-trusted" as const)),
+                  executionSources: [],
+                  storeFile: "/tmp/anicode-test-trust.json",
+                  assessedAt: "2026-07-17T00:00:00.000Z",
+                },
+              }),
         },
         close() {},
       };
@@ -92,7 +195,8 @@ function makeHost(
       if (options.undo) return options.undo(sessionId, arg);
       return { restored: 0, deleted: 0 };
     },
-    async answerPermission() {
+    async answerPermission(_sessionId, _permId, decision) {
+      options.onPermission?.(decision);
       return true;
     },
     dispose() {},
@@ -115,6 +219,201 @@ function mount(host: SessionHost, extra: Record<string, unknown> = {}) {
     <App host={host} cwd="/reg/project" model="debug/demo" sessionId="s_reg" {...extra} />,
   );
 }
+
+test("TUI 安全边界: authoritative trust-change 立即降级并清除权限 UI", async () => {
+  let emit: ((event: SessionEvent) => void) | undefined;
+  const host = makeHost({
+    workspaceTrusted: true,
+    onOpen: (listener) => {
+      emit = listener;
+    },
+  });
+  const view = mount(host, { requireWorkspaceTrust: true, canInspectWorkspace: true });
+  await tick(80);
+  try {
+    emit?.({
+      type: "permission_request",
+      permId: "p-before-revoke",
+      toolName: "bash",
+      ruleKey: "bash:*",
+    });
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /授权请求/);
+
+    emit?.({
+      type: "workspace_trust",
+      assessment: {
+        trusted: false,
+        reason: "execution-config-changed",
+        executionSources: [],
+        storeFile: "/tmp/anicode-test-trust.json",
+        assessedAt: "2026-07-17T00:00:00.000Z",
+      },
+    });
+    await tick(80);
+    const downgraded = view.lastFrame() ?? "";
+    assert.match(downgraded, /工作区信任已撤销/);
+    assert.doesNotMatch(downgraded, /授权请求/);
+
+    view.stdin.write("/diff");
+    view.stdin.write("\r");
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /受限工作区中已禁用/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 受限工作区: 初始与新权限请求均可逐项允许或拒绝", async () => {
+  let emit: ((event: SessionEvent) => void) | undefined;
+  const decisions: string[] = [];
+  const host = makeHost({
+    workspaceTrusted: false,
+    pendingPermissions: [
+      { permId: "p-initial", toolName: "edit", ruleKey: "src/app.ts", risk: "medium" },
+    ],
+    onOpen: (listener) => {
+      emit = listener;
+    },
+    onPermission: (decision) => decisions.push(decision),
+  });
+  const view = mount(host, { requireWorkspaceTrust: true, canInspectWorkspace: true });
+  await tick(100);
+  try {
+    const initial = view.lastFrame() ?? "";
+    assert.match(initial, /内置 write\/edit\/apply_patch\/bash[\s\S]*工具仍可逐项授权/);
+    assert.match(initial, /MCP、hooks、项目扩展与网络访问已禁用/);
+    assert.match(initial, /授权请求/);
+    assert.doesNotMatch(initial, /计划模式 · 只读/);
+
+    view.stdin.write("y");
+    await tick(80);
+    assert.deepEqual(decisions, ["allow"]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+
+    emit?.({
+      type: "permission_request",
+      permId: "p-after-open",
+      toolName: "bash",
+      ruleKey: "npm test",
+      risk: "medium",
+    });
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /授权请求/);
+    view.stdin.write("n");
+    await tick(80);
+    assert.deepEqual(decisions, ["allow", "deny"]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 检查失败: 初始状态严格只读、read ask 可答复且 mode 锁定 plan", async () => {
+  const modeCalls: string[] = [];
+  const decisions: string[] = [];
+  const host = makeHost({
+    workspaceTrusted: false,
+    workspaceTrustReason: "inspection-failed",
+    pendingPermissions: [
+      { permId: "p-strict-read", toolName: "read", ruleKey: "README.md", risk: "medium" },
+    ],
+    onPermission: (decision) => decisions.push(decision),
+    setPermissionMode: async (_sessionId, mode) => {
+      modeCalls.push(mode);
+    },
+  });
+  const view = mount(host, { requireWorkspaceTrust: true });
+  await tick(100);
+  try {
+    const initial = view.lastFrame() ?? "";
+    assert.match(initial, /工作区检查失败/);
+    assert.match(initial, /仅可使用内置 read\/glob\/grep[\s\S]*与计划模式/);
+    assert.match(initial, /计划模式 · 只读/);
+    assert.match(initial, /授权请求: read/);
+    assert.doesNotMatch(initial, /仍可逐项授权/);
+
+    view.stdin.write("n");
+    await tick(80);
+    assert.deepEqual(decisions, ["deny"]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+
+    for (const ch of "/plan off") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /无法退出严格只读计划模式/);
+
+    view.stdin.write("\u001b[Z");
+    await tick(60);
+    assert.match(view.lastFrame() ?? "", /权限模式已锁定为严格只读计划模式/);
+    assert.deepEqual(modeCalls, [], "strict mode must never request default/accept/bypass");
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 检查失败事件: 同为 untrusted 的 reason 升级也进入严格模式", async () => {
+  let emit: ((event: SessionEvent) => void) | undefined;
+  const modeCalls: string[] = [];
+  const decisions: string[] = [];
+  const host = makeHost({
+    workspaceTrusted: false,
+    workspaceTrustReason: "not-trusted",
+    onOpen: (listener) => {
+      emit = listener;
+    },
+    setPermissionMode: async (_sessionId, mode) => {
+      modeCalls.push(mode);
+    },
+    onPermission: (decision) => decisions.push(decision),
+  });
+  const view = mount(host, { requireWorkspaceTrust: true });
+  await tick(100);
+  try {
+    emit?.({
+      type: "permission_request",
+      permId: "p-before-inspection-failure",
+      toolName: "edit",
+      ruleKey: "src/app.ts",
+    });
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /授权请求/);
+
+    emit?.({
+      type: "workspace_trust",
+      assessment: {
+        trusted: false,
+        reason: "inspection-failed",
+        executionSources: [],
+        storeFile: "/tmp/anicode-test-trust.json",
+        assessedAt: "2026-07-17T00:00:00.000Z",
+      },
+    });
+    await tick(80);
+    const strict = view.lastFrame() ?? "";
+    assert.match(strict, /工作区检查失败/);
+    assert.match(strict, /计划模式 · 只读/);
+    assert.doesNotMatch(strict, /授权请求/);
+
+    emit?.({
+      type: "permission_request",
+      permId: "p-after-inspection-failure",
+      toolName: "read",
+      ruleKey: "README.md",
+    });
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /授权请求: read/);
+    view.stdin.write("y");
+    await tick(80);
+    assert.deepEqual(decisions, ["allow"]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
+    view.stdin.write("\u001b[Z");
+    await tick(60);
+    assert.deepEqual(modeCalls, []);
+  } finally {
+    view.unmount();
+  }
+});
 
 test("TUI 回归: Ctrl+E 跳行尾、Ctrl+K 删到行尾", async () => {
   const host = makeHost();
@@ -196,6 +495,56 @@ test("TUI 回归: PageUp/完整鼠标滚轮只回看结果区，不显示额外�
     view.stdin.write("\u001b[<65;10;10M".repeat(3));
     await tick(40);
     assert.doesNotMatch(view.lastFrame() ?? "", /回看历史中/);
+
+    // 默认 selectable 模式使用 DEC 1007：真实终端把滚轮转换成 ↑/↓，应用仍应回看。
+    view.stdin.write("\u001b[A");
+    await tick(40);
+    const alternateScrolled = view.lastFrame() ?? "";
+    assert.notEqual(alternateScrolled, initial);
+    assert.equal(
+      alternateScrolled.split("\n").findIndex((line) => line.includes("输入你的目标")),
+      inputRow,
+    );
+    view.stdin.write("\u001b[B");
+    await tick(40);
+    assert.doesNotMatch(view.lastFrame() ?? "", /回看历史中/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: 回看时流式追加保持可见锚点，PageDown 仍可回到底部", async () => {
+  const events: SessionEvent[] = [];
+  for (let i = 0; i < 24; i++) {
+    events.push({ type: "agent", event: { type: "text", text: `锚点回答-${i}` } });
+    events.push({ type: "agent", event: { type: "done", usage: zeroUsage, turns: 1 } });
+  }
+  let emit: ((event: SessionEvent) => void) | undefined;
+  const host = makeHost({
+    eventsBeforeSnapshot: events,
+    onOpen: (listener) => {
+      emit = listener;
+    },
+  });
+  const view = mount(host, { terminalSize: { rows: 18, cols: 72 } });
+  await tick(120);
+  try {
+    view.stdin.write("\u001b[5~");
+    await tick(50);
+    const before = view.lastFrame() ?? "";
+    const visibleBefore = before.match(/锚点回答-\d+/g) ?? [];
+    assert.ok(visibleBefore.length > 0, before);
+
+    emit?.({ type: "agent", event: { type: "text", text: "新追加的底部回答" } });
+    emit?.({ type: "agent", event: { type: "done", usage: zeroUsage, turns: 1 } });
+    await tick(80);
+    const anchored = view.lastFrame() ?? "";
+    assert.match(anchored, new RegExp(visibleBefore[0]!));
+    assert.doesNotMatch(anchored, /新追加的底部回答/);
+
+    view.stdin.write("\u001b[6~".repeat(8));
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /新追加的底部回答/);
   } finally {
     view.unmount();
   }
@@ -406,6 +755,174 @@ const pickerCatalog = [
   },
 ];
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+const raceProvider: ProviderDescriptor = {
+  id: "race",
+  name: "Race Provider",
+  kind: "openai-compatible",
+  protocol: "openai-chat",
+  aliases: [],
+  baseURL: "https://example.invalid/v1",
+  apiKeyEnv: [],
+  requiresApiKey: false,
+  local: false,
+  capabilities: { tools: true, reasoning: false },
+  limits: {},
+  models: [],
+  catalog: [],
+};
+
+const raceCatalog = [
+  {
+    model: "a",
+    label: "Race A",
+    free: false,
+    openWeight: false,
+    recommended: true,
+    providerId: "race",
+    providerName: "Race Provider",
+    spec: "race/a",
+    local: false,
+    requiresApiKey: false,
+  },
+  {
+    model: "b",
+    label: "Race B",
+    free: false,
+    openWeight: false,
+    recommended: false,
+    providerId: "race",
+    providerName: "Race Provider",
+    spec: "race/b",
+    local: false,
+    requiresApiKey: false,
+  },
+];
+
+test("TUI 回归: /model 后发选择胜出，旧 verify 不得切换或写入错误会话", async () => {
+  const first = deferred<readonly string[]>();
+  const second = deferred<readonly string[]>();
+  let discoveryCall = 0;
+  const created: string[] = [];
+  const host = makeHost({ onCreate: (input) => created.push(input.model) });
+  const view = mount(host, {
+    providers: [raceProvider],
+    catalog: raceCatalog,
+    discoverModels: async () => {
+      discoveryCall++;
+      if (discoveryCall === 1) return ["a", "b"];
+      if (discoveryCall === 2) return first.promise;
+      if (discoveryCall === 3) return second.promise;
+      return ["a", "b"];
+    },
+  });
+  await tick(80);
+  try {
+    view.stdin.write("/model");
+    view.stdin.write("\r");
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /Race A/);
+
+    view.stdin.write("\r"); // A verify pending
+    await tick(20);
+    view.stdin.write("\u001b[B");
+    await tick(20);
+    view.stdin.write("\r"); // B supersedes A
+    await tick(20);
+    second.resolve(["b"]);
+    await tick(120);
+    assert.deepEqual(created, ["race/b"]);
+
+    first.resolve(["a"]);
+    await tick(120);
+    assert.deepEqual(created, ["race/b"]);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: /model Esc 与重开使旧 Tab verify 完全失效", async () => {
+  const stale = deferred<readonly string[]>();
+  const current = deferred<readonly string[]>();
+  let discoveryCall = 0;
+  const host = makeHost();
+  const view = mount(host, {
+    providers: [raceProvider],
+    catalog: raceCatalog,
+    discoverModels: async () => {
+      discoveryCall++;
+      if (discoveryCall === 1 || discoveryCall === 3) return ["a", "b"];
+      if (discoveryCall === 2) return stale.promise;
+      if (discoveryCall === 4) return current.promise;
+      return ["a", "b"];
+    },
+  });
+  await tick(80);
+  try {
+    view.stdin.write("/model");
+    view.stdin.write("\r");
+    await tick(80);
+    view.stdin.write("\t");
+    await tick(20);
+    view.stdin.write("\u001b");
+    await tick(20);
+
+    view.stdin.write("/model");
+    view.stdin.write("\r");
+    await tick(80);
+    view.stdin.write("\t");
+    await tick(20);
+
+    stale.resolve(["a"]);
+    await tick(80);
+    assert.doesNotMatch(view.lastFrame() ?? "", /下一条消息将使用 race\/a/);
+
+    current.resolve(["a"]);
+    await tick(100);
+    assert.match(view.lastFrame() ?? "", /下一条消息将使用 race\/a/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 安全边界: 远端 host 选择 Ollama 模型绝不启动客户端 Ollama", async () => {
+  let localStarts = 0;
+  const created: string[] = [];
+  const host = makeHost({ onCreate: (input) => created.push(input.model) });
+  const view = mount(host, {
+    canInspectWorkspace: false,
+    discoverModels: async (providerId: string) =>
+      providerId === "ollama" ? ["remote-model"] : undefined,
+    ensureLocalOllama: async () => {
+      localStarts++;
+      return "running" as const;
+    },
+  });
+  await tick(80);
+  try {
+    view.stdin.write("/model ollama/remote-model");
+    view.stdin.write("\r");
+    await tick(120);
+    assert.equal(localStarts, 0);
+    assert.deepEqual(created, ["ollama/remote-model"]);
+  } finally {
+    view.unmount();
+  }
+});
+
 test("TUI 回归: /model 选择器键入即过滤，Enter 选中过滤后的首项", async () => {
   let created: { cwd: string; model: string } | undefined;
   const host = makeHost({ onCreate: (input) => (created = input) });
@@ -475,6 +992,41 @@ test("TUI 回归: /plan 开关计划模式——调用 setPermissionMode 并显�
       ["s_reg", "plan"],
       ["s_reg", "default"],
     ]);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 受限工作区: /plan 与 Shift+Tab 仅在 default↔plan 间切换", async () => {
+  const calls: string[] = [];
+  const host = makeHost({
+    workspaceTrusted: false,
+    setPermissionMode: async (_sessionId, mode) => {
+      calls.push(mode);
+    },
+  });
+  const view = mount(host, { requireWorkspaceTrust: true });
+  await tick(100);
+  try {
+    for (const ch of "/plan on") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /计划模式 · 只读/);
+
+    for (const ch of "/plan off") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(80);
+
+    const SHIFT_TAB = "\u001b[Z";
+    view.stdin.write(SHIFT_TAB);
+    await tick(60);
+    assert.match(view.lastFrame() ?? "", /计划模式 · 只读/);
+    view.stdin.write(SHIFT_TAB);
+    await tick(60);
+
+    assert.deepEqual(calls, ["plan", "default", "plan", "default"]);
+    assert.equal(calls.includes("acceptEdits"), false);
+    assert.equal(calls.includes("bypass"), false);
   } finally {
     view.unmount();
   }
@@ -591,7 +1143,9 @@ test("TUI 回归: host 不支持档位时 /profile 明确提示", async () => {
 test("TUI 回归: /model <spec> once 仅覆盖下一条消息的模型，随后自动还原", async () => {
   const host = makeHost();
   const sendLog = (host as SessionHost & { sendLog: { text: string; model?: string }[] }).sendLog;
-  const view = mount(host);
+  const view = mount(host, {
+    discoverModels: async (providerId: string) => (providerId === "alt" ? ["fast"] : undefined),
+  });
   await tick();
   try {
     for (const ch of "/model alt/fast once") view.stdin.write(ch);

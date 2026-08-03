@@ -20,17 +20,21 @@
  *   3. **目录级多实例路由**：请求带 `x-anicode-directory` 头 / `?directory=` 时经
  *      `resolveInstance` 惰性路由到按目录隔离的 SessionManager（未配置则忽略、用默认实例）。
  *
- * 安全：默认只应绑定 127.0.0.1；可选 token —— 提供时所有请求须带
- * `Authorization: Bearer <token>`；SSE 同样只接受 header，凭证绝不进入 URL。
+ * 安全：默认只应绑定 127.0.0.1；除健康检查外，REST/SSE 默认强制 Bearer token。
+ * 凭证只接受 `Authorization` header，绝不进入 URL。
  */
 
 import * as http from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { once } from "node:events";
 import { t } from "../i18n.js";
 import { SessionManager, type SessionEvent, type SessionSnapshot } from "../session-manager.js";
 import type { PermissionDecisionKind } from "../host.js";
 import type { PermissionMode } from "../permission.js";
+import {
+  discoverProviderModels,
+  sanitizeDiscoveredModels,
+  sanitizeProviderId,
+} from "../provider/registry.js";
 import { PartsProjector, messagesToParts } from "../parts.js";
 import { createId } from "../id.js";
 import { PatchSetConflictError, type PatchSetChangeInput } from "../runtime/patchset.js";
@@ -41,11 +45,14 @@ import {
   type ApiValidationIssue,
   type EventEnvelope,
 } from "./api.js";
+import { generateDaemonAuthToken, validateDaemonAuthToken } from "./auth-token.js";
 
 export interface HttpDaemonOptions {
   /** 默认会话实例（无目录路由、或未配置 resolveInstance 时的实例）。 */
   manager: SessionManager;
-  /** 可选 Bearer token；提供时所有请求都要求携带。 */
+  /** Test/embedding override; production defaults to the core provider registry. */
+  discoverModels?: (providerId: string) => Promise<string[] | undefined>;
+  /** Bearer token；省略时安全生成 256-bit token，除健康检查外均强制携带。 */
   token?: string;
   /**
    * 目录级多实例路由（对齐 opencode 单 server 多工程）：给定请求携带的目录，
@@ -55,6 +62,13 @@ export interface HttpDaemonOptions {
   resolveInstance?: (directory: string) => SessionManager | Promise<SessionManager>;
   /** 每个 SSE 流保留的可续传事件条数（Last-Event-ID 回放窗口）。默认 1024。 */
   replayBufferSize?: number;
+  /** 每个 SSE replay ring 的序列化字节上限。默认 8 MiB。 */
+  replayBufferBytes?: number;
+  /**
+   * 慢 SSE 客户端的进程内待发送上限。超过任一上限即断开该客户端，让其携带
+   * Last-Event-ID 重连，避免一个不读数据的终端无限占用 daemon 内存。
+   */
+  sseClientBuffer?: { maxPendingBytes?: number; maxPendingEvents?: number };
   /**
    * 最后一个订阅者断开后，会话扇出（及其 replay 缓冲）延迟释放的毫秒数。
    * 让单客户端断线重连仍能在窗口内增量补发；窗口外回落整份快照。默认 15000。
@@ -67,6 +81,9 @@ export interface HttpDaemonOptions {
 }
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_SSE_SNAPSHOT_BYTES = 256 * 1024 * 1024;
+const INLINE_SSE_SNAPSHOT_BYTES = 1024 * 1024;
+const SSE_SNAPSHOT_CHUNK_CHARS = 128 * 1024;
 
 function isLoopbackHost(host: string): boolean {
   const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
@@ -152,6 +169,36 @@ function noContent(res: http.ServerResponse): void {
   res.end();
 }
 
+/** A disconnected download must release its async iterator instead of waiting forever on drain. */
+export function waitForHttpDrain(res: http.ServerResponse): Promise<void> {
+  if (res.destroyed || res.writableEnded) {
+    return Promise.reject(new Error("artifact client disconnected before response drain"));
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+    const complete = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onDrain = () => complete();
+    const onClose = () => complete(new Error("artifact client disconnected before response drain"));
+    const onError = (error: Error) => complete(error);
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
+    // Cover a close which raced the listener installation.
+    if (res.destroyed || res.writableEnded) onClose();
+  });
+}
+
 function strictBase64(value: string): Uint8Array {
   if (
     value.length % 4 !== 0 ||
@@ -167,13 +214,143 @@ function envelope(type: string, properties: Record<string, unknown>): EventEnvel
 }
 
 /** 可续传事件帧：带 `id:`，浏览器 EventSource 会据此在重连时回发 Last-Event-ID。 */
-function sseEvent(res: http.ServerResponse, ev: EventEnvelope): void {
-  res.write(`id: ${ev.id}\ndata: ${JSON.stringify(ev)}\n\n`);
+function sseEventFrame(ev: EventEnvelope): string {
+  return `id: ${ev.id}\ndata: ${JSON.stringify(ev)}\n\n`;
 }
 
 /** 控制帧（connected/heartbeat/snapshot）：不带 `id:`，不参与 Last-Event-ID 定位。 */
-function sseControl(res: http.ServerResponse, ev: EventEnvelope): void {
-  res.write(`data: ${JSON.stringify(ev)}\n\n`);
+function sseControlFrame(ev: EventEnvelope): string {
+  return `data: ${JSON.stringify(ev)}\n\n`;
+}
+
+/** @internal Minimal ServerResponse surface used by the bounded SSE writer. */
+export interface SseWritable {
+  write(frame: string): boolean;
+  readonly writableLength?: number;
+  on(event: "drain", listener: () => void): unknown;
+  off(event: "drain", listener: () => void): unknown;
+}
+
+/** @internal Exported for deterministic backpressure tests; not re-exported from the package. */
+export class SseBackpressureWriter {
+  private readonly queue: { frame: string; bytes: number }[] = [];
+  private queuedBytes = 0;
+  private blocked = false;
+  private closed = false;
+  private readonly flushWaiters = new Set<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }>();
+
+  constructor(
+    private readonly sink: SseWritable,
+    private readonly limits: { maxPendingBytes: number; maxPendingEvents: number },
+    private readonly onOverflow: () => void,
+  ) {
+    sink.on("drain", this.drain);
+  }
+
+  raw(frame: string): boolean {
+    if (this.closed) return false;
+    const bytes = Buffer.byteLength(frame);
+    if (bytes > this.limits.maxPendingBytes) return this.overflow();
+    if (this.blocked) {
+      if (
+        this.queue.length >= this.limits.maxPendingEvents ||
+        this.queuedBytes + bytes > this.limits.maxPendingBytes
+      ) {
+        return this.overflow();
+      }
+      this.queue.push({ frame, bytes });
+      this.queuedBytes += bytes;
+      return true;
+    }
+    return this.writeToSink(frame);
+  }
+
+  event(ev: EventEnvelope): boolean {
+    return this.raw(sseEventFrame(ev));
+  }
+
+  control(ev: EventEnvelope): boolean {
+    return this.raw(sseControlFrame(ev));
+  }
+
+  async rawAndFlush(frame: string): Promise<void> {
+    if (!this.raw(frame)) throw new Error("SSE connection is closed");
+    await this.flushed();
+  }
+
+  async eventAndFlush(ev: EventEnvelope): Promise<void> {
+    await this.rawAndFlush(sseEventFrame(ev));
+  }
+
+  async controlAndFlush(ev: EventEnvelope): Promise<void> {
+    await this.rawAndFlush(sseControlFrame(ev));
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.queue.length = 0;
+    this.queuedBytes = 0;
+    this.sink.off("drain", this.drain);
+    this.rejectFlushWaiters(new Error("SSE connection closed"));
+  }
+
+  private readonly drain = (): void => {
+    if (this.closed) return;
+    this.blocked = false;
+    while (!this.blocked && this.queue.length > 0) {
+      const next = this.queue.shift()!;
+      this.queuedBytes -= next.bytes;
+      if (!this.writeToSink(next.frame)) return;
+    }
+    if (!this.blocked && this.queue.length === 0) this.resolveFlushWaiters();
+  };
+
+  private writeToSink(frame: string): boolean {
+    try {
+      if (!this.sink.write(frame)) {
+        this.blocked = true;
+        if ((this.sink.writableLength ?? 0) > this.limits.maxPendingBytes) {
+          return this.overflow();
+        }
+      }
+      return true;
+    } catch {
+      return this.overflow();
+    }
+  }
+
+  private overflow(): false {
+    if (this.closed) return false;
+    this.closed = true;
+    this.queue.length = 0;
+    this.queuedBytes = 0;
+    this.sink.off("drain", this.drain);
+    this.rejectFlushWaiters(new Error("SSE client exceeded the pending buffer limit"));
+    this.onOverflow();
+    return false;
+  }
+
+  private flushed(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("SSE connection closed"));
+    if (!this.blocked && this.queue.length === 0) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this.flushWaiters.add({ resolve, reject });
+    });
+  }
+
+  private resolveFlushWaiters(): void {
+    for (const waiter of this.flushWaiters) waiter.resolve();
+    this.flushWaiters.clear();
+  }
+
+  private rejectFlushWaiters(error: Error): void {
+    for (const waiter of this.flushWaiters) waiter.reject(error);
+    this.flushWaiters.clear();
+  }
 }
 
 /** SessionEvent → 命名细粒度事件（含 Message+Parts 投影）。 */
@@ -218,6 +395,13 @@ function deriveNamedEvents(
       return [envelope("session.updated", { sessionId, title: event.title })];
     case "state":
       return [envelope("session.status", { sessionId, running: event.running })];
+    case "workspace_trust":
+      return [
+        envelope("workspace.trust", {
+          sessionId,
+          assessment: event.assessment,
+        }),
+      ];
     case "reverted": {
       const { type: _type, ...rest } = event;
       return [envelope("session.reverted", { sessionId, ...rest })];
@@ -229,15 +413,34 @@ function deriveNamedEvents(
 
 /** 有界环形缓冲：支持按 Last-Event-ID 回放其后事件（未命中返回 null → 需整份重同步）。 */
 class EventRing {
-  private buf: EventEnvelope[] = [];
-  constructor(private max: number) {}
+  private buf: { event: EventEnvelope; bytes: number }[] = [];
+  private bytes = 0;
+  constructor(
+    private max: number,
+    private maxBytes: number,
+  ) {}
   push(ev: EventEnvelope): void {
-    this.buf.push(ev);
-    if (this.buf.length > this.max) this.buf.shift();
+    const bytes = Buffer.byteLength(sseEventFrame(ev));
+    if (bytes > this.maxBytes) {
+      // The live writer applies its own bound. Do not retain one adversarial event forever;
+      // reconnecting session clients will fall back to a fresh snapshot.
+      this.buf = [];
+      this.bytes = 0;
+      return;
+    }
+    this.buf.push({ event: ev, bytes });
+    this.bytes += bytes;
+    while (this.buf.length > this.max || this.bytes > this.maxBytes) {
+      this.bytes -= this.buf.shift()!.bytes;
+    }
   }
   replayAfter(id: string): EventEnvelope[] | null {
-    const i = this.buf.findIndex((e) => e.id === id);
-    return i === -1 ? null : this.buf.slice(i + 1);
+    const i = this.buf.findIndex((item) => item.event.id === id);
+    return i === -1 ? null : this.buf.slice(i + 1).map((item) => item.event);
+  }
+  clear(): void {
+    this.buf = [];
+    this.bytes = 0;
   }
 }
 
@@ -263,15 +466,27 @@ interface Firehose {
 interface InstanceStreams {
   manager: SessionManager;
   feeds: Map<string, SessionFeed>;
+  feedLoads: Map<string, Promise<SessionFeed>>;
+  /** Monotonic revocation generation; a pre-delete lazy load may never publish into a new epoch. */
+  feedEpochs: Map<string, number>;
   firehose?: Firehose;
+}
+
+interface SseAttachment {
+  connection: SseBackpressureWriter;
+  activate: () => void;
 }
 
 export class HttpDaemonServer {
   private server: http.Server;
   private defaultManager: SessionManager;
-  private token?: string;
+  private readonly providerModelDiscovery: (providerId: string) => Promise<string[] | undefined>;
+  private readonly token: string;
   private resolveInstance?: (directory: string) => SessionManager | Promise<SessionManager>;
   private replayBufferSize: number;
+  private replayBufferBytes: number;
+  private sseMaxPendingBytes: number;
+  private sseMaxPendingEvents: number;
   private feedLingerMs: number;
   private onClose?: () => void | Promise<void>;
   private rateWindowMs: number;
@@ -279,6 +494,9 @@ export class HttpDaemonServer {
   private requestRates = new Map<string, { startedAt: number; count: number }>();
   /** 活跃 SSE 连接的清理器，close 时逐个断开。 */
   private sseCleanups = new Set<() => void>();
+  /** Attachments grouped by their feed, used to revoke streams before deleting a session. */
+  private attachedCleanups = new Map<Set<Writer>, Set<(destroy?: boolean) => void>>();
+  private deletingSessions = new Map<SessionManager, Map<string, number>>();
   /** 目录 → 实例的 memo（并发 boot 去重）。 */
   private instances = new Map<string, Promise<SessionManager>>();
   /** manager → 流状态；close 时统一释放。 */
@@ -286,9 +504,17 @@ export class HttpDaemonServer {
 
   constructor(opts: HttpDaemonOptions) {
     this.defaultManager = opts.manager;
-    if (opts.token) this.token = opts.token;
+    this.providerModelDiscovery = opts.discoverModels ?? discoverProviderModels;
+    this.token =
+      opts.token !== undefined ? validateDaemonAuthToken(opts.token) : generateDaemonAuthToken();
     if (opts.resolveInstance) this.resolveInstance = opts.resolveInstance;
     this.replayBufferSize = opts.replayBufferSize ?? 1024;
+    this.replayBufferBytes = Math.max(64 * 1024, opts.replayBufferBytes ?? 8 * 1024 * 1024);
+    this.sseMaxPendingBytes = Math.max(
+      64 * 1024,
+      opts.sseClientBuffer?.maxPendingBytes ?? 8 * 1024 * 1024,
+    );
+    this.sseMaxPendingEvents = Math.max(1, opts.sseClientBuffer?.maxPendingEvents ?? 1024);
     this.feedLingerMs = opts.feedLingerMs ?? 15_000;
     this.rateWindowMs = Math.max(1_000, opts.rateLimit?.windowMs ?? 60_000);
     this.rateMaxRequests = Math.max(1, opts.rateLimit?.maxRequests ?? 600);
@@ -336,9 +562,17 @@ export class HttpDaemonServer {
     return typeof addr === "object" && addr ? addr.port : 0;
   }
 
+  /** Trusted in-process launchers use this to configure clients or a private runtime token file. */
+  authenticationToken(): string {
+    return this.token;
+  }
+
   async close(): Promise<void> {
     for (const cleanup of this.sseCleanups) cleanup();
     this.sseCleanups.clear();
+    await Promise.allSettled(
+      [...this.streams.values()].flatMap((inst) => [...inst.feedLoads.values()]),
+    );
     for (const inst of this.streams.values()) {
       for (const feed of inst.feeds.values()) {
         if (feed.linger) clearTimeout(feed.linger);
@@ -347,13 +581,14 @@ export class HttpDaemonServer {
       inst.firehose?.close();
     }
     this.streams.clear();
+    this.attachedCleanups.clear();
+    this.deletingSessions.clear();
     this.requestRates.clear();
     await new Promise<void>((res) => this.server.close(() => res()));
     await this.onClose?.();
   }
 
   private authorized(req: http.IncomingMessage): boolean {
-    if (!this.token) return true;
     const header = req.headers.authorization;
     if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
     const presented = Buffer.from(header.slice(7));
@@ -398,7 +633,7 @@ export class HttpDaemonServer {
   private streamsFor(manager: SessionManager): InstanceStreams {
     let inst = this.streams.get(manager);
     if (!inst) {
-      inst = { manager, feeds: new Map() };
+      inst = { manager, feeds: new Map(), feedLoads: new Map(), feedEpochs: new Map() };
       this.streams.set(manager, inst);
     }
     return inst;
@@ -461,12 +696,39 @@ export class HttpDaemonServer {
         details: { supported: [PROTOCOL_VERSION] },
       });
     }
-    if (!this.authorized(req)) return json(res, 401, { error: "unauthorized" });
-
     if (req.method === "GET") {
       if (url.pathname === "/healthz") return json(res, 200, { ok: true });
       if (url.pathname === "/global/health")
         return json(res, 200, { ok: true, name: "anicode", protocol: PROTOCOL_VERSION });
+    }
+    if (!this.authorized(req)) {
+      res.setHeader("www-authenticate", 'Bearer realm="anicode"');
+      return json(res, 401, { error: "unauthorized" });
+    }
+
+    const providerModels = /^\/providers\/([^/]+)\/models$/.exec(url.pathname);
+    if (providerModels) {
+      if (req.method !== "GET") return json(res, 405, { error: "method not allowed" });
+      let decodedProviderId: string;
+      try {
+        decodedProviderId = decodeURIComponent(providerModels[1]!);
+      } catch {
+        return json(res, 400, { error: "invalid provider id" });
+      }
+      const providerId = sanitizeProviderId(decodedProviderId);
+      if (!providerId) return json(res, 400, { error: "invalid provider id" });
+      let models: string[] | undefined;
+      try {
+        models = sanitizeDiscoveredModels(await this.providerModelDiscovery(providerId));
+      } catch {
+        // Provider/network errors are an expected negative probe result. Do not expose upstream
+        // credential or endpoint details and never fall back to a static catalog here.
+        models = undefined;
+      }
+      return json(res, 200, { providerId, models: models ?? null });
+    }
+
+    if (req.method === "GET") {
       if (url.pathname === "/doc") return json(res, 200, generateOpenApi());
       if (url.pathname === "/events")
         return this.firehose(await this.managerFor(req, url), res, this.lastEventId(req, url));
@@ -587,7 +849,7 @@ export class HttpDaemonServer {
       });
       for await (const chunk of record.data) {
         if (res.destroyed) throw new Error("artifact client disconnected");
-        if (!res.write(chunk)) await once(res, "drain");
+        if (!res.write(chunk)) await waitForHttpDrain(res);
       }
       res.end();
       return;
@@ -785,8 +1047,21 @@ export class HttpDaemonServer {
         return snap ? json(res, 200, snap) : json(res, 404, { error: "not found" });
       }
       if (req.method === "DELETE") {
-        await manager.deleteSession(sessionId);
-        return noContent(res);
+        this.markSessionDeleting(manager, sessionId, true);
+        try {
+          // Start the authoritative durable fence before doing any stream cleanup. In particular,
+          // a lazy manager.open() may be hung in feedLoads and must never delay the deletion claim.
+          const deletion = manager.deleteSession(sessionId);
+          // Revocation is synchronous and bounded: close all materialized replay sources now and
+          // attach a generation fence to any pending load without awaiting that untrusted promise.
+          this.invalidateSessionStreams(manager, sessionId);
+          await deletion;
+          return noContent(res);
+        } finally {
+          // Catch a feed that materialized while durable deletion was draining its admitted work.
+          this.invalidateSessionStreams(manager, sessionId);
+          this.markSessionDeleting(manager, sessionId, false);
+        }
       }
       if (req.method === "PATCH") {
         const body = (await this.requestJson(req, url)) as { title?: string };
@@ -809,7 +1084,7 @@ export class HttpDaemonServer {
         if (!snap) return json(res, 404, { error: "not found" });
         return json(res, 200, messagesToParts(sessionId, snap.messages));
       }
-      if (action === "checkpoints") return json(res, 200, manager.listCheckpoints(sessionId));
+      if (action === "checkpoints") return json(res, 200, await manager.listCheckpoints(sessionId));
       if (action === "permission-profiles")
         return json(res, 200, await manager.listPermissionProfiles(sessionId));
     }
@@ -903,6 +1178,66 @@ export class HttpDaemonServer {
     }
   }
 
+  private markSessionDeleting(manager: SessionManager, sessionId: string, deleting: boolean): void {
+    let sessions = this.deletingSessions.get(manager);
+    if (deleting) {
+      if (!sessions) {
+        sessions = new Map();
+        this.deletingSessions.set(manager, sessions);
+      }
+      sessions.set(sessionId, (sessions.get(sessionId) ?? 0) + 1);
+      return;
+    }
+    const count = sessions?.get(sessionId) ?? 0;
+    if (count <= 1) sessions?.delete(sessionId);
+    else sessions?.set(sessionId, count - 1);
+    if (sessions?.size === 0) this.deletingSessions.delete(manager);
+  }
+
+  private sessionIsDeleting(manager: SessionManager, sessionId: string): boolean {
+    return (this.deletingSessions.get(manager)?.get(sessionId) ?? 0) > 0;
+  }
+
+  private closeAttached(writers: Set<Writer>): void {
+    for (const cleanup of [...(this.attachedCleanups.get(writers) ?? [])]) cleanup(true);
+  }
+
+  private invalidateSessionStreams(manager: SessionManager, sessionId: string): void {
+    const inst = this.streams.get(manager);
+    if (!inst) return;
+    inst.feedEpochs.set(sessionId, (inst.feedEpochs.get(sessionId) ?? 0) + 1);
+    const feed = inst.feeds.get(sessionId);
+    if (feed) {
+      if (feed.linger) clearTimeout(feed.linger);
+      this.closeAttached(feed.writers);
+      feed.ring.clear();
+      feed.close();
+    }
+    // Never await a lazy load here. Its manager.open() may be blocked indefinitely. The epoch
+    // check in sessionFeed prevents publication, while this continuation closes even a custom
+    // manager implementation that resolves with a handle after the durable delete completes.
+    const pending = inst.feedLoads.get(sessionId);
+    if (pending) {
+      void pending.then(
+        (loaded) => {
+          if (loaded.linger) clearTimeout(loaded.linger);
+          this.closeAttached(loaded.writers);
+          loaded.ring.clear();
+          loaded.close();
+        },
+        () => undefined,
+      );
+    }
+    // The global ring can contain this session and active firehose writers can have its frames
+    // queued. Revoke the whole firehose; clients reconnect and rebuild from current live state.
+    const firehose = inst.firehose;
+    if (firehose) {
+      this.closeAttached(firehose.writers);
+      firehose.ring.clear();
+      firehose.close();
+    }
+  }
+
   /** live 快照；未加载则经 resumeSession 懒载入（不存在返回 undefined）。 */
   private async snapshotOf(manager: SessionManager, sessionId: string) {
     const live = manager.peek(sessionId);
@@ -926,28 +1261,65 @@ export class HttpDaemonServer {
       }
       return existing;
     }
-    const writers = new Set<Writer>();
-    const ring = new EventRing(this.replayBufferSize);
-    const projector = new PartsProjector(sessionId);
-    const emit = (ev: EventEnvelope) => {
-      ring.push(ev);
-      for (const w of writers) w(ev);
-    };
-    const handle = await inst.manager.open(sessionId, (event: SessionEvent) => {
-      emit(envelope("session.event", { sessionId, event }));
-      for (const named of deriveNamedEvents(sessionId, projector, event)) emit(named);
-    });
-    const feed: SessionFeed = {
-      writers,
-      ring,
-      peek: () => inst.manager.peek(sessionId),
-      close: () => {
-        handle.close();
-        inst.feeds.delete(sessionId);
-      },
-    };
-    inst.feeds.set(sessionId, feed);
-    return feed;
+    const pending = inst.feedLoads.get(sessionId);
+    if (pending) return pending;
+    const feedEpoch = inst.feedEpochs.get(sessionId) ?? 0;
+    const load = (async (): Promise<SessionFeed> => {
+      if (this.sessionIsDeleting(inst.manager, sessionId)) {
+        throw new HttpRequestError(404, "NOT_FOUND", "session is being deleted");
+      }
+      const writers = new Set<Writer>();
+      const ring = new EventRing(this.replayBufferSize, this.replayBufferBytes);
+      const projector = new PartsProjector(sessionId);
+      const emit = (ev: EventEnvelope) => {
+        ring.push(ev);
+        for (const w of writers) w(ev);
+      };
+      const handle = await inst.manager
+        .open(sessionId, (event: SessionEvent) => {
+          emit(envelope("session.event", { sessionId, event }));
+          for (const named of deriveNamedEvents(sessionId, projector, event)) emit(named);
+        })
+        .catch((error: unknown) => {
+          if (
+            this.sessionIsDeleting(inst.manager, sessionId) ||
+            (inst.feedEpochs.get(sessionId) ?? 0) !== feedEpoch
+          ) {
+            throw new HttpRequestError(404, "NOT_FOUND", "session is being deleted");
+          }
+          throw error;
+        });
+      let closed = false;
+      const feed: SessionFeed = {
+        writers,
+        ring,
+        peek: () => inst.manager.peek(sessionId),
+        close: () => {
+          if (closed) return;
+          closed = true;
+          if (feed.linger) clearTimeout(feed.linger);
+          ring.clear();
+          writers.clear();
+          handle.close();
+          inst.feeds.delete(sessionId);
+        },
+      };
+      if (
+        this.sessionIsDeleting(inst.manager, sessionId) ||
+        (inst.feedEpochs.get(sessionId) ?? 0) !== feedEpoch
+      ) {
+        feed.close();
+        throw new HttpRequestError(404, "NOT_FOUND", "session is being deleted");
+      }
+      inst.feeds.set(sessionId, feed);
+      return feed;
+    })();
+    inst.feedLoads.set(sessionId, load);
+    try {
+      return await load;
+    } finally {
+      if (inst.feedLoads.get(sessionId) === load) inst.feedLoads.delete(sessionId);
+    }
   }
 
   /** 订阅单会话：server.connected →（Last-Event-ID 增量补发 | session.snapshot）→ 实时。 */
@@ -957,41 +1329,120 @@ export class HttpDaemonServer {
     res: http.ServerResponse,
     lastEventId?: string,
   ): Promise<void> {
+    if (this.sessionIsDeleting(manager, sessionId)) {
+      throw new HttpRequestError(404, "NOT_FOUND", "session is being deleted");
+    }
+    if (!(await this.snapshotOf(manager, sessionId))) {
+      throw new HttpRequestError(404, "NOT_FOUND", "session not found");
+    }
     const inst = this.streamsFor(manager);
     const feed = await this.sessionFeed(inst, sessionId);
+    if (this.sessionIsDeleting(manager, sessionId)) {
+      throw new HttpRequestError(404, "NOT_FOUND", "session is being deleted");
+    }
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    res.write("retry: 1000\n\n");
-    sseControl(res, envelope("server.connected", { protocol: PROTOCOL_VERSION }));
-
-    const replay = lastEventId ? feed.ring.replayAfter(lastEventId) : null;
-    if (replay) {
-      // 增量补发：客户端已有状态，从断点续流，无需整份快照。
-      for (const ev of replay) sseEvent(res, ev);
-    } else {
-      // 首连或缓冲已淘汰该事件：回落整份快照重同步。
-      sseControl(res, envelope("session.snapshot", { sessionId, snapshot: feed.peek() }));
-    }
-
-    this.attach(res, feed.writers, () => {
+    const onEmpty = () => {
       // 最后一个订阅者断开：延迟释放，给断线重连留一个 replay 窗口。
-      if (feed.writers.size > 0 || feed.linger) return;
+      if (inst.feeds.get(sessionId) !== feed || feed.writers.size > 0 || feed.linger) return;
       feed.linger = setTimeout(() => {
         if (feed.writers.size === 0) feed.close();
       }, this.feedLingerMs);
-      feed.linger.unref?.(); // 不因等待释放而拖住进程退出
-    });
+      feed.linger.unref?.();
+    };
+    const pending: { event: EventEnvelope; bytes: number }[] = [];
+    let pendingBytes = 0;
+    let captureOverflow = false;
+    const capture: Writer = (event) => {
+      const bytes = Buffer.byteLength(sseEventFrame(event));
+      if (
+        pending.length >= this.sseMaxPendingEvents ||
+        pendingBytes + bytes > this.sseMaxPendingBytes
+      ) {
+        captureOverflow = true;
+        return;
+      }
+      pending.push({ event, bytes });
+      pendingBytes += bytes;
+    };
+    feed.writers.add(capture);
+    const attachment = this.attach(res, feed.writers, onEmpty, undefined, false);
+    const { connection } = attachment;
+    try {
+      await connection.rawAndFlush("retry: 1000\n\n");
+      await connection.controlAndFlush(
+        envelope("server.connected", { protocol: PROTOCOL_VERSION }),
+      );
+      const replay = lastEventId ? feed.ring.replayAfter(lastEventId) : null;
+      if (replay) {
+        for (const event of replay) await connection.eventAndFlush(event);
+      } else {
+        const snapshot = feed.peek();
+        if (!snapshot) throw new HttpRequestError(404, "NOT_FOUND", "session not found");
+        await this.writeSnapshot(connection, sessionId, snapshot);
+      }
+      while (pending.length > 0) {
+        if (captureOverflow) throw new Error("SSE initial event buffer exceeded its safety limit");
+        const next = pending.shift()!;
+        pendingBytes -= next.bytes;
+        await connection.eventAndFlush(next.event);
+      }
+      if (captureOverflow) throw new Error("SSE initial event buffer exceeded its safety limit");
+      // Synchronous handoff: no manager event can land between removing capture and activating the
+      // live writer, so snapshot/replay is delivered exactly once and always precedes live events.
+      feed.writers.delete(capture);
+      attachment.activate();
+    } catch (error) {
+      feed.writers.delete(capture);
+      if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
+      onEmpty();
+    }
+  }
+
+  private async writeSnapshot(
+    connection: SseBackpressureWriter,
+    sessionId: string,
+    snapshot: SessionSnapshot,
+  ): Promise<void> {
+    const serialized = JSON.stringify(snapshot);
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes > MAX_SSE_SNAPSHOT_BYTES) {
+      throw new Error(`SSE snapshot exceeds ${MAX_SSE_SNAPSHOT_BYTES} bytes`);
+    }
+    if (bytes <= INLINE_SSE_SNAPSHOT_BYTES) {
+      await connection.controlAndFlush(envelope("session.snapshot", { sessionId, snapshot }));
+      return;
+    }
+    const transferId = randomUUID();
+    const chunkChars = Math.max(
+      1024,
+      Math.min(SSE_SNAPSHOT_CHUNK_CHARS, Math.floor(this.sseMaxPendingBytes / 8)),
+    );
+    let index = 0;
+    for (let offset = 0; offset < serialized.length; offset += chunkChars) {
+      const end = Math.min(serialized.length, offset + chunkChars);
+      await connection.controlAndFlush(
+        envelope("session.snapshot.chunk", {
+          sessionId,
+          transferId,
+          index,
+          data: serialized.slice(offset, end),
+          done: end === serialized.length,
+        }),
+      );
+      index++;
+    }
   }
 
   /** 取（或建）全局 firehose 扇出（跨所有 live 会话）。 */
   private ensureFirehose(inst: InstanceStreams): Firehose {
     if (inst.firehose) return inst.firehose;
     const writers = new Set<Writer>();
-    const ring = new EventRing(this.replayBufferSize);
+    const ring = new EventRing(this.replayBufferSize, this.replayBufferBytes);
     const projectors = new Map<string, PartsProjector>();
     const emit = (ev: EventEnvelope) => {
       ring.push(ev);
@@ -1006,12 +1457,17 @@ export class HttpDaemonServer {
       }
       for (const named of deriveNamedEvents(sessionId, projector, event)) emit(named);
     });
+    let closed = false;
     const firehose: Firehose = {
       writers,
       ring,
       close: () => {
+        if (closed) return;
+        closed = true;
+        ring.clear();
+        writers.clear();
         unsub();
-        delete inst.firehose;
+        if (inst.firehose === firehose) delete inst.firehose;
       },
     };
     inst.firehose = firehose;
@@ -1028,28 +1484,81 @@ export class HttpDaemonServer {
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    res.write("retry: 1000\n\n");
-    sseControl(res, envelope("server.connected", { protocol: PROTOCOL_VERSION }));
-    const replay = lastEventId ? fh.ring.replayAfter(lastEventId) : null;
-    if (replay) for (const ev of replay) sseEvent(res, ev);
-    this.attach(res, fh.writers, () => {
-      if (fh.writers.size === 0) fh.close();
-    });
+    this.attach(
+      res,
+      fh.writers,
+      () => {
+        if (fh.writers.size === 0) fh.close();
+      },
+      (connection) => {
+        connection.raw("retry: 1000\n\n");
+        connection.control(envelope("server.connected", { protocol: PROTOCOL_VERSION }));
+        const replay = lastEventId ? fh.ring.replayAfter(lastEventId) : null;
+        if (replay) for (const ev of replay) connection.event(ev);
+      },
+    );
   }
 
-  /** 挂载一个 writer 到流：心跳 + 断开清理（含引用计数回收扇出）。 */
-  private attach(res: http.ServerResponse, writers: Set<Writer>, onEmpty: () => void): void {
-    const writer: Writer = (ev) => sseEvent(res, ev);
-    writers.add(writer);
-    const heartbeat = setInterval(() => sseControl(res, envelope("server.heartbeat", {})), 30_000);
-    const cleanup = () => {
+  /** 挂载有界 writer：drain 恢复、慢客户端断开、心跳与引用计数清理。 */
+  private attach(
+    res: http.ServerResponse,
+    writers: Set<Writer>,
+    onEmpty: () => void,
+    initialize?: (connection: SseBackpressureWriter) => void,
+    activateImmediately = true,
+  ): SseAttachment {
+    let cleaned = false;
+    let active = false;
+    let connection: SseBackpressureWriter;
+    const writer: Writer = (ev) => connection.event(ev);
+    const cleanup = (destroy = false) => {
+      if (cleaned) return;
+      cleaned = true;
       clearInterval(heartbeat);
+      connection.close();
       writers.delete(writer);
       onEmpty();
       this.sseCleanups.delete(cleanup);
-      res.end();
+      const grouped = this.attachedCleanups.get(writers);
+      grouped?.delete(cleanup);
+      if (grouped?.size === 0) this.attachedCleanups.delete(writers);
+      res.off("close", close);
+      res.off("error", close);
+      if (destroy) {
+        if (!res.destroyed) res.destroy();
+      } else if (!res.destroyed && !res.writableEnded) {
+        res.end();
+      }
     };
+    connection = new SseBackpressureWriter(
+      res,
+      {
+        maxPendingBytes: this.sseMaxPendingBytes,
+        maxPendingEvents: this.sseMaxPendingEvents,
+      },
+      () => cleanup(true),
+    );
+    const heartbeat = setInterval(
+      () => connection.control(envelope("server.heartbeat", {})),
+      30_000,
+    );
+    const close = () => cleanup();
     this.sseCleanups.add(cleanup);
-    res.on("close", cleanup);
+    let grouped = this.attachedCleanups.get(writers);
+    if (!grouped) {
+      grouped = new Set();
+      this.attachedCleanups.set(writers, grouped);
+    }
+    grouped.add(cleanup);
+    res.on("close", close);
+    res.on("error", close);
+    initialize?.(connection);
+    const activate = () => {
+      if (cleaned || active) return;
+      active = true;
+      writers.add(writer);
+    };
+    if (activateImmediately) activate();
+    return { connection, activate };
   }
 }

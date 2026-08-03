@@ -129,3 +129,17 @@ test("PluginRuntime: 停用已连接的 MCP 会断开并移除其工具", async 
   assert.equal(fake.closed, 1, "应关闭 MCP client");
   assert.ok(!rt.buildToolRegistry().names().includes("playwright__do"));
 });
+
+test("PluginRuntime: trust suspension closes MCP and reconnects only after resume", async () => {
+  const fake = fakeConnector();
+  const rt = new PluginRuntime(fake.connect, {});
+  await rt.setState(["mcp.playwright"]);
+  assert.ok(rt.buildToolRegistry().names().includes("playwright__do"));
+  await rt.setSuspended(true);
+  assert.equal(fake.closed, 1);
+  assert.ok(!rt.buildToolRegistry().names().includes("playwright__do"));
+  await rt.setSuspended(false);
+  assert.equal(fake.calls.length, 2);
+  assert.ok(rt.buildToolRegistry().names().includes("playwright__do"));
+  rt.dispose();
+});

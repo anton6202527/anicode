@@ -1,11 +1,15 @@
 /** 持久 worker queue：lease/heartbeat/重试，以及 worktree 独占所有权。 */
 
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { hostname } from "node:os";
 import * as path from "node:path";
 import { noTelemetry, parseTraceparent, type SpanContext, type Telemetry } from "./telemetry.js";
 
-export type WorkerJobStatus = "queued" | "leased" | "succeeded" | "failed" | "cancelled";
+export type WorkerJobStatus =
+  "queued" | "leased" | "cancellation_requested" | "succeeded" | "failed" | "cancelled";
+
+export type WorkerCancellationResult = "cancellation_requested" | "cancelled" | "not_cancellable";
 
 export interface WorkerJob<T = unknown, R = unknown> {
   id: string;
@@ -25,6 +29,23 @@ export interface WorkerJob<T = unknown, R = unknown> {
   error?: string;
 }
 
+export interface WorkerEnqueueQuota {
+  tenantId: string;
+  actor: string;
+  maxOutstandingPerTenant: number;
+  maxQueuedPerActor: number;
+}
+
+export class WorkerQueueQuotaError extends Error {
+  constructor(
+    readonly code: "tenant_quota_exceeded" | "actor_queue_full",
+    message: string,
+  ) {
+    super(message);
+    this.name = "WorkerQueueQuotaError";
+  }
+}
+
 interface WorkerDocument {
   version: 1;
   jobs: WorkerJob[];
@@ -33,6 +54,7 @@ interface WorkerDocument {
 export interface WorkerQueueStore {
   transact<T>(fn: (jobs: WorkerJob[]) => T | Promise<T>): Promise<T>;
   enqueueJob?(job: WorkerJob): Promise<WorkerJob>;
+  enqueueJobWithQuota?(job: WorkerJob, quota: WorkerEnqueueQuota): Promise<WorkerJob>;
   claimJob?(
     owner: string,
     types: string[] | undefined,
@@ -52,6 +74,9 @@ export interface WorkerQueueStore {
     retry: boolean,
     fencingToken?: number,
   ): Promise<void>;
+  requestCancellationJob?(jobId: string): Promise<WorkerCancellationResult>;
+  acknowledgeCancellationJob?(jobId: string, owner: string, fencingToken?: number): Promise<void>;
+  /** @deprecated Implement the two-phase cancellation methods above. */
   cancelJob?(jobId: string): Promise<boolean>;
   listJobs?(): Promise<WorkerJob[]>;
   get?(jobId: string): Promise<WorkerJob | undefined>;
@@ -75,10 +100,34 @@ export class MemoryWorkerQueueStore implements WorkerQueueStore {
   }
 }
 
+export interface FileWorkerQueueStoreOptions {
+  /** Lock tuning for tests/embedded stores. Production should use the defaults. */
+  lockTimeoutMs?: number;
+  lockRetryMs?: number;
+}
+
+interface QueueFileLockOwner {
+  version: 1;
+  ownerToken: string;
+  pid: number;
+  host: string;
+  acquiredAt: string;
+}
+
+interface QueueFileLock {
+  handle: import("node:fs/promises").FileHandle;
+  owner: QueueFileLockOwner;
+  dev: bigint;
+  ino: bigint;
+}
+
 export class FileWorkerQueueStore implements WorkerQueueStore {
   private tail: Promise<unknown> = Promise.resolve();
 
-  constructor(readonly file: string) {}
+  constructor(
+    readonly file: string,
+    private readonly options: FileWorkerQueueStoreOptions = {},
+  ) {}
 
   transact<T>(fn: (jobs: WorkerJob[]) => T | Promise<T>): Promise<T> {
     const run = this.tail
@@ -86,35 +135,84 @@ export class FileWorkerQueueStore implements WorkerQueueStore {
       .then(async () => {
         await fs.mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
         const lock = `${this.file}.lock`;
-        const handle = await this.acquire(lock);
+        const lease = await this.acquire(lock);
         try {
           const document = await this.read();
           const result = await fn(document.jobs);
           await this.write(document);
           return result;
         } finally {
-          await handle.close();
-          await fs.rm(lock, { force: true });
+          await this.release(lock, lease).catch(() => undefined);
+          await lease.handle.close();
         }
       });
     this.tail = run;
     return run;
   }
 
-  private async acquire(lock: string): Promise<import("node:fs/promises").FileHandle> {
-    const deadline = Date.now() + 10_000;
+  private async acquire(lock: string): Promise<QueueFileLock> {
+    const deadline = Date.now() + Math.max(1, this.options.lockTimeoutMs ?? 10_000);
+    const retryMs = Math.max(1, this.options.lockRetryMs ?? 10);
     for (;;) {
       try {
-        return await fs.open(lock, "wx", 0o600);
+        const handle = await fs.open(lock, "wx", 0o600);
+        const owner: QueueFileLockOwner = {
+          version: 1,
+          ownerToken: randomBytes(32).toString("hex"),
+          pid: process.pid,
+          host: hostname(),
+          acquiredAt: new Date().toISOString(),
+        };
+        try {
+          await handle.writeFile(JSON.stringify(owner));
+          await handle.sync();
+          const stat = await handle.stat({ bigint: true });
+          return { handle, owner, dev: stat.dev, ino: stat.ino };
+        } catch (error) {
+          await handle.close().catch(() => undefined);
+          // If durable owner publication fails, leave the exclusive inode in place. Removing an
+          // incompletely published lock without a verifiable token could delete a replacement.
+          throw error;
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const stat = await fs.stat(lock).catch(() => undefined);
-        if (stat && Date.now() - stat.mtimeMs > 30_000) await fs.rm(lock, { force: true });
         if (Date.now() >= deadline)
           throw new Error(`Worker queue lock timeout: ${lock}`, { cause: error });
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        // A suspended transaction remains authoritative regardless of mtime. Recovery is an
+        // explicit operator action; this hot path never guesses that an owner is dead.
+        await new Promise((resolve) => setTimeout(resolve, retryMs));
       }
     }
+  }
+
+  private async release(lock: string, lease: QueueFileLock): Promise<void> {
+    const [owner, stat] = await Promise.all([
+      this.readLockOwner(lock).catch(() => undefined),
+      fs.lstat(lock, { bigint: true }).catch(() => undefined),
+    ]);
+    if (
+      owner?.ownerToken === lease.owner.ownerToken &&
+      owner.pid === lease.owner.pid &&
+      stat?.dev === lease.dev &&
+      stat.ino === lease.ino
+    ) {
+      await fs.unlink(lock);
+    }
+  }
+
+  private async readLockOwner(lock: string): Promise<QueueFileLockOwner> {
+    const owner = JSON.parse(await fs.readFile(lock, "utf8")) as Partial<QueueFileLockOwner>;
+    if (
+      owner.version !== 1 ||
+      typeof owner.ownerToken !== "string" ||
+      !/^[a-f0-9]{64}$/.test(owner.ownerToken) ||
+      !Number.isSafeInteger(owner.pid) ||
+      typeof owner.host !== "string" ||
+      typeof owner.acquiredAt !== "string"
+    ) {
+      throw new Error(`Invalid worker queue lock: ${lock}`);
+    }
+    return owner as QueueFileLockOwner;
   }
 
   private async read(): Promise<WorkerDocument> {
@@ -154,7 +252,7 @@ export class DurableWorkerQueue {
   enqueue<T>(
     type: string,
     payload: T,
-    options: { idempotencyKey?: string; maxAttempts?: number } = {},
+    options: { idempotencyKey?: string; maxAttempts?: number; quota?: WorkerEnqueueQuota } = {},
   ) {
     const key = options.idempotencyKey ?? `job:${randomUUID()}`;
     const now = new Date().toISOString();
@@ -169,6 +267,9 @@ export class DurableWorkerQueue {
       createdAt: now,
       updatedAt: now,
     };
+    if (options.quota && this.store.enqueueJobWithQuota) {
+      return this.store.enqueueJobWithQuota(proposed, options.quota) as Promise<WorkerJob<T>>;
+    }
     if (this.store.enqueueJob) {
       return this.store.enqueueJob(proposed) as Promise<WorkerJob<T>>;
     }
@@ -184,6 +285,19 @@ export class DurableWorkerQueue {
     if (this.store.claimJob) return this.store.claimJob(owner, types, leaseMs);
     return this.store.transact(async (jobs) => {
       const now = Date.now();
+      for (const candidate of jobs) {
+        if (
+          candidate.status === "cancellation_requested" &&
+          (!candidate.leaseExpiresAt || Date.parse(candidate.leaseExpiresAt) <= now)
+        ) {
+          candidate.status = "failed";
+          candidate.error =
+            "cancellation acknowledgement lease expired; execution outcome indeterminate";
+          candidate.updatedAt = new Date().toISOString();
+          delete candidate.leaseOwner;
+          delete candidate.leaseExpiresAt;
+        }
+      }
       const job = jobs.find(
         (candidate) =>
           !candidate.type.startsWith("__worktree__:") &&
@@ -253,16 +367,46 @@ export class DurableWorkerQueue {
     });
   }
 
-  cancel(jobId: string): Promise<boolean> {
-    if (this.store.cancelJob) return this.store.cancelJob(jobId);
+  async cancel(jobId: string): Promise<boolean> {
+    return (await this.requestCancellation(jobId)) !== "not_cancellable";
+  }
+
+  requestCancellation(jobId: string): Promise<WorkerCancellationResult> {
+    if (this.store.requestCancellationJob) return this.store.requestCancellationJob(jobId);
     return this.store.transact(async (jobs) => {
       const job = jobs.find((candidate) => candidate.id === jobId);
-      if (!job || ["succeeded", "failed", "cancelled"].includes(job.status)) return false;
+      if (!job || ["succeeded", "failed"].includes(job.status)) return "not_cancellable";
+      if (job.status === "cancelled") return "cancelled";
+      if (job.status === "cancellation_requested") return "cancellation_requested";
+      if (job.status === "leased") {
+        job.status = "cancellation_requested";
+        job.updatedAt = new Date().toISOString();
+        return "cancellation_requested";
+      }
       job.status = "cancelled";
       job.updatedAt = new Date().toISOString();
       delete job.leaseOwner;
       delete job.leaseExpiresAt;
-      return true;
+      return "cancelled";
+    });
+  }
+
+  acknowledgeCancellation(jobId: string, owner: string, fencingToken?: number): Promise<void> {
+    if (this.store.acknowledgeCancellationJob) {
+      return this.store.acknowledgeCancellationJob(jobId, owner, fencingToken);
+    }
+    return this.store.transact(async (jobs) => {
+      const job = jobs.find((candidate) => candidate.id === jobId);
+      if (!job || job.status !== "cancellation_requested" || job.leaseOwner !== owner) {
+        throw new Error(`Cannot acknowledge unowned worker job cancellation ${jobId}`);
+      }
+      if (fencingToken !== undefined && job.fencingToken !== fencingToken) {
+        throw new Error(`Stale fencing token for worker job ${jobId}`);
+      }
+      job.status = "cancelled";
+      job.updatedAt = new Date().toISOString();
+      delete job.leaseOwner;
+      delete job.leaseExpiresAt;
     });
   }
 
@@ -307,8 +451,29 @@ export type WorkerHandler = (
   context?: SpanContext,
 ) => Promise<unknown>;
 
+function linkedAbortController(parent: AbortSignal): {
+  controller: AbortController;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const abort = () => controller.abort(parent.reason ?? new Error("Worker stopped"));
+  if (parent.aborted) abort();
+  else parent.addEventListener("abort", abort, { once: true });
+  return { controller, dispose: () => parent.removeEventListener("abort", abort) };
+}
+
+function ownsLease(job: WorkerJob | undefined, owner: string, fencingToken?: number): boolean {
+  return Boolean(
+    job &&
+    job.status === "leased" &&
+    job.leaseOwner === owner &&
+    (fencingToken === undefined || job.fencingToken === fencingToken),
+  );
+}
+
 export class PersistentWorker {
   private stopped = false;
+  private readonly active = new Set<AbortController>();
 
   constructor(
     readonly id: string,
@@ -336,28 +501,74 @@ export class PersistentWorker {
       },
       trace,
     );
+    const linked = linkedAbortController(signal);
+    this.active.add(linked.controller);
     const heartbeat = setInterval(
       () =>
         void this.queue
           .heartbeat(job.id, this.id, this.leaseMs, job.fencingToken)
-          .catch(() => undefined),
+          .catch((error) => linked.controller.abort(error)),
       Math.max(500, Math.floor(this.leaseMs / 3)),
     );
+    let checkingCancellation = false;
+    const cancellationPoll = setInterval(
+      () => {
+        if (checkingCancellation || linked.controller.signal.aborted) return;
+        checkingCancellation = true;
+        void this.queue
+          .get(job.id)
+          .then((current) => {
+            if (
+              current?.status === "cancellation_requested" &&
+              current.leaseOwner === this.id &&
+              current.fencingToken === job.fencingToken
+            ) {
+              linked.controller.abort(new Error(`Worker job ${job.id} cancellation requested`));
+            }
+          })
+          .catch((error) => linked.controller.abort(error))
+          .finally(() => {
+            checkingCancellation = false;
+          });
+      },
+      Math.max(100, Math.min(1_000, Math.floor(this.leaseMs / 10))),
+    );
     try {
-      const result = await this.handlers[job.type]!(job.payload, signal, span.context());
+      const result = await this.handlers[job.type]!(
+        job.payload,
+        linked.controller.signal,
+        span.context(),
+      );
+      linked.controller.signal.throwIfAborted();
       await this.queue.finish(job.id, this.id, result, job.fencingToken);
       span.setStatus({ code: "ok" });
     } catch (error) {
-      await this.queue.fail(
-        job.id,
-        this.id,
-        error instanceof Error ? error.message : String(error),
-        true,
-        job.fencingToken,
-      );
+      const current = await this.queue.get(job.id).catch(() => undefined);
+      if (
+        current?.status === "cancellation_requested" &&
+        current.leaseOwner === this.id &&
+        current.fencingToken === job.fencingToken
+      ) {
+        await this.queue
+          .acknowledgeCancellation(job.id, this.id, job.fencingToken)
+          .catch(() => undefined);
+      } else if (ownsLease(current, this.id, job.fencingToken)) {
+        await this.queue
+          .fail(
+            job.id,
+            this.id,
+            error instanceof Error ? error.message : String(error),
+            true,
+            job.fencingToken,
+          )
+          .catch(() => undefined);
+      }
       span.recordException(error).setStatus({ code: "error" });
     } finally {
       clearInterval(heartbeat);
+      clearInterval(cancellationPoll);
+      linked.dispose();
+      this.active.delete(linked.controller);
       span.end();
     }
     return true;
@@ -373,6 +584,7 @@ export class PersistentWorker {
 
   stop(): void {
     this.stopped = true;
+    for (const controller of this.active) controller.abort(new Error("Worker stopped"));
   }
 }
 

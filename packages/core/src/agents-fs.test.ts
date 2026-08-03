@@ -83,6 +83,44 @@ test("discoverSubagents: .anicode/agents 同名覆盖 .claude/agents", async () 
   }
 });
 
+test("discoverSubagents: includeProject=false 排除两种项目 agent，保留用户级", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-agent-trust-"));
+  const home = path.join(root, "home");
+  const project = path.join(root, "project");
+  const oldHome = process.env["HOME"];
+  process.env["HOME"] = home;
+  try {
+    const globalDir = path.join(home, ".claude", "agents");
+    const projectDir = path.join(project, ".claude", "agents");
+    const nativeDir = path.join(project, ".anicode", "agents");
+    await Promise.all(
+      [globalDir, projectDir, nativeDir].map((directory) =>
+        fs.mkdir(directory, { recursive: true }),
+      ),
+    );
+    await fs.writeFile(path.join(globalDir, "global.md"), "---\ndescription: global\n---\nglobal");
+    await fs.writeFile(
+      path.join(projectDir, "project.md"),
+      "---\ndescription: project\n---\nproject",
+    );
+    await fs.writeFile(path.join(nativeDir, "native.md"), "---\ndescription: native\n---\nnative");
+    const found = await discoverSubagents(project, [], { includeProject: false });
+    assert.ok(found.some((agent) => agent.name === "global"));
+    assert.equal(
+      found.some((agent) => agent.name === "project"),
+      false,
+    );
+    assert.equal(
+      found.some((agent) => agent.name === "native"),
+      false,
+    );
+  } finally {
+    if (oldHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = oldHome;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 /** 捕获首次请求的工具定义后即结束。 */
 function capturingProvider(sink: { tools: ToolDefinition[] }): Provider {
   return {

@@ -183,3 +183,98 @@ test("auth store: set/get/getSync/remove/list，文件 0600", async () => {
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test("auth store: 损坏文件 fail-close，不会被下一次 set 静默覆盖", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-auth-corrupt-"));
+  const file = path.join(dir, "auth.json");
+  try {
+    await fs.writeFile(file, "{ definitely-not-json", { mode: 0o600 });
+    const store = new AuthStore(file);
+    await assert.rejects(() => store.get("anthropic"), /Invalid credential file JSON/);
+    assert.throws(() => store.getSync("anthropic"), /Invalid credential file JSON/);
+    await assert.rejects(
+      () => store.set("anthropic", { type: "oauth", access: "A", refresh: "R", expiresAt: 1 }),
+      /Invalid credential file JSON/,
+    );
+    assert.equal(await fs.readFile(file, "utf8"), "{ definitely-not-json");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("auth store: 多实例并发更新经文件锁串行，不丢 provider", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-auth-concurrent-"));
+  const file = path.join(dir, "auth.json");
+  try {
+    const stores = [new AuthStore(file), new AuthStore(file)];
+    await Promise.all(
+      Array.from({ length: 40 }, (_, index) =>
+        stores[index % stores.length]!.set(`provider-${index}`, {
+          type: "oauth",
+          access: `A${index}`,
+          refresh: `R${index}`,
+          expiresAt: index + 1,
+        }),
+      ),
+    );
+    const list = await stores[0]!.list();
+    assert.equal(list.length, 40);
+    for (let index = 0; index < 40; index++) {
+      assert.equal((await stores[1]!.get(`provider-${index}`))?.access, `A${index}`);
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("auth store: set 在写文件或 keychain 前拒绝无效的运行时凭证", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-auth-invalid-"));
+  const file = path.join(dir, "auth.json");
+  try {
+    const store = new AuthStore(file);
+    await assert.rejects(
+      () =>
+        store.set("anthropic", {
+          type: "oauth",
+          access: "A",
+          refresh: "R",
+          expiresAt: Number.NaN,
+        }),
+      /Invalid credential entry/,
+    );
+    await assert.rejects(() => fs.stat(file), { code: "ENOENT" });
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("auth store: 不会仅因活跃进程持锁时间较长而抢占锁", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-auth-live-lock-"));
+  const file = path.join(dir, "auth.json");
+  const lock = `${file}.lock`;
+  try {
+    await fs.writeFile(
+      lock,
+      JSON.stringify({ pid: process.pid, token: "live-owner-token-000000000000" }),
+      { mode: 0o600 },
+    );
+    const old = new Date(Date.now() - 60_000);
+    await fs.utimes(lock, old, old);
+    const started = Date.now();
+    const release = setTimeout(() => void fs.rm(lock, { force: true }), 60);
+    try {
+      await new AuthStore(file).set("anthropic", {
+        type: "oauth",
+        access: "A",
+        refresh: "R",
+        expiresAt: 1,
+      });
+    } finally {
+      clearTimeout(release);
+    }
+    assert.ok(Date.now() - started >= 40, "writer should wait for the live lock owner");
+    assert.equal((await new AuthStore(file).get("anthropic"))?.access, "A");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

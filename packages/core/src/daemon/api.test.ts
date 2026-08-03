@@ -25,6 +25,19 @@ test("generateOpenApi: 每条路由都有对应 path+method 条目", () => {
     assert.ok(entry[route.method], `缺 ${route.method} ${route.path}`);
   }
   assert.deepEqual(Object.keys(doc["x-events"]).sort(), Object.keys(EVENTS).sort());
+  const modelDiscovery = doc.paths["/providers/{providerId}/models"]?.["get"] as
+    | {
+        security?: unknown;
+        parameters?: Array<{ name?: string; schema?: Record<string, unknown> }>;
+      }
+    | undefined;
+  assert.deepEqual(modelDiscovery?.security, [{ bearerAuth: [] }]);
+  assert.equal(
+    modelDiscovery?.parameters?.find((parameter) => parameter.name === "providerId")?.schema
+      ?.maxLength,
+    128,
+  );
+  assert.deepEqual((doc.paths["/global/health"]?.["get"] as { security?: unknown }).security, []);
 });
 
 test("OpenAPI 3.1.1 conformance: operationId/path params/responses 完整且唯一", () => {
@@ -95,7 +108,7 @@ test("ROUTES: 路径参数命名合法，method 合法", () => {
   for (const route of ROUTES) {
     assert.match(route.path, /^\//);
     const params = route.path.match(/\{[^}]+\}/g) ?? [];
-    for (const p of params) assert.match(p, /^\{(?:id|artifactId|patchsetId)\}$/);
+    for (const p of params) assert.match(p, /^\{(?:id|artifactId|patchsetId|providerId)\}$/);
     assert.ok(["get", "post", "delete", "patch"].includes(route.method));
   }
 });

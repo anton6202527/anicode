@@ -31,7 +31,7 @@ test("GitHub webhook: HMAC、delivery 去重、失败修复、Check Run 与 merg
   const telemetry = new InMemoryTelemetry();
   const proxy = new NetworkProxy({
     broker,
-    resolver: async () => ["203.0.113.40"],
+    resolver: async () => ["93.184.216.34"],
     fetch: async (target, init) => {
       const path = new URL(String(target)).pathname;
       calls.push({ path, method: String(init?.method) });

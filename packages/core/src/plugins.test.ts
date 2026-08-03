@@ -52,3 +52,22 @@ test("discoverPlugins: 无插件目录时安静返回空", async () => {
   assert.deepEqual(dirs, { names: [], agents: [], skills: [], commands: [] });
   await fs.rm(tmp, { recursive: true, force: true });
 });
+
+test("discoverPlugins: includeProject=false 只保留用户级插件", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-plugin-trust-"));
+  const home = path.join(tmp, "home");
+  const cwd = path.join(tmp, "project");
+  try {
+    await fs.mkdir(path.join(home, ".anicode", "plugins", "global", "commands"), {
+      recursive: true,
+    });
+    await fs.mkdir(path.join(cwd, ".anicode", "plugins", "project", "commands"), {
+      recursive: true,
+    });
+    const discovered = await discoverPlugins(cwd, home, { includeProject: false });
+    assert.deepEqual(discovered.names, ["global"]);
+    assert.ok(discovered.commands.every((dir) => dir.startsWith(home)));
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});

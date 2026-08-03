@@ -2,14 +2,16 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { promises as dns } from "node:dns";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import * as path from "node:path";
+import { Agent as UndiciAgent } from "undici";
 import type {
   ExecutionRuntime,
   IsolatedRunRequest,
   IsolatedRunResult,
 } from "./isolated-runtime.js";
+import type { ScopedProxyCredentialIssuer, ScopedProxyCredentialLease } from "./network-proxy.js";
 import { traceparent } from "./telemetry.js";
 
 export interface KubernetesJobRuntimeOptions {
@@ -17,14 +19,18 @@ export interface KubernetesJobRuntimeOptions {
   namespace?: string;
   apiServer?: string;
   tokenFile?: string;
+  caFile?: string;
   workspacePvc: string;
   hostWorkspaceRoot: string;
   /** 默认把 PVC 中的 workspace 复制到每个 Job 独享的 emptyDir，任务结束即销毁。 */
   ephemeralWorkspace?: boolean;
   workspaceSizeLimit?: string;
   proxyUrl?: string;
+  /** Trusted control-plane issuer. The Pod never receives a shared long-lived credential. */
+  proxyCredentialIssuer?: ScopedProxyCredentialIssuer;
   serviceAccount?: string;
   pollMs?: number;
+  /** Test-runner seam only. Production API calls must use HTTPS with the configured cluster CA. */
   fetch?: typeof fetch;
   resolver?: (hostname: string) => Promise<string[]>;
   requirePinnedImage?: boolean;
@@ -40,6 +46,13 @@ interface KubernetesJobStatus {
   };
 }
 
+type KubernetesEnvironmentVariable =
+  | { name: string; value: string }
+  | {
+      name: string;
+      valueFrom: { secretKeyRef: { name: string; key: string; optional: false } };
+    };
+
 export class KubernetesJobRuntime implements ExecutionRuntime {
   private readonly namespace: string;
   private readonly apiServer: string;
@@ -50,7 +63,23 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
     this.namespace = options.namespace ?? "anicode-runtime";
     this.apiServer = (options.apiServer ?? "https://kubernetes.default.svc").replace(/\/+$/, "");
     this.tokenFile = options.tokenFile ?? "/var/run/secrets/kubernetes.io/serviceaccount/token";
-    this.doFetch = options.fetch ?? fetch;
+    if (options.proxyUrl) assertCredentialFreeProxyUrl(options.proxyUrl);
+    if (options.fetch) {
+      if (!process.env.NODE_TEST_CONTEXT) {
+        throw new Error("Kubernetes custom fetch is restricted to the Node test runner");
+      }
+      this.doFetch = options.fetch;
+    } else {
+      if (!this.apiServer.startsWith("https://")) {
+        throw new Error("Kubernetes API server must use HTTPS");
+      }
+      const ca = readFileSync(
+        options.caFile ?? "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+      );
+      const dispatcher = new UndiciAgent({ connect: { ca } });
+      this.doFetch = ((input, init) =>
+        fetch(input, { ...init, dispatcher } as RequestInit)) as typeof fetch;
+    }
     this.resolver =
       options.resolver ??
       (async (hostname) =>
@@ -62,226 +91,295 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
 
   async run(request: IsolatedRunRequest): Promise<IsolatedRunResult> {
     const started = Date.now();
+    const timeoutMs = Math.max(1_000, request.timeoutMs ?? 120_000);
     if (request.network && !this.options.proxyUrl) {
       throw new Error("Network-enabled Kubernetes job requires the egress proxy");
     }
-    const proxyUrl = request.network
-      ? await this.pinnedProxyUrl(this.options.proxyUrl!)
-      : undefined;
-    const relative = path.relative(
-      path.resolve(this.options.hostWorkspaceRoot),
-      path.resolve(request.cwd),
-    );
-    if (relative.startsWith("..") || path.isAbsolute(relative))
-      throw new Error("Kubernetes cwd escapes workspace root");
-    const [workspaceSubPath, ...cwdParts] = relative.split(path.sep).filter(Boolean);
-    if (!workspaceSubPath || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(workspaceSubPath)) {
-      throw new Error("Kubernetes execution requires a valid workspace id below workspace root");
+    if (request.network && !this.options.proxyCredentialIssuer) {
+      throw new Error(
+        "Network-enabled Kubernetes job requires an execution-scoped proxy credential",
+      );
     }
-    const ephemeral = this.options.ephemeralWorkspace ?? true;
-    if (request.policy === "workspace-write" && !ephemeral) {
-      throw new Error("Kubernetes workspace-write requires transactional ephemeralWorkspace");
-    }
-    const transactionalWrite = ephemeral && request.policy === "workspace-write";
-    const timeoutMs = Math.max(1_000, request.timeoutMs ?? 120_000);
-    const name = `anicode-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-    const labels = {
-      "app.kubernetes.io/name": "anicode-runner",
-      "anicode.dev/network": request.network ? "proxy" : "denied",
-      ...(request.workload?.tenantId
-        ? { "anicode.dev/tenant": labelHash(request.workload.tenantId) }
-        : {}),
-      ...(request.workload?.actor
-        ? { "anicode.dev/actor": labelHash(request.workload.actor) }
-        : {}),
-      ...(request.workload?.executionId
-        ? { "anicode.dev/execution": labelValue(request.workload.executionId) }
-        : {}),
+    let proxyCredential: ScopedProxyCredentialLease | undefined;
+    let encodedPinnedProxyCredential: string | undefined;
+    const redact = (value: string) => {
+      const redacted = proxyCredential?.redact(value) ?? value;
+      return encodedPinnedProxyCredential
+        ? redacted.split(encodedPinnedProxyCredential).join("[REDACTED]")
+        : redacted;
     };
-    const reservedEnvironment = new Set([
-      "ANICODE_JOB_COMMAND",
-      "ANICODE_JOB_NETWORK",
-      "ANICODE_JOB_RELATIVE_CWD",
-      "ANICODE_JOB_SOURCE",
-      "ANICODE_JOB_TIMEOUT_MS",
-      "TMPDIR",
-      "TRACEPARENT",
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "ALL_PROXY",
-      "NO_PROXY",
-    ]);
-    const environment = Object.entries(request.env ?? {})
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-      .filter(([name]) => !reservedEnvironment.has(name.toUpperCase()))
-      .map(([name, value]) => ({ name, value }));
-    if (request.network) {
-      environment.push(
-        { name: "HTTP_PROXY", value: proxyUrl! },
-        { name: "HTTPS_PROXY", value: proxyUrl! },
-        { name: "ALL_PROXY", value: proxyUrl! },
-        { name: "NO_PROXY", value: "" },
+    try {
+      if (request.network && this.options.proxyCredentialIssuer) {
+        const tenantId = request.workload?.tenantId;
+        const executionId = request.workload?.executionId;
+        if (!tenantId || !executionId) {
+          throw new Error("Scoped proxy credentials require tenant and execution ownership");
+        }
+        proxyCredential = await this.options.proxyCredentialIssuer.issue({
+          proxyUrl: this.options.proxyUrl!,
+          tenantId,
+          executionId,
+          ttlMs: Math.min(16 * 60_000, timeoutMs + 30_000),
+          ...(request.signal ? { signal: request.signal } : {}),
+        });
+      }
+      const proxyUrl = request.network
+        ? await this.pinnedProxyUrl(proxyCredential?.proxyUrl ?? this.options.proxyUrl!)
+        : undefined;
+      if (proxyCredential && proxyUrl) {
+        encodedPinnedProxyCredential = Buffer.from(proxyUrl).toString("base64");
+      }
+      const relative = path.relative(
+        path.resolve(this.options.hostWorkspaceRoot),
+        path.resolve(request.cwd),
       );
-    }
-    if (request.traceContext) {
-      environment.push({ name: "TRACEPARENT", value: traceparent(request.traceContext) });
-    }
-    if (transactionalWrite) {
-      environment.push(
-        { name: "ANICODE_JOB_COMMAND", value: request.command },
-        { name: "ANICODE_JOB_NETWORK", value: request.network ? "1" : "0" },
-        { name: "ANICODE_JOB_RELATIVE_CWD", value: cwdParts.join("/") || "." },
-        { name: "ANICODE_JOB_SOURCE", value: "/source" },
-        { name: "ANICODE_JOB_TIMEOUT_MS", value: String(timeoutMs) },
-        { name: "TMPDIR", value: "/workspace" },
-      );
-    }
-    const body = {
-      apiVersion: "batch/v1",
-      kind: "Job",
-      metadata: { name, namespace: this.namespace, labels },
-      spec: {
-        backoffLimit: 0,
-        ttlSecondsAfterFinished: 300,
-        activeDeadlineSeconds: Math.ceil(timeoutMs / 1_000),
-        template: {
-          metadata: { labels },
-          spec: {
-            restartPolicy: "Never",
-            automountServiceAccountToken: false,
-            serviceAccountName: this.options.serviceAccount ?? "anicode-runner",
-            securityContext: { runAsNonRoot: true, seccompProfile: { type: "RuntimeDefault" } },
-            containers: [
-              {
-                name: "runner",
-                image: this.options.image,
-                imagePullPolicy: "IfNotPresent",
-                command: transactionalWrite
-                  ? [
-                      "node",
-                      "--import",
-                      "tsx",
-                      "/app/packages/core/src/runtime/kubernetes-job-entry.ts",
-                    ]
-                  : ["/bin/sh", "-lc", request.command],
-                workingDir: transactionalWrite
-                  ? "/source"
-                  : path.posix.join("/workspace", cwdParts.join("/")),
-                env: environment,
-                securityContext: {
-                  allowPrivilegeEscalation: false,
-                  readOnlyRootFilesystem: true,
-                  capabilities: { drop: ["ALL"] },
-                },
-                resources: {
-                  requests: { cpu: "250m", memory: "256Mi" },
-                  limits: { cpu: "2", memory: "2Gi" },
-                },
-                volumeMounts: [
-                  { name: "workspace", mountPath: "/workspace" },
-                  ...(transactionalWrite
-                    ? [
-                        {
-                          name: "workspace-source",
-                          mountPath: "/source",
-                          subPath: workspaceSubPath,
-                        },
-                      ]
-                    : []),
-                  { name: "tmp", mountPath: "/tmp" },
-                ],
-              },
-            ],
-            ...(ephemeral && !transactionalWrite
-              ? {
-                  initContainers: [
+      if (relative.startsWith("..") || path.isAbsolute(relative))
+        throw new Error("Kubernetes cwd escapes workspace root");
+      const [workspaceSubPath, ...cwdParts] = relative.split(path.sep).filter(Boolean);
+      if (!workspaceSubPath || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(workspaceSubPath)) {
+        throw new Error("Kubernetes execution requires a valid workspace id below workspace root");
+      }
+      const ephemeral = this.options.ephemeralWorkspace ?? true;
+      if (request.policy === "workspace-write") {
+        throw new Error(
+          "Kubernetes workspace-write is disabled until a trusted control-plane patch committer is configured",
+        );
+      }
+      const name = `anicode-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+      const labels = {
+        "app.kubernetes.io/name": "anicode-runner",
+        "anicode.dev/network": request.network ? "proxy" : "denied",
+        ...(request.workload?.tenantId
+          ? { "anicode.dev/tenant": labelHash(request.workload.tenantId) }
+          : {}),
+        ...(request.workload?.actor
+          ? { "anicode.dev/actor": labelHash(request.workload.actor) }
+          : {}),
+        ...(request.workload?.executionId
+          ? { "anicode.dev/execution": labelValue(request.workload.executionId) }
+          : {}),
+      };
+      const proxySecretName = proxyCredential ? `${name}-proxy` : undefined;
+      const reservedEnvironment = new Set([
+        "ANICODE_JOB_COMMAND",
+        "ANICODE_JOB_NETWORK",
+        "ANICODE_JOB_RELATIVE_CWD",
+        "ANICODE_JOB_SOURCE",
+        "ANICODE_JOB_TIMEOUT_MS",
+        "TMPDIR",
+        "TRACEPARENT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+      ]);
+      const environment: KubernetesEnvironmentVariable[] = Object.entries(request.env ?? {})
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+        .filter(([name]) => !reservedEnvironment.has(name.toUpperCase()))
+        .map(([name, value]) => ({ name, value }));
+      if (request.network) {
+        if (proxySecretName) {
+          const secretKeyRef = {
+            secretKeyRef: { name: proxySecretName, key: "proxy-url", optional: false as const },
+          };
+          environment.push(
+            { name: "HTTP_PROXY", valueFrom: secretKeyRef },
+            { name: "HTTPS_PROXY", valueFrom: secretKeyRef },
+            { name: "ALL_PROXY", valueFrom: secretKeyRef },
+            { name: "NO_PROXY", value: "" },
+          );
+        } else {
+          environment.push(
+            { name: "HTTP_PROXY", value: proxyUrl! },
+            { name: "HTTPS_PROXY", value: proxyUrl! },
+            { name: "ALL_PROXY", value: proxyUrl! },
+            { name: "NO_PROXY", value: "" },
+          );
+        }
+      }
+      if (request.traceContext) {
+        environment.push({ name: "TRACEPARENT", value: traceparent(request.traceContext) });
+      }
+      const body = {
+        apiVersion: "batch/v1",
+        kind: "Job",
+        metadata: { name, namespace: this.namespace, labels },
+        spec: {
+          backoffLimit: 0,
+          ttlSecondsAfterFinished: 300,
+          activeDeadlineSeconds: Math.ceil(timeoutMs / 1_000),
+          template: {
+            metadata: { labels },
+            spec: {
+              restartPolicy: "Never",
+              automountServiceAccountToken: false,
+              serviceAccountName: this.options.serviceAccount ?? "anicode-runner",
+              securityContext: { runAsNonRoot: true, seccompProfile: { type: "RuntimeDefault" } },
+              containers: [
+                {
+                  name: "runner",
+                  image: this.options.image,
+                  imagePullPolicy: "IfNotPresent",
+                  command: ["/bin/sh", "-lc", request.command],
+                  workingDir: path.posix.join("/workspace", cwdParts.join("/")),
+                  env: environment,
+                  securityContext: {
+                    allowPrivilegeEscalation: false,
+                    readOnlyRootFilesystem: true,
+                    capabilities: { drop: ["ALL"] },
+                  },
+                  resources: {
+                    requests: { cpu: "250m", memory: "256Mi" },
+                    limits: { cpu: "2", memory: "2Gi" },
+                  },
+                  volumeMounts: [
                     {
-                      name: "workspace-copy",
-                      image: this.options.image,
-                      imagePullPolicy: "IfNotPresent",
-                      command: ["/bin/sh", "-lc", "cp -a /source/. /workspace/"],
-                      securityContext: {
-                        allowPrivilegeEscalation: false,
-                        readOnlyRootFilesystem: true,
-                        capabilities: { drop: ["ALL"] },
-                      },
-                      resources: {
-                        requests: { cpu: "100m", memory: "128Mi" },
-                        limits: { cpu: "1", memory: "1Gi" },
-                      },
-                      volumeMounts: [
-                        {
-                          name: "workspace-source",
-                          mountPath: "/source",
-                          readOnly: true,
-                          subPath: workspaceSubPath,
-                        },
-                        { name: "workspace", mountPath: "/workspace" },
-                        { name: "tmp", mountPath: "/tmp" },
-                      ],
+                      name: "workspace",
+                      mountPath: "/workspace",
+                      readOnly: true,
+                      ...(!ephemeral ? { subPath: workspaceSubPath } : {}),
                     },
+                    { name: "tmp", mountPath: "/tmp" },
                   ],
-                }
-              : {}),
-            volumes: [
+                },
+              ],
               ...(ephemeral
-                ? [
-                    {
-                      name: "workspace-source",
-                      persistentVolumeClaim: {
-                        claimName: this.options.workspacePvc,
-                        readOnly: !transactionalWrite,
+                ? {
+                    initContainers: [
+                      {
+                        name: "workspace-copy",
+                        image: this.options.image,
+                        imagePullPolicy: "IfNotPresent",
+                        command: ["/bin/sh", "-lc", "cp -a /source/. /workspace/"],
+                        securityContext: {
+                          allowPrivilegeEscalation: false,
+                          readOnlyRootFilesystem: true,
+                          capabilities: { drop: ["ALL"] },
+                        },
+                        resources: {
+                          requests: { cpu: "100m", memory: "128Mi" },
+                          limits: { cpu: "1", memory: "1Gi" },
+                        },
+                        volumeMounts: [
+                          {
+                            name: "workspace-source",
+                            mountPath: "/source",
+                            readOnly: true,
+                            subPath: workspaceSubPath,
+                          },
+                          { name: "workspace", mountPath: "/workspace" },
+                          { name: "tmp", mountPath: "/tmp" },
+                        ],
                       },
-                    },
-                    {
-                      name: "workspace",
-                      emptyDir: { sizeLimit: this.options.workspaceSizeLimit ?? "10Gi" },
-                    },
-                  ]
-                : [
-                    {
-                      name: "workspace",
-                      persistentVolumeClaim: {
-                        claimName: this.options.workspacePvc,
-                        readOnly: request.policy === "read-only",
+                    ],
+                  }
+                : {}),
+              volumes: [
+                ...(ephemeral
+                  ? [
+                      {
+                        name: "workspace-source",
+                        persistentVolumeClaim: {
+                          claimName: this.options.workspacePvc,
+                          readOnly: true,
+                        },
                       },
-                    },
-                  ]),
-              { name: "tmp", emptyDir: { sizeLimit: "512Mi" } },
-            ],
+                      {
+                        name: "workspace",
+                        emptyDir: { sizeLimit: this.options.workspaceSizeLimit ?? "10Gi" },
+                      },
+                    ]
+                  : [
+                      {
+                        name: "workspace",
+                        persistentVolumeClaim: {
+                          claimName: this.options.workspacePvc,
+                          readOnly: true,
+                        },
+                      },
+                    ]),
+                { name: "tmp", emptyDir: { sizeLimit: "512Mi" } },
+              ],
+            },
           },
         },
-      },
-    };
-    await this.call(`/apis/batch/v1/namespaces/${this.namespace}/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const cleanup = () =>
-      this.call(`/apis/batch/v1/namespaces/${this.namespace}/jobs/${name}`, {
-        method: "DELETE",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ propagationPolicy: "Foreground", gracePeriodSeconds: 0 }),
-      }).catch(() => undefined);
-    const onAbort = () => void cleanup();
-    request.signal?.addEventListener("abort", onAbort, { once: true });
-    try {
-      const deadline = Date.now() + Math.max(1_000, request.timeoutMs ?? 120_000);
-      const status = await this.waitForCompletion(name, deadline, request.signal);
-      const timedOut = status === "timeout";
-      const exitCode = status === "succeeded" ? 0 : status === "failed" ? 1 : null;
-      const output = await this.logs(name).catch(() => "");
-      return {
-        exitCode,
-        output,
-        timedOut,
-        sandboxed: true,
-        durationMs: Date.now() - started,
       };
+      const cleanup = async () => {
+        const removals: Promise<unknown>[] = [
+          this.call(`/apis/batch/v1/namespaces/${this.namespace}/jobs/${name}`, {
+            method: "DELETE",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ propagationPolicy: "Foreground", gracePeriodSeconds: 0 }),
+          }).catch(() => undefined),
+        ];
+        if (proxySecretName) {
+          removals.push(
+            this.call(
+              `/api/v1/namespaces/${this.namespace}/secrets/${encodeURIComponent(proxySecretName)}`,
+              {
+                method: "DELETE",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ gracePeriodSeconds: 0 }),
+              },
+            ).catch(() => undefined),
+          );
+        }
+        await Promise.all(removals);
+      };
+      const onAbort = () => void cleanup();
+      request.signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        request.signal?.throwIfAborted();
+        if (proxySecretName) {
+          await this.call(`/api/v1/namespaces/${this.namespace}/secrets`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              apiVersion: "v1",
+              kind: "Secret",
+              metadata: {
+                name: proxySecretName,
+                namespace: this.namespace,
+                labels: { ...labels, "anicode.dev/owner-job": name },
+              },
+              immutable: true,
+              type: "Opaque",
+              data: { "proxy-url": Buffer.from(proxyUrl!).toString("base64") },
+            }),
+            ...(request.signal ? { signal: request.signal } : {}),
+          });
+        }
+        request.signal?.throwIfAborted();
+        await this.call(`/apis/batch/v1/namespaces/${this.namespace}/jobs`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          ...(request.signal ? { signal: request.signal } : {}),
+        });
+        const deadline = Date.now() + Math.max(1_000, request.timeoutMs ?? 120_000);
+        const status = await this.waitForCompletion(name, deadline, request.signal);
+        const timedOut = status === "timeout";
+        const exitCode = status === "succeeded" ? 0 : status === "failed" ? 1 : null;
+        const output = redact(await this.logs(name).catch(() => ""));
+        return {
+          exitCode,
+          output,
+          timedOut,
+          sandboxed: true,
+          durationMs: Date.now() - started,
+        };
+      } finally {
+        request.signal?.removeEventListener("abort", onAbort);
+        await cleanup();
+      }
+    } catch (error) {
+      const message = redact(error instanceof Error ? error.message : String(error));
+      // Kubernetes/fetch errors can echo Secret request data. The original error must not survive
+      // as `cause`, otherwise structured loggers could serialize the unredacted capability.
+      // eslint-disable-next-line preserve-caught-error
+      throw new Error(message);
     } finally {
-      request.signal?.removeEventListener("abort", onAbort);
-      await cleanup();
+      await proxyCredential?.revoke().catch(() => undefined);
     }
   }
 
@@ -374,6 +472,20 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       );
     }
     return response;
+  }
+}
+
+function assertCredentialFreeProxyUrl(value: string): void {
+  const url = new URL(value);
+  if (
+    !/^https?:$/.test(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !["", "/"].includes(url.pathname)
+  ) {
+    throw new Error("Kubernetes proxy URL must be credential-free HTTP(S)");
   }
 }
 

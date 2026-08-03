@@ -46,7 +46,7 @@
     "format:check": "prettier --check \"packages/*/src/**/*.{ts,tsx}\" \"*.{json,mjs}\"",
     "changeset": "changeset",
     "version": "changeset version",
-    "release": "npm run build:cli && changeset publish"
+    "release": "npm run verify:release && changeset publish"
   },
   "devDependencies": {
     "@changesets/cli": "^2.31.1",

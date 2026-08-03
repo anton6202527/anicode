@@ -29,6 +29,37 @@ case "$control_image$runner_image" in
 esac
 test -n "$runner_image"
 
+tls_mode="$(kubectl -n "$namespace" get deployment anicode-remote-runtime \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ANICODE_REMOTE_TLS_MODE")].value}')"
+case "$tls_mode" in
+  native) ;;
+  trusted-proxy)
+    service_type="$(kubectl -n "$namespace" get service anicode-remote-runtime \
+      -o jsonpath='{.spec.type}')"
+    test "$service_type" = "ClusterIP"
+    kubectl -n "$namespace" get networkpolicy \
+      remote-runtime-ingress-from-tls-gateway-only >/dev/null
+    ;;
+  *)
+    echo "Remote Runtime has no accepted TLS boundary mode" >&2
+    exit 1
+    ;;
+esac
+
+if test -n "${ANICODE_REMOTE_PUBLIC_URL:-}"; then
+  case "$ANICODE_REMOTE_PUBLIC_URL" in
+    https://*) ;;
+    *)
+      echo "ANICODE_REMOTE_PUBLIC_URL must use https://" >&2
+      exit 1
+      ;;
+  esac
+  node -e 'fetch(new URL("/healthz", process.argv[1])).then(r=>process.exit(r.ok?0:1)).catch(e=>{console.error(e);process.exit(1)})' \
+    "$ANICODE_REMOTE_PUBLIC_URL"
+else
+  echo "ANICODE_REMOTE_PUBLIC_URL is unset; external certificate/TLS routing was not probed" >&2
+fi
+
 secure_run() {
   local name="$1"
   local labels="$2"

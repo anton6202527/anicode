@@ -26,7 +26,7 @@ test("GitHub App token source: RS256 JWT、repository scope、cache 与强制轮
   const authorizations: string[] = [];
   const requests: Array<Record<string, unknown>> = [];
   const proxy = new NetworkProxy({
-    resolver: async () => ["203.0.113.21"],
+    resolver: async () => ["93.184.216.34"],
     fetch: async (_target, init) => {
       authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);

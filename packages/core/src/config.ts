@@ -9,7 +9,7 @@
  *
  * 解析容错：文件缺失跳过；JSON 非法只记 warning，不抛（避免一处手误锁死整个 CLI）。
  */
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs, type BigIntStats } from "node:fs";
 import { t } from "./i18n.js";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -18,6 +18,15 @@ import type { SubagentDefinition } from "./subagent.js";
 import type { LspServerConfig } from "./lsp.js";
 import type { BrowserToolOptions } from "./tools/browser.js";
 import type { PermissionProfile } from "./permission.js";
+import {
+  WorkspaceTrustStore,
+  revalidateWorkspaceTrust,
+  type WorkspaceTrustAssessment,
+} from "./workspace-trust.js";
+
+const MAX_CONFIG_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_PROJECT_ENV_BYTES = 4 * 1024 * 1024;
+const FILE_READ_CHUNK_BYTES = 64 * 1024;
 
 /** 配置里的单个 agent 定义（比 SubagentDefinition 更贴近用户书写习惯）。 */
 export interface ConfigAgent {
@@ -116,12 +125,30 @@ export interface LoadedConfig {
   sources: string[];
   /** 解析告警（非法 JSON 等），供 CLI 决定是否提示。 */
   warnings: string[];
+  /** Present when the caller used the Workspace Trust boundary. */
+  workspaceTrust?: WorkspaceTrustAssessment;
 }
 
 export interface LoadProjectEnvOptions {
   cwd?: string;
   /** 可注入环境对象，便于测试；默认写入当前进程环境。 */
   env?: NodeJS.ProcessEnv;
+  /** Project env is applied only for a currently valid trusted-workspace assessment. */
+  workspaceTrust?: WorkspaceTrustAssessment;
+  /** Reports names only; values are never exposed. */
+  onBlocked?: (entry: { file: string; name: string; reason: "untrusted" | "reserved" }) => void;
+}
+
+export interface LoadConfigOptions {
+  cwd?: string;
+  home?: string;
+  profile?: string;
+  /** Omission is fail-closed: execution-sensitive project fields are ignored. */
+  workspaceTrust?: WorkspaceTrustAssessment;
+}
+
+export interface LoadWorkspaceConfigOptions extends Omit<LoadConfigOptions, "workspaceTrust"> {
+  trustStore?: WorkspaceTrustStore;
 }
 
 /**
@@ -134,21 +161,63 @@ export async function loadProjectEnv(opts: LoadProjectEnvOptions = {}): Promise<
   const cwd = opts.cwd ?? process.cwd();
   const env = opts.env ?? process.env;
   const loaded: string[] = [];
+  // Do not even open project environment files until a complete, previously trusted assessment
+  // has been revalidated. Apart from avoiding accidental activation, this prevents an untrusted
+  // repository from making the host parse or disclose names from an attacker-controlled .env.
+  if (!isCompleteTrustedAssessment(opts.workspaceTrust)) return loaded;
+  const initialTrust = await revalidateWorkspaceTrust(cwd, opts.workspaceTrust);
+  if (!isCompleteTrustedAssessment(initialTrust)) return loaded;
+  const pending: { file: string; key: string; value: string }[] = [];
   for (const name of [".env.local", ".env"]) {
     const file = path.join(cwd, name);
-    let raw: string;
-    try {
-      raw = await fs.readFile(file, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw err;
-    }
+    const raw = await readOptionalTextFileBounded(file, MAX_PROJECT_ENV_BYTES, true);
+    if (raw === undefined) continue;
     for (const [key, value] of parseEnv(raw)) {
-      if (env[key] === undefined) env[key] = value;
+      if (isForbiddenProjectEnvName(key)) {
+        opts.onBlocked?.({ file, name: key, reason: "reserved" });
+        continue;
+      }
+      pending.push({ file, key, value });
     }
     loaded.push(file);
   }
+  // Nothing from the project reaches process.env until the exact execution surface has been
+  // checked again after all reads. Applying from `pending` then uses the immutable strings we read,
+  // so a subsequent file replacement cannot change what this call activates.
+  const finalTrust = await revalidateWorkspaceTrust(cwd, initialTrust);
+  for (const entry of pending) {
+    if (!isCompleteTrustedAssessment(finalTrust)) {
+      opts.onBlocked?.({ file: entry.file, name: entry.key, reason: "untrusted" });
+      continue;
+    }
+    if (env[entry.key] === undefined) env[entry.key] = entry.value;
+  }
   return loaded;
+}
+
+/** Project files may never reconfigure the host control plane or child-process loader. */
+export function isForbiddenProjectEnvName(name: string): boolean {
+  const key = name.toUpperCase();
+  return (
+    key.startsWith("ANICODE_") ||
+    key.startsWith("AGENTX_") ||
+    key.startsWith("LD_") ||
+    key.startsWith("DYLD_") ||
+    [
+      "NODE_OPTIONS",
+      "NODE_PATH",
+      "PATH",
+      "SHELL",
+      "BASH_ENV",
+      "ENV",
+      "ZDOTDIR",
+      "ELECTRON_RUN_AS_NODE",
+      "PYTHONPATH",
+      "PYTHONHOME",
+      "RUBYOPT",
+      "PERL5OPT",
+    ].includes(key)
+  );
 }
 
 function parseEnv(raw: string): [string, string][] {
@@ -178,6 +247,97 @@ function parseEnv(raw: string): [string, string][] {
   return entries;
 }
 
+function isCompleteTrustedAssessment(
+  assessment: WorkspaceTrustAssessment | undefined,
+): assessment is WorkspaceTrustAssessment & {
+  trusted: true;
+  reason: "trusted";
+  identity: NonNullable<WorkspaceTrustAssessment["identity"]>;
+  executionHash: string;
+} {
+  return (
+    assessment?.trusted === true &&
+    assessment.reason === "trusted" &&
+    Boolean(assessment.identity) &&
+    typeof assessment.executionHash === "string" &&
+    /^[a-f0-9]{64}$/.test(assessment.executionHash)
+  );
+}
+
+async function readOptionalTextFileBounded(
+  file: string,
+  maxBytes: number,
+  noFollow: boolean,
+): Promise<string | undefined> {
+  let flags = fsConstants.O_RDONLY;
+  if (typeof fsConstants.O_NONBLOCK === "number") flags |= fsConstants.O_NONBLOCK;
+  if (noFollow && typeof fsConstants.O_NOFOLLOW === "number") flags |= fsConstants.O_NOFOLLOW;
+
+  let handle: import("node:fs/promises").FileHandle;
+  try {
+    handle = await fs.open(file, flags);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`cannot securely open file: ${file}`, { cause: error });
+  }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new Error(`not a regular file: ${file}`);
+    if (before.size > BigInt(maxBytes)) {
+      throw new Error(`file exceeds ${maxBytes} byte limit: ${file}`);
+    }
+    if (noFollow) await assertPathMatchesOpenFile(file, before);
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const remaining = maxBytes + 1 - total;
+      const buffer = Buffer.allocUnsafe(Math.min(FILE_READ_CHUNK_BYTES, remaining));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, total);
+      if (bytesRead === 0) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > maxBytes) throw new Error(`file exceeds ${maxBytes} byte limit: ${file}`);
+
+    const after = await handle.stat({ bigint: true });
+    if (!sameFileMetadata(before, after)) throw new Error(`file changed while reading: ${file}`);
+    if (noFollow) await assertPathMatchesOpenFile(file, before);
+    return Buffer.concat(chunks, total).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertPathMatchesOpenFile(file: string, opened: BigIntStats): Promise<void> {
+  let current: BigIntStats;
+  try {
+    current = await fs.lstat(file, { bigint: true });
+  } catch (error) {
+    throw new Error(`cannot verify file path: ${file}`, { cause: error });
+  }
+  if (
+    !current.isFile() ||
+    current.isSymbolicLink() ||
+    current.dev !== opened.dev ||
+    current.ino !== opened.ino ||
+    !sameFileMetadata(current, opened)
+  ) {
+    throw new Error(`file path changed or is a symlink: ${file}`);
+  }
+}
+
+function sameFileMetadata(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
 const KNOWN_KEYS = new Set([
   "model",
   "smallModel",
@@ -195,23 +355,34 @@ const KNOWN_KEYS = new Set([
   "profiles",
 ]);
 
-function candidatePaths(cwd: string, home: string): string[] {
+function candidatePaths(cwd: string, home: string): { file: string; project: boolean }[] {
   return [
-    path.join(home, ".config", "anicode", "anicode.json"),
-    path.join(cwd, "anicode.json"),
-    path.join(cwd, ".anicode", "anicode.json"),
+    { file: path.join(home, ".config", "anicode", "anicode.json"), project: false },
+    { file: path.join(cwd, "anicode.json"), project: true },
+    { file: path.join(cwd, ".anicode", "anicode.json"), project: true },
     // 项目本地设置（个人授权清单等，不建议入库）；allow_always 写回这里
-    path.join(cwd, ".anicode", "settings.local.json"),
+    { file: path.join(cwd, ".anicode", "settings.local.json"), project: true },
   ];
 }
 
-async function readOne(file: string, warnings: string[]): Promise<AnicodeConfig | null> {
-  let raw: string;
+async function readOne(
+  file: string,
+  warnings: string[],
+  project: boolean,
+): Promise<AnicodeConfig | null> {
+  let raw: string | undefined;
   try {
-    raw = await fs.readFile(file, "utf8");
-  } catch {
-    return null; // 缺失即跳过
+    raw = await readOptionalTextFileBounded(file, MAX_CONFIG_FILE_BYTES, project);
+  } catch (error) {
+    warnings.push(
+      t(
+        `${file}: config read failed (${error instanceof Error ? error.message : String(error)}); ignored`,
+        `${file}: 配置读取失败（${error instanceof Error ? error.message : String(error)}），已忽略`,
+      ),
+    );
+    return null;
   }
+  if (raw === undefined) return null;
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -305,20 +476,44 @@ function merge(base: AnicodeConfig, over: AnicodeConfig): AnicodeConfig {
   };
 }
 
-export async function loadConfig(
-  opts: { cwd?: string; home?: string; profile?: string } = {},
-): Promise<LoadedConfig> {
+export async function loadConfig(opts: LoadConfigOptions = {}): Promise<LoadedConfig> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? os.homedir();
   const warnings: string[] = [];
   const sources: string[] = [];
-  let config: AnicodeConfig = {};
-  for (const file of candidatePaths(cwd, home)) {
-    const one = await readOne(file, warnings);
+  let workspaceTrust = opts.workspaceTrust;
+  if (isCompleteTrustedAssessment(workspaceTrust)) {
+    workspaceTrust = await revalidateWorkspaceTrust(cwd, workspaceTrust);
+  }
+  const loadedFiles: { file: string; project: boolean; config: AnicodeConfig }[] = [];
+  for (const { file, project } of candidatePaths(cwd, home)) {
+    const one = await readOne(file, warnings, project);
     if (one) {
-      config = merge(config, one);
+      loadedFiles.push({ file, project, config: one });
       sources.push(file);
     }
+  }
+  // Close the check/read race: only activate project execution fields when the workspace still
+  // matches the grant after every project config file has been read into memory.
+  if (isCompleteTrustedAssessment(workspaceTrust)) {
+    workspaceTrust = await revalidateWorkspaceTrust(cwd, workspaceTrust);
+  }
+  const projectTrusted = isCompleteTrustedAssessment(workspaceTrust);
+  let config: AnicodeConfig = {};
+  for (const { file, project, config: one } of loadedFiles) {
+    const applied = project && !projectTrusted ? safeUntrustedProjectConfig(one) : one;
+    if (project && !projectTrusted) {
+      const ignored = executionSensitiveKeys(one);
+      if (ignored.length > 0) {
+        warnings.push(
+          t(
+            `${file}: ignored execution-sensitive project settings in an untrusted workspace (${ignored.join(", ")})`,
+            `${file}: 未信任工作区，已忽略可执行项目配置（${ignored.join("、")}）`,
+          ),
+        );
+      }
+    }
+    config = merge(config, applied);
   }
   // 配置档叠加（对齐 Codex --profile）：选中档的局部配置覆盖主配置。
   if (opts.profile) {
@@ -335,7 +530,63 @@ export async function loadConfig(
     }
     delete config.profiles; // 档位已消费；避免下游误用
   }
-  return { config, sources, warnings };
+  return {
+    config,
+    sources,
+    warnings,
+    ...(workspaceTrust ? { workspaceTrust } : {}),
+  };
+}
+
+/**
+ * Safe high-level loader for hosts. It queries the user-level trust store and then applies only
+ * configuration permitted by the resulting assessment.
+ */
+export async function loadConfigWithWorkspaceTrust(
+  opts: LoadWorkspaceConfigOptions = {},
+): Promise<LoadedConfig & { workspaceTrust: WorkspaceTrustAssessment }> {
+  const cwd = opts.cwd ?? process.cwd();
+  const home = opts.home ?? os.homedir();
+  const store = opts.trustStore ?? new WorkspaceTrustStore({ home });
+  const assessment = await store.assess(cwd);
+  const loaded = await loadConfig({
+    cwd,
+    home,
+    ...(opts.profile ? { profile: opts.profile } : {}),
+    workspaceTrust: assessment,
+  });
+  return {
+    ...loaded,
+    workspaceTrust: loaded.workspaceTrust ?? assessment,
+  };
+}
+
+const SAFE_UNTRUSTED_PROJECT_KEYS = ["model", "smallModel", "fallbackModels", "tui"] as const;
+const EXECUTION_SENSITIVE_PROJECT_KEYS = [
+  "mcp",
+  "agents",
+  "lsp",
+  "browser",
+  "instructions",
+  "hooks",
+  "permissions",
+  "permissionProfile",
+  "permissionProfiles",
+  "profiles",
+] as const;
+
+function safeUntrustedProjectConfig(config: AnicodeConfig): AnicodeConfig {
+  const safe: AnicodeConfig = {};
+  for (const key of SAFE_UNTRUSTED_PROJECT_KEYS) {
+    if (Object.hasOwn(config, key)) {
+      Object.assign(safe, { [key]: config[key] });
+    }
+  }
+  return safe;
+}
+
+function executionSensitiveKeys(config: AnicodeConfig): string[] {
+  return EXECUTION_SENSITIVE_PROJECT_KEYS.filter((key) => Object.hasOwn(config, key));
 }
 
 /** 把配置里的 mcp 映射转成 connectMcpServers 需要的数组（注入 name）。 */

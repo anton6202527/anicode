@@ -19,14 +19,24 @@ import * as path from "node:path";
 import { parseFrontmatter, stripFrontmatter, fmString, fmStringList } from "./frontmatter.js";
 import type { SubagentDefinition } from "./subagent.js";
 
+export interface SubagentDiscoveryOptions {
+  /** Defaults to true. Set false until Workspace Trust has been granted. */
+  includeProject?: boolean;
+}
+
 export async function discoverSubagents(
   cwd: string,
   extraDirs: string[] = [],
+  options: SubagentDiscoveryOptions = {},
 ): Promise<SubagentDefinition[]> {
   const dirs = [
     path.join(os.homedir(), ".claude", "agents"),
-    path.join(path.resolve(cwd), ".claude", "agents"),
-    path.join(path.resolve(cwd), ".anicode", "agents"),
+    ...(options.includeProject === false
+      ? []
+      : [
+          path.join(path.resolve(cwd), ".claude", "agents"),
+          path.join(path.resolve(cwd), ".anicode", "agents"),
+        ]),
     ...extraDirs,
   ];
   const byName = new Map<string, SubagentDefinition>();

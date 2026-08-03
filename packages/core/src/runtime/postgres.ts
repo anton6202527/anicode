@@ -18,7 +18,24 @@ import type {
   RuntimeSnapshotStore,
 } from "./durable.js";
 import type { RuntimeAuditRecord } from "./sqlite.js";
-import type { WorkerJob, WorkerQueueStore } from "./worker.js";
+import {
+  WorkerQueueQuotaError,
+  type WorkerCancellationResult,
+  type WorkerEnqueueQuota,
+  type WorkerJob,
+  type WorkerQueueStore,
+} from "./worker.js";
+import {
+  SessionLifecycleUnavailableError,
+  assertLifecycleId,
+  assertLifecycleTtl,
+  type AcquireSessionOperationInput,
+  type ClaimSessionDeletionInput,
+  type SessionDeletionClaim,
+  type SessionLifecycleRecord,
+  type SessionLifecycleStore,
+  type SessionOperationLease,
+} from "./session-lifecycle.js";
 
 type Row = Record<string, unknown>;
 
@@ -37,11 +54,51 @@ function transient(error: unknown): boolean {
   return code === "40001" || code === "40P01";
 }
 
+function boundedPostgresTimeout(
+  value: number | boolean | undefined,
+  fallback: number,
+  label: string,
+): number {
+  const timeout = value ?? fallback;
+  if (
+    typeof timeout !== "number" ||
+    !Number.isInteger(timeout) ||
+    timeout < 100 ||
+    timeout > 300_000
+  ) {
+    throw new Error(`${label} must be an integer from 100 to 300000 ms`);
+  }
+  return timeout;
+}
+
 export class PostgresRuntimeDatabase {
   readonly pool: Pool;
 
   private constructor(config: PoolConfig) {
-    this.pool = new Pool(config);
+    this.pool = new Pool({
+      ...config,
+      connectionTimeoutMillis: boundedPostgresTimeout(
+        config.connectionTimeoutMillis,
+        5_000,
+        "PostgreSQL connection timeout",
+      ),
+      query_timeout: boundedPostgresTimeout(
+        config.query_timeout,
+        30_000,
+        "PostgreSQL query timeout",
+      ),
+      statement_timeout: boundedPostgresTimeout(
+        config.statement_timeout,
+        25_000,
+        "PostgreSQL statement timeout",
+      ),
+      lock_timeout: boundedPostgresTimeout(config.lock_timeout, 5_000, "PostgreSQL lock timeout"),
+      idle_in_transaction_session_timeout: boundedPostgresTimeout(
+        config.idle_in_transaction_session_timeout,
+        15_000,
+        "PostgreSQL idle transaction timeout",
+      ),
+    });
   }
 
   static async open(config: string | PoolConfig): Promise<PostgresRuntimeDatabase> {
@@ -248,9 +305,65 @@ export class PostgresRuntimeDatabase {
       WHERE document.namespace = 'outbox' AND document.key = 'global'
       ON CONFLICT DO NOTHING;
     `;
-    const version = 3;
-    const checksum = createHash("sha256").update(migrationSql).digest("hex");
+    const lifecycleMigrationSql = `
+      ALTER TABLE anicode_sessions ADD COLUMN IF NOT EXISTS workspace_device text;
+      ALTER TABLE anicode_sessions ADD COLUMN IF NOT EXISTS workspace_inode text;
+
+      CREATE TABLE IF NOT EXISTS anicode_session_lifecycle (
+        session_id text PRIMARY KEY,
+        state text NOT NULL CHECK (state IN ('active', 'deleting', 'deleted')),
+        epoch bigint NOT NULL DEFAULT 0,
+        workspace text,
+        workspace_device text,
+        workspace_inode text,
+        delete_owner text,
+        delete_token text,
+        delete_lease_expires_at timestamptz,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_anicode_session_lifecycle_state
+        ON anicode_session_lifecycle(state, delete_lease_expires_at);
+
+      CREATE TABLE IF NOT EXISTS anicode_session_operation_leases (
+        lease_id text PRIMARY KEY,
+        session_id text NOT NULL,
+        owner text NOT NULL,
+        epoch bigint NOT NULL,
+        expires_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_anicode_session_operation_leases_session
+        ON anicode_session_operation_leases(session_id, expires_at);
+    `;
+    const workerCancellationMigrationSql = `
+      ALTER TABLE anicode_worker_jobs
+        DROP CONSTRAINT IF EXISTS anicode_worker_jobs_status_check;
+      ALTER TABLE anicode_worker_jobs
+        ADD CONSTRAINT anicode_worker_jobs_status_check
+        CHECK (status IN (
+          'queued', 'leased', 'cancellation_requested', 'succeeded', 'failed', 'cancelled'
+        ));
+    `;
+    const migrations = [
+      {
+        version: 3,
+        sql: migrationSql,
+        description: "normalized command, outbox, worker queue and worktree leases",
+      },
+      {
+        version: 4,
+        sql: lifecycleMigrationSql,
+        description: "durable session lifecycle leases and workspace identity",
+      },
+      {
+        version: 5,
+        sql: workerCancellationMigrationSql,
+        description: "two-phase durable worker cancellation",
+      },
+    ] as const;
+    const latestVersion = migrations.at(-1)!.version;
     const client = await this.pool.connect();
+    let migrationLockHeld = false;
     try {
       await client.query(`
         CREATE TABLE IF NOT EXISTS anicode_schema_migrations (
@@ -262,45 +375,58 @@ export class PostgresRuntimeDatabase {
         ALTER TABLE anicode_schema_migrations ADD COLUMN IF NOT EXISTS checksum text;
         ALTER TABLE anicode_schema_migrations ADD COLUMN IF NOT EXISTS description text;
       `);
-      await client.query(
-        "SELECT pg_advisory_lock(hashtextextended('anicode:schema-migrations', 0))",
-      );
+      const lockDeadline = Date.now() + 10_000;
+      while (!migrationLockHeld && Date.now() < lockDeadline) {
+        const lock = await client.query(
+          "SELECT pg_try_advisory_lock(hashtextextended('anicode:schema-migrations', 0)) AS locked",
+        );
+        migrationLockHeld = (lock.rows[0] as Row | undefined)?.locked === true;
+        if (!migrationLockHeld) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!migrationLockHeld) {
+        throw new Error("Timed out waiting for the PostgreSQL schema migration lock");
+      }
       const future = await client.query(
         "SELECT version FROM anicode_schema_migrations WHERE version > $1 ORDER BY version LIMIT 1",
-        [version],
+        [latestVersion],
       );
       if (future.rows[0]) {
         throw new Error(
           `Database schema version ${String((future.rows[0] as Row).version)} is newer than this runtime`,
         );
       }
-      const applied = await client.query(
-        "SELECT checksum FROM anicode_schema_migrations WHERE version = $1",
-        [version],
-      );
-      if (applied.rows[0]) {
-        if (String((applied.rows[0] as Row).checksum ?? "") !== checksum) {
-          throw new Error(`Database migration ${version} checksum mismatch`);
-        }
-        return;
-      }
-      await client.query("BEGIN");
-      try {
-        await client.query(migrationSql);
-        await client.query(
-          `INSERT INTO anicode_schema_migrations(version, checksum, description)
-           VALUES ($1, $2, $3)`,
-          [version, checksum, "normalized command, outbox, worker queue and worktree leases"],
+      for (const migration of migrations) {
+        const checksum = createHash("sha256").update(migration.sql).digest("hex");
+        const applied = await client.query(
+          "SELECT checksum FROM anicode_schema_migrations WHERE version = $1",
+          [migration.version],
         );
-        await client.query("COMMIT");
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => undefined);
-        throw error;
+        if (applied.rows[0]) {
+          if (String((applied.rows[0] as Row).checksum ?? "") !== checksum) {
+            throw new Error(`Database migration ${migration.version} checksum mismatch`);
+          }
+          continue;
+        }
+        await client.query("BEGIN");
+        try {
+          await client.query(migration.sql);
+          await client.query(
+            `INSERT INTO anicode_schema_migrations(version, checksum, description)
+             VALUES ($1, $2, $3)`,
+            [migration.version, checksum, migration.description],
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        }
       }
     } finally {
-      await client
-        .query("SELECT pg_advisory_unlock(hashtextextended('anicode:schema-migrations', 0))")
-        .catch(() => undefined);
+      if (migrationLockHeld) {
+        await client
+          .query("SELECT pg_advisory_unlock(hashtextextended('anicode:schema-migrations', 0))")
+          .catch(() => undefined);
+      }
       client.release();
     }
   }
@@ -410,8 +536,367 @@ function eventFromRow<T = unknown>(row: Row): RuntimeEvent<T> {
   };
 }
 
-export class PostgresRuntimeEventStore implements RuntimeEventStore {
+function postgresLifecycleRecord(row: Row, activeLeases: number): SessionLifecycleRecord {
+  return {
+    sessionId: String(row.session_id),
+    state: String(row.state) as SessionLifecycleRecord["state"],
+    epoch: Number(row.epoch),
+    activeLeases,
+    ...(row.workspace != null ? { workspace: String(row.workspace) } : {}),
+    ...(row.workspace_device != null && row.workspace_inode != null
+      ? {
+          workspaceIdentity: {
+            device: String(row.workspace_device),
+            inode: String(row.workspace_inode),
+          },
+        }
+      : {}),
+    ...(row.delete_owner != null ? { deleteOwner: String(row.delete_owner) } : {}),
+    ...(row.delete_token != null ? { deleteToken: String(row.delete_token) } : {}),
+    ...(row.delete_lease_expires_at != null
+      ? { deleteLeaseExpiresAt: new Date(String(row.delete_lease_expires_at)).toISOString() }
+      : {}),
+  };
+}
+
+/** PostgreSQL lifecycle transitions use row locks inside SERIALIZABLE transactions. */
+export class PostgresSessionLifecycleStore implements SessionLifecycleStore {
   constructor(readonly database: PostgresRuntimeDatabase) {}
+
+  get(sessionId: string): Promise<SessionLifecycleRecord | undefined> {
+    assertIdentifier(sessionId, "session lifecycle id");
+    return this.database.transaction(async (client) => {
+      await this.deleteExpiredOperations(client, sessionId);
+      const selected = await client.query(
+        "SELECT * FROM anicode_session_lifecycle WHERE session_id = $1 FOR UPDATE",
+        [sessionId],
+      );
+      const row = selected.rows[0] as Row | undefined;
+      if (!row) return undefined;
+      return postgresLifecycleRecord(row, await this.activeLeaseCount(client, sessionId));
+    });
+  }
+
+  async listDeleted(input: {
+    limit: number;
+    afterSessionId?: string;
+    workspace?: string;
+  }): Promise<SessionLifecycleRecord[]> {
+    this.validateListInput(input);
+    const result = await this.database.pool.query(
+      `SELECT * FROM anicode_session_lifecycle
+       WHERE state = 'deleted'
+         AND ($1::text IS NULL OR session_id > $1)
+         AND ($2::text IS NULL OR workspace = $2)
+       ORDER BY session_id
+       LIMIT $3`,
+      [input.afterSessionId ?? null, input.workspace ?? null, input.limit],
+    );
+    return (result.rows as Row[]).map((row) => postgresLifecycleRecord(row, 0));
+  }
+
+  acquireOperation(input: AcquireSessionOperationInput): Promise<SessionOperationLease> {
+    this.validateInput(input);
+    const leaseId = `sop_${randomUUID()}`;
+    return this.database.transaction(async (client) => {
+      await this.deleteExpiredOperations(client, input.sessionId);
+      await client.query(
+        `INSERT INTO anicode_session_lifecycle
+         (session_id, state, epoch, workspace, workspace_device, workspace_inode)
+         VALUES ($1, 'active', 0, $2, $3, $4) ON CONFLICT(session_id) DO NOTHING`,
+        [
+          input.sessionId,
+          input.workspace ?? null,
+          input.workspaceIdentity?.device ?? null,
+          input.workspaceIdentity?.inode ?? null,
+        ],
+      );
+      const selected = await client.query(
+        "SELECT * FROM anicode_session_lifecycle WHERE session_id = $1 FOR UPDATE",
+        [input.sessionId],
+      );
+      const row = selected.rows[0] as Row;
+      const state = String(row.state) as SessionLifecycleRecord["state"];
+      if (state !== "active") throw new SessionLifecycleUnavailableError(input.sessionId, state);
+      this.assertWorkspace(row, input.workspace, input.workspaceIdentity);
+      if (row.workspace == null && input.workspace) {
+        await client.query(
+          `UPDATE anicode_session_lifecycle SET workspace = $2, updated_at = now()
+           WHERE session_id = $1`,
+          [input.sessionId, input.workspace],
+        );
+      }
+      if (row.workspace_device == null && row.workspace_inode == null && input.workspaceIdentity) {
+        await client.query(
+          `UPDATE anicode_session_lifecycle
+           SET workspace_device = $2, workspace_inode = $3, updated_at = now()
+           WHERE session_id = $1`,
+          [input.sessionId, input.workspaceIdentity.device, input.workspaceIdentity.inode],
+        );
+      }
+      const inserted = await client.query(
+        `INSERT INTO anicode_session_operation_leases
+         (lease_id, session_id, owner, epoch, expires_at)
+         VALUES ($1, $2, $3, $4, clock_timestamp() + ($5 * interval '1 millisecond'))
+         RETURNING expires_at`,
+        [leaseId, input.sessionId, input.owner, Number(row.epoch), input.ttlMs],
+      );
+      return {
+        sessionId: input.sessionId,
+        leaseId,
+        owner: input.owner,
+        epoch: Number(row.epoch),
+        expiresAt: new Date(String((inserted.rows[0] as Row).expires_at)).toISOString(),
+      };
+    });
+  }
+
+  renewOperation(lease: SessionOperationLease, ttlMs: number): Promise<boolean> {
+    this.validateLease(lease);
+    assertLifecycleTtl(ttlMs);
+    return this.database.transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE anicode_session_operation_leases
+         SET expires_at = clock_timestamp() + ($5 * interval '1 millisecond')
+         WHERE lease_id = $1 AND session_id = $2 AND owner = $3 AND epoch = $4
+           AND expires_at > clock_timestamp()`,
+        [lease.leaseId, lease.sessionId, lease.owner, lease.epoch, ttlMs],
+      );
+      return (result.rowCount ?? 0) === 1;
+    });
+  }
+
+  async releaseOperation(lease: SessionOperationLease): Promise<void> {
+    this.validateLease(lease);
+    await this.database.pool.query(
+      `DELETE FROM anicode_session_operation_leases
+       WHERE lease_id = $1 AND session_id = $2 AND owner = $3 AND epoch = $4`,
+      [lease.leaseId, lease.sessionId, lease.owner, lease.epoch],
+    );
+  }
+
+  claimDeletion(input: ClaimSessionDeletionInput): Promise<SessionDeletionClaim> {
+    this.validateInput(input);
+    const replacementToken = `sdel_${randomUUID()}`;
+    return this.database.transaction(async (client) => {
+      await this.deleteExpiredOperations(client, input.sessionId);
+      await client.query(
+        `INSERT INTO anicode_session_lifecycle
+         (session_id, state, epoch, workspace, workspace_device, workspace_inode)
+         VALUES ($1, 'active', 0, $2, $3, $4) ON CONFLICT(session_id) DO NOTHING`,
+        [
+          input.sessionId,
+          input.workspace ?? null,
+          input.workspaceIdentity?.device ?? null,
+          input.workspaceIdentity?.inode ?? null,
+        ],
+      );
+      let selected = await client.query(
+        "SELECT * FROM anicode_session_lifecycle WHERE session_id = $1 FOR UPDATE",
+        [input.sessionId],
+      );
+      let row = selected.rows[0] as Row;
+      this.assertWorkspace(row, input.workspace, input.workspaceIdentity);
+      if (row.workspace == null && input.workspace) {
+        await client.query(
+          "UPDATE anicode_session_lifecycle SET workspace = $2 WHERE session_id = $1",
+          [input.sessionId, input.workspace],
+        );
+        row.workspace = input.workspace;
+      }
+      if (row.workspace_device == null && row.workspace_inode == null && input.workspaceIdentity) {
+        await client.query(
+          `UPDATE anicode_session_lifecycle
+           SET workspace_device = $2, workspace_inode = $3 WHERE session_id = $1`,
+          [input.sessionId, input.workspaceIdentity.device, input.workspaceIdentity.inode],
+        );
+        row.workspace_device = input.workspaceIdentity.device;
+        row.workspace_inode = input.workspaceIdentity.inode;
+      }
+      if (row.state === "deleted") {
+        return {
+          ...postgresLifecycleRecord(row, await this.activeLeaseCount(client, input.sessionId)),
+          claimed: false,
+        };
+      }
+      if (row.state === "active") {
+        await client.query(
+          `UPDATE anicode_session_lifecycle SET state = 'deleting', epoch = epoch + 1,
+           delete_owner = NULL, delete_token = NULL, delete_lease_expires_at = NULL,
+           updated_at = now() WHERE session_id = $1`,
+          [input.sessionId],
+        );
+      }
+      const claimed = await client.query(
+        `UPDATE anicode_session_lifecycle
+         SET delete_owner = $2,
+             delete_token = CASE
+               WHEN delete_owner = $2 AND delete_lease_expires_at > clock_timestamp()
+                 THEN delete_token ELSE $3 END,
+             delete_lease_expires_at = clock_timestamp() + ($4 * interval '1 millisecond'),
+             updated_at = now()
+         WHERE session_id = $1 AND state = 'deleting'
+           AND (delete_lease_expires_at IS NULL OR delete_lease_expires_at <= clock_timestamp()
+                OR delete_owner = $2)
+         RETURNING *`,
+        [input.sessionId, input.owner, replacementToken, input.ttlMs],
+      );
+      if (claimed.rows[0]) {
+        row = claimed.rows[0] as Row;
+        return {
+          ...postgresLifecycleRecord(row, await this.activeLeaseCount(client, input.sessionId)),
+          claimed: true,
+        };
+      }
+      selected = await client.query(
+        "SELECT * FROM anicode_session_lifecycle WHERE session_id = $1",
+        [input.sessionId],
+      );
+      row = selected.rows[0] as Row;
+      return {
+        ...postgresLifecycleRecord(row, await this.activeLeaseCount(client, input.sessionId)),
+        claimed: false,
+      };
+    });
+  }
+
+  renewDeletion(claim: SessionDeletionClaim, ttlMs: number): Promise<boolean> {
+    this.validateClaim(claim);
+    assertLifecycleTtl(ttlMs);
+    return this.database.transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE anicode_session_lifecycle
+         SET delete_lease_expires_at = clock_timestamp() + ($4 * interval '1 millisecond'),
+             updated_at = now()
+         WHERE session_id = $1 AND state = 'deleting' AND delete_owner = $2
+           AND delete_token = $3 AND delete_lease_expires_at > clock_timestamp()`,
+        [claim.sessionId, claim.deleteOwner!, claim.deleteToken!, ttlMs],
+      );
+      return (result.rowCount ?? 0) === 1;
+    });
+  }
+
+  completeDeletion(claim: SessionDeletionClaim): Promise<boolean> {
+    this.validateClaim(claim);
+    return this.database.transaction(async (client) => {
+      await this.deleteExpiredOperations(client, claim.sessionId);
+      // Lock the lifecycle row before counting leases so acquire and completion have one order.
+      const selected = await client.query(
+        "SELECT * FROM anicode_session_lifecycle WHERE session_id = $1 FOR UPDATE",
+        [claim.sessionId],
+      );
+      const row = selected.rows[0] as Row | undefined;
+      if (
+        !row ||
+        row.state !== "deleting" ||
+        row.delete_owner !== claim.deleteOwner ||
+        row.delete_token !== claim.deleteToken ||
+        row.delete_lease_expires_at == null ||
+        (await this.activeLeaseCount(client, claim.sessionId)) !== 0
+      ) {
+        return false;
+      }
+      const result = await client.query(
+        `UPDATE anicode_session_lifecycle SET state = 'deleted',
+         delete_owner = NULL, delete_token = NULL, delete_lease_expires_at = NULL,
+         updated_at = now()
+         WHERE session_id = $1 AND state = 'deleting' AND delete_owner = $2
+           AND delete_token = $3 AND delete_lease_expires_at > clock_timestamp()`,
+        [claim.sessionId, claim.deleteOwner, claim.deleteToken],
+      );
+      return (result.rowCount ?? 0) === 1;
+    });
+  }
+
+  private async deleteExpiredOperations(client: PoolClient, sessionId: string): Promise<void> {
+    await client.query(
+      `DELETE FROM anicode_session_operation_leases
+       WHERE session_id = $1 AND expires_at <= clock_timestamp()`,
+      [sessionId],
+    );
+  }
+
+  private async activeLeaseCount(client: PoolClient, sessionId: string): Promise<number> {
+    const result = await client.query(
+      `SELECT COUNT(*) AS count FROM anicode_session_operation_leases
+       WHERE session_id = $1 AND expires_at > clock_timestamp()`,
+      [sessionId],
+    );
+    return Number((result.rows[0] as Row).count);
+  }
+
+  private assertWorkspace(
+    row: Row,
+    workspace: string | undefined,
+    identity: { device: string; inode: string } | undefined,
+  ): void {
+    if (row.workspace != null && String(row.workspace) !== workspace) {
+      throw new Error(`Session ${String(row.session_id)} workspace lifecycle mismatch`);
+    }
+    if (
+      row.workspace_device != null &&
+      row.workspace_inode != null &&
+      (!identity ||
+        String(row.workspace_device) !== identity.device ||
+        String(row.workspace_inode) !== identity.inode)
+    ) {
+      throw new Error(`Session ${String(row.session_id)} workspace identity lifecycle mismatch`);
+    }
+  }
+
+  private validateInput(input: AcquireSessionOperationInput | ClaimSessionDeletionInput): void {
+    assertIdentifier(input.sessionId, "session lifecycle id");
+    assertLifecycleId(input.owner, "session lifecycle owner");
+    assertLifecycleTtl(input.ttlMs);
+    if (input.workspace !== undefined && input.workspace.length === 0) {
+      throw new Error("Session lifecycle workspace must not be empty");
+    }
+    if (
+      input.workspaceIdentity &&
+      (!input.workspaceIdentity.device || !input.workspaceIdentity.inode)
+    ) {
+      throw new Error("Session lifecycle workspace identity must include device and inode");
+    }
+  }
+
+  private validateListInput(input: {
+    limit: number;
+    afterSessionId?: string;
+    workspace?: string;
+  }): void {
+    if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+      throw new Error("Session lifecycle list limit must be an integer from 1 to 1000");
+    }
+    if (input.afterSessionId !== undefined) {
+      assertIdentifier(input.afterSessionId, "session lifecycle cursor");
+    }
+    if (input.workspace !== undefined && input.workspace.length === 0) {
+      throw new Error("Session lifecycle workspace must not be empty");
+    }
+  }
+
+  private validateLease(lease: SessionOperationLease): void {
+    assertIdentifier(lease.sessionId, "session lifecycle id");
+    assertLifecycleId(lease.leaseId, "session operation lease id");
+    assertLifecycleId(lease.owner, "session lifecycle owner");
+  }
+
+  private validateClaim(claim: SessionDeletionClaim): void {
+    assertIdentifier(claim.sessionId, "session lifecycle id");
+    if (!claim.deleteOwner || !claim.deleteToken) {
+      throw new Error("Session deletion claim is missing its owner or token");
+    }
+    assertLifecycleId(claim.deleteOwner, "session lifecycle owner");
+    assertLifecycleId(claim.deleteToken, "session deletion token");
+  }
+}
+
+export class PostgresRuntimeEventStore implements RuntimeEventStore {
+  readonly lifecycle: SessionLifecycleStore;
+
+  constructor(readonly database: PostgresRuntimeDatabase) {
+    this.lifecycle = new PostgresSessionLifecycleStore(database);
+  }
 
   append<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
     assertIdentifier(input.streamId, "runtime stream id");
@@ -489,6 +974,13 @@ export class PostgresRuntimeEventStore implements RuntimeEventStore {
     );
     return result.rows.map((row) => String((row as Row).stream_id));
   }
+
+  async delete(streamId: string): Promise<void> {
+    assertIdentifier(streamId, "runtime stream id");
+    await this.database.pool.query("DELETE FROM anicode_runtime_events WHERE stream_id = $1", [
+      streamId,
+    ]);
+  }
 }
 
 export class PostgresRuntimeSnapshotStore implements RuntimeSnapshotStore {
@@ -522,6 +1014,14 @@ function sessionMetaFromRow(row: Row): SessionMeta {
     createdAt: new Date(String(row.created_at)).toISOString(),
     updatedAt: new Date(String(row.updated_at)).toISOString(),
     cwd: String(row.cwd),
+    ...(row.workspace_device != null && row.workspace_inode != null
+      ? {
+          workspaceIdentity: {
+            device: String(row.workspace_device),
+            inode: String(row.workspace_inode),
+          },
+        }
+      : {}),
     model: String(row.model),
     ...(row.title != null ? { title: String(row.title) } : {}),
   };
@@ -537,9 +1037,19 @@ export class PostgresSessionStore implements ISessionStore {
       const now = new Date().toISOString();
       const full: SessionMeta = { ...meta, createdAt: now, updatedAt: now };
       await client.query(
-        `INSERT INTO anicode_sessions(id, created_at, updated_at, cwd, model, title)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [full.id, full.createdAt, full.updatedAt, full.cwd, full.model, full.title ?? null],
+        `INSERT INTO anicode_sessions
+         (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          full.id,
+          full.createdAt,
+          full.updatedAt,
+          full.cwd,
+          full.workspaceIdentity?.device ?? null,
+          full.workspaceIdentity?.inode ?? null,
+          full.model,
+          full.title ?? null,
+        ],
       );
       return full;
     });
@@ -572,15 +1082,27 @@ export class PostgresSessionStore implements ISessionStore {
     const updatedAt = await this.database.transaction(async (client) => {
       const timestamp = new Date().toISOString();
       await client.query(
-        `INSERT INTO anicode_sessions(id, created_at, updated_at, cwd, model, title)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO anicode_sessions
+         (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT(id) DO UPDATE SET
            created_at = excluded.created_at,
            updated_at = excluded.updated_at,
            cwd = excluded.cwd,
+           workspace_device = excluded.workspace_device,
+           workspace_inode = excluded.workspace_inode,
            model = excluded.model,
            title = excluded.title`,
-        [meta.id, meta.createdAt, timestamp, meta.cwd, meta.model, meta.title ?? null],
+        [
+          meta.id,
+          meta.createdAt,
+          timestamp,
+          meta.cwd,
+          meta.workspaceIdentity?.device ?? null,
+          meta.workspaceIdentity?.inode ?? null,
+          meta.model,
+          meta.title ?? null,
+        ],
       );
       await client.query("DELETE FROM anicode_session_messages WHERE session_id = $1", [meta.id]);
       for (let index = 0; index < messages.length; index++) {
@@ -938,6 +1460,13 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
     );
     return result.rows.map((row) => commandFromRow(row as Row));
   }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    assertIdentifier(sessionId, "command session id");
+    await this.database.pool.query("DELETE FROM anicode_commands WHERE session_id = $1", [
+      sessionId,
+    ]);
+  }
 }
 
 export class PostgresOutboxStore implements OutboxStore {
@@ -1115,6 +1644,74 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
     return workerFromRow(duplicate.rows[0] as Row);
   }
 
+  enqueueJobWithQuota(job: WorkerJob, quota: WorkerEnqueueQuota): Promise<WorkerJob> {
+    return this.database.transaction(async (client) => {
+      const existing = await client.query(
+        "SELECT * FROM anicode_worker_jobs WHERE idempotency_key = $1",
+        [job.idempotencyKey],
+      );
+      if (existing.rows[0]) return workerFromRow(existing.rows[0] as Row);
+
+      const outstanding = await client.query(
+        `SELECT COUNT(*)::bigint AS count
+         FROM anicode_worker_jobs
+         WHERE status IN ('queued', 'leased', 'cancellation_requested')
+           AND payload->>'tenantId' = $1`,
+        [quota.tenantId],
+      );
+      if (Number((outstanding.rows[0] as Row).count) >= quota.maxOutstandingPerTenant) {
+        throw new WorkerQueueQuotaError("tenant_quota_exceeded", "Tenant execution quota exceeded");
+      }
+
+      const actorQueued = await client.query(
+        `SELECT COUNT(*)::bigint AS count
+         FROM anicode_worker_jobs
+         WHERE status = 'queued'
+           AND payload->>'tenantId' = $1
+           AND payload->>'actor' = $2`,
+        [quota.tenantId, quota.actor],
+      );
+      if (Number((actorQueued.rows[0] as Row).count) >= quota.maxQueuedPerActor) {
+        throw new WorkerQueueQuotaError("actor_queue_full", "Actor execution queue is full");
+      }
+
+      const inserted = await client.query(
+        `INSERT INTO anicode_worker_jobs
+         (id, type, idempotency_key, payload, status, attempts, max_attempts,
+          lease_owner, lease_expires_at, fencing_token, result, error, created_at, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14)
+         ON CONFLICT(idempotency_key) DO NOTHING
+         RETURNING *`,
+        [
+          job.id,
+          job.type,
+          job.idempotencyKey,
+          JSON.stringify(job.payload),
+          job.status,
+          job.attempts,
+          job.maxAttempts,
+          job.leaseOwner ?? null,
+          job.leaseExpiresAt ?? null,
+          job.fencingToken ?? 0,
+          job.result === undefined ? null : JSON.stringify(job.result),
+          job.error ?? null,
+          job.createdAt,
+          job.updatedAt,
+        ],
+      );
+      if (inserted.rows[0]) return workerFromRow(inserted.rows[0] as Row);
+
+      // A concurrent idempotent insert may be invisible to this SERIALIZABLE snapshot.
+      // Force the transaction helper to retry with a fresh snapshot instead of reporting
+      // a spurious conflict or inserting a second job.
+      const retry = new Error("Concurrent worker idempotency conflict") as Error & {
+        code: string;
+      };
+      retry.code = "40001";
+      throw retry;
+    });
+  }
+
   claimJob(
     owner: string,
     types: string[] | undefined,
@@ -1126,6 +1723,14 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
          SET status = 'failed', error = 'lease expired after maximum attempts', updated_at = now(),
              lease_owner = NULL, lease_expires_at = NULL
          WHERE status = 'leased' AND lease_expires_at <= now() AND attempts >= max_attempts`,
+      );
+      await client.query(
+        `UPDATE anicode_worker_jobs
+         SET status = 'failed',
+             error = 'cancellation acknowledgement lease expired; execution outcome indeterminate',
+             updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+         WHERE status = 'cancellation_requested'
+           AND (lease_expires_at IS NULL OR lease_expires_at <= now())`,
       );
       const selected = await client.query(
         `SELECT id FROM anicode_worker_jobs
@@ -1204,14 +1809,43 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
     if ((result.rowCount ?? 0) !== 1) throw new Error(`Cannot fail unowned worker job ${jobId}`);
   }
 
-  async cancelJob(jobId: string): Promise<boolean> {
+  async requestCancellationJob(jobId: string): Promise<WorkerCancellationResult> {
+    const result = await this.database.pool.query(
+      `UPDATE anicode_worker_jobs
+       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancellation_requested' END,
+           updated_at = now(),
+           lease_owner = CASE WHEN status = 'queued' THEN NULL ELSE lease_owner END,
+           lease_expires_at = CASE WHEN status = 'queued' THEN NULL ELSE lease_expires_at END
+       WHERE id = $1 AND status IN ('queued', 'leased', 'cancellation_requested')
+       RETURNING status`,
+      [jobId],
+    );
+    const status = (result.rows[0] as Row | undefined)?.status;
+    if (status === "cancelled" || status === "cancellation_requested") return status;
+    const existing = await this.database.pool.query(
+      "SELECT status FROM anicode_worker_jobs WHERE id = $1",
+      [jobId],
+    );
+    return (existing.rows[0] as Row | undefined)?.status === "cancelled"
+      ? "cancelled"
+      : "not_cancellable";
+  }
+
+  async acknowledgeCancellationJob(
+    jobId: string,
+    owner: string,
+    fencingToken?: number,
+  ): Promise<void> {
     const result = await this.database.pool.query(
       `UPDATE anicode_worker_jobs
        SET status = 'cancelled', updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
-       WHERE id = $1 AND status IN ('queued', 'leased')`,
-      [jobId],
+       WHERE id = $1 AND status = 'cancellation_requested' AND lease_owner = $2
+         AND ($3::bigint IS NULL OR fencing_token = $3)`,
+      [jobId, owner, fencingToken ?? null],
     );
-    return (result.rowCount ?? 0) === 1;
+    if ((result.rowCount ?? 0) !== 1) {
+      throw new Error(`Cannot acknowledge unowned worker job cancellation ${jobId}`);
+    }
   }
 
   async listJobs(): Promise<WorkerJob[]> {
@@ -1356,5 +1990,12 @@ export class PostgresArtifactStore implements ArtifactStore {
       [sessionId, artifactId],
     );
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    assertIdentifier(sessionId, "session id");
+    await this.database.pool.query("DELETE FROM anicode_artifacts WHERE session_id = $1", [
+      sessionId,
+    ]);
   }
 }

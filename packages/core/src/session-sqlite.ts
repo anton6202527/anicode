@@ -89,6 +89,8 @@ export class SqliteSessionStore implements ISessionStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         cwd        TEXT NOT NULL,
+        workspace_device TEXT,
+        workspace_inode  TEXT,
         model      TEXT NOT NULL,
         title      TEXT
       );
@@ -100,6 +102,18 @@ export class SqliteSessionStore implements ISessionStore {
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
     `);
+    const sessionColumns = new Set(
+      db
+        .prepare("PRAGMA table_info(sessions)")
+        .all()
+        .map((row) => String(row.name)),
+    );
+    if (!sessionColumns.has("workspace_device")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN workspace_device TEXT");
+    }
+    if (!sessionColumns.has("workspace_inode")) {
+      db.exec("ALTER TABLE sessions ADD COLUMN workspace_inode TEXT");
+    }
     await fs.chmod(file, 0o600).catch(() => {});
     return new SqliteSessionStore(db, file);
   }
@@ -111,9 +125,18 @@ export class SqliteSessionStore implements ISessionStore {
     try {
       this.db
         .prepare(
-          "INSERT INTO sessions (id, created_at, updated_at, cwd, model, title) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(full.id, full.createdAt, full.updatedAt, full.cwd, full.model, full.title ?? null);
+        .run(
+          full.id,
+          full.createdAt,
+          full.updatedAt,
+          full.cwd,
+          full.workspaceIdentity?.device ?? null,
+          full.workspaceIdentity?.inode ?? null,
+          full.model,
+          full.title ?? null,
+        );
     } catch (err) {
       throw new Error(
         t(`Session ${meta.id} already exists`, `会话 ${meta.id} 已存在`) +
@@ -143,14 +166,16 @@ export class SqliteSessionStore implements ISessionStore {
     try {
       this.db
         .prepare(
-          "INSERT INTO sessions (id, created_at, updated_at, cwd, model, title) VALUES (?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, cwd = excluded.cwd, model = excluded.model, title = excluded.title",
+          "INSERT INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, cwd = excluded.cwd, workspace_device = excluded.workspace_device, workspace_inode = excluded.workspace_inode, model = excluded.model, title = excluded.title",
         )
         .run(
           updated.id,
           updated.createdAt,
           updated.updatedAt,
           updated.cwd,
+          updated.workspaceIdentity?.device ?? null,
+          updated.workspaceIdentity?.inode ?? null,
           updated.model,
           updated.title ?? null,
         );
@@ -171,7 +196,9 @@ export class SqliteSessionStore implements ISessionStore {
   async load(id: string): Promise<SessionData> {
     assertSessionId(id);
     const meta = this.db
-      .prepare("SELECT id, created_at, updated_at, cwd, model, title FROM sessions WHERE id = ?")
+      .prepare(
+        "SELECT id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title FROM sessions WHERE id = ?",
+      )
       .get(id);
     if (!meta) throw new Error(t(`Session ${id} not found`, `会话 ${id} 不存在`));
     const rows = this.db
@@ -186,7 +213,7 @@ export class SqliteSessionStore implements ISessionStore {
   async list(): Promise<SessionMeta[]> {
     const rows = this.db
       .prepare(
-        "SELECT id, created_at, updated_at, cwd, model, title FROM sessions ORDER BY updated_at DESC",
+        "SELECT id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title FROM sessions ORDER BY updated_at DESC",
       )
       .all();
     return rows.map(rowToMeta);
@@ -213,6 +240,7 @@ export class SqliteSessionStore implements ISessionStore {
       await this.create({
         id: meta.id,
         cwd: meta.cwd,
+        ...(meta.workspaceIdentity ? { workspaceIdentity: meta.workspaceIdentity } : {}),
         model: meta.model,
         ...(meta.title ? { title: meta.title } : {}),
       });
@@ -229,6 +257,14 @@ function rowToMeta(row: Record<string, unknown>): SessionMeta {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     cwd: String(row.cwd),
+    ...(row.workspace_device != null && row.workspace_inode != null
+      ? {
+          workspaceIdentity: {
+            device: String(row.workspace_device),
+            inode: String(row.workspace_inode),
+          },
+        }
+      : {}),
     model: String(row.model),
     ...(row.title != null ? { title: String(row.title) } : {}),
   };

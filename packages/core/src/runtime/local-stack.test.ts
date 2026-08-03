@@ -16,7 +16,7 @@ test("LocalRuntimeStack: 密钥迁入 Broker，运行态在 SQLite 严格事务�
   const env: NodeJS.ProcessEnv = {
     OPENAI_API_KEY: "sk-test-secret",
     AWS_ACCESS_KEY_ID: "AKIA_TEST_ONLY",
-    ANICODE_NETWORK_ALLOW_DOMAINS: "example.com",
+    ANICODE_NETWORK_ALLOW_DOMAINS: "93.184.216.34",
     ANICODE_CREDENTIAL_BACKEND: "memory",
   };
   const stack = createLocalRuntimeStack(root, env);
@@ -34,8 +34,8 @@ test("LocalRuntimeStack: 密钥迁入 Broker，运行态在 SQLite 严格事务�
     assert.equal((await stack.runtime.events("s1")).length, 1);
     assert.equal((await fs.stat(path.join(root, "runtime.db"))).isFile(), true);
     assert.equal(
-      (await stack.networkProxy.authorize("https://example.com/docs")).url.hostname,
-      "example.com",
+      (await stack.networkProxy.authorize("https://93.184.216.34/docs")).url.hostname,
+      "93.184.216.34",
     );
     assert.ok((await stack.database.auditLog()).some((event) => event.category === "network"));
   } finally {

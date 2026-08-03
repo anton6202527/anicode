@@ -89,7 +89,7 @@ export class TransactionalExecutionRuntime implements ExecutionRuntime {
   async run(request: IsolatedRunRequest): Promise<IsolatedRunResult> {
     if (request.policy !== "workspace-write") return this.delegate.run(request);
     const root = canonical(request.cwd);
-    const patchsets = new PatchSetService(root);
+    const patchsets = new PatchSetService(root, { directCommit: "trusted-local" });
     await patchsets.recoverIncomplete();
     const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-shell-transaction-"));
     const staged = path.join(temporary, "workspace");
@@ -104,11 +104,13 @@ export class TransactionalExecutionRuntime implements ExecutionRuntime {
         throw new PatchSetConflictError(stagingConflicts);
       }
       const result = await this.delegate.run({ ...request, cwd: staged });
-      if (result.exitCode !== 0 || result.timedOut || request.signal?.aborted) return result;
+      request.signal?.throwIfAborted();
+      if (result.exitCode !== 0 || result.timedOut) return result;
 
       const after = await snapshotTree(staged, this.ignored, this.maxFiles);
       const changedPaths = snapshotConflicts(baseline, after);
       if (changedPaths.length === 0) return result;
+      request.signal?.throwIfAborted();
       const sourceNow = await snapshotTree(root, this.ignored, this.maxFiles);
       const concurrent = changedPaths.filter(
         (relative) => !snapshotEntryEqual(baseline.get(relative), sourceNow.get(relative)),
@@ -138,8 +140,10 @@ export class TransactionalExecutionRuntime implements ExecutionRuntime {
           mode: entry.mode,
         });
       }
+      request.signal?.throwIfAborted();
       const patchset = await patchsets.prepare(changes);
-      await patchsets.apply(patchset);
+      request.signal?.throwIfAborted();
+      await patchsets.apply(patchset, request.signal ? { signal: request.signal } : {});
       const suffix = `\n[PatchSet ${patchset.id} committed]\n${patchsets.preview(patchset)}`;
       return { ...result, output: `${result.output}${suffix}` };
     } finally {

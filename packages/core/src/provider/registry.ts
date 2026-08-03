@@ -202,6 +202,110 @@ let providerCredentialBroker: CredentialBroker | undefined;
 let providerNetworkProxy: NetworkProxy | undefined;
 let providerEnvironmentFallback = true;
 
+const MAX_MODEL_DISCOVERY_BODY_BYTES = 1024 * 1024;
+const MAX_DISCOVERED_MODELS = 500;
+const MAX_MODEL_ID_BYTES = 512;
+const UNSAFE_MODEL_ID = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
+
+/**
+ * Provider ids cross IPC/HTTP boundaries during live model discovery. Keep the accepted shape
+ * deliberately smaller than an arbitrary URL/path segment and never trim attacker-controlled
+ * input into a different provider identity.
+ */
+export function sanitizeProviderId(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)
+    ? value
+    : undefined;
+}
+
+/**
+ * AniCode's provider adapter is a text/tool Chat Completions client. Do not offer endpoint-specific
+ * models that require a different API or produce a non-text artifact. Vision-capable chat models
+ * remain allowed; only clearly specialised model IDs are filtered here.
+ */
+export function isAgentCompatibleModelId(model: string): boolean {
+  const id = model.toLowerCase();
+  const segment = (name: string) => new RegExp(`(^|[-._/:])${name}($|[-._/:])`, "i").test(id);
+  if (segment("embedding") || segment("embeddings") || segment("rerank")) return false;
+  if (segment("moderation") || segment("whisper") || segment("transcribe")) return false;
+  if (segment("tts") || segment("speech") || segment("audio") || segment("realtime")) return false;
+  if (
+    segment("image") ||
+    segment("images") ||
+    segment("imagen") ||
+    segment("dall") ||
+    segment("sora") ||
+    segment("video") ||
+    segment("veo") ||
+    segment("lyria") ||
+    segment("robotics") ||
+    segment("computer-use")
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function safeDiscoveredModelId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const id = value.trim();
+  if (!id || Buffer.byteLength(id, "utf8") > MAX_MODEL_ID_BYTES || UNSAFE_MODEL_ID.test(id)) {
+    return undefined;
+  }
+  return isAgentCompatibleModelId(id) ? id : undefined;
+}
+
+/** Revalidate provider responses at every host/transport boundary; malformed data fails closed. */
+export function sanitizeDiscoveredModels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return [
+    ...new Set(
+      value
+        .map((model) => safeDiscoveredModelId(model))
+        .filter((model): model is string => model !== undefined),
+    ),
+  ].slice(0, MAX_DISCOVERED_MODELS);
+}
+
+async function readBoundedModelPayload(response: Response): Promise<unknown> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_MODEL_DISCOVERY_BODY_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    return undefined;
+  }
+  if (!response.body) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_MODEL_DISCOVERY_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return undefined;
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(
+      Buffer.concat(
+        chunks.map((chunk) => Buffer.from(chunk)),
+        total,
+      ).toString("utf8"),
+    );
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return undefined;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /** 宿主把环境/Keychain/Vault 密钥导入 Broker 后调用；provider adapter 优先从 Broker 取。 */
 export function configureProviderCredentialBroker(
   broker: CredentialBroker | undefined,
@@ -622,13 +726,15 @@ export function listModelCatalog(): ModelCatalogEntry[] {
  */
 export async function discoverProviderModels(
   providerId: string,
-  timeoutMs = 1_200,
+  timeoutMs = 2_000,
   fetchImpl: typeof fetch = fetch,
 ): Promise<string[] | undefined> {
-  const entry = providers.get(providerId);
+  const safeProviderId = sanitizeProviderId(providerId);
+  if (!safeProviderId) return undefined;
+  const entry = providers.get(safeProviderId);
   if (!entry) return undefined;
   const d = entry.descriptor;
-  if (d.kind === "debug") return d.catalog.map((model) => model.model);
+  if (d.kind === "debug") return sanitizeDiscoveredModels(d.catalog.map((model) => model.model));
   if (d.kind !== "openai-compatible") return undefined;
   const runtime = runtimeConfig(d);
   if (!runtime.baseURL || (d.requiresApiKey && !runtime.apiKey)) return undefined;
@@ -656,15 +762,10 @@ export async function discoverProviderModels(
           : {}),
       });
       if (!response.ok) return undefined;
-      const payload = (await response.json()) as { data?: Array<{ id?: unknown }> };
-      if (!Array.isArray(payload.data)) return undefined;
-      return [
-        ...new Set(
-          payload.data
-            .map((model) => (typeof model.id === "string" ? model.id.trim() : ""))
-            .filter(Boolean),
-        ),
-      ].slice(0, 500);
+      const payload = (await readBoundedModelPayload(response)) as
+        { data?: Array<{ id?: unknown }> } | undefined;
+      if (!Array.isArray(payload?.data)) return undefined;
+      return sanitizeDiscoveredModels(payload.data.map((model) => model.id));
     } finally {
       clearTimeout(timer);
     }

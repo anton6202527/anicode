@@ -298,7 +298,7 @@ export const applyPatchTool: Tool = {
     // 提交阶段交给 PatchSet：preview 的 before hash 是乐观锁；journal 先落盘，
     // 跨文件提交中任一 IO 失败会恢复所有已写文件，之后也可按 patchset id 显式回滚。
     if (ctx.signal.aborted) throw new ToolError("会话已中断，补丁未提交");
-    const service = new PatchSetService(ctx.cwd);
+    const service = new PatchSetService(ctx.cwd, { directCommit: "trusted-local" });
     const changes = [...overlay.entries()].map(([abs, content]) => ({
       path: abs,
       content,

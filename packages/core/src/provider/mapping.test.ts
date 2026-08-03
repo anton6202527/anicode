@@ -261,7 +261,7 @@ test("registry: local 标记被改到公网端点时仍强制经过统一网络�
   const requests: Array<{ url: string; authorization: string | null }> = [];
   const proxy = new NetworkProxy({
     policy: { allowDomains: ["provider.example.test"], allowPorts: [443] },
-    resolver: async () => ["203.0.113.10"],
+    resolver: async () => ["93.184.216.34"],
     fetch: (async (input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
       requests.push({ url: String(input), authorization: headers.get("authorization") });
@@ -312,7 +312,7 @@ test("registry: 云端 /models 通过统一网络策略鉴权探测并返回真�
   const requests: Array<{ url: string; authorization: string | null }> = [];
   const proxy = new NetworkProxy({
     policy: { allowDomains: ["models.example.test"], allowPorts: [443] },
-    resolver: async () => ["203.0.113.11"],
+    resolver: async () => ["93.184.216.34"],
     fetch: (async (input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
       requests.push({ url: String(input), authorization: headers.get("authorization") });

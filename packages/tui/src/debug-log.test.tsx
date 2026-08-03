@@ -9,11 +9,19 @@ import { DebugLogger, withDebugLogging } from "./debug-log.js";
 test("debug log: 默认只记内容长度并保持 SessionHost 行为", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
   const file = path.join(dir, "trace.jsonl");
+  let resolveClosed!: (error: Error | undefined) => void;
+  const closed = new Promise<Error | undefined>((resolve) => {
+    resolveClosed = resolve;
+  });
   let disposed = false;
   let sendArgs: unknown[] = [];
   let undoArgs: unknown[] = [];
   const optionalCalls: string[] = [];
   const host: SessionHost = {
+    async discoverModels(providerId) {
+      optionalCalls.push(`models:${providerId}`);
+      return ["live-model"];
+    },
     async listSessions() {
       throw new Error("private host failure sk-super-secret-value");
     },
@@ -52,6 +60,7 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
           running: false,
           pendingPermissions: [],
         },
+        closed,
         close() {},
       };
     },
@@ -97,9 +106,14 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
     },
   };
 
-  const wrapped = withDebugLogging(host, new DebugLogger(file));
+  const logger = new DebugLogger(file, false, { flushIntervalMs: 60_000 });
+  const wrapped = withDebugLogging(host, logger);
+  assert.deepEqual(await wrapped.discoverModels?.("cliproxy"), ["live-model"]);
   const seen: string[] = [];
-  await wrapped.open("s1", (event) => seen.push(event.type));
+  const wrappedHandle = await wrapped.open("s1", (event) => seen.push(event.type));
+  assert.equal(wrappedHandle.closed, closed);
+  resolveClosed(undefined);
+  await wrappedHandle.closed;
   await wrapped.send("s1", "sk-this-must-not-appear", {
     model: "debug/once",
     idempotencyKey: "idem-1",
@@ -114,6 +128,7 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
   await assert.rejects(wrapped.listSessions(), /private host failure/);
   assert.equal(await wrapped.answerPermission("s1", "p1", "allow"), true);
   wrapped.dispose();
+  await logger.close();
 
   const log = await fs.readFile(file, "utf8");
   assert.deepEqual(seen, ["agent", "agent"]);
@@ -129,6 +144,7 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
   ]);
   assert.deepEqual(undoArgs, ["s1", "cp-1", "both"]);
   assert.deepEqual(optionalCalls, [
+    "models:cliproxy",
     "fork:s1:3",
     "compact:s1",
     "mode:s1:plan",
@@ -150,7 +166,11 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
 test("debug log: trace 模式按字段脱敏、截断超长内容并轮转", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
   const file = path.join(dir, "trace.jsonl");
-  const logger = new DebugLogger(file, true, { maxBytes: 512, maxFieldChars: 48 });
+  const logger = new DebugLogger(file, true, {
+    maxBytes: 512,
+    maxFieldChars: 48,
+    flushIntervalMs: 60_000,
+  });
 
   logger.log("secret.fixture", {
     apiKey: "short-value-that-pattern-matching-alone-would-miss",
@@ -160,6 +180,7 @@ test("debug log: trace 模式按字段脱敏、截断超长内容并轮转", asy
     providerKey: "AIza0123456789012345678901234567890123456789",
     longText: "x".repeat(200),
   });
+  await logger.flush();
   const secretLog = await fs.readFile(file, "utf8");
   assert.doesNotMatch(
     secretLog,
@@ -168,6 +189,7 @@ test("debug log: trace 模式按字段脱敏、截断超长内容并轮转", asy
   assert.match(secretLog, /\[REDACTED\]/);
   assert.match(secretLog, /truncated/);
   for (let i = 0; i < 12; i++) logger.log("rotation.fixture", { i, value: "y".repeat(80) });
+  await logger.close();
 
   const current = await fs.readFile(file, "utf8");
   const rotated = await fs.readFile(`${file}.1`, "utf8");
@@ -180,5 +202,23 @@ test("debug log: trace 模式按字段脱敏、截断超长内容并轮转", asy
   assert.ok((await fs.stat(`${file}.1`)).size <= 512);
   assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
 
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("debug log: 慢磁盘背压会有界丢弃并留下计数记录", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
+  const file = path.join(dir, "trace.jsonl");
+  const logger = new DebugLogger(file, false, {
+    maxBytes: 8 * 1024,
+    maxPendingBytes: 512,
+    flushIntervalMs: 60_000,
+  });
+
+  for (let i = 0; i < 100; i++) logger.log("burst.fixture", { i, value: "x".repeat(80) });
+  await logger.close();
+
+  const log = await fs.readFile(file, "utf8");
+  assert.match(log, /"kind":"logger\.dropped"/);
+  assert.match(log, /"records":/);
   await fs.rm(dir, { recursive: true, force: true });
 });

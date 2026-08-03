@@ -6,18 +6,40 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { loadConfig, loadProjectEnv, resolveDefaultModel, t } from "@anicode/core";
+import {
+  loadConfig,
+  loadProjectEnv,
+  resolveDefaultModel,
+  t,
+  WorkspaceTrustStore,
+} from "@anicode/core";
 import { ChatBridge } from "./bridge.js";
 import { buildManager, modelChoices } from "./host.js";
 import type { HostToWebview, WebviewToHost } from "./protocol.js";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd() ?? os.homedir();
-  await loadProjectEnv({ cwd });
-  const { config } = await loadConfig({ cwd });
+  const workspaceTrustStore = new WorkspaceTrustStore();
+  const workspaceTrust = await workspaceTrustStore.assess(cwd);
+  await loadProjectEnv({ cwd, workspaceTrust });
+  const { config } = await loadConfig({ cwd, workspaceTrust });
   const defaultModel = config.model ?? resolveDefaultModel();
   const sessionsDir = path.join(context.globalStorageUri.fsPath, "sessions");
-  const manager = buildManager(sessionsDir);
+  const manager = buildManager(sessionsDir, workspaceTrustStore, cwd);
+
+  if (!workspaceTrust.trusted) {
+    void vscode.window.showWarningMessage(
+      workspaceTrust.reason === "inspection-failed"
+        ? t(
+            `AniCode could not inspect this workspace and is restricted to read/glob/grep in plan mode. Project-provided capabilities and built-in write/shell tools are disabled. Resolve the inspection error, then reload VS Code and review Workspace Trust for ${cwd}.`,
+            `AniCode 无法完成工作区检查，已严格限制为 plan 模式下的 read/glob/grep；项目提供的能力及内置写入/shell 工具均已禁用。请先修复检查错误，再重新加载 VS Code 并审查 ${cwd} 的 Workspace Trust。`,
+          )
+        : t(
+            `AniCode is using restricted workspace mode (${workspaceTrust.reason}). Project environment/execution configuration, MCP, hooks, skills, network extensions, and the PatchSet workflow are disabled. Built-in development tools remain available, with every write or command requiring approval. Run "anicode trust grant --cwd ${cwd}" and reload VS Code to review and enable project-provided capabilities.`,
+            `AniCode 正在使用受限工作区模式（${workspaceTrust.reason}）。项目环境/执行配置、MCP、hooks、skills、联网扩展及 PatchSet 工作流已禁用；内置开发工具仍可使用，每次写入或命令均需授权。请运行“anicode trust grant --cwd ${cwd}”并重新加载 VS Code，以审查并启用项目提供的能力。`,
+          ),
+    );
+  }
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   status.command = "anicode.pickModel";

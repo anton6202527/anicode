@@ -15,7 +15,12 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import { autoUpdater } from "electron-updater";
-import { loadConfig, loadProjectEnv, resolveDefaultModel } from "@anicode/core";
+import {
+  loadConfig,
+  loadProjectEnv,
+  resolveDefaultModel,
+  WorkspaceTrustStore,
+} from "@anicode/core";
 import { Bridge } from "./bridge.js";
 import { trustedExternalUrl, trustedRendererDevUrl } from "../shared/security.js";
 
@@ -81,8 +86,10 @@ function trustedIpcSender(event: IpcMainInvokeEvent): boolean {
 async function createBridge(): Promise<Bridge> {
   const userData = app.getPath("userData");
   const cwd = process.cwd();
-  await loadProjectEnv({ cwd });
-  const { config } = await loadConfig({ cwd });
+  const workspaceTrustStore = new WorkspaceTrustStore();
+  const workspaceTrust = await workspaceTrustStore.assess(cwd);
+  await loadProjectEnv({ cwd, workspaceTrust });
+  const { config } = await loadConfig({ cwd, workspaceTrust });
   return new Bridge({
     cwd,
     sessionsDir: path.join(userData, "sessions"),
@@ -91,6 +98,8 @@ async function createBridge(): Promise<Bridge> {
     appName: app.getName(),
     appVersion: app.getVersion(),
     defaultModel: config.model ?? resolveDefaultModel(),
+    workspaceTrust: workspaceTrustStore,
+    workspaceTrusted: workspaceTrust.trusted,
     isTrustedSender: trustedIpcSender,
   });
 }

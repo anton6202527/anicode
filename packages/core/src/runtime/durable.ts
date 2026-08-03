@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { MemorySessionLifecycleStore, type SessionLifecycleStore } from "./session-lifecycle.js";
 
 export interface RuntimeEvent<T = unknown> {
   id: string;
@@ -32,9 +33,12 @@ export interface AppendRuntimeEvent<T = unknown> {
 }
 
 export interface RuntimeEventStore {
+  /** Shared lifecycle backend colocated with event persistence when available. */
+  readonly lifecycle?: SessionLifecycleStore;
   append<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>>;
   read(streamId: string, afterSequence?: number): Promise<RuntimeEvent[]>;
   listStreams(): Promise<string[]>;
+  delete(streamId: string): Promise<void>;
 }
 
 function assertStreamId(streamId: string): void {
@@ -62,6 +66,7 @@ function makeEvent<T>(input: AppendRuntimeEvent<T>, sequence: number): RuntimeEv
 
 export class MemoryRuntimeEventStore implements RuntimeEventStore {
   private streams = new Map<string, RuntimeEvent[]>();
+  readonly lifecycle = new MemorySessionLifecycleStore();
 
   async append<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
     assertStreamId(input.streamId);
@@ -89,6 +94,11 @@ export class MemoryRuntimeEventStore implements RuntimeEventStore {
 
   async listStreams(): Promise<string[]> {
     return [...this.streams.keys()].sort();
+  }
+
+  async delete(streamId: string): Promise<void> {
+    assertStreamId(streamId);
+    this.streams.delete(streamId);
   }
 }
 
@@ -177,6 +187,11 @@ export class FileRuntimeEventStore implements RuntimeEventStore {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
     }
+  }
+
+  async delete(streamId: string): Promise<void> {
+    assertStreamId(streamId);
+    await this.withStreamLock(streamId, () => fs.rm(this.file(streamId), { force: true }));
   }
 }
 
@@ -301,11 +316,16 @@ function projectRuntimeEvents(
 }
 
 export class DurableRuntime {
+  readonly lifecycle: SessionLifecycleStore;
+
   constructor(
     readonly store: RuntimeEventStore,
     readonly snapshots?: RuntimeSnapshotStore,
     readonly snapshotEvery = 50,
-  ) {}
+    lifecycle?: SessionLifecycleStore,
+  ) {
+    this.lifecycle = lifecycle ?? store.lifecycle ?? new MemorySessionLifecycleStore();
+  }
 
   async record<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
     const event = await this.store.append(input);
@@ -341,6 +361,11 @@ export class DurableRuntime {
     };
     await this.snapshots.put(snapshot);
     return snapshot;
+  }
+
+  async deleteStream(streamId: string): Promise<void> {
+    await this.snapshots?.delete(streamId);
+    await this.store.delete(streamId);
   }
 
   /**

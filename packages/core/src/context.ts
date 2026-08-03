@@ -21,8 +21,17 @@ import type { ChatMessage, ContentPart } from "./types.js";
 
 const MEMORY_FILES = ["AGENTS.md", "CLAUDE.md"];
 
+export interface ProjectMemoryOptions {
+  /** Defaults to true. Set false until Workspace Trust has been granted. */
+  includeProject?: boolean;
+}
+
 /** 从 cwd 向上（到文件系统根或 .git 边界）收集所有记忆文件，就近优先拼接 */
-export async function loadProjectMemory(cwd: string): Promise<string> {
+export async function loadProjectMemory(
+  cwd: string,
+  options: ProjectMemoryOptions = {},
+): Promise<string> {
+  if (options.includeProject === false) return "";
   const chunks: string[] = [];
   let dir = path.resolve(cwd);
   const seenGitRoot = { hit: false };

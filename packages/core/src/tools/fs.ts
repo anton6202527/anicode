@@ -241,7 +241,7 @@ export const writeTool: Tool = {
     const abs = await resolveInside(ctx.cwd, input["path"]);
     const content = String(input["content"] ?? "");
     ensureActive(ctx);
-    const service = new PatchSetService(ctx.cwd);
+    const service = new PatchSetService(ctx.cwd, { directCommit: "trusted-local" });
     const patchset = await service.prepare([{ path: abs, content }]);
     ensureActive(ctx);
     await service.apply(patchset);
@@ -297,7 +297,7 @@ export const editTool: Tool = {
 
     const { updated, replaced, mode } = applyEdit(content, oldStr, newStr, replaceAll);
     ensureActive(ctx);
-    const service = new PatchSetService(ctx.cwd);
+    const service = new PatchSetService(ctx.cwd, { directCommit: "trusted-local" });
     const patchset = await service.prepare([{ path: abs, content: updated }]);
     ensureActive(ctx);
     await service.apply(patchset);

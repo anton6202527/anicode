@@ -25,7 +25,7 @@ test("RemoteRuntime: 经受控代理鉴权、幂等提交并轮询完成", async
   });
   const proxy = new NetworkProxy({
     broker,
-    resolver: async () => ["203.0.113.10"],
+    resolver: async () => ["93.184.216.34"],
     fetch: async (target, init) => {
       const url = String(target);
       const headers = new Headers(init?.headers);
@@ -99,7 +99,7 @@ test("GitHubDelivery: branch/files/draft PR/workflow 构成闭环", async () => 
   });
   const proxy = new NetworkProxy({
     broker,
-    resolver: async () => ["203.0.113.11"],
+    resolver: async () => ["93.184.216.34"],
     fetch: async (target, init) => {
       const path = new URL(String(target)).pathname;
       calls.push({

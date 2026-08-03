@@ -304,6 +304,7 @@ async function main(): Promise<void> {
     process.exitCode = args.deferGate || sum.passed === sum.total ? 0 : 1;
   } finally {
     await telemetry.forceFlush?.();
+    await runtimeStack.artifacts.close?.();
     await runtimeStack.networkProxy.close();
     await runtimeStack.database.close();
   }

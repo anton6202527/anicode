@@ -15,6 +15,7 @@ import type {
 } from "../session-manager.js";
 import type { PermissionDecisionKind } from "../host.js";
 import type { PermissionMode } from "../permission.js";
+import { sanitizeProviderId } from "../provider/registry.js";
 
 const PERMISSION_MODES: readonly string[] = ["default", "acceptEdits", "auto", "bypass", "plan"];
 
@@ -31,8 +32,9 @@ const MAX_OPAQUE_ID_CHARS = 256;
 
 // ---------- 客户端 → 守护进程 ----------
 
-export type ClientRequest =
+export type ClientRequest = (
   | { id: number; method: "listSessions" }
+  | { id: number; method: "discoverModels"; providerId: string }
   | { id: number; method: "createSession"; cwd: string; model: string; title?: string }
   /** 订阅会话事件；结果里带 snapshot，之后经 session_event 帧推送 */
   | { id: number; method: "open"; sessionId: string }
@@ -72,7 +74,11 @@ export type ClientRequest =
   /** 运行时切换权限档位，返回生效 mode。 */
   | { id: number; method: "setPermissionProfile"; sessionId: string; name: string }
   /** 列出会话可用的权限档位。 */
-  | { id: number; method: "listPermissionProfiles"; sessionId: string };
+  | { id: number; method: "listPermissionProfiles"; sessionId: string }
+) & {
+  /** Per-daemon bearer credential. Embedded unauthenticated servers may omit it. */
+  authToken?: string;
+};
 
 // ---------- 守护进程 → 客户端 ----------
 
@@ -160,9 +166,17 @@ export function isClientRequest(value: unknown): value is ClientRequest {
     typeof frame.method !== "string"
   )
     return false;
+  if (
+    frame.authToken !== undefined &&
+    (!stringBetween(frame.authToken, 1, 4_096) || /[\u0000-\u001f\u007f]/.test(frame.authToken))
+  ) {
+    return false;
+  }
   switch (frame.method) {
     case "listSessions":
       return true;
+    case "discoverModels":
+      return sanitizeProviderId(frame.providerId) !== undefined;
     case "createSession":
       return (
         stringBetween(frame.cwd, 1, MAX_CWD_CHARS) &&

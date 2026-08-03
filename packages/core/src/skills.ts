@@ -47,6 +47,11 @@ export interface SkillMeta {
 
 const MAX_DESCRIPTION = 1024;
 
+export interface SkillDiscoveryOptions {
+  /** Defaults to true. Set false until Workspace Trust has been granted. */
+  includeProject?: boolean;
+}
+
 /** 全局技能发现根（跨工具生态，按顺序后者覆盖前者）。 */
 function globalSkillRoots(): string[] {
   const home = os.homedir();
@@ -96,10 +101,16 @@ function readRequiresBins(fm: Record<string, FrontmatterValue>): string[] | unde
 }
 
 /** 扫描默认目录，项目级同名覆盖用户级；标注 requires 与可用性。 */
-export async function discoverSkills(cwd: string, extraDirs: string[] = []): Promise<SkillMeta[]> {
+export async function discoverSkills(
+  cwd: string,
+  extraDirs: string[] = [],
+  options: SkillDiscoveryOptions = {},
+): Promise<SkillMeta[]> {
   const dirs = [
     ...globalSkillRoots(),
-    path.join(path.resolve(cwd), ".claude", "skills"),
+    ...(options.includeProject === false
+      ? []
+      : [path.join(path.resolve(cwd), ".claude", "skills")]),
     ...extraDirs,
   ];
   const byName = new Map<string, SkillMeta>();

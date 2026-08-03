@@ -10,9 +10,12 @@
  */
 
 import * as net from "node:net";
+import * as path from "node:path";
 import { promises as fs } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { t } from "../i18n.js";
 import { SessionManager, type SessionEvent } from "../session-manager.js";
+import { discoverProviderModels, sanitizeDiscoveredModels } from "../provider/registry.js";
 import {
   decodeLines,
   encodeFrame,
@@ -24,22 +27,43 @@ import {
   type ServerFrame,
 } from "./protocol.js";
 import { isWindowsNamedPipePath } from "./socket-path.js";
+import { validateDaemonAuthToken } from "./auth-token.js";
 
 export interface DaemonServerOptions {
   manager: SessionManager;
+  /** Strong local bearer credential. Formal daemon launches always configure one. */
+  authToken?: string;
+  /** Explicit test-only escape hatch; production callers must provide authToken. */
+  unsafeAllowUnauthenticatedForTests?: boolean;
+  /** Test/embedding override; production defaults to the core provider registry. */
+  discoverModels?: (providerId: string) => Promise<string[] | undefined>;
 }
 
 export class DaemonServer {
   private server: net.Server;
   private manager: SessionManager;
+  private readonly providerModelDiscovery: (providerId: string) => Promise<string[] | undefined>;
+  private readonly authTokenDigest: Buffer | undefined;
   private conns = new Set<net.Socket>();
 
   constructor(opts: DaemonServerOptions) {
+    if (opts.authToken === undefined && opts.unsafeAllowUnauthenticatedForTests !== true) {
+      throw new Error("DaemonServer requires a strong authToken");
+    }
+    if (opts.authToken !== undefined && opts.unsafeAllowUnauthenticatedForTests === true) {
+      throw new Error("DaemonServer authToken cannot be combined with unauthenticated test mode");
+    }
     this.manager = opts.manager;
+    this.providerModelDiscovery = opts.discoverModels ?? discoverProviderModels;
+    this.authTokenDigest =
+      opts.authToken !== undefined
+        ? createHash("sha256").update(validateDaemonAuthToken(opts.authToken)).digest()
+        : undefined;
     this.server = net.createServer((sock) => this.onConnection(sock));
   }
 
-  listen(socketPath: string): Promise<void> {
+  async listen(socketPath: string): Promise<void> {
+    if (!isWindowsNamedPipePath(socketPath)) await assertPrivateSocketParent(socketPath);
     return new Promise((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       this.server.once("error", onError);
@@ -117,7 +141,7 @@ export class DaemonServer {
         const { messages, rest } = decodeLines<unknown>(buffer);
         buffer = rest;
         for (const req of messages) {
-          if (!isClientRequest(req)) {
+          if (!isClientRequest(req) || !this.authorized(req)) {
             sock.destroy();
             return;
           }
@@ -136,6 +160,14 @@ export class DaemonServer {
     };
     sock.on("close", cleanup);
     sock.on("error", cleanup);
+  }
+
+  private authorized(req: ClientRequest): boolean {
+    if (!this.authTokenDigest) return true;
+    const presented = createHash("sha256")
+      .update(req.authToken ?? "")
+      .digest();
+    return timingSafeEqual(presented, this.authTokenDigest);
   }
 
   private async handle(
@@ -225,6 +257,14 @@ export class DaemonServer {
     switch (req.method) {
       case "listSessions":
         return this.manager.listSessions();
+      case "discoverModels":
+        try {
+          return sanitizeDiscoveredModels(await this.providerModelDiscovery(req.providerId));
+        } catch {
+          // Discovery is advisory. A provider/network failure must hide the provider and must not
+          // leak credential or upstream error details across the daemon boundary.
+          return undefined;
+        }
       case "createSession":
         return this.manager.createSession({
           cwd: req.cwd,
@@ -290,5 +330,20 @@ export class DaemonServer {
       case "listPermissionProfiles":
         return this.manager.listPermissionProfiles(req.sessionId);
     }
+  }
+}
+
+async function assertPrivateSocketParent(socketPath: string): Promise<void> {
+  const directory = path.dirname(socketPath);
+  const stat = await fs.lstat(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Daemon socket parent is not a real directory: ${directory}`);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new Error(`Daemon socket parent is not owned by the current user: ${directory}`);
+  }
+  if ((stat.mode & 0o777) !== 0o700) {
+    throw new Error(`Daemon socket parent must have mode 0700: ${directory}`);
   }
 }

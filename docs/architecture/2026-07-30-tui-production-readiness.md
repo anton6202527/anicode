@@ -15,7 +15,7 @@ incremental rendering 与 alternate-screen 生命周期。旧的全局 `stdout.w
 - 发布 CLI 要求 Node `>=22.15.0 <25`；构建会拒绝 bundle 中未声明的 runtime external，npm tarball 做 clean-room 启动验证。
 - OpenAI-compatible usage 将普通 input 与 cache read 分离，避免总量重复计费。
 - 授权卡片展示结构化 cwd/risk/network/file mutation/完整操作/脱敏参数；高风险默认拒绝，永久规则二次确认。
-- debug wrapper 保留 `send` options、undo mode 与所有可选 `SessionHost` 方法。
+- debug wrapper 保留 `OpenHandle.closed`、`send` options、undo mode 与所有可选 `SessionHost` 方法；JSONL 写入异步批处理，并以 1 MiB 队列上限做慢盘背压。
 
 ## P1：终端与长会话可靠性
 
@@ -23,8 +23,8 @@ incremental rendering 与 alternate-screen 生命周期。旧的全局 `stdout.w
 - 光标、左右移动、Backspace/Delete、Ctrl+W、列宽裁切按 `Intl.Segmenter` + `string-width` 处理；覆盖 ZWJ emoji、组合音标、旗帜、肤色与 Indic conjunct。
 - 多行 composer 最多显示五个逻辑行，活动行始终在窗口内；Home/End 与上下行移动保持显示列。
 - `useWindowSize` 响应 resize；1–16 列、4–6 行仍保证帧不越界。
-- `--plain / --no-color / --mouse / --no-mouse / --no-alt-screen`、`NO_COLOR`、screen-reader 与非 TTY fail-fast 已接线。交互式 CLI 默认接收滚轮；iTerm2 可按 Option 拖选，`--no-mouse`/`/mouse off` 可恢复无修饰键原生框选。
-- transcript UI cache 限 5,000 条，live text/thinking 与单条渲染均有上限；完整事实仍在 durable session store。
+- `--plain / --no-color / --mouse / --no-mouse / --no-alt-screen`、`NO_COLOR`、screen-reader 与非 TTY fail-fast 已接线。交互式 CLI 默认以 alternate-scroll 保留无修饰键原生框选与滚轮回看；需要鼠标点击时可用 `--mouse`/`/mouse on`，iTerm2 完整跟踪模式下仍可按 Option 拖选。
+- transcript UI cache 同时限制为 1,000 条 / 4 MiB，live text/thinking 与单条渲染均有上限；完整事实仍在 durable session store。回看期间追加、resize 与折叠会维持滚动锚点并重新 clamp。
 - `OpenHandle.closed` 把 HTTP SSE / daemon 断连显式上报；TUI 指数退避五次并支持 `/reconnect` / Ctrl+R。
 - React error boundary 保留可退出的安全画面，并把脱敏诊断写入显式 debug log。
 
@@ -43,6 +43,6 @@ incremental rendering 与 alternate-screen 生命周期。旧的全局 `stdout.w
 ## 验证边界
 
 仓库测试覆盖终端注入、Unicode、粘贴分块、窄/矮窗口、授权、断线重连、错误边界、JSONL exec、
-信号清理与发布 tarball。发布前仍应在 macOS Terminal/iTerm2、VS Code Terminal、kitty/WezTerm、
+信号清理与发布 tarball；release smoke 还会从实际 npm tarball 安装后在 Unix PTY 中启动、输入 `/exit`，验证备用屏进入/恢复，tarball 必须带 MIT LICENSE。发布前仍应在 macOS Terminal/iTerm2、VS Code Terminal、kitty/WezTerm、
 Windows Terminal + WSL 运行人工矩阵，并在真实 SSH/tmux、IME、screen reader 与网络抖动环境做验收；
 这些属于目标部署环境验证，不能由离线单元测试替代。

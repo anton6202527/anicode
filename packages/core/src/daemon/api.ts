@@ -21,7 +21,15 @@ export interface RouteDef {
   parameters?: ApiParameterDef[];
   /** 成功响应：204 表示无 body；schema 表示 200 JSON；"sse" 表示事件流 */
   response: Record<string, unknown> | 204 | "sse";
-  tag: "global" | "session" | "message" | "permission" | "artifact" | "runtime" | "patchset";
+  tag:
+    | "global"
+    | "provider"
+    | "session"
+    | "message"
+    | "permission"
+    | "artifact"
+    | "runtime"
+    | "patchset";
 }
 
 export interface ApiParameterDef {
@@ -80,6 +88,35 @@ export const ROUTES: RouteDef[] = [
     summary: "全局事件流 firehose（SSE 信封，跨所有 live 会话）；支持 Last-Event-ID 续传",
     response: "sse",
     tag: "global",
+  },
+  {
+    method: "get",
+    path: "/providers/{providerId}/models",
+    summary: "从服务端凭证与网络边界发现 provider 当前可用模型；不可用时 models=null",
+    response: {
+      type: "object",
+      required: ["providerId", "models"],
+      additionalProperties: false,
+      properties: {
+        providerId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 128,
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        },
+        models: {
+          oneOf: [
+            {
+              type: "array",
+              maxItems: 500,
+              items: { type: "string", minLength: 1, maxLength: 512 },
+            },
+            { type: "null" },
+          ],
+        },
+      },
+    },
+    tag: "provider",
   },
   {
     method: "get",
@@ -504,6 +541,8 @@ export const EVENTS: Record<string, string> = {
   "server.connected": "连接建立（保证为首帧）",
   "server.heartbeat": "心跳（约 30s 一条）",
   "session.snapshot": "订阅即回放的会话快照（properties = SessionSnapshot）",
+  "session.snapshot.chunk":
+    "大快照的有界分块：{ sessionId, transferId, index, data, done }；按序聚合 data 后解析 SessionSnapshot",
   "session.event": "SessionEvent 原样透传（host 客户端兼容通道）：{ sessionId, event }",
   "session.status": "运行态变化：{ sessionId, running }",
   "session.updated": "标题等元数据变化：{ sessionId, title }",
@@ -655,6 +694,7 @@ const COMPONENT_SCHEMAS: Record<string, Record<string, unknown>> = {
       version: { type: "integer", const: 2 },
       id: { type: "string" },
       root: { type: "string" },
+      sessionId: { type: "string" },
       status: {
         type: "string",
         enum: [
@@ -751,7 +791,15 @@ export function generateOpenApi(): Record<string, unknown> {
           name: match[1],
           in: "path",
           required: true,
-          schema: { type: "string" },
+          schema:
+            match[1] === "providerId"
+              ? {
+                  type: "string",
+                  minLength: 1,
+                  maxLength: 128,
+                  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                }
+              : { type: "string" },
         })),
         ...(route.parameters ?? []),
       ],
@@ -773,6 +821,8 @@ export function generateOpenApi(): Record<string, unknown> {
           },
         },
       },
+      security:
+        route.path === "/healthz" || route.path === "/global/health" ? [] : [{ bearerAuth: [] }],
     };
     (paths[route.path] ??= {})[route.method] = op;
   }
@@ -783,7 +833,7 @@ export function generateOpenApi(): Record<string, unknown> {
       title: "anicode server",
       version: `${PROTOCOL_VERSION}.0.0`,
       description:
-        "AniCode server-first HTTP API。鉴权：可选 Bearer token，REST 与 SSE 均只接受 Authorization header。" +
+        "AniCode server-first HTTP API。鉴权：除健康检查外强制 Bearer token，REST 与 SSE 均只接受 Authorization header。" +
         "多实例路由：请求可带 x-anicode-directory 头或 ?directory= 选择按目录隔离的会话实例（server 配置 resolveInstance 时生效，否则忽略）。" +
         "SSE 续传：事件帧携带 id，断线重连带 Last-Event-ID 头（或 ?lastEventId=）可增量补发丢失事件，缓冲失效时自动回落整份快照。",
     },
@@ -811,7 +861,7 @@ export function generateOpenApi(): Record<string, unknown> {
       },
       securitySchemes: { bearerAuth: { type: "http", scheme: "bearer" } },
     },
-    security: [{ bearerAuth: [] }, {}],
+    security: [{ bearerAuth: [] }],
     "x-events": EVENTS,
   };
 }

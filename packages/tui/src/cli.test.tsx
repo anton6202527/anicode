@@ -5,7 +5,11 @@ import { Readable } from "node:stream";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { registerOpenAICompatibleProvider, type SessionHost } from "@anicode/core";
+import {
+  registerOpenAICompatibleProvider,
+  WorkspaceTrustStore,
+  type SessionHost,
+} from "@anicode/core";
 import {
   colorlessTerminalOutput,
   enterTerminalScreen,
@@ -17,11 +21,14 @@ import {
   resolveConfiguredProvider,
   resolveDefaultModel,
   runMcpCatalogCommand,
+  runTrustCommand,
   runExecCommand,
   selectSessionId,
   startRawModeWatchdog,
+  terminalSafe,
   validateArgs,
 } from "./cli.js";
+import { terminalMouseModeSequence } from "./app.js";
 
 test("CLI: Ink 管理备用屏，清理器只做一次紧急恢复", () => {
   const chunks: string[] = [];
@@ -58,6 +65,15 @@ test("CLI: Ink 管理备用屏，清理器只做一次紧急恢复", () => {
   assert.deepEqual(raw, [false]);
 });
 
+test("CLI: plain-text diagnostics strip terminal and bidi controls", () => {
+  assert.equal(
+    terminalSafe(
+      "safe\u001b[31m red\u001b[0m\u001b]8;;https://evil.invalid\u0007 link\u001b]8;;\u0007\u202e",
+    ),
+    "safe red link",
+  );
+});
+
 test("CLI: --plain 关闭颜色、鼠标与备用屏，颜色适配器保留光标控制", () => {
   const args = parseArgs(["--plain"]);
   assert.equal(args.noColor, true);
@@ -78,6 +94,62 @@ test("CLI: --plain 关闭颜色、鼠标与备用屏，颜色适配器保留光�
   assert.equal(chunks.join(""), "red\u001b[2J");
 });
 
+test("CLI: HTTP token file 参数严格解析且不与明文 token 混用", () => {
+  const parsed = parseArgs([
+    "--http",
+    "http://127.0.0.1:8327",
+    "--http-token-file",
+    "./daemon.token",
+  ]);
+  assert.equal(parsed.httpTokenFile, path.resolve("daemon.token"));
+  assert.throws(
+    () =>
+      parseArgs([
+        "--http",
+        "http://127.0.0.1:8327",
+        "--http-token",
+        "secret",
+        "--http-token-file",
+        "./daemon.token",
+      ]),
+    /不能同时使用|cannot be used together/,
+  );
+});
+
+test("CLI: Workspace Trust grant 要求明确确认且执行面变化会自动失效", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-trust-"));
+  const cwd = path.join(root, "project");
+  const store = new WorkspaceTrustStore({ file: path.join(root, "trust", "workspaces.json") });
+  const chunks: string[] = [];
+  const output = {
+    write: (chunk: string) => (chunks.push(chunk), true),
+  } as unknown as NodeJS.WritableStream;
+  try {
+    await fs.mkdir(cwd);
+    const before = await runTrustCommand(["status", "--cwd", cwd], { store, output });
+    assert.equal(before?.trusted, false);
+
+    const granted = await runTrustCommand(["grant", "--cwd", cwd], {
+      store,
+      output,
+      confirmGrant: async (assessment) => {
+        assert.equal(assessment.identity?.canonicalRoot, await fs.realpath(cwd));
+        return true;
+      },
+    });
+    assert.equal(granted?.trusted, true);
+
+    await fs.writeFile(path.join(cwd, ".env"), "MODEL_API_KEY=changed\n");
+    assert.equal((await store.assess(cwd)).reason, "execution-config-changed");
+
+    const revoked = await runTrustCommand(["revoke", "--cwd", cwd], { store, output });
+    assert.equal(revoked?.trusted, false);
+    assert.match(chunks.join(""), /Workspace Trust|工作区信任/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI: 备用屏每次进入时重置固定视口并清除滚动历史", () => {
   const chunks: string[] = [];
   const raw = {
@@ -95,8 +167,14 @@ test("CLI: 备用屏每次进入时重置固定视口并清除滚动历史", () 
   assert.equal(passthrough, raw);
 });
 
-test("CLI: 默认开启滚轮跟踪，--no-mouse 可恢复无修饰键原生框选", () => {
-  assert.equal(parseArgs([]).mouse, true);
+test("CLI: 默认关闭鼠标跟踪以保留原生框选，--mouse 可显式开启滚轮", () => {
+  const defaults = parseArgs([]);
+  assert.equal(defaults.mouse, false);
+  const defaultSequence = terminalMouseModeSequence(defaults.mouse);
+  assert.match(defaultSequence, /\?1000l/);
+  assert.match(defaultSequence, /\?1006l/);
+  assert.match(defaultSequence, /\?1007h/);
+  assert.doesNotMatch(defaultSequence, /\?1000h|\?1006h/);
   assert.equal(parseArgs(["--no-mouse"]).mouse, false);
   assert.equal(parseArgs(["--mouse"]).mouse, true);
   assert.equal(parseArgs(["--plain"]).mouse, false);
@@ -166,6 +244,25 @@ test("CLI: 收到 SIGTERM 时先幂等恢复终端再重发原信号", () => {
   assert.deepEqual(killed, [[4242, "SIGTERM"]]);
   assert.equal(events.listenerCount("SIGTERM"), 0);
   remove();
+});
+
+test("CLI: 终端清理本身失败也不会吞掉原始信号", () => {
+  const events = new EventEmitter();
+  const killed: Array<[number, NodeJS.Signals]> = [];
+  const target = Object.assign(events, {
+    pid: 4243,
+    kill(pid: number, signal: NodeJS.Signals) {
+      killed.push([pid, signal]);
+      return true;
+    },
+  }) as unknown as NodeJS.Process;
+  installTerminalExitGuard(() => {
+    throw new Error("detached tty");
+  }, target);
+
+  assert.doesNotThrow(() => events.emit("SIGHUP"));
+  assert.deepEqual(killed, [[4243, "SIGHUP"]]);
+  assert.equal(events.listenerCount("SIGHUP"), 0);
 });
 
 test("CLI: TUI 运行期间持续重申 raw mode，停止后不再改写终端", async () => {
@@ -342,10 +439,13 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
 
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-serve-"));
   const sink = { write: () => true } as unknown as NodeJS.WritableStream;
-  const server = await runServeCommand(["--port", "0", "--sessions", path.join(dir, "s")], {
-    output: sink,
-  });
+  const tokenFile = path.join(dir, "serve.token");
+  const server = await runServeCommand(
+    ["--port", "0", "--sessions", path.join(dir, "s"), "--cwd", dir, "--token-file", tokenFile],
+    { output: sink },
+  );
   try {
+    assert.equal((await fs.readFile(tokenFile, "utf8")).trim(), server.authenticationToken());
     const baseUrl = `http://127.0.0.1:${server.port()}`;
     const host = await buildHost({
       model: "debug/demo",
@@ -353,6 +453,7 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
       cwd: dir,
       daemon: false,
       http: baseUrl,
+      httpTokenFile: tokenFile,
       permissionMode: "default",
       socket: "",
       sessionsDir: path.join(dir, "unused"),
@@ -437,13 +538,78 @@ test("CLI exec: demo 模型无 TTY 完成一次 JSONL 会话", async () => {
       .join("")
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { type: string });
-    assert.equal(records[0]?.type, "session.started");
+      .map((line) => JSON.parse(line) as { type: string; message?: string });
+    assert.ok(records.some((record) => record.type === "warning"));
+    const warnings = records
+      .filter((record) => record.type === "warning")
+      .map((record) => record.message ?? "")
+      .join("\n");
+    assert.match(warnings, /headless run fails closed|无头运行会拒绝权限请求/);
+    assert.match(warnings, /--auto\/--accept-edits/);
+    assert.doesNotMatch(
+      warnings,
+      /only read\/glob\/grep|仅可使用 read\/glob\/grep|plan mode|计划模式/,
+    );
+    assert.ok(records.some((record) => record.type === "session.started"));
     assert.ok(records.some((record) => record.type === "session.event"));
     assert.equal(records[records.length - 1]?.type, "session.completed");
   } finally {
     if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
     else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI exec: inspection-failed 明确退回只读 plan，不承诺 write/bash", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-exec-trust-failed-"));
+  const cwd = path.join(root, "workspace");
+  const outsideEnv = path.join(root, "outside.env");
+  const chunks: string[] = [];
+  const output = {
+    write: (chunk: string) => (chunks.push(chunk), true),
+  } as unknown as NodeJS.WritableStream;
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.XDG_CONFIG_HOME = path.join(root, "config");
+  try {
+    await fs.mkdir(cwd);
+    await fs.writeFile(outsideEnv, "UNTRUSTED_KEY=blocked\n");
+    await fs.symlink(outsideEnv, path.join(cwd, ".env"));
+    await runExecCommand(
+      [
+        "--demo",
+        "--cwd",
+        cwd,
+        "--sessions",
+        path.join(root, "sessions"),
+        "--prompt",
+        "inspect safely",
+        "--jsonl",
+      ],
+      { output, error: output },
+    );
+    const warnings = chunks
+      .join("")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; message?: string })
+      .filter((record) => record.type === "warning")
+      .map((record) => record.message ?? "")
+      .join("\n");
+    assert.match(warnings, /Workspace inspection failed|工作区检查失败/);
+    assert.match(warnings, /read\/glob\/grep/);
+    assert.match(warnings, /plan mode|plan 模式/);
+    assert.doesNotMatch(warnings, /approve built-in development tools|内置开发工具逐项授权/);
+  } finally {
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    await fs.rm(root, { recursive: true, force: true });
   }
 });

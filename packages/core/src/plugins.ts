@@ -24,10 +24,21 @@ export interface PluginDirs {
   commands: string[];
 }
 
-export async function discoverPlugins(cwd: string, home?: string): Promise<PluginDirs> {
+export interface PluginDiscoveryOptions {
+  /** Defaults to true. Set false until Workspace Trust has been granted. */
+  includeProject?: boolean;
+}
+
+export async function discoverPlugins(
+  cwd: string,
+  home?: string,
+  options: PluginDiscoveryOptions = {},
+): Promise<PluginDirs> {
   const roots = [
     path.join(home ?? os.homedir(), ".anicode", "plugins"),
-    path.join(path.resolve(cwd), ".anicode", "plugins"),
+    ...(options.includeProject === false
+      ? []
+      : [path.join(path.resolve(cwd), ".anicode", "plugins")]),
   ];
   const out: PluginDirs = { names: [], agents: [], skills: [], commands: [] };
   for (const root of roots) {

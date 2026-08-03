@@ -135,6 +135,19 @@ function applyEvent(se: SessionEvent): void {
     // 标题变化：webview 暂不展示标题，忽略。
     return;
   }
+  if (se.type === "workspace_trust") {
+    state.items.push({
+      kind: "info",
+      text: se.assessment.trusted
+        ? t("Workspace trust granted", "工作区已授信")
+        : t(
+            "Workspace trust revoked; restricted mode is active",
+            "工作区信任已撤销，受限模式已生效",
+          ),
+    });
+    render();
+    return;
+  }
   const ev = se.event;
   switch (ev.type) {
     case "user_message":

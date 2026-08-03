@@ -95,6 +95,39 @@ test("skills: 自动检测 metadata.requires.bins，缺依赖标 available=false
   }
 });
 
+test("skills: includeProject=false 排除项目 skill，保留用户级与显式额外目录", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-skill-trust-"));
+  const home = path.join(root, "home");
+  const project = path.join(root, "project");
+  const extra = path.join(root, "extra");
+  const oldHome = process.env["HOME"];
+  process.env["HOME"] = home;
+  try {
+    await writeSkill(
+      path.join(home, ".claude", "skills"),
+      "global",
+      "---\nname: global\ndescription: global\n---\nbody",
+    );
+    await writeSkill(
+      path.join(project, ".claude", "skills"),
+      "project",
+      "---\nname: project\ndescription: project\n---\nbody",
+    );
+    await writeSkill(extra, "extra", "---\nname: extra\ndescription: extra\n---\nbody");
+    const found = await discoverSkills(project, [extra], { includeProject: false });
+    assert.ok(found.some((skill) => skill.name === "global"));
+    assert.ok(found.some((skill) => skill.name === "extra"));
+    assert.equal(
+      found.some((skill) => skill.name === "project"),
+      false,
+    );
+  } finally {
+    if (oldHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = oldHome;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("skills: skill 工具加载正文时剥离 YAML frontmatter", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-skill-tool-"));
   try {

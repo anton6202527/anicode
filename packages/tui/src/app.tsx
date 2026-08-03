@@ -22,6 +22,7 @@ import {
   Text,
   useApp,
   useInput,
+  useIsScreenReaderEnabled,
   usePaste,
   useStdout,
   useWindowSize,
@@ -29,7 +30,6 @@ import {
   type Key,
 } from "ink";
 import {
-  discoverProviderModels,
   diagnoseProvider,
   discoverSkills,
   expandCommand,
@@ -112,6 +112,10 @@ interface State {
   costUSD?: number;
   todos: TodoItem[];
   meta: { id: string; cwd: string; model: string; title?: string };
+  /** Core snapshot is authoritative; false means the SessionManager has enforced restricted mode. */
+  workspaceTrusted: boolean;
+  /** inspection-failed is stricter than an ordinary untrusted workspace. */
+  workspaceTrustReason: string | undefined;
   /** 每次成功 open 都重挂 Static，避免会话切换时沿用旧索引。 */
   generation: number;
   opening: boolean;
@@ -127,8 +131,10 @@ type Action =
       running: boolean;
       todos: TodoItem[];
       meta: State["meta"];
+      workspaceTrusted: boolean;
+      workspaceTrustReason: string | undefined;
     }
-  | { t: "opening"; v: boolean }
+  | { t: "opening"; v: boolean; restrict?: boolean }
   | { t: "push"; item: Item }
   | { t: "live"; delta: string }
   | { t: "liveThinking"; delta: string }
@@ -141,23 +147,96 @@ type Action =
   | { t: "running"; v: boolean }
   | { t: "usage"; u: Usage; costUSD?: number }
   | { t: "title"; title: string }
-  | { t: "todos"; todos: TodoItem[] };
+  | { t: "todos"; todos: TodoItem[] }
+  | { t: "workspaceTrust"; trusted: boolean; reason?: string };
 
-export const MAX_TRANSCRIPT_ROWS = 5_000;
+/** UI cache only; durable history remains in SessionHost. Keep Yoga/node work bounded. */
+export const MAX_TRANSCRIPT_ROWS = 1_000;
+export const MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
 export const MAX_LIVE_TEXT_CHARS = 256 * 1024;
 const MAX_LIVE_THINKING_CHARS = 32 * 1024;
+const MAX_ACTIVE_TOOLS = 200;
+const MAX_TODOS = 200;
+const MAX_PENDING_PERMISSIONS = 100;
+const MAX_SESSION_PICKER_ROWS = 1_000;
 
-export function boundTranscriptRows(rows: Row[], max = MAX_TRANSCRIPT_ROWS): Row[] {
-  if (rows.length <= max) return rows;
-  if (max <= 0) return [];
-  if (max === 1) return [rows[rows.length - 1]!];
-  // Preserve the session boundary at the top while bounding the append-only UI
-  // cache. Full history remains durable in SessionHost and can be reloaded.
-  return [rows[0]!, ...rows.slice(-(max - 1))];
+function normalizeTranscriptRow(row: Row): Row {
+  if (row.kind === "logo") return row;
+  if (row.kind === "tool") {
+    return {
+      ...row,
+      name: terminalDisplayText(row.name, 4 * 1024),
+      ruleKey: terminalDisplayText(row.ruleKey, 16 * 1024),
+      ...(row.detail ? { detail: terminalDisplayText(row.detail, 16 * 1024) } : {}),
+    };
+  }
+  return { ...row, text: terminalDisplayText(row.text) };
+}
+
+function transcriptRowBytes(row: Row): number {
+  if (row.kind === "logo") return 8;
+  if (row.kind === "tool") {
+    return Buffer.byteLength(row.id + row.name + row.ruleKey + (row.detail ?? ""), "utf8") + 64;
+  }
+  return Buffer.byteLength(row.text, "utf8") + 32;
+}
+
+function boundNormalizedTranscriptRows(rows: Row[], max: number, maxBytes: number): Row[] {
+  if (max <= 0 || maxBytes <= 0 || rows.length === 0) return [];
+  const last = rows[rows.length - 1]!;
+  if (max === 1) return [last];
+
+  // Preserve the session boundary plus one contiguous recent tail. If the newest
+  // row alone exceeds the byte budget (for example an adversarial tool id), keep
+  // it so the UI never hides the current operation; its display fields are capped.
+  const first = rows[0]!;
+  const tail: Row[] = [];
+  let bytes = transcriptRowBytes(first);
+  for (let i = rows.length - 1; i >= 1 && tail.length < max - 1; i--) {
+    const row = rows[i]!;
+    const rowBytes = transcriptRowBytes(row);
+    if (tail.length > 0 && bytes + rowBytes > maxBytes) break;
+    tail.push(row);
+    bytes += rowBytes;
+  }
+  tail.reverse();
+  return tail.length === rows.length - 1 ? rows : [first, ...tail];
+}
+
+export function boundTranscriptRows(
+  rows: Row[],
+  max = MAX_TRANSCRIPT_ROWS,
+  maxBytes = MAX_TRANSCRIPT_BYTES,
+): Row[] {
+  return boundNormalizedTranscriptRows(rows.map(normalizeTranscriptRow), max, maxBytes);
 }
 
 function appendTranscriptRow(rows: Row[], row: Row): Row[] {
-  return boundTranscriptRows([...rows, row]);
+  return boundNormalizedTranscriptRows(
+    [...rows, normalizeTranscriptRow(row)],
+    MAX_TRANSCRIPT_ROWS,
+    MAX_TRANSCRIPT_BYTES,
+  );
+}
+
+function boundActiveTools(
+  tools: Map<string, Extract<Item, { kind: "tool" }>>,
+): Map<string, Extract<Item, { kind: "tool" }>> {
+  const recent = [...tools.entries()].slice(-MAX_ACTIVE_TOOLS);
+  return new Map(
+    recent.map(([id, tool]) => [
+      id,
+      normalizeTranscriptRow(tool) as Extract<Item, { kind: "tool" }>,
+    ]),
+  );
+}
+
+function boundTodos(todos: readonly TodoItem[]): TodoItem[] {
+  return todos.slice(0, MAX_TODOS).map((todo) => ({
+    ...todo,
+    content: terminalInlineText(todo.content),
+    ...(todo.activeForm ? { activeForm: terminalInlineText(todo.activeForm) } : {}),
+  }));
 }
 
 function appendBoundedText(current: string, delta: string, max: number): string {
@@ -166,25 +245,38 @@ function appendBoundedText(current: string, delta: string, max: number): string 
   return `… ${t("older live output omitted", "较早的实时输出已省略")} …\n${next.slice(-max)}`;
 }
 
+function strictWorkspaceInspectionNotice(cwd: string): string {
+  return t(
+    `Workspace inspection failed: strict read-only mode is enforced for ${cwd}. Only built-in read/glob/grep and plan mode are available; writes, edits, bash, MCP, hooks, project extensions, and network access are disabled. Resolve the inspection error and reopen the session.`,
+    `工作区检查失败：${cwd} 已强制进入严格只读模式。仅可使用内置 read/glob/grep 与计划模式；写入、编辑、bash、MCP、hooks、项目扩展和网络访问均已禁用。请排除检查错误后重新打开会话。`,
+  );
+}
+
 function reducer(s: State, a: Action): State {
   switch (a.t) {
     case "reset":
       return {
         items: boundTranscriptRows(a.items),
-        activeTools: a.activeTools,
+        activeTools: boundActiveTools(a.activeTools),
         subagentActivity: new Map(),
         liveText: "",
         liveThinking: "",
         running: a.running,
         usage: a.usage,
         ...(a.costUSD !== undefined ? { costUSD: a.costUSD } : {}),
-        todos: a.todos,
+        todos: boundTodos(a.todos),
         meta: a.meta,
+        workspaceTrusted: a.workspaceTrusted,
+        workspaceTrustReason: a.workspaceTrustReason,
         generation: s.generation + 1,
         opening: false,
       };
     case "opening":
-      return { ...s, opening: a.v };
+      return {
+        ...s,
+        opening: a.v,
+        ...(a.v && a.restrict ? { workspaceTrusted: false, workspaceTrustReason: undefined } : {}),
+      };
     case "push":
       return { ...s, items: appendTranscriptRow(s.items, a.item) };
     case "live":
@@ -211,12 +303,16 @@ function reducer(s: State, a: Action): State {
       };
     case "toolStart": {
       const activeTools = new Map(s.activeTools);
+      if (!activeTools.has(a.id) && activeTools.size >= MAX_ACTIVE_TOOLS) {
+        const oldest = activeTools.keys().next().value;
+        if (oldest !== undefined) activeTools.delete(oldest);
+      }
       const previous = activeTools.get(a.id);
       activeTools.set(a.id, {
         kind: "tool",
         id: a.id,
-        name: a.name,
-        ruleKey: a.ruleKey,
+        name: terminalInlineText(a.name),
+        ruleKey: terminalDisplayText(a.ruleKey, 16 * 1024),
         status: previous?.status === "deny" ? "deny" : "run",
       });
       return { ...s, activeTools };
@@ -268,7 +364,36 @@ function reducer(s: State, a: Action): State {
     case "title":
       return { ...s, meta: { ...s.meta, title: a.title } };
     case "todos":
-      return { ...s, todos: a.todos };
+      return { ...s, todos: boundTodos(a.todos) };
+    case "workspaceTrust": {
+      if (s.workspaceTrusted === a.trusted && s.workspaceTrustReason === a.reason) return s;
+      const notice = a.trusted
+        ? t(
+            "Workspace trust was granted; local workspace integrations are available again.",
+            "工作区已授予信任；本地工作区集成已恢复。",
+          )
+        : a.reason === "inspection-failed"
+          ? strictWorkspaceInspectionNotice(s.meta.cwd)
+          : t(
+              `Workspace trust was revoked${a.reason ? ` (${a.reason})` : ""}; local workspace integrations are now disabled.`,
+              `工作区信任已撤销${a.reason ? `（${a.reason}）` : ""}；本地工作区集成现已禁用。`,
+            );
+      return {
+        ...s,
+        workspaceTrusted: a.trusted,
+        workspaceTrustReason: a.reason,
+        items: appendTranscriptRow(s.items, { kind: "info", text: notice }),
+        // A trust downgrade drains the core session. Do not retain controls for
+        // privileged work that belonged to the previous trusted instance.
+        ...(a.trusted
+          ? {}
+          : {
+              activeTools: new Map<string, Extract<Item, { kind: "tool" }>>(),
+              subagentActivity: new Map<string, string>(),
+              todos: [],
+            }),
+      };
+    }
   }
 }
 
@@ -319,6 +444,13 @@ export function terminalDisplayText(text: string, max = MAX_RENDERED_ITEM_CHARS)
   if (safe.length <= max) return safe;
   const start = nextGraphemeIndex(safe, safe.length - max);
   return `… ${t("older display content omitted", "较早的显示内容已省略")} …\n${safe.slice(start)}`;
+}
+
+/** Metadata belongs on one terminal row; control sequences/newlines are never markup. */
+function terminalInlineText(text: string, max = 4 * 1024): string {
+  return terminalDisplayText(text, max)
+    .replace(/[\t\n]+/g, " ")
+    .trim();
 }
 
 /** Extract user-authored prompts from a persisted conversation for composer history. */
@@ -705,11 +837,17 @@ function useTerminalSize(): { rows: number; cols: number } {
   };
 }
 
-const TERMINAL_MOUSE_MODES_OFF = "\x1b[?1007l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const TERMINAL_MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const TERMINAL_MOUSE_MODES_OFF = `\x1b[?1007l${TERMINAL_MOUSE_TRACKING_OFF}`;
 
-/** 完整跟踪用于点击和滚轮；关闭模式保留无修饰键的终端原生框选。 */
+/**
+ * 完整跟踪用于点击和 SGR 滚轮；可选择模式只启用 alternate scroll（1007），
+ * 让备用屏把滚轮转换成方向键，同时保留无修饰键的终端原生框选。
+ */
 export function terminalMouseModeSequence(fullTracking: boolean): string {
-  return fullTracking ? "\x1b[?1007l\x1b[?1000h\x1b[?1006h" : TERMINAL_MOUSE_MODES_OFF;
+  return fullTracking
+    ? `\x1b[?1007l${TERMINAL_MOUSE_TRACKING_OFF}\x1b[?1000h\x1b[?1006h`
+    : `${TERMINAL_MOUSE_TRACKING_OFF}\x1b[?1007h`;
 }
 
 type PendingPerm = PendingPermission;
@@ -718,6 +856,17 @@ interface SessionPickerState {
   rows: SessionSummary[];
   index: number;
   filter: string;
+}
+
+interface ModelPickerState {
+  rows: PickerRow[];
+  index: number;
+  filter: string;
+  /** Identity of this specific picker opening, not merely its visible rows. */
+  generation: number;
+  /** Session identity captured when the picker was opened. */
+  sessionId: string;
+  sessionGeneration: number;
 }
 
 export interface AppProps {
@@ -729,7 +878,7 @@ export interface AppProps {
   providers?: readonly ProviderDescriptor[];
   /** 内置可选模型目录（含免费/开源模型），供 /model 选择器使用。 */
   catalog?: readonly ModelCatalogEntry[];
-  /** 测试/远端宿主可注入服务端模型探测；缺省使用当前进程的 provider registry。 */
+  /** 测试可覆盖宿主侧模型探测；缺省委托 SessionHost，能力缺失时 fail closed。 */
   discoverModels?: (providerId: string) => Promise<readonly string[] | undefined>;
   /** 仅本地 host 可安全读取当前进程 env；daemon 的凭证属于服务端进程。 */
   inspectProviderCredentials?: boolean;
@@ -750,6 +899,14 @@ export interface AppProps {
   terminalControl?: boolean;
   /** CLI-owned absolute terminal caret used to anchor IME composition without global patches. */
   terminalCaret?: TerminalCaretController;
+  /** Initial paint only; the first host snapshot replaces this value. */
+  workspaceTrusted?: boolean;
+  /** Production hosts require an explicit trusted assessment; legacy test hosts may omit it. */
+  requireWorkspaceTrust?: boolean;
+  /** False for daemon/HTTP clients whose session cwd belongs to another process or machine. */
+  canInspectWorkspace?: boolean;
+  /** Test/embed override; invoked only for a local host selecting an Ollama model. */
+  ensureLocalOllama?: () => Promise<"running" | "started" | "missing" | "timeout">;
 }
 
 export type TuiKeybindingAction =
@@ -766,7 +923,7 @@ export const DEFAULT_KEYBINDINGS: Record<TuiKeybindingAction, string> = {
   reconnect: "ctrl+r",
   toggleToolOutput: "ctrl+o",
   permissionCycle: "shift+tab",
-  quit: "ctrl+z",
+  quit: "ctrl+q",
 };
 
 export function matchesKeybinding(input: string, key: Key, binding: string): boolean {
@@ -798,7 +955,7 @@ export function App({
   sessionId: initialId,
   providers = [],
   catalog = [],
-  discoverModels = discoverProviderModels,
+  discoverModels: discoverModelsOverride,
   inspectProviderCredentials = false,
   commands = [],
   mcpStatus,
@@ -808,8 +965,21 @@ export function App({
   keybindings,
   terminalControl = false,
   terminalCaret,
+  workspaceTrusted: initialWorkspaceTrusted = true,
+  requireWorkspaceTrust = false,
+  canInspectWorkspace = true,
+  ensureLocalOllama = ensureOllama,
 }: AppProps) {
   const { exit, suspendTerminal } = useApp();
+  const discoverModels = useCallback(
+    (providerId: string): Promise<readonly string[] | undefined> => {
+      if (discoverModelsOverride) return discoverModelsOverride(providerId);
+      if (host.discoverModels) return host.discoverModels(providerId);
+      return Promise.resolve(undefined);
+    },
+    [discoverModelsOverride, host],
+  );
+  const screenReader = useIsScreenReaderEnabled();
   const suspendTerminalWithCaret = useCallback(
     async (callback: () => void | Promise<void>): Promise<void> => {
       terminalCaret?.pause();
@@ -843,6 +1013,10 @@ export function App({
     usage: emptyUsage,
     todos: [],
     meta: { id: initialId, cwd, model },
+    workspaceTrusted: requireWorkspaceTrust
+      ? initialWorkspaceTrusted === true
+      : initialWorkspaceTrusted,
+    workspaceTrustReason: undefined,
     generation: 0,
     opening: true,
   });
@@ -892,9 +1066,12 @@ export function App({
     if (activePermissionId && terminalControl && stdout.isTTY) stdout.write("\x07");
   }, [activePermissionId, stdout, terminalControl]);
   // /model 选择器：非空即打开，index 为高亮项，filter 为搜索词。
-  const [picker, setPicker] = useState<{ rows: PickerRow[]; index: number; filter: string } | null>(
-    null,
-  );
+  const [picker, setPicker] = useState<ModelPickerState | null>(null);
+  /** Only the newest asynchronous /model refresh may publish picker state. */
+  const modelProbeGenerationRef = useRef(0);
+  /** Invalidates selection verification when a picker closes/reopens or another choice starts. */
+  const modelPickerGenerationRef = useRef(0);
+  const modelSelectionGenerationRef = useRef(0);
   // /lang 切换语言：整屏重渲染，让所有 t() 就地重取。
   const [, bumpLang] = useReducer((n: number) => n + 1, 0);
   useEffect(() => onLangChange(bumpLang), []);
@@ -904,14 +1081,16 @@ export function App({
   const allCommands = useMemo<CommandMenuRow[]>(
     () => [
       ...builtinCommands(),
-      ...commands.map((c) => ({
-        name: c.name,
-        description: c.description || t("Custom command", "自定义命令"),
-      })),
+      ...(state.workspaceTrusted
+        ? commands.map((c) => ({
+            name: c.name,
+            description: c.description || t("Custom command", "自定义命令"),
+          }))
+        : []),
     ],
     // lang 是有意的重算触发器：builtinCommands()/t() 读的是当前语言，切换时须重建。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [commands, lang],
+    [commands, lang, state.workspaceTrusted],
   );
   const [menuIndex, setMenuIndex] = useState(0);
   const menuIndexRef = useRef(0);
@@ -923,6 +1102,41 @@ export function App({
   const [permMode, setPermMode] = useState<PermissionMode>("default");
   // per-prompt 模型覆盖：仅下一条消息生效（/model <spec> once 或选择器里 Tab 设定）。
   const [nextModel, setNextModel] = useState<string | null>(null);
+  const activeSessionRef = useRef({ id: sessionId, generation: state.generation });
+  activeSessionRef.current = { id: sessionId, generation: state.generation };
+  const workspaceTrustedRef = useRef(state.workspaceTrusted);
+  const workspaceTrustReasonRef = useRef<string | undefined>(state.workspaceTrustReason);
+
+  const closeModelPicker = useCallback((): void => {
+    modelPickerGenerationRef.current++;
+    modelSelectionGenerationRef.current++;
+    setPicker(null);
+  }, []);
+
+  const switchSession = useCallback(
+    (id: string): void => {
+      // Invalidate old async picker work synchronously, before React commits the
+      // session state change. This closes the event-loop race with a resolved probe.
+      modelPickerGenerationRef.current++;
+      modelSelectionGenerationRef.current++;
+      modelProbeGenerationRef.current++;
+      activeSessionRef.current = { id, generation: state.generation };
+      setPicker(null);
+      setNextModel(null);
+      setSessionId(id);
+    },
+    [state.generation],
+  );
+
+  useEffect(() => {
+    if (state.workspaceTrusted) return;
+    // Restricted workspaces still use the ordinary per-action permission dialog for built-in
+    // tools. Pending requests are cleared only by the authoritative downgrade, so later requests
+    // (including askRules on strict read/glob/grep) remain answerable and cannot deadlock a drive.
+    setExpandedToolIds(new Set());
+    const strict = state.workspaceTrustReason === "inspection-failed";
+    setPermMode(strict ? "plan" : "default");
+  }, [state.workspaceTrustReason, state.workspaceTrusted]);
   // 超窄终端下弹框横向滚动偏移（列）；仅当弹框比屏还宽时生效，切换弹框时归零。
   const [hoff, setHoff] = useState(0);
   const hoffRef = useRef(0);
@@ -959,8 +1173,8 @@ export function App({
     },
     [],
   );
-  // 交互式 CLI 默认启用完整鼠标协议，使备用屏中的滚轮能进入固定 transcript 视口。
-  // iTerm2 可按住 Option 临时绕过 mouse reporting 选字；/mouse off 则恢复普通拖选。
+  // 默认只启用 alternate scroll：滚轮转为方向键，鼠标仍由终端负责原生拖选。
+  // --mouse 或 /mouse on 才启用完整点击/SGR 滚轮跟踪；iTerm2 下可按 Option 临时选字。
   useEffect(() => {
     if (!terminalControl || !stdout.isTTY) return;
     stdout.write(terminalMouseModeSequence(mouseTracking));
@@ -974,8 +1188,10 @@ export function App({
     state.activeTools.size === 0;
   // 回看滚动偏移：0=贴底看最新，>0=结果视口向上回看的终端行数。
   const [scrollOffset, setScrollOffset] = useState(0);
+  const scrollOffsetRef = useRef(0);
   const transcriptViewportRef = useRef<DOMElement | null>(null);
   const transcriptContentRef = useRef<DOMElement | null>(null);
+  const transcriptMetricsRef = useRef<{ content: number; viewport: number } | null>(null);
   const maxTranscriptScroll = useCallback((): number => {
     const viewport = transcriptViewportRef.current?.yogaNode?.getComputedHeight() ?? 0;
     const content = transcriptContentRef.current?.yogaNode?.getComputedHeight() ?? 0;
@@ -983,13 +1199,48 @@ export function App({
   }, []);
   const scrollTranscript = useCallback(
     (rows: number): void => {
-      setScrollOffset((offset) => Math.max(0, Math.min(offset + rows, maxTranscriptScroll())));
+      const next = Math.max(0, Math.min(scrollOffsetRef.current + rows, maxTranscriptScroll()));
+      scrollOffsetRef.current = next;
+      setScrollOffset(next);
     },
     [maxTranscriptScroll],
   );
   const resetTranscriptScroll = useCallback((): void => {
+    scrollOffsetRef.current = 0;
     setScrollOffset(0);
   }, []);
+  // Preserve the visible top row while the transcript grows, rewraps on resize,
+  // or shrinks after a tool is collapsed. At the live bottom, remain pinned there.
+  useLayoutEffect(() => {
+    const viewport = transcriptViewportRef.current?.yogaNode?.getComputedHeight() ?? 0;
+    const content = transcriptContentRef.current?.yogaNode?.getComputedHeight() ?? 0;
+    const previous = transcriptMetricsRef.current;
+    transcriptMetricsRef.current = { content, viewport };
+    if (!previous) return;
+    const max = Math.max(0, content - viewport);
+    const current = scrollOffsetRef.current;
+    const anchored =
+      current === 0
+        ? 0
+        : Math.max(
+            0,
+            Math.min(current + (content - previous.content) - (viewport - previous.viewport), max),
+          );
+    if (anchored === current) return;
+    scrollOffsetRef.current = anchored;
+    setScrollOffset(anchored);
+  }, [
+    termRows,
+    termCols,
+    state.items,
+    state.liveText,
+    state.liveThinking,
+    state.activeTools,
+    state.subagentActivity,
+    state.todos,
+    state.running,
+    expandedToolIds,
+  ]);
   const closeRef = useRef<(() => void) | null>(null);
   const flushRef = useRef<(() => void) | null>(null);
   // 流式生成指示：running 期间以 ~120ms 步进推进 spinner 帧并刷新计时。
@@ -998,9 +1249,10 @@ export function App({
   useEffect(() => {
     if (!state.running) return;
     runStartRef.current = Date.now();
+    if (screenReader) return;
     const id = setInterval(() => setSpin((n) => n + 1), 120);
     return () => clearInterval(id);
-  }, [state.running]);
+  }, [screenReader, state.running]);
 
   useEffect(
     () => () => {
@@ -1009,11 +1261,27 @@ export function App({
     [],
   );
 
+  const beginModelPickerSelection = useCallback((opened: ModelPickerState): (() => boolean) => {
+    const selectionGeneration = ++modelSelectionGenerationRef.current;
+    const pickerGeneration = opened.generation;
+    const selectedSessionId = opened.sessionId;
+    const selectedSessionGeneration = opened.sessionGeneration;
+    return () => {
+      const active = activeSessionRef.current;
+      return (
+        modelPickerGenerationRef.current === pickerGeneration &&
+        modelSelectionGenerationRef.current === selectionGeneration &&
+        active.id === selectedSessionId &&
+        active.generation === selectedSessionGeneration
+      );
+    };
+  }, []);
+
   const selectModel = useCallback(
-    async (spec: string): Promise<void> => {
+    async (spec: string, isCurrent: () => boolean = () => true): Promise<void> => {
+      if (!isCurrent()) return;
       // 本地 Ollama 模型：选中即尝试自启动服务，省去手动 `ollama serve`。
-      if (spec.startsWith("ollama/")) {
-        setPicker(null);
+      if (spec.startsWith("ollama/") && canInspectWorkspace) {
         dispatch({
           t: "push",
           item: {
@@ -1021,8 +1289,10 @@ export function App({
             text: t("Ensuring the local Ollama is started…", "正在确保本地 Ollama 已启动…"),
           },
         });
-        const r = await ensureOllama();
+        const r = await ensureLocalOllama();
+        if (!isCurrent()) return;
         if (r === "missing") {
+          closeModelPicker();
           dispatch({
             t: "push",
             item: {
@@ -1036,6 +1306,7 @@ export function App({
           return;
         }
         if (r === "timeout") {
+          closeModelPicker();
           dispatch({
             t: "push",
             item: {
@@ -1069,19 +1340,34 @@ export function App({
               ...(state.meta.title ? { title: state.meta.title } : {}),
             })
           : await host.createSession({ cwd: state.meta.cwd, model: spec });
+      if (!isCurrent()) return;
       setSessions(null);
-      setPicker(null);
-      setSessionId(meta.id);
+      switchSession(meta.id);
     },
-    [conversationEmpty, host, sessionId, state.meta.cwd, state.meta.title],
+    [
+      closeModelPicker,
+      canInspectWorkspace,
+      conversationEmpty,
+      ensureLocalOllama,
+      host,
+      sessionId,
+      state.meta.cwd,
+      state.meta.title,
+      switchSession,
+    ],
   );
 
   const openSessionPicker = useCallback(async (): Promise<void> => {
-    const rows = await host.listSessions();
+    const listed = await host.listSessions();
+    const currentRow = listed.find((row) => row.id === sessionId);
+    const rows = listed.slice(0, MAX_SESSION_PICKER_ROWS);
+    if (currentRow && !rows.some((row) => row.id === currentRow.id)) {
+      rows[Math.max(0, MAX_SESSION_PICKER_ROWS - 1)] = currentRow;
+    }
     const current = rows.findIndex((row) => row.id === sessionId);
-    setPicker(null);
+    closeModelPicker();
     setSessions({ rows, index: current >= 0 ? current : 0, filter: "" });
-  }, [host, sessionId]);
+  }, [closeModelPicker, host, sessionId]);
 
   // 订阅当前会话：载入 snapshot → 渲染，远端流断开后指数退避重连。
   useEffect(() => {
@@ -1093,8 +1379,14 @@ export function App({
     closeRef.current = null;
     setPendings([]);
     setExpandedToolIds(new Set());
+    modelProbeGenerationRef.current++;
+    closeModelPicker();
     setPermMode("default"); // 新会话回到默认模式
-    dispatch({ t: "opening", v: true });
+    if (requireWorkspaceTrust) {
+      workspaceTrustedRef.current = false;
+      workspaceTrustReasonRef.current = undefined;
+    }
+    dispatch({ t: "opening", v: true, restrict: requireWorkspaceTrust });
     // 事件合流：流式 token 高频到达时，把一帧内的事件攒成一批，
     // 用 ~16ms 定时器统一 flush（React18 会自动 batch 这些 dispatch），
     // 把「每 token 一次全屏重渲染」降到 ~60fps 上限。
@@ -1114,6 +1406,11 @@ export function App({
       const buffered: SessionEvent[] = [];
       const onEvent = (ev: SessionEvent) => {
         if (closed || generation !== subscriptionGeneration) return;
+        const trustUpdate = workspaceTrustUpdateFromEvent(ev);
+        if (trustUpdate) {
+          workspaceTrustedRef.current = trustUpdate.trusted;
+          workspaceTrustReasonRef.current = trustUpdate.reason;
+        }
         if (!ready) {
           buffered.push(ev);
           return;
@@ -1166,7 +1463,31 @@ export function App({
           closeRef.current = handle.close;
           const snap = handle.snapshot;
           const restored = restoreTranscript(snap.messages);
-          const initialItems: Row[] = [sessionBoundary(snap.meta), ...restored.items];
+          const workspaceTrusted = requireWorkspaceTrust
+            ? snap.workspaceTrust?.trusted === true
+            : snap.workspaceTrust?.trusted !== false;
+          const workspaceTrustReason = snap.workspaceTrust?.reason;
+          workspaceTrustedRef.current = workspaceTrusted;
+          workspaceTrustReasonRef.current = workspaceTrustReason;
+          const strictWorkspaceInspection =
+            !workspaceTrusted && workspaceTrustReason === "inspection-failed";
+          const initialItems: Row[] = [
+            sessionBoundary(snap.meta),
+            ...(workspaceTrusted
+              ? []
+              : [
+                  {
+                    kind: "info" as const,
+                    text: strictWorkspaceInspection
+                      ? strictWorkspaceInspectionNotice(snap.meta.cwd)
+                      : t(
+                          `Restricted workspace (${workspaceTrustReason ?? "not-trusted"}): built-in write/edit/apply_patch/bash tools remain available with per-action authorization. MCP, hooks, project extensions, and network access are disabled. Use anicode trust grant --cwd ${snap.meta.cwd} in an interactive terminal to restore integrations.`,
+                          `工作区处于受限模式（${workspaceTrustReason ?? "not-trusted"}）：内置 write/edit/apply_patch/bash 工具仍可逐项授权；MCP、hooks、项目扩展与网络访问已禁用。可在交互式终端运行 anicode trust grant --cwd ${snap.meta.cwd} 恢复集成。`,
+                        ),
+                  },
+                ]),
+            ...restored.items,
+          ];
           historyRef.current = promptHistoryFromMessages(snap.messages);
           histPosRef.current = null;
           dispatch({
@@ -1184,11 +1505,20 @@ export function App({
               model: snap.meta.model,
               ...(snap.meta.title ? { title: snap.meta.title } : {}),
             },
+            workspaceTrusted,
+            workspaceTrustReason,
           });
           setPendings(snap.pendingPermissions);
           resetTranscriptScroll();
           ready = true;
-          for (const ev of buffered) handleEvent(ev, dispatch, setPendings);
+          for (const ev of buffered) {
+            const trustUpdate = workspaceTrustUpdateFromEvent(ev);
+            if (trustUpdate) {
+              workspaceTrustedRef.current = trustUpdate.trusted;
+              workspaceTrustReasonRef.current = trustUpdate.reason;
+            }
+            handleEvent(ev, dispatch, setPendings);
+          }
           if (attempt > 0) {
             dispatch({
               t: "push",
@@ -1214,7 +1544,14 @@ export function App({
       activeClose?.();
       closeRef.current = null;
     };
-  }, [host, reconnectGeneration, resetTranscriptScroll, sessionId]);
+  }, [
+    closeModelPicker,
+    host,
+    reconnectGeneration,
+    requireWorkspaceTrust,
+    resetTranscriptScroll,
+    sessionId,
+  ]);
 
   const toggleToolDetail = useCallback(
     (requestedId?: string): boolean => {
@@ -1234,6 +1571,38 @@ export function App({
       return true;
     },
     [state.items],
+  );
+
+  const verifyAdvertisedModel = useCallback(
+    async (spec: string, isCurrent: () => boolean = () => true): Promise<boolean> => {
+      const slash = spec.indexOf("/");
+      const providerId = slash > 0 ? spec.slice(0, slash) : "";
+      const modelId = slash > 0 ? spec.slice(slash + 1) : "";
+      let advertised: readonly string[] | undefined;
+      if (providerId && modelId) {
+        try {
+          advertised = await discoverModels(providerId);
+        } catch {
+          advertised = undefined;
+        }
+      }
+      // The picker/session may have changed while discovery was in flight. A
+      // stale response must be completely silent, including its error notice.
+      if (!isCurrent()) return false;
+      if (advertised?.includes(modelId)) return true;
+      dispatch({
+        t: "push",
+        item: {
+          kind: "error",
+          text: t(
+            `${spec} is not currently advertised by its model endpoint; refresh /model and choose an available model`,
+            `${spec} 当前未被模型端点列为可用；请刷新 /model 后选择可用模型`,
+          ),
+        },
+      });
+      return false;
+    },
+    [discoverModels],
   );
 
   const runSlash = useCallback(
@@ -1261,6 +1630,19 @@ export function App({
         return true;
       }
       if (cmd === "editor") {
+        if (!canInspectWorkspace || !workspaceTrustedRef.current) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(
+                "The local editor is unavailable for a remote or restricted workspace.",
+                "远端或受限工作区中不可使用本地编辑器。",
+              ),
+            },
+          });
+          return true;
+        }
         try {
           const edited = await editInExternalEditor(inputRef.current, {
             cwd: state.meta.cwd,
@@ -1395,8 +1777,8 @@ export function App({
                   "已开启鼠标滚轮跟踪；iTerm2 按住 Option 可拖选，或用 /mouse off",
                 )
               : t(
-                  "Native text selection enabled; use PageUp/PageDown to scroll results",
-                  "已恢复终端原生框选；使用 PageUp/PageDown 回看结果",
+                  "Native text selection and wheel scrolling enabled; PageUp/PageDown also scroll",
+                  "已开启原生框选和滚轮回看；PageUp/PageDown 也可回看",
                 ),
           },
         });
@@ -1410,7 +1792,33 @@ export function App({
         return true;
       }
       if (cmd === "skills") {
-        const skills = await discoverSkills(state.meta.cwd);
+        if (!canInspectWorkspace) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                "The connected host does not expose workspace skill discovery.",
+                "当前连接的宿主未开放工作区 Skill 发现。",
+              ),
+            },
+          });
+          return true;
+        }
+        if (!workspaceTrustedRef.current) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                "Skills are disabled in a restricted workspace.",
+                "受限工作区中已禁用 Skills。",
+              ),
+            },
+          });
+          return true;
+        }
+        const skills = await discoverSkills(state.meta.cwd, [], { includeProject: true });
         dispatch({ t: "push", item: { kind: "info", text: skillsText(skills) } });
         return true;
       }
@@ -1419,7 +1827,9 @@ export function App({
         if (!spec) {
           // 不带参数：并发读取每个 provider 的鉴权 `/models`。只有端点实际响应且
           // 返回了该模型，才允许进入选择器；仅有静态目录或 API Key 不算可用。
+          const generation = ++modelProbeGenerationRef.current;
           const live = await probeLive(providers, discoverModels);
+          if (generation !== modelProbeGenerationRef.current) return true;
           const rows = buildPickerRows(catalog, providers, inspectProviderCredentials, live);
           if (rows.length === 0) {
             dispatch({
@@ -1435,9 +1845,20 @@ export function App({
             return true;
           }
           setSessions(null);
-          setPicker({ rows, index: 0, filter: "" });
+          const pickerGeneration = ++modelPickerGenerationRef.current;
+          modelSelectionGenerationRef.current++;
+          const active = activeSessionRef.current;
+          setPicker({
+            rows,
+            index: 0,
+            filter: "",
+            generation: pickerGeneration,
+            sessionId: active.id,
+            sessionGeneration: active.generation,
+          });
           return true;
         }
+        if (!(await verifyAdvertisedModel(spec))) return true;
         // `/model <spec> once`：仅下一条消息用该模型（per-prompt 覆盖），不新建会话。
         if ((rest[1] ?? "").toLowerCase() === "once") {
           setNextModel(spec);
@@ -1467,7 +1888,7 @@ export function App({
           return true;
         }
         setSessions(null);
-        setSessionId(id); // 触发 useEffect 重新订阅
+        switchSession(id); // 触发 useEffect 重新订阅
         return true;
       }
       if (cmd === "new") {
@@ -1478,7 +1899,7 @@ export function App({
           ...(title ? { title } : {}),
         });
         setSessions(null);
-        setSessionId(meta.id);
+        switchSession(meta.id);
         return true;
       }
       if (cmd === "undo") {
@@ -1516,7 +1937,7 @@ export function App({
           const title = rest.join(" ") || undefined;
           const meta = await host.forkSession(sessionId, title ? { title } : undefined);
           setSessions(null);
-          setSessionId(meta.id); // 切到分叉出的新会话；原会话保持不动
+          switchSession(meta.id); // 切到分叉出的新会话；原会话保持不动
           dispatch({
             t: "push",
             item: {
@@ -1551,6 +1972,20 @@ export function App({
         }
         const arg = (rest[0] ?? "").toLowerCase();
         const next = arg === "on" ? true : arg === "off" ? false : permMode !== "plan";
+        if (workspaceTrustReasonRef.current === "inspection-failed" && !next) {
+          setPermMode("plan");
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                "Workspace inspection failed; strict read-only plan mode cannot be disabled.",
+                "工作区检查失败；无法退出严格只读计划模式。",
+              ),
+            },
+          });
+          return true;
+        }
         try {
           await host.setPermissionMode(sessionId, next ? "plan" : "default");
           setPermMode(next ? "plan" : "default");
@@ -1572,6 +2007,19 @@ export function App({
         return true;
       }
       if (cmd === "profile") {
+        if (!workspaceTrustedRef.current) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                "Permission profiles are disabled in a restricted workspace.",
+                "受限工作区中已禁用权限档位。",
+              ),
+            },
+          });
+          return true;
+        }
         if (!host.setPermissionProfile || !host.listPermissionProfiles) {
           dispatch({
             t: "push",
@@ -1641,6 +2089,30 @@ export function App({
         return true;
       }
       if (cmd === "diff") {
+        if (!canInspectWorkspace || !workspaceTrustedRef.current) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: !canInspectWorkspace
+                ? t(
+                    "/diff is unavailable because this client cannot inspect the host workspace.",
+                    "/diff 不可用：当前客户端无法检查宿主工作区。",
+                  )
+                : t("/diff is disabled in a restricted workspace.", "/diff 在受限工作区中已禁用。"),
+            },
+          });
+          return true;
+        }
+        const operationSession = { ...activeSessionRef.current };
+        const operationIsCurrent = (): boolean => {
+          const active = activeSessionRef.current;
+          return (
+            workspaceTrustedRef.current &&
+            active.id === operationSession.id &&
+            active.generation === operationSession.generation
+          );
+        };
         // 对齐 Codex /diff：直接展示当前工作区改动（含未跟踪文件），不经模型。
         const { execFile } = await import("node:child_process");
         const { promisify } = await import("node:util");
@@ -1652,6 +2124,7 @@ export function App({
             }),
             run("git", ["-C", state.meta.cwd, "ls-files", "--others", "--exclude-standard"]),
           ]);
+          if (!operationIsCurrent()) return true;
           const MAX_LINES = 400;
           const lines = diff.stdout.split("\n");
           const body =
@@ -1673,6 +2146,7 @@ export function App({
           const text = (body.trim() || t("(no changes)", "（无改动）")) + extra;
           dispatch({ t: "push", item: { kind: "info", text } });
         } catch (err) {
+          if (!operationIsCurrent()) return true;
           dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
         }
         return true;
@@ -1765,6 +2239,16 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         return true;
       }
       if (cmd === "mcp") {
+        if (!workspaceTrustedRef.current) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t("MCP is disabled in a restricted workspace.", "受限工作区中已禁用 MCP。"),
+            },
+          });
+          return true;
+        }
         if (!mcpStatus) {
           dispatch({
             t: "push",
@@ -1795,7 +2279,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         return true;
       }
       // 自定义命令（.anicode/command/*.md 或 MCP prompt）：产出提示后发送。
-      const custom = commands.find((c) => c.name === cmd);
+      const custom = workspaceTrustedRef.current ? commands.find((c) => c.name === cmd) : undefined;
       if (custom) {
         let prompt: string;
         try {
@@ -1843,6 +2327,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       state.costUSD,
       exit,
       commands,
+      canInspectWorkspace,
       mcpStatus,
       sessionId,
       permMode,
@@ -1850,6 +2335,8 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       toggleToolDetail,
       suspendTerminalWithCaret,
       mouseTracking,
+      verifyAdvertisedModel,
+      switchSession,
     ],
   );
 
@@ -1881,24 +2368,34 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         return;
       }
       // 运行中发送 = steering（core 在 turn 边界注入）；user 条目由事件渲染。
-      // 先展开 @文件引用（把文件内容拼进消息），再发送。
+      // @文件只能由拥有该工作区且当前仍受信任的本地客户端展开。远端
+      // 客户端必须把原文交给 host，绝不能读取客户端机器上的同名 cwd。
       const modelOverride = nextModel; // per-prompt 覆盖：本条消费掉即清
       if (modelOverride) setNextModel(null);
       dispatch({ t: "running", v: true });
-      void expandFileMentions(text, state.meta.cwd)
+      const mayInspect = canInspectWorkspace && workspaceTrustedRef.current;
+      const expansion = mayInspect
+        ? expandFileMentions(text, state.meta.cwd)
+        : Promise.resolve({ text, missing: [] as string[] });
+      void expansion
         .then(({ text: expanded, missing }) => {
-          for (const m of missing) {
-            dispatch({
-              t: "push",
-              item: {
-                kind: "info",
-                text: t(`@${m}: file not found, kept as-is`, `@${m}: 未找到该文件，已按原文保留`),
-              },
-            });
+          // A trust downgrade may race the filesystem read. Do not send locally
+          // expanded contents after the authoritative trust event has arrived.
+          const useExpanded = mayInspect && workspaceTrustedRef.current;
+          if (useExpanded) {
+            for (const m of missing) {
+              dispatch({
+                t: "push",
+                item: {
+                  kind: "info",
+                  text: t(`@${m}: file not found, kept as-is`, `@${m}: 未找到该文件，已按原文保留`),
+                },
+              });
+            }
           }
           return host.send(
             sessionId,
-            expanded,
+            useExpanded ? expanded : text,
             modelOverride ? { model: modelOverride } : undefined,
           );
         })
@@ -1909,6 +2406,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     },
     [
       host,
+      canInspectWorkspace,
       nextModel,
       recordPromptHistory,
       resetTranscriptScroll,
@@ -1918,8 +2416,22 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     ],
   );
 
-  // shift+tab 轮盘：在 default → acceptEdits → plan → bypass 间循环，一次切换免去逐次授权。
+  // shift+tab 轮盘：受信任时完整轮盘；普通受限时 default ↔ plan；检查失败时锁定 plan。
   const cyclePermMode = useCallback((): void => {
+    if (workspaceTrustReasonRef.current === "inspection-failed") {
+      setPermMode("plan");
+      dispatch({
+        t: "push",
+        item: {
+          kind: "info",
+          text: t(
+            "Workspace inspection failed; permission mode is locked to strict read-only plan.",
+            "工作区检查失败；权限模式已锁定为严格只读计划模式。",
+          ),
+        },
+      });
+      return;
+    }
     if (!host.setPermissionMode) {
       dispatch({
         t: "push",
@@ -1933,8 +2445,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       });
       return;
     }
-    const cur = PERM_CYCLE.indexOf(permMode);
-    const next = PERM_CYCLE[(cur + 1) % PERM_CYCLE.length]!;
+    const cycle = workspaceTrustedRef.current
+      ? PERM_CYCLE
+      : (["default", "plan"] as const satisfies readonly PermissionMode[]);
+    const cur = cycle.indexOf(permMode as (typeof cycle)[number]);
+    const next = cur < 0 ? "default" : cycle[(cur + 1) % cycle.length]!;
     setPermMode(next);
     void host.setPermissionMode(sessionId, next).catch((err) => {
       setPermMode(permMode); // 回滚 UI 到切换前，避免与后端不一致
@@ -1974,7 +2489,23 @@ Requirements: read the actual diff and surrounding code before judging; verify e
 
   useInput((ch, key) => {
     const mouse = parseMouseInput(ch);
-    // Ctrl+Z 退出（与 Ctrl+C 一致）；raw 模式下 Ctrl+Z 可能是 "z" 或 SUB 字符。
+    // POSIX job control: Ctrl+Z must suspend instead of exiting. Ink's suspension
+    // boundary restores raw/alternate-screen state before SIGTSTP and redraws on SIGCONT.
+    const ctrlZ = (key.ctrl && ch.toLowerCase() === "z") || ch === "\u001a";
+    if (ctrlZ && process.platform !== "win32") {
+      void suspendTerminalWithCaret(() => {
+        process.kill(process.pid, "SIGTSTP");
+      }).catch((err) => {
+        dispatch({
+          t: "push",
+          item: {
+            kind: "error",
+            text: t(`Suspend failed: ${errorMessage(err)}`, `挂起失败: ${errorMessage(err)}`),
+          },
+        });
+      });
+      return;
+    }
     if (matchesKeybinding(ch, key, bindings.quit)) {
       exit();
       return;
@@ -2022,6 +2553,26 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       scrollTranscript(-page);
       return;
     }
+    // selectable 模式不接管鼠标；终端的 alternate-scroll(1007) 会把滚轮变成普通
+    // ↑/↓。结果区确实可滚且输入为空（或已经在回看）时，把无修饰方向键解释为滚轮。
+    // 短会话和有内容的 composer 仍保留原有的多行编辑/Prompt 历史行为。
+    const selectableScrollArrow =
+      !mouseTracking &&
+      !dialogOpen &&
+      !menuOpen &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.shift &&
+      (inputRef.current.length === 0 || scrollOffset > 0) &&
+      maxTranscriptScroll() > 0;
+    if (selectableScrollArrow && key.upArrow) {
+      scrollTranscript(3);
+      return;
+    }
+    if (selectableScrollArrow && key.downArrow) {
+      scrollTranscript(-3);
+      return;
+    }
     // 普通结果页的滚轮只移动内部会话视口，不交给终端滚动整块 alt-screen。
     // 触控板可能在一个 stdin chunk 里合并多次事件，wheelDelta 已累计。
     if (mouse !== null && !dialogOpen && !menuOpen) {
@@ -2032,6 +2583,34 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     }
     if (picker) {
       const visible = filterPickerRows(picker.rows, picker.filter);
+      const chooseModel = (spec: string, once: boolean): void => {
+        const isCurrent = beginModelPickerSelection(picker);
+        void (async () => {
+          if (!(await verifyAdvertisedModel(spec, isCurrent)) || !isCurrent()) return;
+          if (once) {
+            // All checks above are synchronous from this point; invalidate the
+            // picker before publishing the one-shot selection.
+            closeModelPicker();
+            setNextModel(spec);
+            dispatch({
+              t: "push",
+              item: {
+                kind: "info",
+                text: t(
+                  `Next message will use ${spec} (this prompt only)`,
+                  `下一条消息将使用 ${spec}（仅这一条）`,
+                ),
+              },
+            });
+            return;
+          }
+          await selectModel(spec, isCurrent);
+        })().catch((err) => {
+          if (!isCurrent()) return;
+          closeModelPicker();
+          dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
+        });
+      };
       if (mouse !== null) {
         if (mouse.wheelDelta !== 0) {
           setPicker((p) => {
@@ -2059,17 +2638,12 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           );
           const clicked = hitTestSprite(sprite, mouse.leftClick.column, mouse.leftClick.row);
           const spec = clicked === null ? undefined : visible[clicked]?.spec;
-          if (spec) {
-            void selectModel(spec).catch((err) => {
-              setPicker(null);
-              dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
-            });
-          }
+          if (spec) chooseModel(spec, false);
         }
         return;
       }
       if (key.escape) {
-        setPicker(null);
+        closeModelPicker();
         return;
       }
       // 超窄终端弹框比屏还宽时，←/→ 横向滚动查看被裁掉的内容（不宽则无副作用）。
@@ -2093,31 +2667,13 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       }
       if (key.return) {
         const spec = visible[picker.index]?.spec;
-        if (spec) {
-          void selectModel(spec).catch((err) => {
-            setPicker(null);
-            dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
-          });
-        }
+        if (spec) chooseModel(spec, false);
         return;
       }
       // Tab：per-prompt 覆盖——仅下一条消息用选中模型，不新建会话。
       if (key.tab) {
         const spec = visible[picker.index]?.spec;
-        if (spec) {
-          setPicker(null);
-          setNextModel(spec);
-          dispatch({
-            t: "push",
-            item: {
-              kind: "info",
-              text: t(
-                `Next message will use ${spec} (this prompt only)`,
-                `下一条消息将使用 ${spec}（仅这一条）`,
-              ),
-            },
-          });
-        }
+        if (spec) chooseModel(spec, true);
         return;
       }
       if (key.backspace || key.delete) {
@@ -2158,7 +2714,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           const selected = clicked === null ? undefined : visible[clicked];
           if (selected) {
             setSessions(null);
-            setSessionId(selected.id);
+            switchSession(selected.id);
           }
         }
         return;
@@ -2187,7 +2743,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         const selected = visible[sessions.index];
         if (selected) {
           setSessions(null);
-          setSessionId(selected.id);
+          switchSession(selected.id);
         }
         return;
       }
@@ -2340,7 +2896,15 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       return;
     }
     if (state.running && key.escape) {
-      void host.interrupt(sessionId);
+      void host.interrupt(sessionId).catch((err) => {
+        dispatch({
+          t: "push",
+          item: {
+            kind: "error",
+            text: t(`Interrupt failed: ${errorMessage(err)}`, `中断失败: ${errorMessage(err)}`),
+          },
+        });
+      });
       return;
     }
     // shift+tab：切换权限模式轮盘（对齐 Claude Code）。先于命令菜单的 Tab 补全拦截，故菜单开着也能切。
@@ -2586,7 +3150,13 @@ Requirements: read the actual diff and surrounding code before judging; verify e
   const visibleItems = state.items;
   const baseKey = 0;
 
-  const spinner = state.running ? SPINNER[spin % SPINNER.length]! : "●";
+  const spinner = screenReader
+    ? state.running
+      ? t("generating", "生成中")
+      : ""
+    : state.running
+      ? SPINNER[spin % SPINNER.length]!
+      : "●";
   const elapsedS =
     state.running && runStartRef.current
       ? Math.floor((Date.now() - runStartRef.current) / 1000)
@@ -2596,6 +3166,13 @@ Requirements: read the actual diff and surrounding code before judging; verify e
   const showInput = overlayMode || !sessions;
   // 非浮层模式（测试）下命令菜单改由 in-tree 渲染在输入框上方；浮层模式由写入层合成盖屏。
   const inTreeMenu = !overlayMode && !picker ? matchCommands(allCommands, input) : [];
+  const currentPermModeHint =
+    state.workspaceTrustReason === "inspection-failed"
+      ? t(
+          "⏸ plan mode · strict read-only (workspace inspection failed; locked)",
+          "⏸ 计划模式 · 只读（工作区检查失败，已锁定）",
+        )
+      : permModeHint(permMode);
   // 提示行仅在需要时出现（对齐 opencode 的极简）：运行中显示中断/追加；
   // 计划模式或临时模型激活时提示其状态；否则空闲态不显示常规导航提示。
   const hintItems = leaderPending
@@ -2608,9 +3185,14 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     : state.running
       ? [t("esc interrupt", "esc 中断"), t("enter append", "enter 追加")]
       : [
-          ...(permModeHint(permMode) ? [permModeHint(permMode)!] : []),
+          ...(currentPermModeHint ? [currentPermModeHint] : []),
           ...(nextModel
-            ? [t(`↳ next: ${nextModel} (once)`, `↳ 下一条: ${nextModel}（仅一次）`)]
+            ? [
+                t(
+                  `↳ next: ${terminalInlineText(nextModel)} (once)`,
+                  `↳ 下一条: ${terminalInlineText(nextModel)}（仅一次）`,
+                ),
+              ]
             : []),
         ];
   const inlinePickerHeight = Math.max(8, Math.min(12, termRows - 8));
@@ -2666,7 +3248,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
 
   // 底部状态栏精简为一行（对齐 opencode）：左 cwd，右 token/花费。模型已在输入框内展示，
   // 这里不再重复；品牌行也去掉。成本无价格信息时省略。
-  const cwdLabel = tildify(state.meta.cwd);
+  const cwdLabel = terminalInlineText(tildify(state.meta.cwd));
   const costPart =
     state.costUSD !== undefined && state.costUSD > 0 ? ` · $${state.costUSD.toFixed(4)}` : "";
   const cachePart =
@@ -2687,76 +3269,15 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         />
       ) : null}
       {!overlayMode && pendings[0] ? (
-        <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
-          <Box>
-            <Text color="yellow" bold>
-              {`${t("⚠ Permission request: ", "⚠ 授权请求: ")}${sanitizeTerminalText(
-                pendings[0].toolName,
-              )} · ${(pendings[0].risk ?? "medium").toUpperCase()}${
-                pendings.length > 1
-                  ? t(
-                      ` (${pendings.length - 1} more pending)`,
-                      `（还有 ${pendings.length - 1} 个待裁决）`,
-                    )
-                  : ""
-              }`}
-            </Text>
-          </Box>
-          {pendings[0].cwd ? (
-            <Box>
-              <Text>{`cwd: ${sanitizeTerminalText(pendings[0].cwd)}`}</Text>
-            </Box>
-          ) : null}
-          <Box>
-            <Text bold>{sanitizeTerminalText(pendings[0].ruleKey)}</Text>
-          </Box>
-          <Box>
-            <Text>{permissionInputPreview(pendings[0].input)}</Text>
-          </Box>
-          {termRows >= 18
-            ? permissionPatchPreview(pendings[0].input, 6).map((line, index) => (
-                <Box key={`patch:${index}`}>
-                  <Text
-                    color={line.startsWith("+") ? "green" : line.startsWith("-") ? "red" : "gray"}
-                    wrap="truncate"
-                  >
-                    {truncWidth(line, Math.max(1, termCols - 4))}
-                  </Text>
-                </Box>
-              ))
-            : null}
-          {pendings[0].rulePartsComplete === false ? (
-            <Text color="red" bold>
-              {t("Command analysis is incomplete", "无法完整解析命令边界")}
-            </Text>
-          ) : null}
-          {[
-            { keyName: "y", label: t("Allow once", "允许一次"), color: "green" },
-            {
-              keyName: "a",
-              label: t("Allow for this session", "本会话允许并记住"),
-              color: "cyan",
-            },
-            {
-              keyName: "p",
-              label: t("Always allow in this project", "永久允许（写入项目）"),
-              color: "magenta",
-            },
-            { keyName: "n", label: t("Deny", "拒绝"), color: "red" },
-          ].map(({ keyName, label, color }, index) => (
-            <Box key={keyName}>
-              <Text inverse={index === permissionIndex} bold>
-                {index === permissionIndex ? "› " : "  "}[<Text color={color}>{keyName}</Text>]{" "}
-                {label}
-              </Text>
-            </Box>
-          ))}
-          <Box>
-            <Text>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
-          </Box>
-        </Box>
+        <PermissionPanel
+          pending={pendings[0]}
+          pendingCount={pendings.length}
+          index={permissionIndex}
+          termRows={termRows}
+          termCols={termCols}
+        />
       ) : null}
-      {inputCluster}
+      {!pendings[0] || overlayMode || termRows >= 16 ? inputCluster : null}
     </>
   );
 
@@ -2766,16 +3287,18 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         // 首次进入 / 空会话：opencode 风格欢迎页——顶部保留会话边界与信息条目，
         // 大 logo + 输入框（含 Tip）作为一组垂直居中。
         <>
-          {state.items
-            .filter((i) => i.kind !== "logo")
-            .map((item, i) => (
-              <ItemView
-                key={`top:${i}`}
-                item={item as Item}
-                width={termCols}
-                expanded={item.kind === "tool" && expandedToolIds.has(item.id)}
-              />
-            ))}
+          {!pendings[0] || termRows >= 8
+            ? state.items
+                .filter((i) => i.kind !== "logo")
+                .map((item, i) => (
+                  <ItemView
+                    key={`top:${i}`}
+                    item={item as Item}
+                    width={termCols}
+                    expanded={item.kind === "tool" && expandedToolIds.has(item.id)}
+                  />
+                ))
+            : null}
           <Box
             flexGrow={1}
             minHeight={0}
@@ -2783,7 +3306,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             overflow="hidden"
             justifyContent="center"
           >
-            <Welcome width={termCols} />
+            {!pendings[0] || termRows >= 16 ? <Welcome width={termCols} /> : null}
             {controls}
           </Box>
         </>
@@ -2803,6 +3326,8 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             flexDirection="column"
             overflow="hidden"
             justifyContent="flex-end"
+            aria-role="list"
+            aria-state={{ busy: state.running }}
           >
             {/*
              * 内层 flexShrink={0}：不让 Ink 把消息行按 flex 压缩（否则会渲染成
@@ -2877,7 +3402,12 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         </>
       )}
 
-      <Box justifyContent="space-between" flexShrink={0}>
+      <Box
+        justifyContent="space-between"
+        flexShrink={0}
+        aria-hidden={screenReader}
+        display={pendings[0] && termRows < 8 ? "none" : "flex"}
+      >
         {/* 路径拿左侧剩余列（尾部优先，从头截断）；token/花费固定在右。 */}
         <Text dimColor wrap="truncate">
           {truncWidthStart(cwdLabel, termCols - dispWidth(statusRight) - 1)}
@@ -2896,11 +3426,51 @@ function tildify(p: string): string {
   return home && p.startsWith(home) ? "~" + p.slice(home.length) : p;
 }
 
+/**
+ * Trust changes are delivered by newer hosts as an authoritative session event.
+ * Keep a narrow compatibility decoder so this TUI remains usable while daemon
+ * and SDK clients roll forward independently.
+ */
+function workspaceTrustUpdateFromEvent(
+  se: SessionEvent,
+): { trusted: boolean; reason?: string } | undefined {
+  const record = se as unknown as Record<string, unknown>;
+  if (
+    record["type"] !== "workspace_trust" &&
+    record["type"] !== "workspace_trust_changed" &&
+    record["type"] !== "workspace_trust_change"
+  ) {
+    return undefined;
+  }
+  const nested =
+    record["workspaceTrust"] && typeof record["workspaceTrust"] === "object"
+      ? (record["workspaceTrust"] as Record<string, unknown>)
+      : record["assessment"] && typeof record["assessment"] === "object"
+        ? (record["assessment"] as Record<string, unknown>)
+        : record;
+  if (typeof nested["trusted"] !== "boolean") return undefined;
+  const reason = typeof nested["reason"] === "string" ? nested["reason"] : undefined;
+  return { trusted: nested["trusted"], ...(reason ? { reason } : {}) };
+}
+
 function handleEvent(
   se: SessionEvent,
   dispatch: React.Dispatch<Action>,
   setPendings: React.Dispatch<React.SetStateAction<PendingPerm[]>>,
 ) {
+  if (se.type === "workspace_trust") {
+    const update = workspaceTrustUpdateFromEvent(se);
+    if (!update) return;
+    if (!update.trusted) setPendings([]);
+    dispatch({ t: "workspaceTrust", ...update });
+    return;
+  }
+  const trustUpdate = workspaceTrustUpdateFromEvent(se);
+  if (trustUpdate) {
+    if (!trustUpdate.trusted) setPendings([]);
+    dispatch({ t: "workspaceTrust", ...trustUpdate });
+    return;
+  }
   if (se.type === "state") {
     dispatch({ t: "running", v: se.running });
     if (!se.running) dispatch({ t: "flushLive" });
@@ -3128,8 +3698,8 @@ function helpText(): string {
       "Ctrl+G 外部编辑器 · Ctrl+O 工具输出 · Ctrl+R 重连（可在 tui.keybindings 配置）",
     ),
     t(
-      "Shift+Tab             Cycle permission mode: default → accept-edits → plan → bypass",
-      "Shift+Tab             轮换权限模式：默认 → 自动接受编辑 → 计划 → 跳过授权",
+      "Shift+Tab             Cycle permission mode (restricted: default ↔ plan only)",
+      "Shift+Tab             轮换权限模式（受限工作区仅默认 ↔ 计划）",
     ),
     t(
       "/undo [mode]          Rewind the last turn; mode: files (default) / conversation / both",
@@ -3404,21 +3974,40 @@ export function filterPickerRows(rows: readonly PickerRow[], filter: string): Pi
   );
 }
 
-/** 并发探测所有 provider；只有鉴权 `/models` 成功的模型才进入 `/model`。 */
-async function probeLive(
+/** 有界并发探测 provider；只有鉴权 `/models` 成功的模型才进入 `/model`。 */
+export async function probeLive(
   providers: readonly ProviderDescriptor[],
   discover: (providerId: string) => Promise<readonly string[] | undefined>,
+  options: { concurrency?: number; timeoutMs?: number } = {},
 ): Promise<ProviderProbe> {
   const probed = new Set(providers.map((provider) => provider.id));
-  const discovered = await Promise.all(
-    providers.map(async (provider) => {
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 4, providers.length || 1));
+  const timeoutMs = Math.max(100, options.timeoutMs ?? 8_000);
+  const discovered = new Map<string, readonly string[] | undefined>();
+  let next = 0;
+  let accepting = true;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (accepting) {
+      const index = next++;
+      const provider = providers[index];
+      if (!provider) return;
       const models = await discover(provider.id).catch(() => undefined);
-      return [provider.id, models] as const;
+      if (accepting) discovered.set(provider.id, models);
+    }
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.all(workers),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
     }),
-  );
+  ]);
+  accepting = false;
+  if (timer) clearTimeout(timer);
   const live = new Set<string>();
   const models = new Map<string, readonly string[]>();
-  for (const [providerId, ids] of discovered) {
+  for (const [providerId, ids] of [...discovered]) {
     if (ids === undefined) continue;
     live.add(providerId);
     models.set(providerId, ids);
@@ -3540,6 +4129,7 @@ function ModelPicker({
             );
           }
           if (entry.kind === "provider") {
+            const providerName = terminalInlineText(entry.name);
             return (
               <Text
                 key={`provider:${start + i}:${entry.name}`}
@@ -3548,18 +4138,21 @@ function ModelPicker({
                 bold
                 wrap="truncate"
               >
-                {entry.name}
-                {fill(dispWidth(entry.name))}
+                {providerName}
+                {fill(dispWidth(providerName))}
               </Text>
             );
           }
           const { row, index: globalIdx } = entry;
           const selected = globalIdx === index;
-          const rightTag = row.free ? "Free" : row.ready === false ? row.readyHint : "";
+          const label = terminalInlineText(row.label);
+          const rightTag = terminalInlineText(
+            row.free ? "Free" : row.ready === false ? row.readyHint : "",
+          );
           // 选中行画成整行暖橙底、深色字（对齐 opencode）。
           if (selected) {
             const rightW = dispWidth(rightTag);
-            const left = truncWidth(`● ${row.label}`, inner - rightW - 1);
+            const left = truncWidth(`● ${label}`, inner - rightW - 1);
             const pad = Math.max(1, inner - dispWidth(left) - rightW);
             return (
               <Text key={row.spec} backgroundColor={PICKER_HL} color="black">
@@ -3572,10 +4165,10 @@ function ModelPicker({
           return (
             <Text key={row.spec} backgroundColor={PICKER_BG} wrap="truncate">
               {"  "}
-              {truncWidth(row.label, Math.max(1, inner - dispWidth(rightTag) - 3))}
+              {truncWidth(label, Math.max(1, inner - dispWidth(rightTag) - 3))}
               {fill(
                 2 +
-                  dispWidth(truncWidth(row.label, Math.max(1, inner - dispWidth(rightTag) - 3))) +
+                  dispWidth(truncWidth(label, Math.max(1, inner - dispWidth(rightTag) - 3))) +
                   dispWidth(rightTag),
               )}
               <Text dimColor>{rightTag}</Text>
@@ -3630,7 +4223,7 @@ export function Welcome({ width }: { width: number }) {
   const from = Math.max(0, Math.floor((bigW - width) / 2));
   const to = from + Math.min(width, bigW);
   return (
-    <Box flexDirection="column" alignItems="center" marginBottom={2}>
+    <Box flexDirection="column" alignItems="center" marginBottom={2} aria-hidden={true}>
       {Array.from({ length: LOGO_ROWS }).map((_, r) => (
         <Text key={r} wrap="truncate">
           <Text color="#6b6b6b">{clipSegment(head[r]!, 0, from, to)}</Text>
@@ -3649,7 +4242,7 @@ export function WelcomeTip({ width }: { width: number }) {
   if (width < 28) return null;
   const cardWidth = Math.min(64, width - 4);
   return (
-    <Box width={width} justifyContent="center" marginTop={1}>
+    <Box width={width} justifyContent="center" marginTop={1} aria-hidden={true}>
       <Box width={cardWidth}>
         <Text wrap="wrap">
           <Text color="#f59e0b">● </Text>
@@ -3679,7 +4272,7 @@ function errorMessage(value: unknown): string {
 function mergePendings(a: PendingPerm[], b: PendingPerm[]): PendingPerm[] {
   const merged = new Map<string, PendingPerm>();
   for (const p of [...a, ...b]) merged.set(p.permId, p);
-  return [...merged.values()];
+  return [...merged.values()].slice(0, MAX_PENDING_PERMISSIONS);
 }
 
 interface MouseInput {
@@ -3744,7 +4337,13 @@ export function subagentActivityLine(inner: unknown): string | null {
 
 function TodoList({ todos }: { todos: TodoItem[] }) {
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}>
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="gray"
+      paddingX={1}
+      aria-role="list"
+    >
       <Text dimColor>{t("Task list", "任务清单")}</Text>
       {todos.map((todo, i) => {
         const mark = todo.status === "completed" ? "✔" : todo.status === "in_progress" ? "●" : "○";
@@ -3762,7 +4361,7 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
                   ? { dimColor: true }
                   : {})}
             >
-              {text}
+              {terminalInlineText(text)}
             </Text>
           </Text>
         );
@@ -3789,7 +4388,8 @@ function CommandMenu({
       ? Math.min(Math.max(0, idx - Math.floor(viewportHeight / 2)), rows.length - viewportHeight)
       : 0;
   const visible = rows.slice(start, start + viewportHeight);
-  const nameCol = Math.min(18, Math.max(1, ...rows.map((r) => dispWidth("/" + r.name)))) + 2;
+  const nameCol =
+    Math.min(18, Math.max(1, ...rows.map((r) => dispWidth("/" + terminalInlineText(r.name))))) + 2;
   const inner = Math.max(1, width - 2);
   const fill = (used: number) => " ".repeat(Math.max(0, inner - used));
   return (
@@ -3803,9 +4403,12 @@ function CommandMenu({
     >
       {visible.map((r, i) => {
         const globalIndex = start + i;
-        const name = "/" + r.name;
+        const name = "/" + terminalInlineText(r.name);
         const namePad = name + " ".repeat(Math.max(1, nameCol - dispWidth(name)));
-        const description = truncWidth(r.description, Math.max(1, inner - dispWidth(namePad)));
+        const description = truncWidth(
+          terminalInlineText(r.description),
+          Math.max(1, inner - dispWidth(namePad)),
+        );
         const trailing = fill(dispWidth(namePad) + dispWidth(description));
         if (globalIndex === idx) {
           return (
@@ -3839,13 +4442,29 @@ function SessionList({
   filter: string;
   currentId: string;
 }) {
+  const viewportHeight = 10;
+  const idx = Math.max(0, Math.min(index, sessions.length - 1));
+  const start =
+    sessions.length > viewportHeight
+      ? Math.min(
+          Math.max(0, idx - Math.floor(viewportHeight / 2)),
+          sessions.length - viewportHeight,
+        )
+      : 0;
+  const visible = sessions.slice(start, start + viewportHeight);
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="cyan"
+      paddingX={1}
+      aria-role="listbox"
+    >
       <Text color="cyan" bold>
         {t("Sessions", "会话列表")}
       </Text>
       <Text dimColor>
-        {filter ? `${filter} ` : ""}
+        {filter ? `${terminalInlineText(filter)} ` : ""}
         {t("Search · ↑↓ select · Enter open · esc close", "搜索 · ↑↓ 选择 · Enter 打开 · esc 关闭")}
       </Text>
       {sessions.length === 0 ? (
@@ -3855,18 +4474,171 @@ function SessionList({
             : t("(no sessions)", "（暂无会话）")}
         </Text>
       ) : null}
-      {sessions.slice(0, 10).map((s, i) => {
-        const selected = i === index;
+      {visible.map((s, i) => {
+        const selected = start + i === idx;
         const current = s.id === currentId;
         return (
-          <Text key={s.id} {...(selected ? { backgroundColor: PICKER_HL, color: "black" } : {})}>
+          <Text
+            key={s.id}
+            {...(selected ? { backgroundColor: PICKER_HL, color: "black" } : {})}
+            aria-label={`${terminalInlineText(s.title ?? t("(untitled)", "(无标题)"))} ${terminalInlineText(s.model)}`}
+          >
             {current ? "● " : "  "}
-            {s.title ?? t("(untitled)", "(无标题)")}
+            {terminalInlineText(s.title ?? t("(untitled)", "(无标题)"))}
             {s.running ? t(" · running", " · 运行中") : ""}
-            <Text dimColor={!selected}> {s.model}</Text>
+            <Text dimColor={!selected}> {terminalInlineText(s.model)}</Text>
           </Text>
         );
       })}
+    </Box>
+  );
+}
+
+function PermissionPanel({
+  pending,
+  pendingCount,
+  index,
+  termRows,
+  termCols,
+}: {
+  pending: PendingPerm;
+  pendingCount: number;
+  index: number;
+  termRows: number;
+  termCols: number;
+}) {
+  const options = [
+    { keyName: "y", label: t("Allow once", "允许一次"), short: t("Once", "一次"), color: "green" },
+    {
+      keyName: "a",
+      label: t("Allow for this session", "本会话允许并记住"),
+      short: t("Session", "会话"),
+      color: "cyan",
+    },
+    {
+      keyName: "p",
+      label: t("Always allow in this project", "永久允许（写入项目）"),
+      short: t("Project", "项目"),
+      color: "magenta",
+    },
+    { keyName: "n", label: t("Deny", "拒绝"), short: t("Deny", "拒绝"), color: "red" },
+  ] as const;
+  const title = `${t("⚠ Permission request: ", "⚠ 授权请求: ")}${terminalInlineText(
+    pending.toolName,
+  )} · ${(pending.risk ?? "medium").toUpperCase()}${
+    pendingCount > 1
+      ? t(` (${pendingCount - 1} more pending)`, `（还有 ${pendingCount - 1} 个待裁决）`)
+      : ""
+  }`;
+  const compact = termRows < 16;
+
+  if (termRows < 8) {
+    return (
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor="yellow"
+        overflow="hidden"
+        aria-role="radiogroup"
+      >
+        <Text color="yellow" bold wrap="truncate">
+          {truncWidth(`⚠ ${terminalInlineText(pending.toolName)}`, Math.max(1, termCols - 2))}
+        </Text>
+        <Text wrap="truncate">
+          [<Text color="red">n</Text>] {t("Deny", "拒绝")} · [<Text color="green">y</Text>]{" "}
+          {t("Once", "一次")}
+        </Text>
+      </Box>
+    );
+  }
+
+  if (compact) {
+    const selected = options[index] ?? options[0];
+    // Deny is deliberately first so it remains visible even in the narrowest
+    // supported terminal; arrows still reach every option and Enter confirms.
+    const compactKeys = [options[3], options[0], options[1], options[2]];
+    return (
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor="yellow"
+        paddingX={1}
+        overflow="hidden"
+        aria-role="radiogroup"
+      >
+        <Text color="yellow" bold wrap="truncate">
+          {truncWidth(title, Math.max(1, termCols - 4))}
+        </Text>
+        <Text bold wrap="truncate">
+          {truncWidth(terminalInlineText(pending.ruleKey, 16 * 1024), Math.max(1, termCols - 4))}
+        </Text>
+        <Text inverse bold wrap="truncate">
+          {`› [${selected.keyName}] ${selected.label}`}
+        </Text>
+        <Text wrap="truncate">
+          {compactKeys.map((option, optionIndex) => (
+            <React.Fragment key={option.keyName}>
+              {optionIndex > 0 ? " · " : ""}[<Text color={option.color}>{option.keyName}</Text>]{" "}
+              {option.short}
+            </React.Fragment>
+          ))}
+        </Text>
+        <Text dimColor wrap="truncate">
+          {t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}
+        </Text>
+      </Box>
+    );
+  }
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="yellow"
+      paddingX={1}
+      aria-role="radiogroup"
+    >
+      <Box>
+        <Text color="yellow" bold>
+          {title}
+        </Text>
+      </Box>
+      {pending.cwd ? (
+        <Box>
+          <Text>{`cwd: ${terminalInlineText(pending.cwd)}`}</Text>
+        </Box>
+      ) : null}
+      <Box>
+        <Text bold>{terminalDisplayText(pending.ruleKey, 16 * 1024)}</Text>
+      </Box>
+      <Box>
+        <Text>{permissionInputPreview(pending.input)}</Text>
+      </Box>
+      {permissionPatchPreview(pending.input, 6).map((line, lineIndex) => (
+        <Box key={`patch:${lineIndex}`}>
+          <Text
+            color={line.startsWith("+") ? "green" : line.startsWith("-") ? "red" : "gray"}
+            wrap="truncate"
+          >
+            {truncWidth(line, Math.max(1, termCols - 4))}
+          </Text>
+        </Box>
+      ))}
+      {pending.rulePartsComplete === false ? (
+        <Text color="red" bold>
+          {t("Command analysis is incomplete", "无法完整解析命令边界")}
+        </Text>
+      ) : null}
+      {options.map(({ keyName, label, color }, optionIndex) => (
+        <Box key={keyName} aria-role="radio" aria-state={{ selected: optionIndex === index }}>
+          <Text inverse={optionIndex === index} bold>
+            {optionIndex === index ? "› " : "  "}[<Text color={color}>{keyName}</Text>] {label}
+          </Text>
+        </Box>
+      ))}
+      <Box>
+        <Text>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
+      </Box>
     </Box>
   );
 }
@@ -4074,7 +4846,14 @@ export function InputPanel({
 }) {
   if (width <= 3) {
     return (
-      <Box width={Math.max(1, width)} ref={panelRef} overflow="hidden">
+      <Box
+        width={Math.max(1, width)}
+        ref={panelRef}
+        overflow="hidden"
+        aria-role="textbox"
+        aria-label={`${t("Prompt", "输入")}: ${text || placeholder || panelPlaceholder()}`}
+        aria-state={{ multiline: true, busy: running }}
+      >
         <Text wrap="truncate">{running ? spinner : "›"}</Text>
       </Box>
     );
@@ -4131,8 +4910,9 @@ export function InputPanel({
 
   // 模型行只显示 provider 后面的模型标识；项目名与会话标题已在其他界面提供。
   // 例如 deepseek/deepseek-v4-flash → deepseek-v4-flash；OpenRouter 的嵌套 model id 保留。
-  const slash = model.indexOf("/");
-  const modelLabel = slash >= 0 ? model.slice(slash + 1) : model;
+  const safeModel = terminalInlineText(model);
+  const slash = safeModel.indexOf("/");
+  const modelLabel = slash >= 0 ? safeModel.slice(slash + 1) : safeModel;
 
   // 前导空格 +（运行中才画的 spinner）+ 模型名按剩余列预算裁掉。
   // 空闲态不再显示 ● 点（对齐 opencode）；spinner 仅在生成时作为活动指示出现。
@@ -4153,7 +4933,16 @@ export function InputPanel({
   );
 
   return (
-    <Box flexDirection="column" width={width} ref={panelRef}>
+    <Box
+      flexDirection="column"
+      width={width}
+      ref={panelRef}
+      aria-role="textbox"
+      aria-label={`${t("Prompt", "输入")}: ${
+        text ? terminalDisplayText(text) : (placeholder ?? panelPlaceholder())
+      }. ${t("Model", "模型")}: ${modelLabel}`}
+      aria-state={{ multiline: true, busy: running }}
+    >
       {rowLine(null, 0)}
       {editorRows.map((row) => (
         <React.Fragment key={row.key}>{rowLine(row.node, row.used)}</React.Fragment>

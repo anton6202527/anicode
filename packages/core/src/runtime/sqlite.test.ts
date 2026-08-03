@@ -97,6 +97,11 @@ test("SQLite runtime: JSONL 会话幂等迁移，事务追加不丢消息", asyn
     const primary = new SqliteRuntimeSessionStore(database);
     const migrated = new MigratingSessionStore(primary, legacy);
     assert.equal((await migrated.list())[0]?.createdAt, legacyMeta.createdAt);
+    assert.deepEqual(
+      await primary.list(),
+      [],
+      "metadata listing must not eagerly import legacy transcript bodies",
+    );
     assert.equal((await migrated.load("session-legacy")).messages.length, 1);
     // 第二次 list 不重复导入；两个独立 SQLite 连接追加后 index 仍唯一且内容完整。
     await migrated.list();
@@ -111,8 +116,40 @@ test("SQLite runtime: JSONL 会话幂等迁移，事务追加不丢消息", asyn
       }),
     ]);
     assert.equal((await primary.load("session-legacy")).messages.length, 3);
+    await primary.create({
+      id: "session-identity",
+      cwd: root,
+      workspaceIdentity: { device: "device-1", inode: "inode-2" },
+      model: "debug/demo",
+    });
+    assert.deepEqual((await primary.load("session-identity")).workspaceIdentity, {
+      device: "device-1",
+      inode: "inode-2",
+    });
+
+    const interruptedLegacy = await legacy.create({
+      id: "session-interrupted",
+      cwd: root,
+      model: "debug/demo",
+    });
+    await legacy.append(interruptedLegacy.id, {
+      role: "user",
+      content: [{ type: "text", text: "recover interrupted import" }],
+    });
+    await primary.create({ id: interruptedLegacy.id, cwd: root, model: "debug/demo" });
+    assert.equal(
+      (await new MigratingSessionStore(primary, legacy).load(interruptedLegacy.id)).messages.length,
+      1,
+      "an empty primary row left by an interrupted migration must import only that legacy body",
+    );
+
     await migrated.delete("session-legacy");
-    assert.deepEqual(await new MigratingSessionStore(primary, legacy).list(), []);
+    assert.deepEqual(
+      new Set(
+        (await new MigratingSessionStore(primary, legacy).list()).map((session) => session.id),
+      ),
+      new Set(["session-identity", "session-interrupted"]),
+    );
   } finally {
     await secondDatabase.close();
     await database.close();
@@ -133,7 +170,7 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
     );
     assert.deepEqual(
       migrations.map((row) => Number(row.version)),
-      [1, 2],
+      [1, 2, 3],
     );
     assert.ok(migrations.every((row) => /^[a-f0-9]{64}$/.test(String(row.checksum))));
 
@@ -171,4 +208,70 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
   }
   assert.throws(() => new SqliteRuntimeDatabase(file), /migration 2 checksum mismatch/);
   await fs.rm(root, { recursive: true, force: true });
+});
+
+test("SQLite runtime: v2 database upgrades to v3 without changing old checksums", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-v2-upgrade-"));
+  const file = path.join(root, "runtime.db");
+  const seeded = new SqliteRuntimeDatabase(file);
+  let oldChecksums: string[];
+  try {
+    oldChecksums = await seeded.run((db) =>
+      db
+        .prepare("SELECT checksum FROM schema_migrations WHERE version IN (1, 2) ORDER BY version")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).checksum)),
+    );
+    await seeded.run((db) => {
+      db.exec(`
+        DROP TABLE session_operation_leases;
+        DROP TABLE session_lifecycle;
+        ALTER TABLE sessions DROP COLUMN workspace_device;
+        ALTER TABLE sessions DROP COLUMN workspace_inode;
+        DELETE FROM schema_migrations WHERE version = 3;
+      `);
+    });
+  } finally {
+    await seeded.close();
+  }
+
+  const upgraded = new SqliteRuntimeDatabase(file);
+  try {
+    const versions = await upgraded.run((db) =>
+      db
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all()
+        .map((row) => Number((row as Record<string, unknown>).version)),
+    );
+    assert.deepEqual(versions, [1, 2, 3]);
+    const checksums = await upgraded.run((db) =>
+      db
+        .prepare("SELECT checksum FROM schema_migrations WHERE version IN (1, 2) ORDER BY version")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).checksum)),
+    );
+    assert.deepEqual(checksums, oldChecksums, "v3 must not rewrite historical migration records");
+    const columns = await upgraded.run((db) =>
+      db
+        .prepare("PRAGMA table_info(sessions)")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).name)),
+    );
+    assert.ok(columns.includes("workspace_device"));
+    assert.ok(columns.includes("workspace_inode"));
+    assert.ok(
+      await upgraded.run((db) =>
+        Boolean(
+          db
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle'",
+            )
+            .get(),
+        ),
+      ),
+    );
+  } finally {
+    await upgraded.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

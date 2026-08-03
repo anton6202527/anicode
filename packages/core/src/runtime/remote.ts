@@ -24,7 +24,7 @@ export interface RemoteRuntimeOptions {
 
 interface RemoteExecution {
   id: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  status: "queued" | "running" | "cancellation_requested" | "succeeded" | "failed" | "cancelled";
   result?: IsolatedRunResult;
   error?: string;
 }
@@ -86,8 +86,8 @@ export class RemoteRuntime implements ExecutionRuntime {
       ).catch(() => undefined);
     request.signal?.addEventListener("abort", abort, { once: true });
     try {
-      while (["queued", "running"].includes(execution.status)) {
-        if (request.signal?.aborted) throw new Error("Remote execution cancelled");
+      while (["queued", "running", "cancellation_requested"].includes(execution.status)) {
+        if (request.signal?.aborted) throw new Error("Remote execution cancellation requested");
         if (Date.now() >= deadline) {
           await this.call(
             "DELETE",
