@@ -14,7 +14,7 @@ import {
   WorkspaceTrustStore,
 } from "@anicode/core";
 import { ChatBridge } from "./bridge.js";
-import { buildManager, modelChoices } from "./host.js";
+import { buildManagerCompositionAsync, modelChoices } from "./host.js";
 import type { HostToWebview, WebviewToHost } from "./protocol.js";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -25,7 +25,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const { config } = await loadConfig({ cwd, workspaceTrust });
   const defaultModel = config.model ?? resolveDefaultModel();
   const sessionsDir = path.join(context.globalStorageUri.fsPath, "sessions");
-  const manager = buildManager(sessionsDir, workspaceTrustStore, cwd);
+  const managerComposition = await buildManagerCompositionAsync(
+    sessionsDir,
+    workspaceTrustStore,
+    cwd,
+    config,
+  );
+  const manager = managerComposition.manager;
 
   if (!workspaceTrust.trusted) {
     void vscode.window.showWarningMessage(
@@ -45,14 +51,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   status.command = "anicode.pickModel";
   context.subscriptions.push(status);
 
-  const provider = new ChatViewProvider(context.extensionUri, manager, cwd, defaultModel, () => {
-    status.text = `$(sparkle) ${provider.model}`;
-    status.tooltip = t(
-      `AniCode Zen model: ${provider.model} (click to switch)`,
-      `AniCode Zen 模型：${provider.model}（点击切换）`,
-    );
-    status.show();
-  });
+  const provider = new ChatViewProvider(
+    context.extensionUri,
+    manager,
+    cwd,
+    defaultModel,
+    () => {
+      status.text = `$(sparkle) ${provider.model}`;
+      status.tooltip = t(
+        `AniCode Zen model: ${provider.model} (click to switch)`,
+        `AniCode Zen 模型：${provider.model}（点击切换）`,
+      );
+      status.show();
+    },
+    () => managerComposition.dispose(),
+  );
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, provider, {
@@ -81,6 +94,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly cwd: string,
     defaultModel: string,
     private readonly onModelChange: () => void,
+    private readonly disposeManager: () => Promise<void>,
   ) {
     this.bridge = new ChatBridge(manager, cwd, defaultModel, () => {});
     this.onModelChange();
@@ -202,6 +216,9 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   dispose(): void {
     this.bridge.dispose();
+    void this.disposeManager().catch((error) =>
+      console.error("anicode vscode: resource shutdown failed", error),
+    );
   }
 
   private html(webview: vscode.Webview): string {

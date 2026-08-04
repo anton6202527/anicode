@@ -573,6 +573,16 @@ function recordValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function permissionModeValue(value: unknown): value is PermissionMode {
+  return (
+    value === "default" ||
+    value === "acceptEdits" ||
+    value === "auto" ||
+    value === "bypass" ||
+    value === "plan"
+  );
+}
+
 function sessionSnapshotValue(value: unknown): value is SessionSnapshot {
   if (!recordValue(value)) return false;
   return (
@@ -581,6 +591,7 @@ function sessionSnapshotValue(value: unknown): value is SessionSnapshot {
     Array.isArray(value.messages) &&
     recordValue(value.usage) &&
     typeof value.running === "boolean" &&
+    (value.permissionMode === undefined || permissionModeValue(value.permissionMode)) &&
     Array.isArray(value.pendingPermissions)
   );
 }

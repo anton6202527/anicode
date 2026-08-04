@@ -50,3 +50,80 @@ test("TransactionalExecutionRuntime: failed shell discards staged writes", async
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("TransactionalExecutionRuntime: default policy cannot bypass commit or background boundaries", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-transaction-default-"));
+  await fs.writeFile(path.join(root, "file.txt"), "before");
+  let delegatedCwd = "";
+  const delegate: ExecutionRuntime = {
+    async run(request) {
+      delegatedCwd = request.cwd;
+      await fs.writeFile(path.join(request.cwd, "file.txt"), "after");
+      return { exitCode: 0, output: "", timedOut: false, sandboxed: true, durationMs: 1 };
+    },
+    prepare(request) {
+      return { file: "bash", args: [], env: {}, sandboxed: true, cwd: request.cwd };
+    },
+  };
+  try {
+    const runtime = new TransactionalExecutionRuntime(delegate);
+    await runtime.run({ command: "change", cwd: root });
+    assert.notEqual(delegatedCwd, root);
+    assert.equal(await fs.readFile(path.join(root, "file.txt"), "utf8"), "after");
+    assert.throws(
+      () => runtime.prepare({ command: "background", cwd: root }),
+      /Background workspace-write shell is disabled/,
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("TransactionalExecutionRuntime: oversized source file fails before clone or delegate execution", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-transaction-file-cap-"));
+  await fs.writeFile(path.join(root, "large.bin"), Buffer.alloc(2_048));
+  let delegated = 0;
+  const runtime = new TransactionalExecutionRuntime(
+    {
+      async run() {
+        delegated++;
+        return { exitCode: 0, output: "", timedOut: false, sandboxed: true, durationMs: 1 };
+      },
+    },
+    { maxFileBytes: 1_024, maxSourceBytes: 8_192 },
+  );
+  try {
+    await assert.rejects(
+      runtime.run({ command: "true", cwd: root, policy: "workspace-write" }),
+      /file exceeds 1024 bytes/,
+    );
+    assert.equal(delegated, 0);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("TransactionalExecutionRuntime: total source byte cap fails before disk amplification", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-transaction-source-cap-"));
+  await fs.writeFile(path.join(root, "a.bin"), Buffer.alloc(700));
+  await fs.writeFile(path.join(root, "b.bin"), Buffer.alloc(700));
+  let delegated = 0;
+  const runtime = new TransactionalExecutionRuntime(
+    {
+      async run() {
+        delegated++;
+        return { exitCode: 0, output: "", timedOut: false, sandboxed: true, durationMs: 1 };
+      },
+    },
+    { maxFileBytes: 1_024, maxSourceBytes: 1_024 },
+  );
+  try {
+    await assert.rejects(
+      runtime.run({ command: "true", cwd: root, policy: "workspace-write" }),
+      /exceeds 1024 source bytes/,
+    );
+    assert.equal(delegated, 0);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

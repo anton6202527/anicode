@@ -235,6 +235,52 @@ function request(
   });
 }
 
+test("NetworkProxy: in-process responses have a decoded body limit", async () => {
+  let cancelled = false;
+  const proxy = new NetworkProxy({
+    policy: { allowDomains: ["bounded.anicode.test"] },
+    resolver: async () => ["8.8.8.8"],
+    maxResponseBytes: 128,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(96));
+            controller.enqueue(new Uint8Array(96));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      ),
+  });
+
+  const response = await proxy.fetch("https://bounded.anicode.test/data");
+  await assert.rejects(response.arrayBuffer(), /exceeds 128 bytes/);
+  assert.equal(cancelled, true);
+});
+
+test("NetworkProxy: oversized declared response is rejected before consumption", async () => {
+  let cancelled = false;
+  const proxy = new NetworkProxy({
+    policy: { allowDomains: ["bounded.anicode.test"] },
+    resolver: async () => ["8.8.8.8"],
+    maxResponseBytes: 128,
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "content-length": "129" } },
+      ),
+  });
+
+  await assert.rejects(proxy.fetch("https://bounded.anicode.test/data"), /exceeds 128 bytes/);
+  assert.equal(cancelled, true);
+});
+
 test("NetworkProxyServer: execution-scoped credentials expire, revoke, redact, and reject reuse", async () => {
   const upstream = http.createServer((_request, response) => response.end("scoped"));
   const upstreamPort = await listen(upstream);

@@ -1,8 +1,11 @@
 /**
- * 本地 Ollama 自启动：选中/默认使用 `ollama/*` 模型时，若守护未在跑就
- * 后台拉起 `ollama serve` 并轮询到就绪，省去用户手动开服务的步骤。
+ * 本地 Ollama 就绪检查。默认绝不从 PATH 自动执行二进制；需要自启动时，用户必须
+ * 同时显式启用开关并提供一个绝对、可信的可执行文件路径。
  */
 import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { terminateProcessTree } from "@anicode/core";
 
 const DEFAULT_BASE = "http://127.0.0.1:11434";
 
@@ -10,12 +13,28 @@ function rootOf(base: string): string {
   return base.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
 }
 
+export function safeOllamaBase(base: string): string | undefined {
+  try {
+    const url = new URL(rootOf(base));
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    if (url.username || url.password) return undefined;
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") return undefined;
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
 /** 探测 Ollama 是否在跑（GET /api/tags，短超时）。 */
 export async function ollamaLive(base = DEFAULT_BASE): Promise<boolean> {
+  const safeBase = safeOllamaBase(base);
+  if (!safeBase) return false;
   try {
-    const res = await fetch(`${rootOf(base)}/api/tags`, {
+    const res = await fetch(`${safeBase}/api/tags`, {
       signal: AbortSignal.timeout(800),
     });
+    await res.body?.cancel();
     return res.ok;
   } catch {
     return false;
@@ -25,21 +44,45 @@ export async function ollamaLive(base = DEFAULT_BASE): Promise<boolean> {
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * 确保 Ollama 在跑：已在跑返回 "running"；成功拉起返回 "started"；
- * 未安装返回 "missing"；拉起后超时未就绪返回 "timeout"。
+ * 确保 Ollama 在跑：默认只检查，不执行 PATH。显式配置可信绝对路径后才允许自启动。
  */
 export async function ensureOllama(
   base = process.env["OLLAMA_BASE_URL"] || DEFAULT_BASE,
   timeoutMs = 15000,
-): Promise<"running" | "started" | "missing" | "timeout"> {
+): Promise<"running" | "started" | "manual" | "unsafe" | "missing" | "timeout"> {
+  if (!safeOllamaBase(base)) return "unsafe";
   if (await ollamaLive(base)) return "running";
 
-  // 拉起 `ollama serve`：靠 'spawn' / 'error' 事件区分「成功启动」与「命令不存在」，
-  // 不再把 ENOENT 误判成超时。
+  if (process.env["ANICODE_OLLAMA_AUTO_START"] !== "1") return "manual";
+  const configuredExecutable = process.env["ANICODE_OLLAMA_EXECUTABLE"];
+  if (!configuredExecutable || !path.isAbsolute(configuredExecutable)) return "missing";
+  let executable: string;
+  try {
+    executable = await fs.realpath(configuredExecutable);
+    const stat = await fs.stat(executable);
+    if (!stat.isFile()) return "missing";
+    if (process.platform !== "win32") {
+      const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+      if (
+        (currentUid !== undefined && stat.uid !== currentUid && stat.uid !== 0) ||
+        stat.mode & 0o022
+      ) {
+        return "missing";
+      }
+    }
+  } catch {
+    return "missing";
+  }
+
+  let child: ReturnType<typeof spawn> | undefined;
   const spawned = await new Promise<boolean>((resolve) => {
-    let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("ollama", ["serve"], { detached: true, stdio: "ignore" });
+      child = spawn(executable, ["serve"], {
+        detached: process.platform !== "win32",
+        stdio: "ignore",
+        windowsHide: true,
+        env: ollamaEnvironment(),
+      });
     } catch {
       resolve(false);
       return;
@@ -48,21 +91,54 @@ export async function ensureOllama(
     const done = (ok: boolean) => {
       if (settled) return;
       settled = true;
-      resolve(ok);
+      clearTimeout(timer);
+      if (ok || !child) {
+        resolve(ok);
+      } else {
+        void terminateProcessTree(child).then(
+          () => resolve(false),
+          () => resolve(false),
+        );
+      }
     };
-    child.once("error", () => done(false)); // ENOENT：未安装
+    const timer = setTimeout(() => done(false), 5_000);
+    child.once("error", () => done(false));
     child.once("spawn", () => {
-      child.unref();
+      child!.unref();
       done(true);
     });
-    setTimeout(() => done(true), 800); // 两事件都没来时的兜底
   });
   if (!spawned) return "missing";
 
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + Math.max(1, Math.min(timeoutMs, 60_000));
   while (Date.now() < deadline) {
     await delay(300);
     if (await ollamaLive(base)) return "started";
   }
+  if (child) await terminateProcessTree(child);
   return "timeout";
+}
+
+function ollamaEnvironment(): NodeJS.ProcessEnv {
+  const allowed = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "OLLAMA_HOST",
+    "OLLAMA_MODELS",
+    "OLLAMA_KEEP_ALIVE",
+    "OLLAMA_NUM_PARALLEL",
+    "OLLAMA_MAX_LOADED_MODELS",
+  ];
+  return Object.fromEntries(
+    allowed.flatMap((name) => {
+      const value = process.env[name];
+      return value === undefined ? [] : [[name, value]];
+    }),
+  );
 }

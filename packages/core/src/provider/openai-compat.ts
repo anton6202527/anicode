@@ -20,6 +20,12 @@ import type {
 } from "../types.js";
 import { emptyUsage } from "../types.js";
 
+const MAX_STREAM_EVENTS = 100_000;
+const MAX_STREAM_TEXT_BYTES = 16 * 1024 * 1024;
+const MAX_STREAM_TOOL_ARGUMENT_BYTES = 2 * 1024 * 1024;
+const MAX_STREAM_TOOL_CALLS = 256;
+const MAX_STREAM_TOOL_ID_BYTES = 4_096;
+
 export interface OpenAICompatOptions {
   /** 显示名，如 "openai" / "ollama" / "deepseek" */
   name?: string;
@@ -116,24 +122,47 @@ export class OpenAICompatProvider implements Provider {
     const textParts: string[] = [];
     let finishReason: string | null = null;
     let usage: Usage = emptyUsage();
+    let eventCount = 0;
+    let textBytes = 0;
 
     for await (const chunk of stream) {
+      if (++eventCount > MAX_STREAM_EVENTS) throw new Error("Provider stream event limit exceeded");
       const choice = chunk.choices[0];
       if (choice?.delta?.content) {
+        textBytes += Buffer.byteLength(choice.delta.content, "utf8");
+        if (textBytes > MAX_STREAM_TEXT_BYTES) {
+          throw new Error("Provider text stream size limit exceeded");
+        }
         textParts.push(choice.delta.content);
         yield { type: "text_delta", text: choice.delta.content };
       }
       for (const tc of choice?.delta?.tool_calls ?? []) {
         let entry = pending.get(tc.index);
         if (!entry) {
+          if (pending.size >= MAX_STREAM_TOOL_CALLS) {
+            throw new Error("Provider tool-call count limit exceeded");
+          }
           entry = { id: "", name: "", json: "", argFragments: [] };
           pending.set(tc.index, entry);
         }
         entry.id = mergeFragment(entry.id, tc.id);
         entry.name = mergeFragment(entry.name, tc.function?.name);
+        if (
+          Buffer.byteLength(entry.id, "utf8") > MAX_STREAM_TOOL_ID_BYTES ||
+          Buffer.byteLength(entry.name, "utf8") > MAX_STREAM_TOOL_ID_BYTES
+        ) {
+          throw new Error("Provider tool-call identifier limit exceeded");
+        }
         if (tc.function?.arguments) {
-          entry.json += tc.function.arguments;
-          entry.argFragments.push(tc.function.arguments);
+          const merged = mergeFragment(entry.json, tc.function.arguments);
+          if (Buffer.byteLength(merged, "utf8") > MAX_STREAM_TOOL_ARGUMENT_BYTES) {
+            throw new Error("Provider tool-call arguments limit exceeded");
+          }
+          const delta = merged.startsWith(entry.json)
+            ? merged.slice(entry.json.length)
+            : tc.function.arguments;
+          entry.json = merged;
+          if (delta) entry.argFragments.push(delta);
         }
       }
       if (choice?.finish_reason) finishReason = choice.finish_reason;

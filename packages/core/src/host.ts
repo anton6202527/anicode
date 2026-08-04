@@ -81,7 +81,7 @@ export interface SessionHost {
     sessionId: string,
   ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }>;
   /**
-   * 运行时切换权限模式（如 /plan 计划模式）。可选：不支持的传输（暂未接线的 daemon）
+   * 运行时切换权限模式。可选：不支持的传输（暂未接线的 daemon）
    * 可不实现，前端应在调用前判空。
    */
   setPermissionMode?(sessionId: string, mode: PermissionMode): Promise<void>;
@@ -92,8 +92,8 @@ export interface SessionHost {
   setPermissionProfile?(sessionId: string, name: string): Promise<PermissionMode>;
   /** 会话可用的权限档位（供 /profile 无参列表）。可选。 */
   listPermissionProfiles?(sessionId: string): Promise<Record<string, PermissionProfile>>;
-  /** 释放资源：远程断开 socket；本地中断本进程持有的 live drive。 */
-  dispose(): void;
+  /** 释放资源：远程断开 socket；本地等待持久状态与 telemetry 刷盘。 */
+  dispose(): void | Promise<void>;
 }
 
 /** 进程内实现：直接委托给 SessionManager */
@@ -168,7 +168,7 @@ export class LocalSessionHost implements SessionHost {
   listPermissionProfiles(sessionId: string): Promise<Record<string, PermissionProfile>> {
     return this.manager.listPermissionProfiles(sessionId);
   }
-  dispose(): void {
-    this.manager.dispose();
+  dispose(): Promise<void> {
+    return this.manager.shutdown();
   }
 }

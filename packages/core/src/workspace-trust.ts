@@ -29,6 +29,12 @@ const PROJECT_CONFIG_FILES = [
 /** Plain-text project environment files are inert while untrusted, but active after a grant. */
 const PROJECT_ENV_FILES = [".env.local", ".env"] as const;
 const PROJECT_MEMORY_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
+const PROJECT_GIT_EXECUTION_FILES = [
+  ".gitattributes",
+  path.join(".git", "config"),
+  path.join(".git", "config.worktree"),
+  path.join(".git", "info", "attributes"),
+] as const;
 
 /** Project-owned files that may inject prompts, tools, commands, or executable configuration. */
 const PROJECT_EXECUTION_ROOTS = [
@@ -518,6 +524,42 @@ async function inspectWorkspaceExecution(cwd: string): Promise<ExecutionInspecti
     sources.push(relative);
   }
 
+  const rootGitMarker = path.join(identity.canonicalRoot, ".git");
+  const rootGitStat = await safeLstat(rootGitMarker, ".git");
+  if (rootGitStat?.isSymbolicLink()) {
+    throw new WorkspaceTrustError("Workspace .git marker may not be a symlink");
+  }
+  if (rootGitStat && !rootGitStat.isDirectory() && !rootGitStat.isFile()) {
+    throw new WorkspaceTrustError("Workspace .git marker must be a directory or regular file");
+  }
+  if (rootGitStat?.isFile()) {
+    const opened = await readOptionalStableRegularFile(rootGitMarker, ".git", 4096);
+    if (!opened) throw new WorkspaceTrustError("Workspace .git marker changed during inspection");
+    accountFile(opened.content, ".git");
+    addHashField(hash, "git-execution:.git", opened.content);
+    sources.push(".git");
+  } else {
+    addHashField(hash, "git-execution:.git", rootGitStat ? "directory" : "missing");
+  }
+  for (const relative of PROJECT_GIT_EXECUTION_FILES) {
+    if (relative.startsWith(`.git${path.sep}`) && !rootGitStat?.isDirectory()) {
+      addHashField(hash, `git-execution:${portable(relative)}`, "unavailable");
+      continue;
+    }
+    const opened = await readOptionalStableRegularFile(
+      path.join(identity.canonicalRoot, relative),
+      relative,
+      MAX_CONFIG_BYTES,
+    );
+    if (!opened) {
+      addHashField(hash, `git-execution:${portable(relative)}`, "missing");
+      continue;
+    }
+    accountFile(opened.content, relative);
+    addHashField(hash, `git-execution:${portable(relative)}`, opened.content);
+    sources.push(relative);
+  }
+
   // Agent project memory walks from cwd towards the filesystem root and stops at the first .git
   // marker. Fingerprint the same search surface (including missing boundary markers), otherwise an
   // AGENTS.md edit after a grant could silently replace the system instructions.
@@ -545,7 +587,10 @@ async function inspectWorkspaceExecution(cwd: string): Promise<ExecutionInspecti
     memoryDirectory = parent;
   }
 
-  for (const relativeRoot of PROJECT_EXECUTION_ROOTS) {
+  const executionRoots = rootGitStat?.isDirectory()
+    ? [...PROJECT_EXECUTION_ROOTS, path.join(".git", "hooks")]
+    : [...PROJECT_EXECUTION_ROOTS];
+  for (const relativeRoot of executionRoots) {
     const absoluteRoot = path.join(identity.canonicalRoot, relativeRoot);
     const walk = async (
       directory: string,

@@ -8,16 +8,23 @@
  *     （{decision?, reason?, updatedInput?, additionalContext?}）；
  *     非 JSON 的非空 stdout 视为 additionalContext
  *   - 退出码 2：block，stderr（缺省 stdout）作为 reason
- *   - 其他退出码 / 启动失败 / 超时：视为无操作（hook 是增强，不能弄垮 loop）
- *   - 超时默认 60s，到点 SIGKILL
+ *   - 其他退出码 / 超时：视为无操作；隔离或进程树清理失败则 fail-close
+ *   - 超时默认 60s，并等待整棵进程树退出
  *
  * 安全边界：命令来自用户自己的配置文件（等同 shell 配置的信任级别），
- * 不经过权限引擎——hook 本身就是用户加装的策略引擎。
+ * 不经过交互式权限确认；production runtime 仍强制 sandbox 与事务化提交。
  */
 
 import { spawn } from "node:child_process";
-import type { HookEventName, HookPayload, HookRegistration, HookResult } from "./hooks.js";
-import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import {
+  HookExecutionBoundaryError,
+  type HookEventName,
+  type HookPayload,
+  type HookRegistration,
+  type HookResult,
+} from "./hooks.js";
+import { terminateProcessTree, type ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import { sanitizedShellEnv } from "./tools/shell-spawn.js";
 
 export interface CommandHookConfig {
   event: HookEventName;
@@ -53,6 +60,39 @@ export function isHookEventName(v: unknown): v is HookEventName {
   return typeof v === "string" && (HOOK_EVENTS as readonly string[]).includes(v);
 }
 
+function interpretCommandHook(code: number | null, stdout: string, stderr = ""): HookResult | void {
+  if (code === 2) {
+    return { decision: "block", reason: (stderr || stdout).trim() || "被命令 hook 拦截" };
+  }
+  if (code !== 0) return undefined;
+  const text = stdout.trim();
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out: HookResult = {};
+      if (parsed.decision === "block" || parsed.decision === "allow") {
+        out.decision = parsed.decision;
+      }
+      if (typeof parsed.reason === "string") out.reason = parsed.reason;
+      if (
+        parsed.updatedInput &&
+        typeof parsed.updatedInput === "object" &&
+        !Array.isArray(parsed.updatedInput)
+      ) {
+        out.updatedInput = parsed.updatedInput as Record<string, unknown>;
+      }
+      if (typeof parsed.additionalContext === "string") {
+        out.additionalContext = parsed.additionalContext;
+      }
+      return out;
+    }
+  } catch {
+    // Non-JSON output is context for the next model turn.
+  }
+  return { additionalContext: text };
+}
+
 /** 执行一条命令 hook：stdin 喂 payload JSON，按退出码/输出解释结果。 */
 async function runCommandHook(
   cfg: CommandHookConfig,
@@ -64,25 +104,40 @@ async function runCommandHook(
     Number.isFinite(requestedTimeout) && requestedTimeout > 0
       ? Math.min(Math.max(100, requestedTimeout), 300_000)
       : 60_000;
-  return new Promise<HookResult | void>((resolve) => {
-    let child;
+  if (payload.signal?.aborted) return undefined;
+  const stdin = JSON.stringify({ ...payload, signal: undefined, hook_event_name: payload.event });
+  if (options.executionRuntime) {
     try {
-      const prepared = options.executionRuntime?.prepare?.({
+      const result = await options.executionRuntime.run({
         command: cfg.command,
         cwd: payload.cwd,
+        stdin,
+        includeTransactionSummary: false,
         policy: "workspace-write",
         network: false,
+        timeoutMs,
+        ...(payload.signal ? { signal: payload.signal } : {}),
+        env: sanitizedShellEnv(),
       });
-      // A runtime without prepare() cannot support the hook's stdin protocol. Fail closed by
-      // skipping it instead of silently escaping to an unsandboxed host shell.
-      if (options.executionRuntime && !prepared) {
-        resolve(undefined);
-        return;
-      }
-      child = spawn(prepared?.file ?? "/bin/sh", prepared?.args ?? ["-c", cfg.command], {
-        cwd: prepared?.cwd ?? payload.cwd,
-        ...(prepared ? { env: prepared.env } : {}),
+      if (payload.signal?.aborted || result.timedOut) return undefined;
+      return interpretCommandHook(result.exitCode, result.output);
+    } catch (error) {
+      if (payload.signal?.aborted) return undefined;
+      throw new HookExecutionBoundaryError(
+        `Command hook isolated execution failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
+  return new Promise<HookResult | void>((resolve, reject) => {
+    let child;
+    try {
+      child = spawn("/bin/sh", ["-c", cfg.command], {
+        cwd: payload.cwd,
+        env: sanitizedShellEnv(),
         stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+        windowsHide: true,
       });
     } catch {
       resolve(undefined);
@@ -91,22 +146,40 @@ async function runCommandHook(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let termination: Promise<void> | undefined;
     const finish = (r: HookResult | void) => {
       if (!settled) {
         settled = true;
         clearTimeout(timer);
+        payload.signal?.removeEventListener("abort", onAbort);
         resolve(r);
       }
     };
+    const failBoundary = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      payload.signal?.removeEventListener("abort", onAbort);
+      reject(
+        new HookExecutionBoundaryError(
+          `Command hook process tree cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        ),
+      );
+    };
+    const terminate = () => {
+      termination ??= terminateProcessTree(child);
+      void termination.catch(() => undefined);
+      return termination;
+    };
     const timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* 已退出 */
-      }
-      finish(undefined); // 超时按无操作
+      void terminate().then(() => finish(undefined), failBoundary); // 超时按无操作
     }, timeoutMs);
     timer.unref?.();
+    const onAbort = () => void terminate().then(() => finish(undefined), failBoundary);
+    payload.signal?.addEventListener("abort", onAbort, { once: true });
+    // Abort can race the pre-spawn check and listener installation; close that window explicitly.
+    if (payload.signal?.aborted) onAbort();
     const capture = (current: string, chunk: Buffer): string => {
       if (current.length >= MAX_HOOK_OUTPUT_CHARS) return current;
       return current + chunk.toString().slice(0, MAX_HOOK_OUTPUT_CHARS - current.length);
@@ -116,48 +189,28 @@ async function runCommandHook(
     child.stdin?.on("error", () => {
       // Hook may exit before consuming stdin; close/exit still carries the result.
     });
-    child.on("error", () => finish(undefined));
+    child.on("error", (error) => {
+      if (!child.pid) {
+        finish(undefined);
+        return;
+      }
+      void terminate().then(
+        () => finish(undefined),
+        (cleanupError) => failBoundary(new AggregateError([error, cleanupError])),
+      );
+    });
     child.on("close", (code) => {
-      if (code === 2) {
-        // Claude Code 约定：exit 2 = block，stderr 为理由
-        finish({ decision: "block", reason: (stderr || stdout).trim() || "被命令 hook 拦截" });
-        return;
-      }
-      if (code !== 0) {
-        finish(undefined);
-        return;
-      }
-      const text = stdout.trim();
-      if (!text) {
-        finish(undefined);
-        return;
-      }
-      try {
-        const parsed = JSON.parse(text) as Record<string, unknown>;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          const out: HookResult = {};
-          if (parsed.decision === "block" || parsed.decision === "allow")
-            out.decision = parsed.decision;
-          if (typeof parsed.reason === "string") out.reason = parsed.reason;
-          if (
-            parsed.updatedInput &&
-            typeof parsed.updatedInput === "object" &&
-            !Array.isArray(parsed.updatedInput)
-          )
-            out.updatedInput = parsed.updatedInput as Record<string, unknown>;
-          if (typeof parsed.additionalContext === "string")
-            out.additionalContext = parsed.additionalContext;
-          finish(out);
-          return;
+      void (async () => {
+        if (!termination && process.platform !== "win32") {
+          termination = terminateProcessTree(child);
         }
-      } catch {
-        /* 非 JSON：整段 stdout 作为注入上下文 */
-      }
-      finish({ additionalContext: text });
+        await termination;
+        finish(interpretCommandHook(code, stdout, stderr));
+      })().catch(failBoundary);
     });
     // stdin 喂 payload；附 hook_event_name 别名字段方便复用 Claude Code 脚本。
     try {
-      child.stdin?.write(JSON.stringify({ ...payload, hook_event_name: payload.event }));
+      child.stdin?.write(stdin);
       child.stdin?.end();
     } catch {
       /* 进程可能已退出 */
@@ -172,6 +225,7 @@ export function commandHook(
 ): HookRegistration {
   return {
     event: cfg.event,
+    mutatesWorkspace: true,
     ...(cfg.matcher !== undefined ? { matcher: cfg.matcher } : {}),
     handler: (payload) => runCommandHook(cfg, payload, options),
   };

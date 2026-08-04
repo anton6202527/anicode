@@ -83,6 +83,14 @@ export class SteeringInbox {
     this.pending.push(text);
   }
 
+  /**
+   * Recovery-only path: retain a notice for the next drive without invoking onIdle while the host
+   * is still constructing and has not yet registered the live session.
+   */
+  holdNotice(text: string): void {
+    this.pending.push(text);
+  }
+
   hasNotices(): boolean {
     return this.notices.length > 0;
   }

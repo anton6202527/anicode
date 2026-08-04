@@ -247,8 +247,8 @@ function appendBoundedText(current: string, delta: string, max: number): string 
 
 function strictWorkspaceInspectionNotice(cwd: string): string {
   return t(
-    `Workspace inspection failed: strict read-only mode is enforced for ${cwd}. Only built-in read/glob/grep and plan mode are available; writes, edits, bash, MCP, hooks, project extensions, and network access are disabled. Resolve the inspection error and reopen the session.`,
-    `工作区检查失败：${cwd} 已强制进入严格只读模式。仅可使用内置 read/glob/grep 与计划模式；写入、编辑、bash、MCP、hooks、项目扩展和网络访问均已禁用。请排除检查错误后重新打开会话。`,
+    `Workspace inspection failed: the strict read-only safety lock is enforced for ${cwd}. Only built-in read/glob/grep are available; writes, edits, bash, MCP, hooks, project extensions, and network access are disabled. Resolve the inspection error and reopen the session.`,
+    `工作区检查失败：${cwd} 已启用严格只读安全锁。仅可使用内置 read/glob/grep；写入、编辑、bash、MCP、hooks、项目扩展和网络访问均已禁用。请排除检查错误后重新打开会话。`,
   );
 }
 
@@ -579,17 +579,10 @@ function builtinCommands(): CommandMenuRow[] {
       ),
     },
     {
-      name: "plan",
-      description: t(
-        "Toggle plan mode: read-only planning /plan [on|off]",
-        "切换计划模式：只读规划 /plan [on|off]",
-      ),
-    },
-    {
       name: "profile",
       description: t(
-        "Switch permission profile /profile [name] (readonly/default/workspace/full)",
-        "切换权限档位 /profile [name]（readonly/default/workspace/full）",
+        "Switch permission profile /profile [name] (default/workspace/full)",
+        "切换权限档位 /profile [name]（default/workspace/full）",
       ),
     },
     {
@@ -654,26 +647,23 @@ export function matchCommands(all: readonly CommandMenuRow[], text: string): Com
 
 /**
  * shift+tab 权限模式轮盘（对齐 Claude Code 的循环切换）：
- * default 逐项确认 → acceptEdits 自动放行编辑 → plan 只读计划 → bypass 全自动跳过授权 → 回到 default。
+ * default 逐项确认 → acceptEdits 自动放行编辑 → bypass 全自动跳过授权 → 回到 default。
  * 切到 default 之外任一档都免去逐次授权；bypass 最危险，只跳过授权但压不过显式 deny/ask 规则。
  */
-export const PERM_CYCLE: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "bypass"];
+export const PERM_CYCLE: readonly PermissionMode[] = ["default", "acceptEdits", "bypass"];
 
 /** 当前权限模式的状态行提示（default 无提示，返回 null）。i18n 双语。 */
 export function permModeHint(mode: PermissionMode): string | null {
   switch (mode) {
     case "acceptEdits":
-      return t("⏵⏵ accept edits on (shift+tab to cycle)", "⏵⏵ 自动接受编辑（shift+tab 切换）");
+      return t("⏵⏵ accept edits on (Shift+Tab to cycle)", "⏵⏵ 自动接受编辑（Shift+Tab 切换）");
     case "plan":
-      return t(
-        "⏸ plan mode · read-only (shift+tab to cycle)",
-        "⏸ 计划模式 · 只读（shift+tab 切换）",
-      );
+      return t("⏸ strict read-only safety lock", "⏸ 严格只读安全锁");
     case "auto":
     case "bypass":
       return t(
-        "⏵⏵ bypass permissions on (shift+tab to cycle)",
-        "⏵⏵ 跳过所有授权（shift+tab 切换）",
+        "⏵⏵ bypass permissions on (Shift+Tab to cycle)",
+        "⏵⏵ 跳过所有授权（Shift+Tab 切换）",
       );
     default:
       return null;
@@ -689,10 +679,7 @@ export function permModeNotice(mode: PermissionMode): string {
         "权限模式：自动接受编辑 —— 文件编辑自动放行，bash 等仍会询问",
       );
     case "plan":
-      return t(
-        "Permission mode: plan — read-only, no writes or exec",
-        "权限模式：计划模式 —— 只读，不写盘不执行",
-      );
+      return t("Strict read-only safety lock is active.", "严格只读安全锁已启用。");
     case "auto":
     case "bypass":
       return t(
@@ -905,8 +892,12 @@ export interface AppProps {
   requireWorkspaceTrust?: boolean;
   /** False for daemon/HTTP clients whose session cwd belongs to another process or machine. */
   canInspectWorkspace?: boolean;
+  /** False when this client must not mutate host-owned permission controls (for example remote hosts). */
+  allowPermissionControls?: boolean;
   /** Test/embed override; invoked only for a local host selecting an Ollama model. */
-  ensureLocalOllama?: () => Promise<"running" | "started" | "missing" | "timeout">;
+  ensureLocalOllama?: () => Promise<
+    "running" | "started" | "manual" | "unsafe" | "missing" | "timeout"
+  >;
 }
 
 export type TuiKeybindingAction =
@@ -968,6 +959,7 @@ export function App({
   workspaceTrusted: initialWorkspaceTrusted = true,
   requireWorkspaceTrust = false,
   canInspectWorkspace = true,
+  allowPermissionControls = true,
   ensureLocalOllama = ensureOllama,
 }: AppProps) {
   const { exit, suspendTerminal } = useApp();
@@ -1097,15 +1089,24 @@ export function App({
   // OpenCode 同款 leader：Ctrl+X 后接一键命令；状态短暂显示在输入框下方。
   const [leaderPending, setLeaderPending] = useState(false);
   const leaderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 计划模式：/plan 切换；只读规划，退出后执行。会话切换时回到默认。
-  // 权限模式为单一真源（shift+tab 轮盘 / /plan / /profile 都改它）。
+  // 权限模式由宿主快照恢复；内部 plan 值仅用于检查失败后的严格只读安全锁兼容。
+  // UI ref 统一承接 Shift+Tab 与 /profile，再由宿主快照校准。
   const [permMode, setPermMode] = useState<PermissionMode>("default");
+  const permModeRef = useRef<PermissionMode>("default");
+  const updatePermMode = useCallback((mode: PermissionMode): void => {
+    permModeRef.current = mode;
+    setPermMode(mode);
+  }, []);
   // per-prompt 模型覆盖：仅下一条消息生效（/model <spec> once 或选择器里 Tab 设定）。
   const [nextModel, setNextModel] = useState<string | null>(null);
   const activeSessionRef = useRef({ id: sessionId, generation: state.generation });
   activeSessionRef.current = { id: sessionId, generation: state.generation };
   const workspaceTrustedRef = useRef(state.workspaceTrusted);
   const workspaceTrustReasonRef = useRef<string | undefined>(state.workspaceTrustReason);
+  const permissionControlsEnabled =
+    allowPermissionControls &&
+    state.workspaceTrusted &&
+    state.workspaceTrustReason !== "inspection-failed";
 
   const closeModelPicker = useCallback((): void => {
     modelPickerGenerationRef.current++;
@@ -1135,8 +1136,8 @@ export function App({
     // (including askRules on strict read/glob/grep) remain answerable and cannot deadlock a drive.
     setExpandedToolIds(new Set());
     const strict = state.workspaceTrustReason === "inspection-failed";
-    setPermMode(strict ? "plan" : "default");
-  }, [state.workspaceTrustReason, state.workspaceTrusted]);
+    updatePermMode(strict ? "plan" : "default");
+  }, [state.workspaceTrustReason, state.workspaceTrusted, updatePermMode]);
   // 超窄终端下弹框横向滚动偏移（列）；仅当弹框比屏还宽时生效，切换弹框时归零。
   const [hoff, setHoff] = useState(0);
   const hoffRef = useRef(0);
@@ -1280,7 +1281,7 @@ export function App({
   const selectModel = useCallback(
     async (spec: string, isCurrent: () => boolean = () => true): Promise<void> => {
       if (!isCurrent()) return;
-      // 本地 Ollama 模型：选中即尝试自启动服务，省去手动 `ollama serve`。
+      // 本地 Ollama 模型只探测 loopback。自动启动必须由用户显式配置可信绝对路径。
       if (spec.startsWith("ollama/") && canInspectWorkspace) {
         dispatch({
           t: "push",
@@ -1291,6 +1292,34 @@ export function App({
         });
         const r = await ensureLocalOllama();
         if (!isCurrent()) return;
+        if (r === "unsafe") {
+          closeModelPicker();
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(
+                "Ollama endpoints must use loopback without URL credentials.",
+                "Ollama 端点必须是无 URL 凭据的本机 loopback 地址。",
+              ),
+            },
+          });
+          return;
+        }
+        if (r === "manual") {
+          closeModelPicker();
+          dispatch({
+            t: "push",
+            item: {
+              kind: "error",
+              text: t(
+                "Ollama is not running. Start `ollama serve` manually, or explicitly configure ANICODE_OLLAMA_AUTO_START=1 with ANICODE_OLLAMA_EXECUTABLE set to its absolute trusted path.",
+                "Ollama 尚未运行。请手动启动 `ollama serve`；或显式设置 ANICODE_OLLAMA_AUTO_START=1，并将 ANICODE_OLLAMA_EXECUTABLE 设为可信绝对路径。",
+              ),
+            },
+          });
+          return;
+        }
         if (r === "missing") {
           closeModelPicker();
           dispatch({
@@ -1381,7 +1410,7 @@ export function App({
     setExpandedToolIds(new Set());
     modelProbeGenerationRef.current++;
     closeModelPicker();
-    setPermMode("default"); // 新会话回到默认模式
+    updatePermMode("default"); // snapshot 到达后会替换为宿主的权威模式
     if (requireWorkspaceTrust) {
       workspaceTrustedRef.current = false;
       workspaceTrustReasonRef.current = undefined;
@@ -1471,6 +1500,15 @@ export function App({
           workspaceTrustReasonRef.current = workspaceTrustReason;
           const strictWorkspaceInspection =
             !workspaceTrusted && workspaceTrustReason === "inspection-failed";
+          const snapshotPermissionMode = strictWorkspaceInspection
+            ? "plan"
+            : !workspaceTrusted &&
+                snap.permissionMode !== undefined &&
+                snap.permissionMode !== "default" &&
+                snap.permissionMode !== "plan"
+              ? "default"
+              : (snap.permissionMode ?? "default");
+          updatePermMode(snapshotPermissionMode);
           const initialItems: Row[] = [
             sessionBoundary(snap.meta),
             ...(workspaceTrusted
@@ -1551,6 +1589,7 @@ export function App({
     requireWorkspaceTrust,
     resetTranscriptScroll,
     sessionId,
+    updatePermMode,
   ]);
 
   const toggleToolDetail = useCallback(
@@ -1956,57 +1995,20 @@ export function App({
         }
         return true;
       }
-      if (cmd === "plan") {
-        if (!host.setPermissionMode) {
-          dispatch({
-            t: "push",
-            item: {
-              kind: "error",
-              text: t(
-                "This transport doesn't support runtime plan mode; start with --permission-mode plan.",
-                "当前传输不支持运行时计划模式；可用 --permission-mode plan 启动。",
-              ),
-            },
-          });
-          return true;
-        }
-        const arg = (rest[0] ?? "").toLowerCase();
-        const next = arg === "on" ? true : arg === "off" ? false : permMode !== "plan";
-        if (workspaceTrustReasonRef.current === "inspection-failed" && !next) {
-          setPermMode("plan");
-          dispatch({
-            t: "push",
-            item: {
-              kind: "info",
-              text: t(
-                "Workspace inspection failed; strict read-only plan mode cannot be disabled.",
-                "工作区检查失败；无法退出严格只读计划模式。",
-              ),
-            },
-          });
-          return true;
-        }
-        try {
-          await host.setPermissionMode(sessionId, next ? "plan" : "default");
-          setPermMode(next ? "plan" : "default");
-          dispatch({
-            t: "push",
-            item: {
-              kind: "info",
-              text: next
-                ? t(
-                    "Plan mode ON: read-only. Ask for a plan, then /plan off to execute.",
-                    "已进入计划模式：只读。先让它给方案，再 /plan off 退出执行。",
-                  )
-                : t("Plan mode OFF.", "已退出计划模式。"),
-            },
-          });
-        } catch (err) {
-          dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
-        }
-        return true;
-      }
       if (cmd === "profile") {
+        if (!allowPermissionControls) {
+          dispatch({
+            t: "push",
+            item: {
+              kind: "info",
+              text: t(
+                "Permission profiles are owned by the host and cannot be changed from this client.",
+                "权限档位由宿主管理，当前客户端无法切换。",
+              ),
+            },
+          });
+          return true;
+        }
         if (!workspaceTrustedRef.current) {
           dispatch({
             t: "push",
@@ -2035,10 +2037,13 @@ export function App({
         }
         const name = (rest[0] ?? "").trim();
         try {
+          const profiles = await host.listPermissionProfiles(sessionId);
+          const visibleProfiles = Object.entries(profiles).filter(([, profile]) => {
+            return profile.mode !== "plan";
+          });
           if (!name) {
-            // 无参：列出可用档位。
-            const profiles = await host.listPermissionProfiles(sessionId);
-            const lines = Object.entries(profiles).map(
+            // 内部只读安全档位不作为可交互 TUI 档位暴露。
+            const lines = visibleProfiles.map(
               ([n, p]) =>
                 `  ${n}${p.mode ? ` → ${p.mode}` : ""}${p.description ? ` · ${p.description}` : ""}`,
             );
@@ -2052,8 +2057,21 @@ export function App({
             });
             return true;
           }
+          if (profiles[name]?.mode === "plan") {
+            dispatch({
+              t: "push",
+              item: {
+                kind: "error",
+                text: t(
+                  "Read-only permission profiles are not available in the TUI.",
+                  "TUI 不提供只读权限档位。",
+                ),
+              },
+            });
+            return true;
+          }
           const mode = await host.setPermissionProfile(sessionId, name);
-          setPermMode(mode); // 权限指示与档位保持一致
+          updatePermMode(mode); // 权限指示与档位保持一致
           dispatch({
             t: "push",
             item: {
@@ -2328,9 +2346,10 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       exit,
       commands,
       canInspectWorkspace,
+      allowPermissionControls,
       mcpStatus,
       sessionId,
-      permMode,
+      updatePermMode,
       reconnect,
       toggleToolDetail,
       suspendTerminalWithCaret,
@@ -2416,17 +2435,44 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     ],
   );
 
-  // shift+tab 轮盘：受信任时完整轮盘；普通受限时 default ↔ plan；检查失败时锁定 plan。
+  // Shift+Tab 轮盘仅对受信任工作区开放；检查失败时保留内部只读锁兼容值。
   const cyclePermMode = useCallback((): void => {
     if (workspaceTrustReasonRef.current === "inspection-failed") {
-      setPermMode("plan");
+      updatePermMode("plan");
       dispatch({
         t: "push",
         item: {
           kind: "info",
           text: t(
-            "Workspace inspection failed; permission mode is locked to strict read-only plan.",
-            "工作区检查失败；权限模式已锁定为严格只读计划模式。",
+            "Workspace inspection failed; the strict read-only safety lock cannot be changed.",
+            "工作区检查失败；严格只读安全锁无法切换。",
+          ),
+        },
+      });
+      return;
+    }
+    if (!workspaceTrustedRef.current) {
+      updatePermMode("default");
+      dispatch({
+        t: "push",
+        item: {
+          kind: "info",
+          text: t(
+            "Permission controls are fixed in a restricted workspace.",
+            "受限工作区中权限模式固定，无法切换。",
+          ),
+        },
+      });
+      return;
+    }
+    if (!allowPermissionControls) {
+      dispatch({
+        t: "push",
+        item: {
+          kind: "info",
+          text: t(
+            "Permission controls are owned by the host and cannot be changed from this client.",
+            "权限设置由宿主管理，当前客户端无法切换。",
           ),
         },
       });
@@ -2445,18 +2491,19 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       });
       return;
     }
-    const cycle = workspaceTrustedRef.current
-      ? PERM_CYCLE
-      : (["default", "plan"] as const satisfies readonly PermissionMode[]);
-    const cur = cycle.indexOf(permMode as (typeof cycle)[number]);
+    const cycle = PERM_CYCLE;
+    const current = permModeRef.current;
+    const cur = cycle.indexOf(current as (typeof cycle)[number]);
     const next = cur < 0 ? "default" : cycle[(cur + 1) % cycle.length]!;
-    setPermMode(next);
+    updatePermMode(next);
     void host.setPermissionMode(sessionId, next).catch((err) => {
-      setPermMode(permMode); // 回滚 UI 到切换前，避免与后端不一致
+      // A later rapid Shift+Tab may already have advanced again; do not let this
+      // request's failure roll that newer optimistic state back.
+      if (permModeRef.current === next) updatePermMode(current);
       dispatch({ t: "push", item: { kind: "error", text: errorMessage(err) } });
     });
     dispatch({ t: "push", item: { kind: "info", text: permModeNotice(next) } });
-  }, [host, sessionId, permMode]);
+  }, [allowPermissionControls, host, sessionId, updatePermMode]);
 
   // Ink 7 separates bracketed paste from key input. Clipboard text is inserted
   // verbatim (after control-sequence sanitization), including newlines, and is
@@ -2508,6 +2555,13 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     }
     if (matchesKeybinding(ch, key, bindings.quit)) {
       exit();
+      return;
+    }
+    // Permission mode is a global control: keep it reachable even while a permission,
+    // model, or session picker is open. A request that is already waiting still needs
+    // one explicit decision; the new mode governs subsequent checks.
+    if (matchesKeybinding(ch, key, bindings.permissionCycle)) {
+      cyclePermMode();
       return;
     }
     // 弹框/命令菜单打开时，主界面不参与回看滚动（对齐需求：弹框在，主界面不滚动）。
@@ -2789,6 +2843,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
             termCols,
             permissionIndexRef.current,
             anchor,
+            permissionControlsEnabled,
           );
           const clicked = hitTestSprite(sprite, mouse.leftClick.column, mouse.leftClick.row);
           if (clicked !== null) {
@@ -2905,11 +2960,6 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           },
         });
       });
-      return;
-    }
-    // shift+tab：切换权限模式轮盘（对齐 Claude Code）。先于命令菜单的 Tab 补全拦截，故菜单开着也能切。
-    if (matchesKeybinding(ch, key, bindings.permissionCycle)) {
-      cyclePermMode();
       return;
     }
     // 斜杠命令补全菜单（输入框正上方、方向朝上）：正在敲命令名时接管方向键/Tab/Enter/Esc。
@@ -3105,7 +3155,16 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     }
     if (pendings[0]) {
       const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
-      return show(buildPermissionOverlay(pendings, termRows, termCols, permissionIndex, anchor));
+      return show(
+        buildPermissionOverlay(
+          pendings,
+          termRows,
+          termCols,
+          permissionIndex,
+          anchor,
+          permissionControlsEnabled,
+        ),
+      );
     }
     if (sessions) {
       const visible = filterSessionRows(sessions.rows, sessions.filter);
@@ -3131,6 +3190,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
     picker,
     pendings,
     permissionIndex,
+    permissionControlsEnabled,
     sessions,
     sessionId,
     input,
@@ -3169,12 +3229,12 @@ Requirements: read the actual diff and surrounding code before judging; verify e
   const currentPermModeHint =
     state.workspaceTrustReason === "inspection-failed"
       ? t(
-          "⏸ plan mode · strict read-only (workspace inspection failed; locked)",
-          "⏸ 计划模式 · 只读（工作区检查失败，已锁定）",
+          "⏸ strict read-only safety lock (workspace inspection failed)",
+          "⏸ 严格只读安全锁（工作区检查失败）",
         )
       : permModeHint(permMode);
   // 提示行仅在需要时出现（对齐 opencode 的极简）：运行中显示中断/追加；
-  // 计划模式或临时模型激活时提示其状态；否则空闲态不显示常规导航提示。
+  // 严格安全锁、非默认权限档位或临时模型激活时提示其状态；否则空闲态不显示常规导航提示。
   const hintItems = leaderPending
     ? [
         t(
@@ -3183,7 +3243,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         ),
       ]
     : state.running
-      ? [t("esc interrupt", "esc 中断"), t("enter append", "enter 追加")]
+      ? [
+          t("esc interrupt", "esc 中断"),
+          t("enter append", "enter 追加"),
+          ...(currentPermModeHint ? [currentPermModeHint] : []),
+        ]
       : [
           ...(currentPermModeHint ? [currentPermModeHint] : []),
           ...(nextModel
@@ -3275,6 +3339,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           index={permissionIndex}
           termRows={termRows}
           termCols={termCols}
+          showPermissionControls={permissionControlsEnabled}
         />
       ) : null}
       {!pendings[0] || overlayMode || termRows >= 16 ? inputCluster : null}
@@ -3698,8 +3763,8 @@ function helpText(): string {
       "Ctrl+G 外部编辑器 · Ctrl+O 工具输出 · Ctrl+R 重连（可在 tui.keybindings 配置）",
     ),
     t(
-      "Shift+Tab             Cycle permission mode (restricted: default ↔ plan only)",
-      "Shift+Tab             轮换权限模式（受限工作区仅默认 ↔ 计划）",
+      "Shift+Tab             Cycle permission mode (trusted workspaces only)",
+      "Shift+Tab             轮换权限模式（仅可信工作区）",
     ),
     t(
       "/undo [mode]          Rewind the last turn; mode: files (default) / conversation / both",
@@ -3708,10 +3773,6 @@ function helpText(): string {
     t(
       "/fork [title]         Fork this session into a new one (original untouched)",
       "/fork [标题]          把当前会话分叉成新会话（原会话不动）",
-    ),
-    t(
-      "/plan [on|off]        Toggle plan mode: read-only planning; exit to execute",
-      "/plan [on|off]        切换计划模式：只读规划；退出后再执行",
     ),
     t(
       "/skills               List auto-detected skills and availability",
@@ -4500,12 +4561,14 @@ function PermissionPanel({
   index,
   termRows,
   termCols,
+  showPermissionControls,
 }: {
   pending: PendingPerm;
   pendingCount: number;
   index: number;
   termRows: number;
   termCols: number;
+  showPermissionControls: boolean;
 }) {
   const options = [
     { keyName: "y", label: t("Allow once", "允许一次"), short: t("Once", "一次"), color: "green" },
@@ -4584,7 +4647,12 @@ function PermissionPanel({
           ))}
         </Text>
         <Text dimColor wrap="truncate">
-          {t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}
+          {showPermissionControls
+            ? t(
+                "↑↓ select · Enter confirm · Shift+Tab mode",
+                "↑↓ 选择 · Enter 确认 · Shift+Tab 切模式",
+              )
+            : t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}
         </Text>
       </Box>
     );
@@ -4637,7 +4705,14 @@ function PermissionPanel({
         </Box>
       ))}
       <Box>
-        <Text>{t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}</Text>
+        <Text>
+          {showPermissionControls
+            ? t(
+                "↑↓ select · Enter confirm · Shift+Tab mode",
+                "↑↓ 选择 · Enter 确认 · Shift+Tab 切模式",
+              )
+            : t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认")}
+        </Text>
       </Box>
     </Box>
   );

@@ -30,10 +30,22 @@ interface JsonRpcMessage {
   params?: any;
 }
 
-const PROTOCOL_VERSION = "2025-06-18";
+const MODERN_PROTOCOL_VERSION = "2026-07-28";
+const LEGACY_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+const DEFAULT_LEGACY_PROTOCOL_VERSION = "2025-11-25";
+const PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo";
+const CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities";
+const SERVER_INFO_META = "io.modelcontextprotocol/serverInfo";
 const MAX_MCP_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_MCP_CONCURRENT_CALLS = 32;
 const MAX_MCP_RESULT_CHARS = 512 * 1024;
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
 
 /** 启动 stdio MCP server；返回句柄用于停止读入（不 dispose manager，归宿主管）。 */
 export function serveMcp(opts: McpServeOptions): { close(): void } {
@@ -43,6 +55,7 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
   let buffer = Buffer.alloc(0);
   let activeCalls = 0;
   let closed = false;
+  let legacyInitialized = false;
 
   const write = (obj: unknown): void => {
     const frame = JSON.stringify(obj) + "\n";
@@ -62,10 +75,67 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
       }) + "\n",
     );
   };
-  const reply = (id: JsonRpcMessage["id"], result: unknown): void =>
-    write({ jsonrpc: "2.0", id, result });
-  const replyError = (id: JsonRpcMessage["id"], code: number, message: string): void =>
-    write({ jsonrpc: "2.0", id, error: { code, message } });
+  const reply = (id: JsonRpcMessage["id"], result: unknown, modern = false): void => {
+    const value = asRecord(result);
+    write({
+      jsonrpc: "2.0",
+      id,
+      result: modern
+        ? {
+            ...value,
+            resultType: "complete",
+            _meta: { ...asRecord(value["_meta"]), [SERVER_INFO_META]: info },
+          }
+        : result,
+    });
+  };
+  const replyError = (
+    id: JsonRpcMessage["id"],
+    code: number,
+    message: string,
+    data?: unknown,
+  ): void =>
+    write({
+      jsonrpc: "2.0",
+      id,
+      error: { code, message, ...(data === undefined ? {} : { data }) },
+    });
+
+  /** 校验现代请求的自包含元数据；返回 false 时已回复错误。 */
+  const isModernRequest = (msg: JsonRpcMessage): boolean | undefined => {
+    const meta = asRecord(asRecord(msg.params)["_meta"]);
+    const requested = meta[PROTOCOL_VERSION_META];
+    if (requested === undefined) {
+      if (legacyInitialized) return false;
+      replyError(msg.id, -32602, "request requires protocol metadata or legacy initialize");
+      return undefined;
+    }
+    if (typeof requested !== "string") {
+      replyError(msg.id, -32602, `${PROTOCOL_VERSION_META} must be a string`);
+      return undefined;
+    }
+    if (requested !== MODERN_PROTOCOL_VERSION) {
+      replyError(msg.id, -32022, "unsupported MCP protocol version", {
+        supported: [MODERN_PROTOCOL_VERSION],
+        requested,
+      });
+      return undefined;
+    }
+    const capabilities = meta[CLIENT_CAPABILITIES_META];
+    if (capabilities === null || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+      replyError(msg.id, -32602, `${CLIENT_CAPABILITIES_META} must be an object`);
+      return undefined;
+    }
+    const clientInfo = meta[CLIENT_INFO_META];
+    if (clientInfo !== undefined) {
+      const record = asRecord(clientInfo);
+      if (typeof record["name"] !== "string" || typeof record["version"] !== "string") {
+        replyError(msg.id, -32602, `${CLIENT_INFO_META} must contain name and version`);
+        return undefined;
+      }
+    }
+    return true;
+  };
 
   const tools = [
     {
@@ -149,25 +219,46 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
 
   function handle(msg: JsonRpcMessage): void {
     const id = msg.id;
-    switch (msg.method) {
-      case "initialize":
-        reply(id, {
-          protocolVersion:
-            typeof msg.params?.protocolVersion === "string"
-              ? msg.params.protocolVersion
-              : PROTOCOL_VERSION,
+    if (msg.method === "server/discover") {
+      const modern = isModernRequest(msg);
+      if (modern !== true) return;
+      reply(
+        id,
+        {
+          supportedVersions: [MODERN_PROTOCOL_VERSION],
           capabilities: { tools: {} },
-          serverInfo: info,
-        });
-        return;
-      case "notifications/initialized":
-      case "notifications/cancelled":
-        return; // 通知，无需回应
+        },
+        true,
+      );
+      return;
+    }
+    if (msg.method === "initialize") {
+      const requested =
+        typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion : undefined;
+      legacyInitialized = true;
+      reply(id, {
+        protocolVersion:
+          requested && LEGACY_PROTOCOL_VERSIONS.includes(requested)
+            ? requested
+            : DEFAULT_LEGACY_PROTOCOL_VERSION,
+        capabilities: { tools: {} },
+        serverInfo: info,
+      });
+      return;
+    }
+    if (msg.method === "notifications/initialized" || msg.method === "notifications/cancelled") {
+      return; // 通知，无需回应
+    }
+
+    const modern = isModernRequest(msg);
+    if (modern === undefined) return;
+    switch (msg.method) {
       case "ping":
-        reply(id, {});
+        if (modern) replyError(id, -32601, "unknown method: ping");
+        else reply(id, {});
         return;
       case "tools/list":
-        reply(id, { tools });
+        reply(id, { tools }, modern);
         return;
       case "tools/call": {
         const name = String(msg.params?.name ?? "");
@@ -193,12 +284,18 @@ export function serveMcp(opts: McpServeOptions): { close(): void } {
         // 异步执行，不串行阻塞后续请求；结果/错误都以 MCP tool result 形态回传。
         void runTool(name, args)
           .then(
-            (text) => reply(id, { content: [{ type: "text", text }], isError: false }),
+            (text) => reply(id, { content: [{ type: "text", text }], isError: false }, modern),
             (err: unknown) =>
-              reply(id, {
-                content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-                isError: true,
-              }),
+              reply(
+                id,
+                {
+                  content: [
+                    { type: "text", text: err instanceof Error ? err.message : String(err) },
+                  ],
+                  isError: true,
+                },
+                modern,
+              ),
           )
           .finally(() => activeCalls--);
         return;

@@ -15,7 +15,7 @@
 
 import type { ImagePart, ToolResultPart, Usage } from "./types.js";
 import type { AgentEvent } from "./agent.js";
-import { ToolError, type ToolRegistry } from "./tools/tool.js";
+import { ToolError, type Tool, type ToolRegistry } from "./tools/tool.js";
 import type { PermissionDecision, PermissionEngine } from "./permission.js";
 import type { HookRunner } from "./hooks.js";
 import { Chan } from "./chan.js";
@@ -27,6 +27,14 @@ import type { SecurityPolicyEngine } from "./security/policy.js";
 
 export type ToolCall = { id: string; name: string; args: Record<string, unknown> };
 
+export interface ToolExecutionFenceRequest {
+  toolCallId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  ruleKey: string;
+  signal: AbortSignal;
+}
+
 export interface ToolExecutorOptions {
   tools: ToolRegistry;
   perm: PermissionEngine;
@@ -36,6 +44,10 @@ export interface ToolExecutorOptions {
   sandbox?: "none" | "read-only" | "workspace-write";
   /** 单个工具结果注入历史的字符上限（超出截中段）。 */
   maxToolResultChars: number;
+  /** 同一批并行安全工具的最大并发，默认 8。 */
+  maxConcurrentTools?: number;
+  /** 单个工具统一执行超时（毫秒），默认 10 分钟。 */
+  toolTimeoutMs?: number;
   /**
    * 并发分组发生在执行前。只要 PreToolUse 或只读 ask-confirm 可能改写入参，
    * 就必须保守串行，避免按旧参数判成安全、最终却执行写操作。
@@ -52,10 +64,23 @@ export interface ToolExecutorOptions {
   traceParent?: () => SpanContext | undefined;
   /** 成功写入后通知 Verifier 收集变更路径。 */
   onFilesChanged?: (paths: string[]) => void;
+  /** Durable command lease/fencing gate, awaited immediately before any side-effecting tool body. */
+  beforeToolExecution?: (request: ToolExecutionFenceRequest) => void | Promise<void>;
+  /** Tree-global concurrency slot; held until the actual tool Promise settles. */
+  acquireToolExecutionSlot?: (signal: AbortSignal) => Promise<() => void>;
 }
 
 export class ToolExecutor {
+  private readonly rawExecutions = new Set<Promise<unknown>>();
+
   constructor(private readonly o: ToolExecutorOptions) {}
+
+  /** Keep durable command ownership until aborted/timed-out tool code has actually settled. */
+  async awaitIdle(): Promise<void> {
+    while (this.rawExecutions.size > 0) {
+      await Promise.allSettled([...this.rawExecutions]);
+    }
+  }
 
   /**
    * 执行一轮工具调用：连续的只读调用组成一批并行执行，副作用调用按序串行。
@@ -81,8 +106,12 @@ export class ToolExecutor {
         batch.push(calls[i + batch.length]!);
       }
       i += batch.length;
-      if (batch.length === 1) yield* this.runToolSafe(batch[0]!, signal, results, images);
-      else yield* this.runToolBatch(batch, signal, results, images);
+      const concurrency = Math.max(1, Math.floor(this.o.maxConcurrentTools ?? 8));
+      for (let offset = 0; offset < batch.length; offset += concurrency) {
+        const chunk = batch.slice(offset, offset + concurrency);
+        if (chunk.length === 1) yield* this.runToolSafe(chunk[0]!, signal, results, images);
+        else yield* this.runToolBatch(chunk, signal, results, images);
+      }
     }
     return { results, images };
   }
@@ -200,12 +229,18 @@ export class ToolExecutor {
     let blockedReason: string | null = null;
     let preContext: string | undefined;
     if (this.o.hooks.has("PreToolUse")) {
-      const h = await this.o.hooks.run({
-        event: "PreToolUse",
-        cwd: this.o.cwd,
-        toolName: call.name,
-        toolInput: args,
-      });
+      const h = await raceWithSignal(
+        this.o.hooks.run({
+          event: "PreToolUse",
+          cwd: this.o.cwd,
+          toolName: call.name,
+          toolInput: args,
+          signal,
+        }),
+        signal,
+      );
+      throwIfAborted(signal);
+      if (h.mutatedWorkspace) this.o.onFilesChanged?.([this.o.cwd]);
       if (h.blocked) blockedReason = h.reason ?? "被 PreToolUse hook 拦截";
       if (h.updatedInput) args = h.updatedInput;
       hookAllowed = h.allowed;
@@ -241,20 +276,24 @@ export class ToolExecutor {
     }
 
     // hook 的 allow 也进权限门 —— 它跳过 mode/confirm，但压不过 deny/ask 规则
-    let decision: PermissionDecision = await this.o.perm.check({
-      toolName: call.name,
-      input: args,
-      cwd: this.o.cwd,
-      readOnly: tool.readOnly,
-      mutatesFiles: tool.mutatesFiles ?? false,
-      network: args["network"] === true,
-      ruleKey,
-      ...(tool.ruleParts ? { ruleParts: tool.ruleParts(args) } : {}),
-      ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(args) } : {}),
-      ...(hookAllowed ? { hookAllowed } : {}),
-      toolCallId: call.id,
+    let decision: PermissionDecision = await raceWithSignal(
+      this.o.perm.check({
+        toolName: call.name,
+        input: args,
+        cwd: this.o.cwd,
+        readOnly: tool.readOnly,
+        mutatesFiles: tool.mutatesFiles ?? false,
+        network: tool.capabilities?.includes("network") || args["network"] === true,
+        ruleKey,
+        ...(tool.ruleParts ? { ruleParts: tool.ruleParts(args) } : {}),
+        ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(args) } : {}),
+        ...(hookAllowed ? { hookAllowed } : {}),
+        toolCallId: call.id,
+        signal,
+      }),
       signal,
-    });
+    );
+    throwIfAborted(signal);
 
     // confirm 可以收窄/改写参数，但确认针对的是原动作。最终动作必须重新经过
     // deny/ask 不可绕过层，不能借 updatedInput 把安全请求换成被禁请求。
@@ -267,7 +306,7 @@ export class ToolExecutor {
         cwd: this.o.cwd,
         readOnly: tool.readOnly,
         mutatesFiles: tool.mutatesFiles ?? false,
-        network: updated["network"] === true,
+        network: tool.capabilities?.includes("network") || updated["network"] === true,
         ruleKey: updatedRuleKey,
         ...(tool.ruleParts ? { ruleParts: tool.ruleParts(updated) } : {}),
         ...(tool.rulePartsComplete ? { rulePartsComplete: tool.rulePartsComplete(updated) } : {}),
@@ -325,36 +364,107 @@ export class ToolExecutor {
       this.o.traceParent?.(),
     );
     const toolContext = toolSpan.context();
-    const settled = tool
-      .run(input, {
-        cwd: this.o.cwd,
-        signal,
-        ...(this.o.sandbox ? { sandbox: this.o.sandbox } : {}),
-        ...(this.o.isolatedRuntime ? { isolatedRuntime: this.o.isolatedRuntime } : {}),
-        ...(this.o.networkProxy ? { networkProxy: this.o.networkProxy } : {}),
-        ...(toolContext ? { traceContext: toolContext } : {}),
-        modelSupportsImages: this.o.supportsImages(),
-        attachImage: (img) => localImages.push(img),
-        emit: (progress) =>
-          chan.push({ type: "tool_progress", id: call.id, name: call.name, event: progress }),
-        addUsage: (usage) => this.o.addUsage(usage),
+    const execution = new AbortController();
+    let active = true;
+    let timedOut = false;
+    const timeoutMs = Math.max(1_000, this.o.toolTimeoutMs ?? 10 * 60_000);
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      execution.abort(new ToolError(`工具 ${call.name} 执行超时（${timeoutMs}ms）`));
+    }, timeoutMs);
+    timeout.unref?.();
+    const onParentAbort = () =>
+      execution.abort(signal.reason ?? new ToolError(`工具 ${call.name} 已中断`));
+    if (signal.aborted) onParentAbort();
+    else signal.addEventListener("abort", onParentAbort, { once: true });
+
+    type ToolOutcome = { ok: true; content: string } | { ok: false; err: unknown };
+    const raw: Promise<ToolOutcome> = Promise.resolve()
+      .then(async () => {
+        const releaseTreeSlot = this.o.acquireToolExecutionSlot
+          ? await this.o.acquireToolExecutionSlot(execution.signal)
+          : () => undefined;
+        try {
+          if (this.requiresExecutionFence(tool) && this.o.beforeToolExecution) {
+            throwIfAborted(execution.signal);
+            await raceWithSignal(
+              Promise.resolve().then(() =>
+                this.o.beforeToolExecution!({
+                  toolCallId: call.id,
+                  toolName: call.name,
+                  input,
+                  ruleKey: tool.ruleKey(input),
+                  signal: execution.signal,
+                }),
+              ),
+              execution.signal,
+            );
+            throwIfAborted(execution.signal);
+          }
+          if (tool.mutatesFiles || tool.capabilities?.includes("filesystem-write")) {
+            this.o.onFilesChanged?.(changedPaths(input, this.o.cwd));
+          }
+          return await tool.run(input, {
+            cwd: this.o.cwd,
+            signal: execution.signal,
+            ...(this.o.sandbox ? { sandbox: this.o.sandbox } : {}),
+            ...(this.o.isolatedRuntime ? { isolatedRuntime: this.o.isolatedRuntime } : {}),
+            ...(this.o.networkProxy ? { networkProxy: this.o.networkProxy } : {}),
+            ...(toolContext ? { traceContext: toolContext } : {}),
+            modelSupportsImages: this.o.supportsImages(),
+            attachImage: (img) => {
+              if (active) localImages.push(img);
+            },
+            emit: (progress) => {
+              if (active)
+                chan.push({ type: "tool_progress", id: call.id, name: call.name, event: progress });
+            },
+            addUsage: (usage) => {
+              if (active) this.o.addUsage(usage);
+            },
+          });
+        } finally {
+          releaseTreeSlot();
+        }
       })
       .then(
-        (content) => {
-          toolSpan.setStatus({ code: "ok" });
-          return { ok: true as const, content };
-        },
-        (err: unknown) => {
-          toolSpan.recordException(err).setStatus({ code: "error" });
-          return { ok: false as const, err };
-        },
-      )
-      .finally(() => {
-        toolSpan.end();
-        chan.close();
-      });
+        (content) => ({ ok: true as const, content }),
+        (err: unknown) => ({ ok: false as const, err }),
+      );
+    this.rawExecutions.add(raw);
+    void raw.then(
+      () => this.rawExecutions.delete(raw),
+      () => this.rawExecutions.delete(raw),
+    );
+    let onExecutionAbort: (() => void) | undefined;
+    const aborted = new Promise<ToolOutcome>((resolve) => {
+      onExecutionAbort = () =>
+        resolve({
+          ok: false,
+          err:
+            execution.signal.reason ??
+            new ToolError(
+              timedOut
+                ? `工具 ${call.name} 执行超时（${timeoutMs}ms）`
+                : `工具 ${call.name} 已中断`,
+            ),
+        });
+      if (execution.signal.aborted) onExecutionAbort();
+      else execution.signal.addEventListener("abort", onExecutionAbort, { once: true });
+    });
+    const settled = Promise.race([raw, aborted]).finally(() => {
+      active = false;
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onParentAbort);
+      if (onExecutionAbort) execution.signal.removeEventListener("abort", onExecutionAbort);
+      chan.close();
+    });
     for await (const ev of chan) yield ev;
     const r = await settled;
+
+    if (r.ok) toolSpan.setStatus({ code: "ok" });
+    else toolSpan.recordException(r.err).setStatus({ code: "error" });
+    toolSpan.end();
 
     const isError = !r.ok;
     let content = truncateToolResult(
@@ -364,14 +474,19 @@ export class ToolExecutor {
     if (preContext) content += reminder(preContext);
     // PostToolUse 对成功和失败都执行；反馈（含 block reason）回传给模型。
     if (this.o.hooks.has("PostToolUse")) {
-      const h = await this.o.hooks.run({
-        event: "PostToolUse",
-        cwd: this.o.cwd,
-        toolName: call.name,
-        toolInput: input,
-        toolResult: content,
-        isError,
-      });
+      const h = await raceWithSignal(
+        this.o.hooks.run({
+          event: "PostToolUse",
+          cwd: this.o.cwd,
+          toolName: call.name,
+          toolInput: input,
+          toolResult: content,
+          isError,
+          signal,
+        }),
+        signal,
+      );
+      if (h.mutatedWorkspace) this.o.onFilesChanged?.([this.o.cwd]);
       const feedback = h.blocked ? h.reason : h.additionalContext;
       if (feedback) content += reminder(feedback);
     }
@@ -383,16 +498,19 @@ export class ToolExecutor {
       ...(isError ? { isError: true } : {}),
     };
     results.push(result);
-    if (!isError && tool.mutatesFiles) {
-      const paths = ["path", "file", "file_path"]
-        .map((key) => input[key])
-        .filter((value): value is string => typeof value === "string" && value.length > 0);
-      this.o.onFilesChanged?.(paths);
-    }
     // 图片附在本轮 tool_result 之后进入同一条 user 消息（由 run 汇总后排序）。
     // 工具失败时丢弃：错误结果配一堆图片只会白烧上下文。
     if (!isError && localImages.length) images.push(...localImages);
     yield { type: "tool_result", id: call.id, name: call.name, content, isError };
+  }
+
+  private requiresExecutionFence(tool: Tool): boolean {
+    if (!tool.readOnly) return true;
+    return Boolean(
+      tool.capabilities?.some((capability) =>
+        ["filesystem-write", "network", "process", "persistent-process"].includes(capability),
+      ),
+    );
   }
 }
 
@@ -404,6 +522,30 @@ function errResult(id: string, name: string, msg: string): ToolResultPart {
 
 function errText(err: unknown): string {
   return String((err as { message?: unknown })?.message ?? err);
+}
+
+function changedPaths(input: Record<string, unknown>, cwd: string): string[] {
+  const paths = ["path", "file", "file_path"]
+    .map((key) => input[key])
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  return paths.length > 0 ? paths : [cwd];
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
+function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason ?? new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 /** 超长工具结果截中段（保头 80% + 尾 20%，头尾往往比中段信息密度高） */

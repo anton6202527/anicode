@@ -1,5 +1,6 @@
 import { IsolatedRuntime, type ExecutionRuntime } from "../runtime/isolated-runtime.js";
-import { ToolRegistry, type Tool } from "./tool.js";
+import { t } from "../i18n.js";
+import { ToolRegistry, type Tool, type ToolCapability } from "./tool.js";
 import { readTool, writeTool, editTool, globTool, grepTool } from "./fs.js";
 import { bashTool } from "./bash.js";
 import { createTodoTool } from "./todo.js";
@@ -24,7 +25,7 @@ export {
   type ShellCommandAnalysis,
 } from "./bash.js";
 export { createTodoTool, type TodoItem } from "./todo.js";
-export { webFetchTool, htmlToText } from "./webfetch.js";
+export { createWebFetchTool, webFetchTool, htmlToText } from "./webfetch.js";
 export {
   createWebSearchTool,
   formatSearchResults,
@@ -83,6 +84,41 @@ export const RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES = [
   "todo_write",
 ] as const;
 
+/** Arbitrary or persistent host-process surfaces removed when native isolation is unavailable. */
+export const LOCAL_PROCESS_TOOL_NAMES = [
+  "bash",
+  "bash_output",
+  "write_stdin",
+  "list_shells",
+  "kill_shell",
+  "diagnostics",
+  "definition",
+  "references",
+  "symbols",
+  "browser",
+] as const;
+
+/** Process surfaces that an ephemeral OCI execution cannot keep alive between tool calls. */
+export const PERSISTENT_PROCESS_TOOL_NAMES = [
+  "bash_output",
+  "write_stdin",
+  "list_shells",
+  "kill_shell",
+  "diagnostics",
+  "definition",
+  "references",
+  "symbols",
+  "browser",
+] as const;
+
+function withCapabilities(tool: Tool, capabilities: readonly ToolCapability[]): Tool {
+  return {
+    ...tool,
+    capabilities,
+    ...(tool.fork ? { fork: () => withCapabilities(tool.fork!(), capabilities) } : {}),
+  };
+}
+
 function withoutNetworkParameter(parameters: Record<string, unknown>): Record<string, unknown> {
   const properties = parameters["properties"];
   if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
@@ -102,6 +138,41 @@ function forceNetworkDisabled(runtime: ExecutionRuntime): ExecutionRuntime {
   };
 }
 
+function withoutBackgroundParameter(parameters: Record<string, unknown>): Record<string, unknown> {
+  const properties = parameters["properties"];
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    return { ...parameters };
+  }
+  const foregroundProperties = { ...(properties as Record<string, unknown>) };
+  delete foregroundProperties["run_in_background"];
+  return { ...parameters, properties: foregroundProperties };
+}
+
+/** Foreground-only shell facade for ephemeral OCI runtimes (which intentionally lack prepare()). */
+export function foregroundOnlyBash(tool: Tool = bashTool): Tool {
+  return {
+    ...tool,
+    // OCI execution is foreground-only, not read-only: redirects, generators and formatters can
+    // still mutate the mounted workspace and therefore must trigger dirty verification.
+    capabilities: ["process", "filesystem-write"],
+    def: {
+      ...tool.def,
+      description: t(
+        "Run a foreground shell command inside the pinned OCI runtime. Background processes are unavailable because each execution is ephemeral.",
+        "在固定摘要的 OCI 运行时中执行前台 shell 命令。每次执行都是临时容器，因此不支持后台进程。",
+      ),
+      parameters: withoutBackgroundParameter(tool.def.parameters),
+    },
+    run(input, ctx) {
+      const foregroundInput = { ...input };
+      delete foregroundInput["run_in_background"];
+      return tool.run(foregroundInput, ctx);
+    },
+  };
+}
+
+export const foregroundOnlyBashTool: Tool = foregroundOnlyBash();
+
 // Local fallback is deliberately fail-closed: if the host cannot enforce its OS sandbox,
 // restricted bash fails instead of silently spawning an unrestricted process.
 const restrictedLocalRuntime = new IsolatedRuntime({ failClosed: true, requireProxy: true });
@@ -112,6 +183,7 @@ const restrictedLocalRuntime = new IsolatedRuntime({ failClosed: true, requirePr
  */
 export const restrictedWorkspaceBashTool: Tool = {
   ...bashTool,
+  capabilities: ["process", "filesystem-write"],
   def: {
     ...bashTool.def,
     parameters: withoutNetworkParameter(bashTool.def.parameters),
@@ -131,19 +203,19 @@ export const restrictedWorkspaceBashTool: Tool = {
  */
 export function defaultTools(): ToolRegistry {
   return new ToolRegistry()
-    .register(readTool)
-    .register(writeTool)
-    .register(editTool)
-    .register(applyPatchTool)
-    .register(globTool)
-    .register(grepTool)
-    .register(bashTool)
-    .register(bashOutputTool)
-    .register(killShellTool)
-    .register(writeStdinTool)
-    .register(listShellsTool)
-    .register(webFetchTool)
-    .register(createTodoTool());
+    .register(withCapabilities(readTool, ["filesystem-read"]))
+    .register(withCapabilities(writeTool, ["filesystem-write"]))
+    .register(withCapabilities(editTool, ["filesystem-write"]))
+    .register(withCapabilities(applyPatchTool, ["filesystem-write"]))
+    .register(withCapabilities(globTool, ["filesystem-read"]))
+    .register(withCapabilities(grepTool, ["filesystem-read"]))
+    .register(withCapabilities(bashTool, ["process", "filesystem-write"]))
+    .register(withCapabilities(bashOutputTool, ["persistent-process"]))
+    .register(withCapabilities(killShellTool, ["persistent-process"]))
+    .register(withCapabilities(writeStdinTool, ["persistent-process"]))
+    .register(withCapabilities(listShellsTool, ["persistent-process"]))
+    .register(withCapabilities(webFetchTool, ["network"]))
+    .register(withCapabilities(createTodoTool(), ["memory"]));
 }
 
 /** 为交互式未信任工作区创建隔离的、有状态工具注册表。 */

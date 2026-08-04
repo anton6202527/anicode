@@ -637,6 +637,7 @@ export function buildPermissionOverlay(
   termCols: number,
   selected = 0,
   anchorTop?: number,
+  showPermissionControls = true,
 ): Sprite {
   // 与输入面板同宽同左缘；不再居中挡住正在看的上下文。
   const width = Math.max(1, termCols);
@@ -763,16 +764,21 @@ export function buildPermissionOverlay(
   });
   if (!compact) L.push(blank());
   L.push(
-    bodyLR(
-      [{ text: t("esc interrupt", "esc 中断"), fg: DLG.text, bold: true }],
-      [
-        {
-          text: t("↑↓ select · Enter confirm", "↑↓ 选择 · Enter 确认"),
-          fg: DLG.text,
-          bold: true,
-        },
-      ],
-    ),
+    bodyL([
+      {
+        text: truncWidth(
+          showPermissionControls
+            ? t(
+                "esc interrupt · Shift+Tab mode · ↑↓ select · Enter confirm",
+                "esc 中断 · Shift+Tab 切模式 · ↑↓ 选择 · Enter 确认",
+              )
+            : t("esc interrupt · ↑↓ select · Enter confirm", "esc 中断 · ↑↓ 选择 · Enter 确认"),
+          inner,
+        ),
+        fg: DLG.text,
+        bold: true,
+      },
+    ]),
   );
   if (!compact) L.push(blank());
   return {

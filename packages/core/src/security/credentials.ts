@@ -351,6 +351,16 @@ export class CredentialBroker {
     return id;
   }
 
+  /** Inspect only the authorized destination name; does not expose or consume the secret value. */
+  leaseEnvironmentName(leaseId: string): string | undefined {
+    const lease = this.leases.get(leaseId);
+    if (!lease || lease.expiresAt <= Date.now() || lease.usesLeft <= 0) {
+      this.leases.delete(leaseId);
+      throw new Error("Credential lease expired or exhausted");
+    }
+    return lease.scope.env;
+  }
+
   private consume(leaseId: string): { credential: CredentialRegistration; scope: CredentialScope } {
     const lease = this.leases.get(leaseId);
     if (!lease || lease.expiresAt <= Date.now() || lease.usesLeft <= 0) {

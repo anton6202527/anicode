@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { HookRunner, type HookRegistration } from "./hooks.js";
+import { HookExecutionBoundaryError, HookRunner, type HookRegistration } from "./hooks.js";
 
 test("HookRunner: matcher 命中，updatedInput 链式传递并拼接 context", async () => {
   const seen: Record<string, unknown>[] = [];
@@ -50,6 +50,7 @@ test("HookRunner: matcher 命中，updatedInput 链式传递并拼接 context", 
   assert.deepEqual(outcome, {
     blocked: false,
     allowed: true,
+    mutatedWorkspace: false,
     updatedInput: { command: "git status", stage: 2 },
     additionalContext: "first context\nsecond context",
   });
@@ -94,6 +95,7 @@ test("HookRunner: block 一票否决、保留此前 context，并停止后续 ho
   assert.deepEqual(outcome, {
     blocked: true,
     allowed: false,
+    mutatedWorkspace: false,
     reason: "result rejected",
     additionalContext: "before block",
   });
@@ -123,6 +125,22 @@ test("HookRunner: 单个 hook 抛错时隔离异常并继续执行", async () =>
   assert.deepEqual(outcome, {
     blocked: false,
     allowed: false,
+    mutatedWorkspace: false,
     additionalContext: "still running",
   });
+});
+
+test("HookRunner: process boundary cleanup failure is fail-closed, not best-effort", async () => {
+  const runner = new HookRunner([
+    {
+      event: "Stop",
+      async handler() {
+        throw new HookExecutionBoundaryError("tree still alive");
+      },
+    },
+  ]);
+  await assert.rejects(
+    () => runner.run({ event: "Stop", cwd: "/tmp/project" }),
+    /tree still alive/,
+  );
 });

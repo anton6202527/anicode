@@ -4,8 +4,10 @@
  * 两种传输：
  *   - stdio（本地进程）：JSON-RPC 2.0，换行分隔帧。
  *   - Streamable HTTP（远程 server）：POST JSON-RPC 到单一 endpoint，响应为
- *     application/json 或 text/event-stream(SSE)；用 Mcp-Session-Id 维持会话。
- * 支持 initialize / tools/list / tools/call。每个 MCP 工具包装成 core Tool
+ *     application/json 或 text/event-stream(SSE)。2026-07-28 为无状态请求；旧协议
+ *     仍用 initialize + Mcp-Session-Id 维持会话。
+ * 客户端先用 server/discover 探测 2026-07-28，旧 server 自动回退 initialize。
+ * 支持 tools/list / tools/call。每个 MCP 工具包装成 core Tool
  * （默认非只读——外部工具不可信，一律走权限门）。
  *
  * 自研、无外部依赖：stdio 可用「假 server 脚本」离线测试，HTTP 可用本地 http server 测试。
@@ -14,7 +16,7 @@
  *   - per-request 超时（对齐 Codex tool_timeout_sec；默认 60s，per-server 可配）
  *   - notifications/tools/list_changed → onToolsChanged 回调（对齐 Claude Code 自动刷新）
  *   - resources/prompts 的客户端方法（listResources/readResource/listPrompts/getPrompt），
- *     供前端做 @资源 提及与 /prompt 命令；按 initialize 声明的能力裁剪。
+ *     供前端做 @资源 提及与 /prompt 命令；按 discover/initialize 声明的能力裁剪。
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -23,7 +25,7 @@ import { sanitizedShellEnv } from "./tools/shell-spawn.js";
 import { t } from "./i18n.js";
 import type { Tool, ToolContext } from "./tools/tool.js";
 import { ToolError } from "./tools/tool.js";
-import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import { terminateProcessTree, type ExecutionRuntime } from "./runtime/isolated-runtime.js";
 import type { NetworkProxy } from "./runtime/network-proxy.js";
 import { noTelemetry, traceparent, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
 
@@ -31,7 +33,7 @@ interface JsonRpcResponse {
   jsonrpc: "2.0";
   id: number;
   result?: any;
-  error?: { code: number; message: string };
+  error?: { code: number; message: string; data?: unknown };
 }
 
 interface McpToolSpec {
@@ -40,10 +42,49 @@ interface McpToolSpec {
   inputSchema?: Record<string, unknown>;
 }
 
+interface McpHeaderBinding {
+  headerName: string;
+  path: string[];
+  type: "string" | "integer" | "boolean";
+}
+
 /** MCP 请求默认超时；挂死的 server 不该无限期占住一次工具调用。 */
 const DEFAULT_TIMEOUT_MS = 60_000;
+/** 旧 stdio server 可能静默丢弃 server/discover，探测必须使用较短独立上限。 */
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 3_000;
 const MAX_MCP_STDIO_FRAME_BYTES = 4 * 1024 * 1024;
+const MAX_MCP_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_MCP_SSE_EVENTS = 10_000;
 const MAX_MCP_PENDING_REQUESTS = 256;
+const MODERN_PROTOCOL_VERSION = "2026-07-28";
+const LEGACY_PROTOCOL_VERSION = "2025-11-25";
+const PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo";
+const CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities";
+const MCP_HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const MAX_MCP_SCHEMA_NODES = 4_096;
+
+class McpRpcError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+    readonly data?: unknown,
+    readonly httpStatus?: number,
+  ) {
+    super(`MCP ${code}: ${message}`);
+    this.name = "McpRpcError";
+  }
+}
+
+class McpHttpError extends Error {
+  constructor(
+    readonly status: number,
+    body: string,
+  ) {
+    super(`MCP HTTP ${status}: ${body.slice(0, 200)}`);
+    this.name = "McpHttpError";
+  }
+}
 
 /** server 声明的资源元数据（resources/list）。 */
 export interface McpResource {
@@ -94,6 +135,8 @@ export interface McpStdioConfig {
   network?: boolean;
   /** 单个请求的超时（毫秒）；默认 60000。 */
   timeoutMs?: number;
+  /** 2026-07-28 server/discover 探测上限；默认 min(timeoutMs, 3000)。 */
+  discoveryTimeoutMs?: number;
 }
 
 /** Streamable HTTP 传输：远程 server（含云端官方 server）。 */
@@ -113,6 +156,8 @@ export interface McpHttpConfig {
   };
   /** 单个请求的超时（毫秒）；默认 60000。 */
   timeoutMs?: number;
+  /** 2026-07-28 server/discover 探测上限；默认 min(timeoutMs, 3000)。 */
+  discoveryTimeoutMs?: number;
 }
 
 export type McpServerConfig = McpStdioConfig | McpHttpConfig;
@@ -151,21 +196,221 @@ function shellCommand(file: string, args: readonly string[]): string {
   return [file, ...args].map(shellQuote).join(" ");
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function positiveTimeout(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** 2026-07-28 将原握手信息放入每个请求的 params._meta。 */
+function modernParams(params: unknown): Record<string, unknown> {
+  const base = asRecord(params);
+  const existingMeta = asRecord(base["_meta"]);
+  return {
+    ...base,
+    _meta: {
+      ...existingMeta,
+      [PROTOCOL_VERSION_META]: MODERN_PROTOCOL_VERSION,
+      [CLIENT_INFO_META]: { name: "anicode", version: "0.0.1" },
+      [CLIENT_CAPABILITIES_META]: {},
+    },
+  };
+}
+
+function assertCompleteResult(result: unknown, method: string): void {
+  const value = asRecord(result);
+  const resultType = value["resultType"];
+  if (resultType === undefined) {
+    throw new Error(`MCP ${method} response is missing required resultType`);
+  }
+  if (resultType === "complete") return;
+  if (resultType === "input_required") {
+    throw new Error(`MCP ${method} requires client input, which anicode does not support yet`);
+  }
+  throw new Error(`MCP ${method} returned unsupported resultType: ${String(resultType)}`);
+}
+
+function shouldFallbackToLegacy(error: unknown, http: boolean): boolean {
+  // 现代保留错误证明对端理解 2026 协议，永远不能降级。
+  if (error instanceof McpRpcError && [-32020, -32021, -32022].includes(error.code)) {
+    return false;
+  }
+  // stdio 无状态码，规范要求除现代保留错误外的探测失败均视作 legacy 证据。
+  if (!http) return true;
+
+  const status =
+    error instanceof McpRpcError
+      ? error.httpStatus
+      : error instanceof McpHttpError
+        ? error.status
+        : undefined;
+  // 认证失败、服务故障、超时和网络错误不是协议年代证据，必须原样失败。
+  if (status === 401 || status === 403 || (status !== undefined && status >= 500)) return false;
+  if (status === 400 || status === 404 || status === 405) return true;
+  // 一些旧 Streamable HTTP server 用 200 JSON-RPC 错误响应未知 pre-init 方法。
+  return (
+    (status === undefined || status === 200) &&
+    error instanceof McpRpcError &&
+    (error.code === -32601 || error.code === -32602)
+  );
+}
+
+function compileMcpHeaderBindings(
+  inputSchema: unknown,
+): { ok: true; bindings: McpHeaderBinding[] } | { ok: false; reason: string } {
+  const bindings: McpHeaderBinding[] = [];
+  const seenHeaders = new Set<string>();
+  let visited = 0;
+  try {
+    const visit = (
+      value: unknown,
+      reachable: boolean,
+      propertyNode: boolean,
+      path: string[],
+    ): void => {
+      if (Array.isArray(value)) {
+        for (const child of value) visit(child, false, false, path);
+        return;
+      }
+      if (value === null || typeof value !== "object") return;
+      if (++visited > MAX_MCP_SCHEMA_NODES) throw new Error("input schema is too complex");
+      const node = value as Record<string, unknown>;
+      if (Object.hasOwn(node, "x-mcp-header")) {
+        if (!reachable || !propertyNode) {
+          throw new Error("x-mcp-header must annotate a statically reachable property");
+        }
+        const headerName = node["x-mcp-header"];
+        if (typeof headerName !== "string" || !MCP_HEADER_TOKEN.test(headerName)) {
+          throw new Error("x-mcp-header must be a non-empty HTTP token");
+        }
+        const type = node["type"];
+        if (type !== "string" && type !== "integer" && type !== "boolean") {
+          throw new Error("x-mcp-header requires property type string, integer, or boolean");
+        }
+        const normalized = headerName.toLowerCase();
+        if (seenHeaders.has(normalized)) {
+          throw new Error("x-mcp-header names must be case-insensitively unique");
+        }
+        seenHeaders.add(normalized);
+        bindings.push({ headerName, path: [...path], type });
+      }
+
+      const properties = node["properties"];
+      if (properties !== null && typeof properties === "object" && !Array.isArray(properties)) {
+        for (const [name, child] of Object.entries(properties as Record<string, unknown>)) {
+          visit(child, reachable, true, [...path, name]);
+        }
+      }
+      for (const [key, child] of Object.entries(node)) {
+        if (key === "x-mcp-header" || key === "properties") continue;
+        visit(child, false, false, path);
+      }
+    };
+    visit(inputSchema, true, false, []);
+    return { ok: true, bindings };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : "invalid x-mcp-header" };
+  }
+}
+
+function mcpParameterHeaders(
+  bindings: readonly McpHeaderBinding[],
+  input: Record<string, unknown>,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const binding of bindings) {
+    let current: unknown = input;
+    let found = true;
+    for (const segment of binding.path) {
+      const record = asRecord(current);
+      if (!Object.hasOwn(record, segment)) {
+        found = false;
+        break;
+      }
+      current = record[segment];
+    }
+    if (!found) continue;
+    const valid =
+      (binding.type === "string" && typeof current === "string") ||
+      (binding.type === "boolean" && typeof current === "boolean") ||
+      (binding.type === "integer" && typeof current === "number" && Number.isSafeInteger(current));
+    if (!valid) {
+      throw new ToolError(`MCP header parameter ${binding.path.join(".")} must be ${binding.type}`);
+    }
+    headers[`mcp-param-${binding.headerName}`] = encodeMcpHeaderValue(String(current));
+  }
+  return headers;
+}
+
 // ---------- 传输抽象 ----------
 
 interface McpTransport {
-  request(method: string, params: unknown, context?: SpanContext): Promise<any>;
-  notify(method: string, params: unknown): void;
-  close(): void;
+  request(
+    method: string,
+    params: unknown,
+    context?: SpanContext,
+    timeoutMs?: number,
+    parameterHeaders?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<any>;
+  notify(method: string, params: unknown): void | Promise<void>;
+  close(): void | Promise<void>;
+  /** 旧 Streamable HTTP 后续请求需要复用 initialize 协商出的版本 header。 */
+  setLegacyProtocolVersion?(version: string): void;
   /** server 主动通知（notifications/*）的回调；由客户端在握手后设置。 */
   onNotification?: (method: string, params: unknown) => void;
+}
+
+async function initializeLegacy(
+  transport: McpTransport,
+  cfg: McpServerConfig,
+  telemetry: Telemetry,
+  http: boolean,
+): Promise<{ capabilities: Record<string, unknown>; protocolVersion: string }> {
+  const span = telemetry.startSpan("anicode.mcp.request", {
+    "rpc.system": "jsonrpc",
+    "rpc.method": "initialize",
+    "anicode.mcp.server": cfg.name,
+    "anicode.mcp.transport": http ? "http" : "stdio",
+    "anicode.mcp.protocol_era": "legacy",
+  });
+  try {
+    const result = await transport.request(
+      "initialize",
+      {
+        protocolVersion: LEGACY_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "anicode", version: "0.0.1" },
+      },
+      span.context(),
+    );
+    span.setStatus({ code: "ok" });
+    const protocolVersion =
+      typeof result?.protocolVersion === "string"
+        ? result.protocolVersion
+        : LEGACY_PROTOCOL_VERSION;
+    transport.setLegacyProtocolVersion?.(protocolVersion);
+    return { capabilities: asRecord(result?.capabilities), protocolVersion };
+  } catch (error) {
+    span.recordException(error).setStatus({ code: "error" });
+    await transport.close();
+    throw error;
+  } finally {
+    span.end();
+  }
 }
 
 // ---------- 客户端 ----------
 
 export class McpClient {
-  /** initialize 握手取回的 server 能力面。 */
+  /** server/discover 或 initialize 取回的 server 能力面。 */
   readonly capabilities: McpServerCapabilities;
+  /** 实际选择的协议版本。 */
+  readonly protocolVersion: string;
 
   /** 配置里的 server 名（工具/prompt 的前缀）。 */
   get name(): string {
@@ -176,44 +421,81 @@ export class McpClient {
     private readonly serverName: string,
     private readonly transport: McpTransport,
     capabilities: McpServerCapabilities,
+    protocolVersion: string,
+    private readonly modern: boolean,
+    private readonly http: boolean,
     private readonly telemetry: Telemetry,
   ) {
     this.capabilities = capabilities;
+    this.protocolVersion = protocolVersion;
   }
 
-  /** 启动 server（按 config 选传输）并完成 initialize 握手。 */
+  /** 启动 server，优先协商 2026-07-28；旧 server 回退 initialize 握手。 */
   static async start(cfg: McpServerConfig, handlers?: McpClientHandlers): Promise<McpClient> {
-    const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timeoutMs = positiveTimeout(cfg.timeoutMs, DEFAULT_TIMEOUT_MS);
     const transport: McpTransport = isHttp(cfg)
       ? new HttpTransport(cfg, timeoutMs, handlers?.networkProxy, handlers?.credentialBroker)
       : new StdioTransport(cfg, timeoutMs, handlers?.credentialBroker, handlers?.executionRuntime);
     const telemetry = handlers?.telemetry ?? noTelemetry;
-    const initSpan = telemetry.startSpan("anicode.mcp.request", {
+    const discoverSpan = telemetry.startSpan("anicode.mcp.request", {
       "rpc.system": "jsonrpc",
-      "rpc.method": "initialize",
+      "rpc.method": "server/discover",
       "anicode.mcp.server": cfg.name,
       "anicode.mcp.transport": isHttp(cfg) ? "http" : "stdio",
     });
-    let init: any;
+    let discover: any;
+    let legacyFallback = false;
     try {
-      init = await transport.request(
-        "initialize",
-        {
-          protocolVersion: "2024-11-05",
-          capabilities: {},
-          clientInfo: { name: "anicode", version: "0.0.1" },
-        },
-        initSpan.context(),
+      discover = await transport.request(
+        "server/discover",
+        modernParams({}),
+        discoverSpan.context(),
+        Math.min(timeoutMs, positiveTimeout(cfg.discoveryTimeoutMs, DEFAULT_DISCOVERY_TIMEOUT_MS)),
       );
-      initSpan.setStatus({ code: "ok" });
+      discoverSpan.setStatus({ code: "ok" });
     } catch (error) {
-      initSpan.recordException(error).setStatus({ code: "error" });
-      transport.close();
-      throw error;
+      if (!shouldFallbackToLegacy(error, isHttp(cfg))) {
+        discoverSpan.recordException(error).setStatus({ code: "error" });
+        await transport.close();
+        throw error;
+      }
+      legacyFallback = true;
+      discoverSpan.addEvent("anicode.mcp.legacy_fallback", {
+        "anicode.mcp.reason": error instanceof Error ? error.name : "unknown",
+      });
+      discoverSpan.setStatus({ code: "ok" });
     } finally {
-      initSpan.end();
+      discoverSpan.end();
     }
-    const caps = init?.capabilities ?? {};
+
+    let capabilities: Record<string, unknown>;
+    let protocolVersion: string;
+    if (legacyFallback) {
+      const initialized = await initializeLegacy(transport, cfg, telemetry, isHttp(cfg));
+      capabilities = initialized.capabilities;
+      protocolVersion = initialized.protocolVersion;
+    } else {
+      try {
+        assertCompleteResult(discover, "server/discover");
+        const supported = Array.isArray(discover?.supportedVersions)
+          ? discover.supportedVersions.filter(
+              (value: unknown): value is string => typeof value === "string",
+            )
+          : [];
+        if (!supported.includes(MODERN_PROTOCOL_VERSION)) {
+          throw new Error(
+            `MCP server ${cfg.name} does not support ${MODERN_PROTOCOL_VERSION} (supported: ${supported.join(", ") || "none"})`,
+          );
+        }
+        capabilities = asRecord(discover?.capabilities);
+        protocolVersion = MODERN_PROTOCOL_VERSION;
+      } catch (error) {
+        await transport.close();
+        throw error;
+      }
+    }
+
+    const caps = capabilities;
     const client = new McpClient(
       cfg.name,
       transport,
@@ -222,12 +504,24 @@ export class McpClient {
         resources: Boolean(caps.resources),
         prompts: Boolean(caps.prompts),
       },
+      protocolVersion,
+      !legacyFallback,
+      isHttp(cfg),
       telemetry,
     );
     transport.onNotification = (method) => {
       if (method === "notifications/tools/list_changed") handlers?.onToolsChanged?.();
     };
-    transport.notify("notifications/initialized", {});
+    if (legacyFallback) {
+      try {
+        // 旧协议要求 initialized 先于任何普通请求；HTTP 必须等待 2xx，避免 tools/list
+        // 在并行负载下抢跑并被严格 server 以 400 拒绝。
+        await transport.notify("notifications/initialized", {});
+      } catch (error) {
+        await transport.close();
+        throw error;
+      }
+    }
     return client;
   }
 
@@ -235,7 +529,25 @@ export class McpClient {
   async listTools(): Promise<Tool[]> {
     const res = await this.request("tools/list", {});
     const specs: McpToolSpec[] = res?.tools ?? [];
-    return specs.map((spec) => this.wrap(spec));
+    const tools: Tool[] = [];
+    for (const spec of specs) {
+      let bindings: McpHeaderBinding[] = [];
+      if (this.modern && this.http) {
+        const compiled = compileMcpHeaderBindings(spec.inputSchema);
+        if (!compiled.ok) {
+          const span = this.telemetry.startSpan("anicode.mcp.tool_schema_rejected", {
+            "anicode.mcp.server": this.serverName,
+            "anicode.mcp.tool": String(spec.name).slice(0, 256),
+            "anicode.mcp.reason": compiled.reason,
+          });
+          span.setStatus({ code: "error", message: compiled.reason }).end();
+          continue;
+        }
+        bindings = compiled.bindings;
+      }
+      tools.push(this.wrap(spec, bindings));
+    }
+    return tools;
   }
 
   /** 列出 server 声明的资源；server 未声明 resources 能力时返回空数组。 */
@@ -290,11 +602,17 @@ export class McpClient {
       .join("\n");
   }
 
-  close(): void {
-    this.transport.close();
+  async close(): Promise<void> {
+    await this.transport.close();
   }
 
-  private async request(method: string, params: unknown, parent?: SpanContext): Promise<any> {
+  private async request(
+    method: string,
+    params: unknown,
+    parent?: SpanContext,
+    parameterHeaders?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<any> {
     const span = this.telemetry.startSpan(
       "anicode.mcp.request",
       {
@@ -305,7 +623,16 @@ export class McpClient {
       parent,
     );
     try {
-      const result = await this.transport.request(method, params, span.context());
+      const wireParams = this.modern ? modernParams(params) : params;
+      const result = await this.transport.request(
+        method,
+        wireParams,
+        span.context(),
+        undefined,
+        parameterHeaders,
+        signal,
+      );
+      if (this.modern) assertCompleteResult(result, method);
       span.setStatus({ code: "ok" });
       return result;
     } catch (error) {
@@ -316,13 +643,27 @@ export class McpClient {
     }
   }
 
-  private wrap(spec: McpToolSpec): Tool {
+  private wrap(spec: McpToolSpec, headerBindings: readonly McpHeaderBinding[]): Tool {
     const fqName = `${this.serverName}__${spec.name}`;
     const serverName = this.serverName;
-    const callTool = (input: Record<string, unknown>, parent?: SpanContext) =>
-      this.request("tools/call", { name: spec.name, arguments: input }, parent);
+    const callTool = (
+      input: Record<string, unknown>,
+      parent?: SpanContext,
+      signal?: AbortSignal,
+    ) => {
+      const parameterHeaders =
+        this.modern && this.http ? mcpParameterHeaders(headerBindings, input) : undefined;
+      return this.request(
+        "tools/call",
+        { name: spec.name, arguments: input },
+        parent,
+        parameterHeaders,
+        signal,
+      );
+    };
     return {
       readOnly: false, // 外部工具默认不可信，走权限门
+      capabilities: this.http ? ["network"] : ["process", "persistent-process"],
       def: {
         name: fqName,
         description: spec.description ?? `MCP 工具 ${spec.name}（来自 ${serverName}）`,
@@ -333,7 +674,7 @@ export class McpClient {
       },
       ruleKey: (input) => `${spec.name} ${JSON.stringify(input).slice(0, 80)}`,
       async run(input: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-        const res = await callTool(input, ctx.traceContext);
+        const res = await callTool(input, ctx.traceContext, ctx.signal);
         return renderToolResult(res);
       },
     };
@@ -350,6 +691,7 @@ class StdioTransport implements McpTransport {
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   private terminalError: Error | undefined;
+  private termination: Promise<void> | undefined;
   onNotification?: (method: string, params: unknown) => void;
 
   constructor(
@@ -359,6 +701,7 @@ class StdioTransport implements McpTransport {
     executionRuntime?: ExecutionRuntime,
   ) {
     let env: NodeJS.ProcessEnv = { ...sanitizedShellEnv(), ...safeMcpEnvironment(config.env) };
+    const credentialLeases: string[] = [];
     for (const [name, credentialId] of Object.entries(config.credentialEnv ?? {})) {
       if (Object.hasOwn(config.env ?? {}, name)) {
         throw new Error(`MCP ${config.name} env ${name} cannot be both static and broker-managed`);
@@ -372,13 +715,13 @@ class StdioTransport implements McpTransport {
         ttlMs: 30_000,
         maxUses: 1,
       });
-      const injected = broker.injectEnv(lease, env);
-      if (!(name in injected)) {
+      if (broker.leaseEnvironmentName(lease) !== name) {
         throw new Error(
           `MCP ${config.name} credential ${credentialId} is not scoped for env ${name}`,
         );
       }
-      env = injected;
+      if (executionRuntime) credentialLeases.push(lease);
+      else env = broker.injectEnv(lease, env);
     }
     let file = config.command;
     let args = config.args ?? [];
@@ -396,6 +739,7 @@ class StdioTransport implements McpTransport {
         policy: "read-only",
         network: config.network ?? false,
         env,
+        ...(credentialLeases.length > 0 ? { credentialLeases } : {}),
       });
       file = prepared.file;
       args = prepared.args;
@@ -407,19 +751,31 @@ class StdioTransport implements McpTransport {
       // 禁止把宿主全部密钥隐式继承给第三方 MCP；只注入该 server 明确声明的 env。
       env,
       ...(cwd ? { cwd } : {}),
+      detached: process.platform !== "win32",
+      windowsHide: true,
     });
     this.proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
     // A noisy server must not block itself on a full stderr pipe. Diagnostics belong in the
     // explicit debug log at the host boundary; never retain unbounded third-party stderr here.
     this.proc.stderr.on("data", () => {});
-    this.proc.on("error", (error) => this.failTransport(error, false));
+    this.proc.on("error", (error) => this.failTransport(error));
     this.proc.on("exit", () => {
-      this.failTransport(new Error(t("MCP server has exited", "MCP server 已退出")), false);
+      this.failTransport(new Error(t("MCP server has exited", "MCP server 已退出")));
     });
   }
 
-  request(method: string, params: unknown, _context?: SpanContext): Promise<any> {
+  request(
+    method: string,
+    params: unknown,
+    _context?: SpanContext,
+    timeoutOverrideMs?: number,
+    _parameterHeaders?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<any> {
     if (this.terminalError) return Promise.reject(this.terminalError);
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason ?? new Error(`MCP request cancelled (${method})`));
+    }
     if (this.pending.size >= MAX_MCP_PENDING_REQUESTS) {
       return Promise.reject(
         new Error(
@@ -431,36 +787,76 @@ class StdioTransport implements McpTransport {
       );
     }
     const id = this.nextId++;
+    const requestTimeoutMs = positiveTimeout(timeoutOverrideMs, this.timeoutMs);
     return new Promise((resolve, reject) => {
+      let cancelling = false;
+      const onAbort = () =>
+        cancel(
+          signal?.reason instanceof Error
+            ? signal.reason
+            : new Error(t(`MCP request cancelled (${method})`, `MCP 请求已取消（${method}）`)),
+        );
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const cancel = (error: Error) => {
+        if (cancelling || !this.pending.delete(id)) return;
+        cancelling = true;
+        cleanup();
+        try {
+          this.writeFrame({
+            jsonrpc: "2.0",
+            method: "notifications/cancelled",
+            params: { requestId: id, reason: error.message },
+          });
+        } catch {
+          /* the hard process-tree stop below is authoritative */
+        }
+        this.failTransport(error);
+        // A stdio server is a child we own: do not acknowledge cancellation until its entire
+        // process tree is gone. This also prevents a server which ignores the notification from
+        // committing a later host-side effect.
+        void this.stopProcess().then(
+          () => reject(error),
+          (terminationError) =>
+            reject(new AggregateError([error, terminationError], "Failed to terminate MCP server")),
+        );
+      };
       // 超时：挂死的 server 不该无限期占住一次工具调用；如实告知方法与时限。
-      const timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          reject(
+      const timer = setTimeout(
+        () =>
+          cancel(
             new Error(
               t(
-                `MCP request timed out (${method}, ${this.timeoutMs}ms)`,
-                `MCP 请求超时（${method}，${this.timeoutMs}ms）`,
+                `MCP request timed out (${method}, ${requestTimeoutMs}ms)`,
+                `MCP 请求超时（${method}，${requestTimeoutMs}ms）`,
               ),
             ),
-          );
-        }
-      }, this.timeoutMs);
+          ),
+        requestTimeoutMs,
+      );
       timer.unref?.();
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          cleanup();
           resolve(v);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          cleanup();
           reject(e);
         },
       });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       try {
         this.writeFrame({ jsonrpc: "2.0", id, method, params });
       } catch (error) {
         this.pending.delete(id);
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       }
     });
@@ -470,9 +866,9 @@ class StdioTransport implements McpTransport {
     this.writeFrame({ jsonrpc: "2.0", method, params });
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.failTransport(new Error(t("MCP client has closed", "MCP 客户端已关闭")), false);
-    this.proc.kill();
+    await this.stopProcess();
   }
 
   private writeFrame(obj: unknown): void {
@@ -528,7 +924,12 @@ class StdioTransport implements McpTransport {
     this.buffer = Buffer.alloc(0);
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
-    if (terminate) this.proc.kill();
+    if (terminate) void this.stopProcess().catch(() => undefined);
+  }
+
+  private stopProcess(): Promise<void> {
+    this.termination ??= terminateProcessTree(this.proc);
+    return this.termination;
   }
 
   private handleMessage(body: string): void {
@@ -562,16 +963,31 @@ class StdioTransport implements McpTransport {
     const p = this.pending.get(msg.id);
     if (!p) return;
     this.pending.delete(msg.id);
-    if (msg.error) p.reject(new Error(`MCP ${msg.error.code}: ${msg.error.message}`));
+    if (msg.error) p.reject(new McpRpcError(msg.error.code, msg.error.message, msg.error.data));
     else p.resolve(msg.result);
   }
 }
 
 // ---------- Streamable HTTP 传输 ----------
 
+function requestProtocolVersion(params: unknown): string | undefined {
+  const value = asRecord(asRecord(params)["_meta"])[PROTOCOL_VERSION_META];
+  return typeof value === "string" ? value : undefined;
+}
+
+/** MCP HTTP header 只允许安全 ASCII；其他值按规范使用 UTF-8 Base64 sentinel。 */
+function encodeMcpHeaderValue(value: string): string {
+  const safeAscii = /^[\x20-\x7e]+$/.test(value) && value.trim() === value;
+  const sentinel = value.startsWith("=?base64?") && value.endsWith("?=");
+  return safeAscii && !sentinel
+    ? value
+    : `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
 class HttpTransport implements McpTransport {
   private nextId = 1;
   private sessionId: string | null = null;
+  private legacyProtocolVersion: string | undefined;
   onNotification?: (method: string, params: unknown) => void;
 
   constructor(
@@ -584,39 +1000,79 @@ class HttpTransport implements McpTransport {
     rejectSensitiveHeaders(config.headers);
   }
 
-  async request(method: string, params: unknown, context?: SpanContext): Promise<any> {
+  async request(
+    method: string,
+    params: unknown,
+    context?: SpanContext,
+    timeoutOverrideMs?: number,
+    parameterHeaders?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<any> {
+    if (signal?.aborted) throw signal.reason ?? new Error(`MCP request cancelled (${method})`);
     const id = this.nextId++;
+    const requestTimeoutMs = positiveTimeout(timeoutOverrideMs, this.timeoutMs);
+    const modern = requestProtocolVersion(params) === MODERN_PROTOCOL_VERSION;
     // 超时覆盖整个请求（含 SSE 流式响应体的读取），abort 统一收束。
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), this.timeoutMs);
+    let timedOut = false;
+    const onAbort = () =>
+      ac.abort(signal?.reason ?? new Error(t("MCP request cancelled", "MCP 请求已取消")));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ac.abort(new Error(`MCP request timed out (${method})`));
+    }, requestTimeoutMs);
     timer.unref?.();
     try {
-      const res = await this.post({ jsonrpc: "2.0", id, method, params }, ac.signal, context);
-      // initialize 响应会带 Mcp-Session-Id，后续请求需回带。
-      const sid = res.headers.get("mcp-session-id");
-      if (sid) this.sessionId = sid;
+      const res = await this.post(
+        { jsonrpc: "2.0", id, method, params },
+        ac.signal,
+        context,
+        parameterHeaders,
+      );
+      // 只有旧 initialize 协议允许传输层 session；现代响应即便误带也不得吸收。
+      if (!modern) {
+        const sid = res.headers.get("mcp-session-id");
+        if (sid) this.sessionId = sid;
+      }
       const message = await this.readResponse(res, id);
-      if (message.error) throw new Error(`MCP ${message.error.code}: ${message.error.message}`);
+      if (message.error)
+        throw new McpRpcError(
+          message.error.code,
+          message.error.message,
+          message.error.data,
+          res.status,
+        );
       return message.result;
     } catch (err) {
-      if (ac.signal.aborted) {
+      if (timedOut) {
         throw new Error(
           t(
-            `MCP request timed out (${method}, ${this.timeoutMs}ms)`,
-            `MCP 请求超时（${method}，${this.timeoutMs}ms）`,
+            `MCP request timed out (${method}, ${requestTimeoutMs}ms)`,
+            `MCP 请求超时（${method}，${requestTimeoutMs}ms）`,
           ),
           { cause: err },
         );
       }
+      if (signal?.aborted) throw signal.reason ?? err;
       throw err;
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
-  notify(method: string, params: unknown): void {
-    // 通知无需响应；失败静默（notifications/initialized 等不影响后续）。
-    void this.post({ jsonrpc: "2.0", method, params }).catch(() => {});
+  async notify(method: string, params: unknown): Promise<void> {
+    const res = await this.post({ jsonrpc: "2.0", method, params });
+    if (!res.ok) {
+      throw new McpHttpError(res.status, await readBoundedResponseText(res).catch(() => ""));
+    }
+    // 规范响应通常为 202 空 body；若 server 附带 body，主动释放连接资源。
+    await res.body?.cancel().catch(() => {});
+  }
+
+  setLegacyProtocolVersion(version: string): void {
+    this.legacyProtocolVersion = version;
   }
 
   close(): void {
@@ -624,19 +1080,56 @@ class HttpTransport implements McpTransport {
     // 尽力释放服务端会话；失败无妨。
     void this.fetch({
       method: "DELETE",
-      headers: { ...this.config.headers, "mcp-session-id": this.sessionId },
+      headers: {
+        ...this.config.headers,
+        "mcp-session-id": this.sessionId,
+        ...(this.legacyProtocolVersion === "2025-06-18" ||
+        this.legacyProtocolVersion === "2025-11-25"
+          ? { "mcp-protocol-version": this.legacyProtocolVersion }
+          : {}),
+      },
     }).catch(() => {});
   }
 
-  private post(body: unknown, signal?: AbortSignal, context?: SpanContext): Promise<Response> {
+  private post(
+    body: unknown,
+    signal?: AbortSignal,
+    context?: SpanContext,
+    parameterHeaders?: Record<string, string>,
+  ): Promise<Response> {
+    const envelope = asRecord(body);
+    const method = typeof envelope["method"] === "string" ? envelope["method"] : undefined;
+    const params = asRecord(envelope["params"]);
+    const protocolVersion = requestProtocolVersion(params);
+    const modern = protocolVersion === MODERN_PROTOCOL_VERSION;
+    const legacyHeaderVersion =
+      !modern &&
+      (this.legacyProtocolVersion === "2025-06-18" || this.legacyProtocolVersion === "2025-11-25")
+        ? this.legacyProtocolVersion
+        : undefined;
+    const name =
+      method === "tools/call" || method === "prompts/get"
+        ? params["name"]
+        : method === "resources/read"
+          ? params["uri"]
+          : undefined;
     return this.fetch({
       method: "POST",
       headers: {
+        ...this.config.headers,
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
-        ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
+        ...(modern && protocolVersion
+          ? {
+              "mcp-protocol-version": protocolVersion,
+              ...(method ? { "mcp-method": method } : {}),
+              ...(typeof name === "string" ? { "mcp-name": encodeMcpHeaderValue(name) } : {}),
+            }
+          : {}),
+        ...(legacyHeaderVersion ? { "mcp-protocol-version": legacyHeaderVersion } : {}),
+        ...(!modern && this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
+        ...(modern ? parameterHeaders : {}),
         ...(context ? { traceparent: traceparent(context) } : {}),
-        ...this.config.headers,
       },
       body: JSON.stringify(body),
       ...(signal ? { signal } : {}),
@@ -673,13 +1166,18 @@ class HttpTransport implements McpTransport {
   /** 读取一个 JSON-RPC 响应：application/json 直接解析；text/event-stream 读到匹配 id 的消息。 */
   private async readResponse(res: Response, id: number): Promise<JsonRpcResponse> {
     if (!res.ok) {
-      throw new Error(
-        `MCP HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`,
-      );
+      const text = await readBoundedResponseText(res).catch(() => "");
+      try {
+        const parsed = JSON.parse(text) as JsonRpcResponse;
+        if (parsed?.id === id && parsed.error) return parsed;
+      } catch {
+        // 非 JSON 错误页属于传输错误；由协商层决定是否回退 legacy。
+      }
+      throw new McpHttpError(res.status, text);
     }
     const ctype = res.headers.get("content-type") ?? "";
     if (ctype.includes("application/json")) {
-      return (await res.json()) as JsonRpcResponse;
+      return JSON.parse(await readBoundedResponseText(res)) as JsonRpcResponse;
     }
     if (ctype.includes("text/event-stream")) {
       const msg = await readSseForId(res, id, this.onNotification);
@@ -690,7 +1188,7 @@ class HttpTransport implements McpTransport {
       return msg;
     }
     // 少数 server 不带 content-type；尝试当 JSON 解析。
-    const text = await res.text();
+    const text = await readBoundedResponseText(res);
     try {
       return JSON.parse(text) as JsonRpcResponse;
     } catch {
@@ -715,16 +1213,29 @@ async function readSseForId(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let totalBytes = 0;
+  let eventCount = 0;
+  let complete = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        complete = true;
+        break;
+      }
+      totalBytes += value?.byteLength ?? 0;
+      if (totalBytes > MAX_MCP_HTTP_RESPONSE_BYTES) {
+        throw new Error(`MCP SSE response exceeds ${MAX_MCP_HTTP_RESPONSE_BYTES} bytes`);
+      }
       buf += decoder.decode(value, { stream: true });
       let sep: number;
       // SSE 事件以空行分隔。
       while ((sep = indexOfDoubleNewline(buf)) >= 0) {
         const rawEvent = buf.slice(0, sep);
         buf = buf.slice(sep).replace(/^(\r?\n){1,2}/, "");
+        if (++eventCount > MAX_MCP_SSE_EVENTS) {
+          throw new Error(`MCP SSE response exceeds ${MAX_MCP_SSE_EVENTS} events`);
+        }
         const data = sseData(rawEvent);
         if (!data) continue;
         try {
@@ -738,9 +1249,44 @@ async function readSseForId(
       }
     }
   } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
   return null;
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maximum = MAX_MCP_HTTP_RESPONSE_BYTES,
+): Promise<string> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maximum) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`MCP HTTP response exceeds ${maximum} bytes`);
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+  let complete = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        text += decoder.decode();
+        return text;
+      }
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maximum) throw new Error(`MCP HTTP response exceeds ${maximum} bytes`);
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 function indexOfDoubleNewline(s: string): number {

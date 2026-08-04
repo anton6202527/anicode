@@ -39,6 +39,9 @@ export class RemoteRuntime implements ExecutionRuntime {
   }
 
   async run(request: IsolatedRunRequest): Promise<IsolatedRunResult> {
+    if (request.stdin !== undefined) {
+      throw new Error("Remote execution does not support stdin payloads");
+    }
     const span = this.telemetry.startSpan(
       "anicode.remote.client",
       {

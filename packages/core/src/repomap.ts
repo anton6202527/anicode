@@ -28,6 +28,8 @@ export interface RepoMapOptions {
   query?: string;
   /** 默认 true；关闭时使用旧的一次性扫描排序。 */
   incremental?: boolean;
+  /** Trusted host-owned cache directory outside cwd. */
+  cacheDirectory?: string;
   indexFile?: string;
   embed?: CodeEmbedding;
   lspPool?: LspPool;
@@ -215,6 +217,7 @@ async function walk(dir: string, root: string, out: string[], maxFiles: number):
 export async function gatherRepoMap(cwd: string, opts: RepoMapOptions = {}): Promise<string> {
   if (opts.incremental !== false) {
     const index = new TypedCodeGraph(cwd, {
+      ...(opts.cacheDirectory ? { cacheDirectory: opts.cacheDirectory } : {}),
       ...(opts.indexFile ? { indexFile: opts.indexFile } : {}),
       ...(opts.maxFiles ? { maxFiles: opts.maxFiles } : {}),
       ...(opts.maxFileBytes ? { maxFileBytes: opts.maxFileBytes } : {}),

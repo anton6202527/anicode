@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { SessionManager, type SessionEvent } from "./session-manager.js";
 import { SessionStore } from "./session.js";
 import type { Provider, StreamEvent } from "./types.js";
+import { DurableRuntime, MemoryRuntimeEventStore } from "./runtime/durable.js";
 
 function plainProvider(): Provider {
   return {
@@ -111,6 +112,57 @@ test("checkpoint/undo: 未启用 checkpoints 的会话 undo 报错、列表为�
     assert.equal((await m.listCheckpoints(s.id)).length, 0);
     await assert.rejects(() => m.undo(s.id), /未启用工作区快照/);
     m.dispose();
+  } finally {
+    await fs.rm(repo, { recursive: true, force: true });
+    await fs.rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint/usage: 通过 durable runtime 跨进程恢复，不因 resume 归零", async () => {
+  const repo = await gitRepo();
+  const storeDir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-ckpt-restart-"));
+  const store = new SessionStore(path.join(storeDir, "sessions"));
+  const runtime = new DurableRuntime(new MemoryRuntimeEventStore());
+  try {
+    await fs.writeFile(path.join(repo, "f.txt"), "before\n");
+    execFileSync("git", ["add", "-A"], { cwd: repo });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: repo });
+    const first = new SessionManager({
+      store,
+      runtime,
+      resolveProvider: () => ({ provider: plainProvider(), model: "scripted" }),
+      checkpoints: true,
+    });
+    const created = await first.createSession({ cwd: repo, model: "scripted" });
+    await first.send(created.id, "第一轮");
+    assert.deepEqual((await first.resumeSession(created.id)).usage, {
+      inputTokens: 5,
+      outputTokens: 3,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+    await first.shutdown();
+
+    const restarted = new SessionManager({
+      store,
+      runtime,
+      resolveProvider: () => ({ provider: plainProvider(), model: "scripted" }),
+      checkpoints: true,
+    });
+    const resumed = await restarted.resumeSession(created.id);
+    assert.deepEqual(resumed.usage, {
+      inputTokens: 5,
+      outputTokens: 3,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+    assert.equal(resumed.contextUsage?.tokens, 5);
+    assert.equal((await restarted.listCheckpoints(created.id)).length, 1);
+
+    await fs.writeFile(path.join(repo, "f.txt"), "after-crash\n");
+    await restarted.undo(created.id);
+    assert.equal(await fs.readFile(path.join(repo, "f.txt"), "utf8"), "before\n");
+    await restarted.shutdown();
   } finally {
     await fs.rm(repo, { recursive: true, force: true });
     await fs.rm(storeDir, { recursive: true, force: true });

@@ -3,9 +3,13 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { commandHook, commandHooksFromConfig, isHookEventName } from "./hooks-exec.js";
 import { HookRunner } from "./hooks.js";
-import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import type { ExecutionRuntime, IsolatedRunRequest } from "./runtime/isolated-runtime.js";
+import { TransactionalExecutionRuntime } from "./runtime/transactional-runtime.js";
 
 const payload = { event: "PreToolUse" as const, cwd: process.cwd(), toolName: "bash" };
 
@@ -57,6 +61,27 @@ test("命令 hook: 超时按无操作处理（不挂死 loop）", async () => {
   assert.equal(outcome.blocked, false);
 });
 
+test(
+  "命令 hook: 超时会等待整棵进程树退出，孙进程不能延迟写入",
+  { skip: process.platform === "win32" ? "requires POSIX shell process groups" : false },
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-hook-tree-"));
+    const marker = path.join(root, "orphan-marker");
+    try {
+      const reg = commandHook({
+        event: "Stop",
+        command: `(sleep 0.7; printf orphan > ${shellQuote(marker)}) & wait`,
+        timeoutMs: 100,
+      });
+      await new HookRunner([reg]).run({ event: "Stop", cwd: root });
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      await assert.rejects(fs.access(marker), /ENOENT/);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("commandHooksFromConfig: 无效条目剔除，合法条目生效", () => {
   const regs = commandHooksFromConfig([
     { event: "PreToolUse", matcher: "bash", command: "true" },
@@ -72,23 +97,18 @@ test("commandHooksFromConfig: 无效条目剔除，合法条目生效", () => {
   assert.ok(!isHookEventName("Bogus"));
 });
 
-test("命令 hook: production runtime 通过 prepare 收口命令、cwd 与脱敏环境", async () => {
-  const prepared: string[] = [];
+test("命令 hook: production runtime 通过 foreground run 收口 stdin、cwd 与策略", async () => {
+  let captured: IsolatedRunRequest | undefined;
   const runtime: ExecutionRuntime = {
-    async run() {
-      throw new Error("hook stdin protocol must use prepare");
-    },
-    prepare(request) {
-      prepared.push(`${request.policy}:${request.network}:${request.cwd}:${request.command}`);
+    async run(request) {
+      captured = request;
+      const input = JSON.parse(request.stdin ?? "") as { event?: string };
       return {
-        file: process.execPath,
-        args: [
-          "-e",
-          "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>console.log(JSON.stringify({additionalContext:JSON.parse(s).event})))",
-        ],
-        cwd: request.cwd,
-        env: { PATH: process.env.PATH },
+        exitCode: 0,
+        output: JSON.stringify({ additionalContext: input.event }),
+        timedOut: false,
         sandboxed: true,
+        durationMs: 1,
       };
     },
   };
@@ -101,15 +121,29 @@ test("命令 hook: production runtime 通过 prepare 收口命令、cwd 与脱�
     cwd: process.cwd(),
   });
   assert.equal(outcome.additionalContext, "SessionStart");
-  assert.deepEqual(prepared, [`workspace-write:false:${process.cwd()}:untrusted-project-hook`]);
+  assert.equal(captured?.policy, "workspace-write");
+  assert.equal(captured?.network, false);
+  assert.equal(captured?.cwd, process.cwd());
+  assert.equal(captured?.command, "untrusted-project-hook");
+  assert.equal(captured?.includeTransactionSummary, false);
+  assert.equal(
+    (JSON.parse(captured?.stdin ?? "") as { hook_event_name?: string }).hook_event_name,
+    "SessionStart",
+  );
 });
 
-test("命令 hook: 不支持 prepare 的远程 runtime 不得回退宿主 shell", async () => {
+test("命令 hook: runtime without prepare still executes through run, never host spawn", async () => {
   let executed = false;
   const runtime: ExecutionRuntime = {
     async run() {
       executed = true;
-      return { exitCode: 0, output: "", timedOut: false, sandboxed: true, durationMs: 1 };
+      return {
+        exitCode: 2,
+        output: "runtime block",
+        timedOut: false,
+        sandboxed: true,
+        durationMs: 1,
+      };
     },
   };
   const registration = commandHook(
@@ -120,6 +154,39 @@ test("命令 hook: 不支持 prepare 的远程 runtime 不得回退宿主 shell"
     event: "SessionStart",
     cwd: process.cwd(),
   });
-  assert.equal(outcome.blocked, false);
-  assert.equal(executed, false);
+  assert.equal(outcome.blocked, true);
+  assert.equal(outcome.reason, "runtime block");
+  assert.equal(executed, true);
 });
+
+test("命令 hook: Transactional foreground commits writes without leaking PatchSet summary", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-hook-transaction-"));
+  const delegate: ExecutionRuntime = {
+    async run(request) {
+      await fs.writeFile(path.join(request.cwd, "hook.txt"), "committed\n");
+      return {
+        exitCode: 0,
+        output: JSON.stringify({ additionalContext: "clean hook output" }),
+        timedOut: false,
+        sandboxed: true,
+        durationMs: 1,
+      };
+    },
+  };
+  try {
+    const registration = commandHook(
+      { event: "Stop", command: "project-hook" },
+      { executionRuntime: new TransactionalExecutionRuntime(delegate) },
+    );
+    const outcome = await new HookRunner([registration]).run({ event: "Stop", cwd: root });
+    assert.equal(outcome.additionalContext, "clean hook output");
+    assert.doesNotMatch(outcome.additionalContext ?? "", /PatchSet/);
+    assert.equal(await fs.readFile(path.join(root, "hook.txt"), "utf8"), "committed\n");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}

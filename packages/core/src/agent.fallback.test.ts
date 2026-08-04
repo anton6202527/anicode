@@ -154,7 +154,10 @@ test("成本估算：estimateCostUSD 与 Agent.estimatedCostUSD", async () => {
   }
   // 100 in × $3 + 50 out × $15 + 10 cacheRead × $0.3 + 5 cacheWrite × $3.75（每 MTok）
   const expected = (100 * 3 + 50 * 15 + 10 * 0.3 + 5 * 3.75) / 1_000_000;
-  assert.ok(Math.abs((agent.estimatedCostUSD ?? 0) - expected) < 1e-12);
+  assert.ok(
+    Math.abs((agent.estimatedCostUSD ?? 0) - expected) < 1e-12,
+    `estimated ${agent.estimatedCostUSD}, expected ${expected}`,
+  );
 
   const unpriced = new Agent({
     provider: okProvider("ok"),

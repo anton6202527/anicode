@@ -11,6 +11,10 @@ on:
         description: Number of real tasks to run (280 for the full matrix)
         required: false
         default: "40"
+      trials:
+        description: Repeated trials per task (defaults to 3 for canary, 1 for full matrix)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -40,26 +44,41 @@ jobs:
       shard_count: ${{ steps.plan.outputs.shard_count }}
       shards: ${{ steps.plan.outputs.shards }}
       baseline: ${{ steps.plan.outputs.baseline }}
+      baseline_manifest: ${{ steps.plan.outputs.baseline_manifest }}
+      trials: ${{ steps.plan.outputs.trials }}
     steps:
       - id: plan
         env:
           REQUESTED_LIMIT: ${{ inputs.limit || '40' }}
+          REQUESTED_TRIALS: ${{ inputs.trials || '' }}
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           limit="$REQUESTED_LIMIT"
-          if [ "$SCHEDULE" = "30 18 * * 0" ]; then limit=280; fi
+          trials="$REQUESTED_TRIALS"
+          if [ "$SCHEDULE" = "30 18 * * 0" ]; then limit=280; trials=1; fi
           case "$limit" in (*[!0-9]*|'') echo "limit must be an integer" >&2; exit 1;; esac
           if [ "$limit" -lt 1 ] || [ "$limit" -gt 280 ]; then
             echo "limit must be between 1 and 280" >&2
             exit 1
           fi
-          if [ "$limit" -gt 80 ]; then shard_count=20; else shard_count=4; fi
+          if [ -z "$trials" ]; then
+            if [ "$limit" -gt 80 ]; then trials=1; else trials=3; fi
+          fi
+          case "$trials" in (*[!0-9]*|'') echo "trials must be an integer" >&2; exit 1;; esac
+          if [ "$trials" -lt 1 ] || [ "$trials" -gt 20 ]; then
+            echo "trials must be between 1 and 20" >&2
+            exit 1
+          fi
+          work=$((limit * trials))
+          if [ "$work" -gt 80 ]; then shard_count=20; else shard_count=4; fi
           shards="$(node -e 'const n=Number(process.argv[1]);process.stdout.write(JSON.stringify(Array.from({length:n},(_,i)=>i)))' "$shard_count")"
           {
             echo "limit=$limit"
+            echo "trials=$trials"
             echo "shard_count=$shard_count"
             echo "shards=$shards"
-            echo "baseline=packages/eval/baselines/real-$limit.json"
+            echo "baseline=packages/eval/baselines/real-$limit-t$trials.json"
+            echo "baseline_manifest=packages/eval/baselines/real-$limit-t$trials.manifest.json"
           } >> "$GITHUB_OUTPUT"
 
   readiness:
@@ -67,6 +86,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
       - name: Require production credentials, runtime and reviewed baseline
         env:
           ENABLED: ${{ vars.ANICODE_REAL_EVAL_ENABLED }}
@@ -75,13 +99,23 @@ jobs:
           VAULT_ROLE: ${{ vars.ANICODE_VAULT_ROLE }}
           RUNTIME_IMAGE: ${{ vars.ANICODE_EVAL_RUNTIME_IMAGE }}
           BASELINE: ${{ needs.plan.outputs.baseline }}
+          BASELINE_MANIFEST: ${{ needs.plan.outputs.baseline_manifest }}
+          TRIALS: ${{ needs.plan.outputs.trials }}
+          TRUSTED_KEYS: ${{ vars.ANICODE_EVAL_BASELINE_TRUSTED_KEYS }}
+          ANICODE_EVAL_BASELINE_TRUSTED_KEYS: ${{ vars.ANICODE_EVAL_BASELINE_TRUSTED_KEYS }}
         run: |
           test "$ENABLED" = "true" || { echo "ANICODE_REAL_EVAL_ENABLED must be true" >&2; exit 1; }
           test -n "$MODEL" || { echo "ANICODE_EVAL_MODEL is required" >&2; exit 1; }
           test -n "$VAULT_ADDR" || { echo "ANICODE_VAULT_ADDR is required" >&2; exit 1; }
           test -n "$VAULT_ROLE" || { echo "ANICODE_VAULT_ROLE is required" >&2; exit 1; }
           test -n "$RUNTIME_IMAGE" || { echo "ANICODE_EVAL_RUNTIME_IMAGE is required" >&2; exit 1; }
+          test -n "$TRUSTED_KEYS" || { echo "ANICODE_EVAL_BASELINE_TRUSTED_KEYS is required" >&2; exit 1; }
           test -f "$BASELINE" || { echo "Reviewed real-eval baseline is missing: $BASELINE" >&2; exit 1; }
+          test -f "$BASELINE_MANIFEST" || { echo "Reviewed real-eval baseline manifest is missing: $BASELINE_MANIFEST" >&2; exit 1; }
+          npm run eval:baseline --workspace @anicode/eval -- verify \
+            --baseline "$BASELINE" --manifest "$BASELINE_MANIFEST" \
+            --expect-model "$MODEL" --expect-suite real --expect-trials "$TRIALS" \
+            --expect-runtime-image "$RUNTIME_IMAGE"
 
   # Credentials come from workload identity/Vault. The label must target an ARC ephemeral scale set
   # configured to forward runner diagnostics before Pod deletion.
@@ -122,6 +156,7 @@ jobs:
           --suite real
           --model "${{ vars.ANICODE_EVAL_MODEL }}"
           --limit "${{ needs.plan.outputs.limit }}"
+          --trials "${{ needs.plan.outputs.trials }}"
           --shard-index "${{ matrix.shard }}"
           --shard-count "${{ needs.plan.outputs.shard_count }}"
           --concurrency 2
@@ -152,11 +187,16 @@ jobs:
           pattern: real-eval-shard-*
           path: real-eval-shards
       - name: Merge shards and apply the quality gate
+        env:
+          ANICODE_EVAL_BASELINE_TRUSTED_KEYS: ${{ vars.ANICODE_EVAL_BASELINE_TRUSTED_KEYS }}
         run: >-
           npm run eval:merge --workspace @anicode/eval --
           --input real-eval-shards
           --output real-eval.json
           --baseline "${{ needs.plan.outputs.baseline }}"
+          --baseline-manifest "${{ needs.plan.outputs.baseline_manifest }}"
+          --expect-real-limit "${{ needs.plan.outputs.limit }}"
+          --expect-trials "${{ needs.plan.outputs.trials }}"
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

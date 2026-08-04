@@ -69,7 +69,7 @@ export type ClientRequest = (
       permId: string;
       decision: PermissionDecisionKind;
     }
-  /** 运行时切换权限模式（/plan 等）。socket 与 HTTP 传输能力对齐。 */
+  /** 运行时切换权限模式。socket 与 HTTP 传输能力对齐。 */
   | { id: number; method: "setPermissionMode"; sessionId: string; mode: PermissionMode }
   /** 运行时切换权限档位，返回生效 mode。 */
   | { id: number; method: "setPermissionProfile"; sessionId: string; name: string }

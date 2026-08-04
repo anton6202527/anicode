@@ -66,12 +66,14 @@ export interface AnicodeConfig {
         credentialEnv?: Record<string, string>;
         network?: boolean;
         timeoutMs?: number;
+        discoveryTimeoutMs?: number;
       }
     | {
         url: string;
         headers?: Record<string, string>;
         credential?: { id: string; header?: string; scheme?: string };
         timeoutMs?: number;
+        discoveryTimeoutMs?: number;
       }
   >;
   /** 自定义子 agent：name → 定义。 */
@@ -600,6 +602,7 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
         ...(c.headers ? { headers: c.headers } : {}),
         ...(c.credential ? { credential: c.credential } : {}),
         ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
+        ...(c.discoveryTimeoutMs ? { discoveryTimeoutMs: c.discoveryTimeoutMs } : {}),
       };
     }
     return {
@@ -610,6 +613,7 @@ export function toMcpServerConfigs(config: AnicodeConfig): McpServerConfig[] {
       ...(c.credentialEnv ? { credentialEnv: c.credentialEnv } : {}),
       ...(c.network !== undefined ? { network: c.network } : {}),
       ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
+      ...(c.discoveryTimeoutMs ? { discoveryTimeoutMs: c.discoveryTimeoutMs } : {}),
     };
   });
 }

@@ -156,6 +156,24 @@ test("overlay: 会话列表与授权弹框定宽且含关键信息", () => {
   assert.match(pt, /授权请求/);
   assert.match(pt, /bash/);
   assert.match(pt, /允许并记住/);
+  assert.match(pt, /Shift\+Tab/);
+
+  const fixedPermission = buildPermissionOverlay(
+    [{ toolName: "bash", ruleKey: "npm test" }],
+    30,
+    80,
+    0,
+    undefined,
+    false,
+  );
+  assert.doesNotMatch(fixedPermission.lines.map(strip).join("\n"), /Shift\+Tab|切模式/);
+
+  const narrowPerm = buildPermissionOverlay(
+    [{ toolName: "bash", ruleKey: "curl -s wttr.in/Wuhu" }],
+    30,
+    30,
+  );
+  for (const l of narrowPerm.lines) assert.equal(visW(l), narrowPerm.width);
 
   const anchored = buildPermissionOverlay(
     [{ toolName: "bash", ruleKey: "npm test" }],

@@ -14,6 +14,14 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { t } from "./i18n.js";
+import { terminateProcessTree } from "./runtime/isolated-runtime.js";
+import {
+  createIsolatedGitPlumbing,
+  hardenedGitArguments,
+  hardenedGitEnvironment,
+  trustedGitExecutable,
+  validateGitRepository,
+} from "./runtime/git-control.js";
 
 export interface EnvInfo {
   cwd: string;
@@ -67,7 +75,7 @@ export async function gatherEnv(cwd: string, now: Date = new Date()): Promise<st
     info.isGitRepo = true;
     const [branch, status, commits] = await Promise.all([
       git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
-      git(cwd, ["status", "--porcelain=v1", "--untracked-files=normal"]),
+      isolatedGitStatus(cwd),
       git(cwd, ["log", "--oneline", "-5"]),
     ]);
     if (branch) info.gitBranch = branch.trim();
@@ -98,15 +106,12 @@ function safeOsVersion(): string {
 }
 
 async function isGitRepo(cwd: string): Promise<boolean> {
-  // 直接查 .git（比 spawn 快、无副作用）；worktree 场景 .git 是文件也算。
   try {
-    await fs.access(path.join(cwd, ".git"));
+    await validateGitRepository(cwd);
     return true;
   } catch {
-    /* 继续向上探测：cwd 可能在仓库子目录 */
+    return false;
   }
-  const out = await git(cwd, ["rev-parse", "--is-inside-work-tree"]);
-  return out?.trim() === "true";
 }
 
 /** 保留前 n 行，超出用省略提示，避免 git status 在大改动时撑爆上下文。 */
@@ -121,35 +126,76 @@ function clampLines(text: string, n: number): string {
 }
 
 /** 跑一条 git 子命令，带 3s 超时；任何失败返回 null（不抛）。 */
-function git(cwd: string, args: string[]): Promise<string | null> {
+async function isolatedGitStatus(cwd: string): Promise<string | null> {
+  let plumbing: Awaited<ReturnType<typeof createIsolatedGitPlumbing>> | undefined;
+  try {
+    const repository = await validateGitRepository(cwd);
+    const head = await git(cwd, ["rev-parse", "--verify", "-q", "HEAD"]);
+    plumbing = await createIsolatedGitPlumbing(cwd, path.join(repository.gitDir, "index"));
+    if (head?.trim()) {
+      await fs.writeFile(path.join(plumbing.gitDir, "HEAD"), `${head.trim()}\n`, { mode: 0o600 });
+    }
+    return await git(
+      cwd,
+      ["status", "--porcelain=v1", "--untracked-files=normal"],
+      plumbing.environment,
+    );
+  } catch {
+    return null;
+  } finally {
+    await plumbing?.cleanup().catch(() => undefined);
+  }
+}
+
+function git(
+  cwd: string,
+  args: string[],
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<string | null> {
   return new Promise((resolve) => {
     let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] });
-    } catch {
-      return resolve(null);
-    }
-    let out = "";
-    let done = false;
-    const finish = (v: string | null) => {
-      if (done) return;
-      done = true;
-      resolve(v);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(null);
-    }, 3000);
-    child.stdout?.on("data", (b: Buffer) => {
-      if (out.length < 8192) out += b.toString();
-    });
-    child.on("error", () => {
-      clearTimeout(timer);
-      finish(null);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      finish(code === 0 ? out : null);
-    });
+    void (async () => {
+      await validateGitRepository(cwd);
+      const executable = await trustedGitExecutable();
+      child = spawn(executable, hardenedGitArguments(args, cwd), {
+        cwd,
+        env: hardenedGitEnvironment(extraEnv),
+        stdio: ["ignore", "pipe", "ignore"],
+        detached: process.platform !== "win32",
+        windowsHide: true,
+      });
+      let out = "";
+      let done = false;
+      let termination: Promise<void> | undefined;
+      const finish = (v: string | null) => {
+        if (done) return;
+        done = true;
+        resolve(v);
+      };
+      const timer = setTimeout(() => {
+        termination ??= terminateProcessTree(child);
+        void termination.then(
+          () => finish(null),
+          () => finish(null),
+        );
+      }, 3000);
+      child.stdout?.on("data", (b: Buffer) => {
+        if (out.length < 8192) out += b.toString();
+      });
+      child.on("error", () => {
+        clearTimeout(timer);
+        finish(null);
+      });
+      child.on("close", (code) => {
+        void (async () => {
+          if (!termination && process.platform !== "win32") {
+            termination = terminateProcessTree(child);
+          }
+          await termination;
+          clearTimeout(timer);
+          finish(code === 0 ? out : null);
+        })().catch(() => finish(null));
+      });
+    })().catch(() => resolve(null));
   });
 }

@@ -28,7 +28,7 @@ test("项目记忆: 逐级向上收集 AGENTS.md，止于 .git", async () => {
 
   const system = composeSystem("你是助手。", mem);
   assert.match(system, /你是助手/);
-  assert.match(system, /项目记忆/);
+  assert.match(system, /项目记忆|Project memory/);
 
   assert.equal(
     await loadProjectMemory(sub, { includeProject: false }),
@@ -45,6 +45,26 @@ test("项目记忆: 无记忆文件返回空，composeSystem 原样", async () =
   assert.equal(mem, "");
   assert.equal(composeSystem("base", ""), "base");
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("项目记忆: 无 .git 时不越过 cwd，且拒绝指向工作区外的 symlink", async () => {
+  const outer = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mem-boundary-"));
+  const cwd = path.join(outer, "workspace");
+  await fs.mkdir(cwd);
+  await fs.writeFile(path.join(outer, "AGENTS.md"), "outside-parent-secret");
+  await fs.writeFile(path.join(outer, "outside.md"), "outside-link-secret");
+  await fs.symlink(path.join(outer, "outside.md"), path.join(cwd, "AGENTS.md"));
+  const memory = await loadProjectMemory(cwd);
+  assert.doesNotMatch(memory, /outside-parent-secret|outside-link-secret/);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test("项目记忆: 超大记忆文件被跳过", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mem-large-"));
+  await fs.mkdir(path.join(cwd, ".git"));
+  await fs.writeFile(path.join(cwd, "AGENTS.md"), "x".repeat(300 * 1024));
+  assert.equal(await loadProjectMemory(cwd), "");
+  await fs.rm(cwd, { recursive: true, force: true });
 });
 
 test("compaction: 未超阈值不压缩", async () => {
@@ -236,7 +256,7 @@ test("microcompaction: 只清旧工具结果且不修改传入历史", () => {
   const res = microcompact(history, 1);
   assert.equal(res.cleared, 2);
   assert.match((history[1]!.content[0] as any).content, /^0:x/);
-  assert.match((res.messages[1]!.content[0] as any).content, /已清理/);
+  assert.match((res.messages[1]!.content[0] as any).content, /已清理|body cleared/);
   assert.match((res.messages[5]!.content[0] as any).content, /^2:x/);
 });
 

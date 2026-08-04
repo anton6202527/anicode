@@ -593,6 +593,10 @@ const COMPONENT_SCHEMAS: Record<string, Record<string, unknown>> = {
       usage: { type: "object" },
       costUSD: { type: "number" },
       running: { type: "boolean" },
+      permissionMode: {
+        type: "string",
+        enum: ["default", "acceptEdits", "auto", "bypass", "plan"],
+      },
       pendingPermissions: { type: "array", items: { type: "object" } },
     },
   },

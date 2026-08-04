@@ -147,7 +147,7 @@ export class PermissionEngine {
     for (const name of names) this.editTools.add(name.toLowerCase());
   }
 
-  /** 运行时切换权限模式（如 /plan 进入/退出计划模式）。直接切模式后档位名不再准确，清掉。 */
+  /** 运行时切换权限模式。直接切模式后档位名不再准确，清掉。 */
   setMode(mode: PermissionMode): void {
     this.mode = mode;
     this.profileName = null;
@@ -175,6 +175,7 @@ export class PermissionEngine {
   }
 
   async check(req: PermissionRequest): Promise<PermissionDecision> {
+    if (req.signal?.aborted) return { behavior: "deny", message: "授权请求已取消" };
     // 无法完整分析复杂命令时，只要该工具配置了 deny 规则就保守拒绝，避免
     // `git status $(rm ...)` 之类把被禁动作藏进细粒度规则看不到的位置。
     if (this.matchesDeny(req)) {
@@ -223,7 +224,11 @@ export class PermissionEngine {
         message: `工具 ${req.toolName} 需要授权，但未配置确认回调（非交互环境）`,
       };
     }
-    const decision = await this.confirm(req);
+    const confirmation = Promise.resolve(this.confirm(req));
+    const decision = req.signal
+      ? await raceWithSignal(confirmation, req.signal)
+      : await confirmation;
+    if (req.signal?.aborted) return { behavior: "deny", message: "授权请求已取消" };
     if (decision.behavior === "allow" && decision.remember && !decision.updatedInput) {
       this.remembered.add(`${req.toolName}::${req.ruleKey}`);
       if (decision.remember === "always") {
@@ -285,6 +290,18 @@ export class PermissionEngine {
       parts.some((p) => matchesAnyRule(this.askRules, req.toolName, p))
     );
   }
+}
+
+function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason ?? new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 /** 规则匹配：精确工具名，或 "Tool(glob)" 形式对 ruleKey 做 glob */

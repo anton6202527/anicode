@@ -63,7 +63,7 @@ test("后台任务空闲期完成：通知积压，下一次 send 注入并广�
   const agent = new Agent({
     provider,
     model: "m",
-    cwd: "/x",
+    cwd: process.cwd(),
     system: "PARENT",
     subagents: true,
     injectEnv: false,
@@ -78,7 +78,11 @@ test("后台任务空闲期完成：通知积压，下一次 send 注入并广�
   releaseChild();
   // 等后台任务收尾（无 onTaskNotice 出口 → 通知积压在 Agent 内部）
   while (agent.backgroundTasks[0]!.status === "running") await new Promise((r) => setTimeout(r, 5));
-  assert.equal(agent.backgroundTasks[0]!.status, "done");
+  assert.equal(
+    agent.backgroundTasks[0]!.status,
+    "done",
+    agent.backgroundTasks[0]!.error ?? "background task unexpectedly failed",
+  );
 
   const events: string[] = [];
   for await (const ev of agent.send("下一步")) {
@@ -142,7 +146,7 @@ test("后台任务 drive 中完成：turn 边界注入，loop 续跑让模型当
   const agent = new Agent({
     provider,
     model: "m",
-    cwd: "/x",
+    cwd: process.cwd(),
     system: "PARENT",
     subagents: true,
     injectEnv: false,

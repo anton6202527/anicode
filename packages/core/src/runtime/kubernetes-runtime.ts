@@ -90,6 +90,9 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
   }
 
   async run(request: IsolatedRunRequest): Promise<IsolatedRunResult> {
+    if (request.stdin !== undefined) {
+      throw new Error("Kubernetes Job execution does not support stdin payloads");
+    }
     const started = Date.now();
     const timeoutMs = Math.max(1_000, request.timeoutMs ?? 120_000);
     if (request.network && !this.options.proxyUrl) {

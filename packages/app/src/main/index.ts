@@ -90,7 +90,7 @@ async function createBridge(): Promise<Bridge> {
   const workspaceTrust = await workspaceTrustStore.assess(cwd);
   await loadProjectEnv({ cwd, workspaceTrust });
   const { config } = await loadConfig({ cwd, workspaceTrust });
-  return new Bridge({
+  return Bridge.create({
     cwd,
     sessionsDir: path.join(userData, "sessions"),
     pluginsFile: path.join(userData, "plugins.json"),
@@ -98,6 +98,7 @@ async function createBridge(): Promise<Bridge> {
     appName: app.getName(),
     appVersion: app.getVersion(),
     defaultModel: config.model ?? resolveDefaultModel(),
+    config,
     workspaceTrust: workspaceTrustStore,
     workspaceTrusted: workspaceTrust.trusted,
     isTrustedSender: trustedIpcSender,

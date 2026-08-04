@@ -34,7 +34,7 @@ anicode --model custom/<model-id>
 ```
 
 TUI 内命令:`/model` 选模型 · `/sessions` 列会话 · `/resume <id>` 续接 · `/new [标题]` · `/help`。
-运行中 Enter 追加指令、Esc 中断;授权提示 `y` 允许 / `a` 允许并记住 / `n` 拒绝。
+受信任的本地交互 TUI 默认使用最高权限并自动批准（首次用 `anicode trust grant --cwd "$PWD"` 授信）；该默认仍服从显式 `deny` / `ask`、sandbox、网络策略与 workspace scope。`Shift+Tab` 可在普通、自动接受编辑、跳过授权之间循环（不含计划档），弹框打开时也有效。未信任、远端与无头入口保持保守。运行中 Enter 追加指令、Esc 中断；若仍有授权提示，可用 `y` 允许 / `a` 允许并记住 / `n` 拒绝。
 默认保留终端原生鼠标框选/复制与备用屏滚轮回看；需要鼠标点击弹框时用 `anicode --mouse`，或在运行中用 `/mouse on|off` 切换。
 POSIX 终端中 `Ctrl+Z` 挂起、`fg` 恢复，默认 `Ctrl+Q` 退出。
 `/model` 每次打开都会刷新 provider 的鉴权模型目录，只展示本次返回且兼容文本/工具调用的模型；直接指定模型和 `once` 也不能绕过实时目录校验。目录刷新不会逐模型发起计费推理探测。

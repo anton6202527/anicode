@@ -41,6 +41,19 @@ export interface AcceptCommandInput {
   messageCountBefore?: number;
 }
 
+export class CommandIdempotencyConflictError extends Error {
+  readonly code = "COMMAND_IDEMPOTENCY_CONFLICT";
+
+  constructor(readonly idempotencyKey: string) {
+    super(
+      `Durable command idempotency key ${JSON.stringify(
+        idempotencyKey,
+      )} was reused with a different prompt or model`,
+    );
+    this.name = "CommandIdempotencyConflictError";
+  }
+}
+
 export interface CommandInboxStore {
   read(sessionId: string): Promise<DurableCommand[]>;
   write(sessionId: string, commands: DurableCommand[]): Promise<void>;
@@ -81,6 +94,17 @@ function assertId(value: string, label: string): void {
 
 function cloneCommand(command: DurableCommand): DurableCommand {
   return { ...command };
+}
+
+/**
+ * An idempotency key names one immutable command payload. Returning an earlier command for a
+ * different prompt/model would make retries execute data the caller did not submit and turns a
+ * convenient dedupe key into a cross-request confused-deputy boundary.
+ */
+function assertSameCommandPayload(existing: DurableCommand, proposed: DurableCommand): void {
+  if (existing.text !== proposed.text || existing.model !== proposed.model) {
+    throw new CommandIdempotencyConflictError(proposed.idempotencyKey);
+  }
 }
 
 export class MemoryCommandInboxStore implements CommandInboxStore {
@@ -238,7 +262,10 @@ export class CommandInbox {
     if (this.store.insertCommand) return this.store.insertCommand(proposed);
     return this.transact(input.sessionId, async (commands) => {
       const duplicate = commands.find((command) => command.idempotencyKey === key);
-      if (duplicate) return cloneCommand(duplicate);
+      if (duplicate) {
+        assertSameCommandPayload(duplicate, proposed);
+        return cloneCommand(duplicate);
+      }
       commands.push(proposed);
       return cloneCommand(proposed);
     });
@@ -259,7 +286,7 @@ export class CommandInbox {
       if (!command) throw new Error(`Unknown durable command: ${commandId}`);
       const leaseActive =
         command.leaseExpiresAt !== undefined && Date.parse(command.leaseExpiresAt) > now;
-      if (command.status === "running" && leaseActive && command.leaseOwner !== owner) {
+      if (command.status === "running" && leaseActive) {
         throw new Error(`Durable command ${commandId} is leased by ${command.leaseOwner}`);
       }
       if (!["accepted", "running"].includes(command.status)) {
@@ -293,6 +320,9 @@ export class CommandInbox {
       if (fencingToken !== undefined && command.fencingToken !== fencingToken) {
         throw new Error(`Stale fencing token for command ${commandId}`);
       }
+      if (!command.leaseExpiresAt || Date.parse(command.leaseExpiresAt) <= Date.now()) {
+        throw new Error(`Expired lease for command ${commandId}`);
+      }
       command.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
       command.updatedAt = new Date().toISOString();
     });
@@ -311,9 +341,16 @@ export class CommandInbox {
     return this.transact(sessionId, async (commands) => {
       const command = commands.find((candidate) => candidate.id === commandId);
       if (!command) throw new Error(`Unknown durable command: ${commandId}`);
+      if (["completed", "failed", "cancelled"].includes(command.status)) {
+        if (!lease && command.status === status && command.error === (error || undefined)) return;
+        throw new Error(`Durable command ${commandId} is already ${command.status}`);
+      }
       if (
         lease &&
-        (command.leaseOwner !== lease.owner || command.fencingToken !== lease.fencingToken)
+        (command.leaseOwner !== lease.owner ||
+          command.fencingToken !== lease.fencingToken ||
+          !command.leaseExpiresAt ||
+          Date.parse(command.leaseExpiresAt) <= Date.now())
       ) {
         throw new Error(`Stale fencing token for command ${commandId}`);
       }

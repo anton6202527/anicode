@@ -1,7 +1,8 @@
 /** Tree-sitter AST + LSP 类型信息 + 向量库的增量跨语言代码图。 */
 
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { chmodSync, mkdtempSync, promises as fs, realpathSync, rmSync } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Lang, parse, registerDynamicLanguage, type SgNode } from "@ast-grep/napi";
 import python from "@ast-grep/lang-python";
@@ -84,6 +85,8 @@ export interface TypedGraphSearchHit {
 }
 
 export interface TypedCodeGraphOptions {
+  /** Trusted host-owned cache directory. Defaults to a private per-process runtime directory. */
+  cacheDirectory?: string;
   indexFile?: string;
   vectorStore?: VectorStore;
   vectorFile?: string;
@@ -96,6 +99,52 @@ export interface TypedCodeGraphOptions {
   maxLspReferencesPerFile?: number;
   maxLspInvalidatedFiles?: number;
   embeddingBatchSize?: number;
+  /** Maximum serialized JSON index size. Defaults to 64 MiB. */
+  maxCacheBytes?: number;
+  /** Maximum aggregate source bytes processed by one refresh. Defaults to 256 MiB. */
+  maxTotalSourceBytes?: number;
+}
+
+const MAX_GRAPH_FILES = 5_000;
+const MAX_EMBEDDING_DIMENSIONS = 4_096;
+const MAX_VECTOR_CONTENT_BYTES = 64 * 1024;
+let privateCacheRoot: string | undefined;
+
+function runtimeCacheRoot(): string {
+  if (privateCacheRoot) return privateCacheRoot;
+  const created = mkdtempSync(path.join(realpathSync(os.tmpdir()), "anicode-repomap-"));
+  chmodSync(created, 0o700);
+  privateCacheRoot = created;
+  process.once("exit", () => {
+    try {
+      rmSync(created, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup only; the directory is private and contains derived data.
+    }
+  });
+  return created;
+}
+
+function pathInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+function boundedPositive(value: number | undefined, fallback: number, maximum: number): number {
+  if (!Number.isFinite(value) || value === undefined) return fallback;
+  return Math.max(1, Math.min(maximum, Math.floor(value)));
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  return bytes
+    .subarray(0, maxBytes)
+    .toString("utf8")
+    .replace(/\uFFFD$/u, "");
 }
 
 const SKIP = new Set([
@@ -354,14 +403,33 @@ export class TypedCodeGraph {
     readonly root: string,
     private readonly options: TypedCodeGraphOptions = {},
   ) {
-    this.root = path.resolve(root);
-    this.indexFile =
-      options.indexFile ?? path.join(this.root, ".anicode", "typed-code-graph-v4.json");
-    this.vectors =
-      options.vectorStore ??
-      new SqliteVectorStore(
-        options.vectorFile ?? path.join(this.root, ".anicode", "code-vectors.db"),
-      );
+    const requestedRoot = path.resolve(root);
+    this.root = realpathSync(requestedRoot);
+    const cacheDirectory = path.resolve(
+      options.cacheDirectory ??
+        path.join(
+          runtimeCacheRoot(),
+          createHash("sha256").update(this.root).digest("hex").slice(0, 32),
+        ),
+    );
+    const requestedIndex = path.resolve(
+      options.indexFile ?? path.join(cacheDirectory, "graph-v4.json"),
+    );
+    const requestedVectors = path.resolve(
+      options.vectorFile ?? path.join(cacheDirectory, "vectors.db"),
+    );
+    if (
+      (options.indexFile &&
+        (pathInside(requestedRoot, requestedIndex) || pathInside(this.root, requestedIndex))) ||
+      (options.vectorFile &&
+        (pathInside(requestedRoot, requestedVectors) || pathInside(this.root, requestedVectors))) ||
+      (options.cacheDirectory &&
+        (pathInside(requestedRoot, cacheDirectory) || pathInside(this.root, cacheDirectory)))
+    ) {
+      throw new Error("Typed-code-graph caches must live outside the workspace");
+    }
+    this.indexFile = requestedIndex;
+    this.vectors = options.vectorStore ?? new SqliteVectorStore(requestedVectors);
     this.ownsVectors = !options.vectorStore;
     this.namespace = `repo:${createHash("sha256").update(this.root).digest("hex").slice(0, 24)}`;
   }
@@ -375,14 +443,25 @@ export class TypedCodeGraph {
     this.stats.lspInvalidated = 0;
     const previous = await this.load();
     const paths: string[] = [];
-    await walk(this.root, paths, this.options.maxFiles ?? 5_000);
+    const maxFiles = boundedPositive(this.options.maxFiles, MAX_GRAPH_FILES, MAX_GRAPH_FILES);
+    await walk(this.root, paths, maxFiles);
     const files: Record<string, TypedCodeFile> = {};
     const changed: TypedCodeFile[] = [];
+    let totalSourceBytes = 0;
     for (const absolute of paths) {
-      const stat = await fs.stat(absolute, { bigint: true });
+      const canonical = await fs.realpath(absolute);
+      if (!pathInside(this.root, canonical)) continue;
+      const stat = await fs.stat(canonical, { bigint: true });
+      if (!stat.isFile()) continue;
       const size = Number(stat.size);
-      if (size > (this.options.maxFileBytes ?? 512 * 1024)) continue;
-      const relative = path.relative(this.root, absolute);
+      if (size > boundedPositive(this.options.maxFileBytes, 512 * 1024, 8 * 1024 * 1024)) continue;
+      totalSourceBytes += size;
+      if (
+        totalSourceBytes >
+        boundedPositive(this.options.maxTotalSourceBytes, 256 * 1024 * 1024, 1024 * 1024 * 1024)
+      )
+        break;
+      const relative = path.relative(this.root, canonical);
       const cached = previous?.files[relative];
       const inode = `${stat.dev}:${stat.ino}`;
       const mtimeNs = stat.mtimeNs.toString();
@@ -398,7 +477,7 @@ export class TypedCodeGraph {
         this.stats.reused++;
         continue;
       }
-      const content = await fs.readFile(absolute, "utf8");
+      const content = await fs.readFile(canonical, "utf8");
       const parsed = parseFile(relative, content);
       if (!parsed) continue;
       parsed.size = size;
@@ -406,7 +485,7 @@ export class TypedCodeGraph {
       parsed.mtimeNs = mtimeNs;
       parsed.ctimeNs = ctimeNs;
       parsed.inode = inode;
-      await this.enrichWithLsp(absolute, parsed);
+      await this.enrichWithLsp(canonical, parsed);
       files[relative] = parsed;
       changed.push(parsed);
       this.stats.parsed++;
@@ -553,7 +632,13 @@ export class TypedCodeGraph {
       line: number,
       column: number,
     ): TypedCodeSymbol | undefined => {
-      const relative = path.relative(this.root, path.resolve(absolute));
+      let canonical: string;
+      try {
+        canonical = realpathSync(path.resolve(absolute));
+      } catch {
+        return undefined;
+      }
+      const relative = path.relative(this.root, canonical);
       if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
       const candidates = files[relative]?.symbols ?? [];
       const closest = candidates
@@ -629,6 +714,9 @@ export class TypedCodeGraph {
         throw new Error("Embedding provider returned an unexpected batch size");
       }
       dimensions ??= embeddings[0]?.length;
+      if (dimensions && dimensions > MAX_EMBEDDING_DIMENSIONS) {
+        throw new Error(`Embedding dimensions exceed ${MAX_EMBEDDING_DIMENSIONS}`);
+      }
       for (const embedding of embeddings) {
         if (
           !embedding ||
@@ -644,7 +732,7 @@ export class TypedCodeGraph {
           namespace: this.namespace,
           id: file.path,
           embedding: embeddings[index]!,
-          content: batchTexts[index]!,
+          content: truncateUtf8(batchTexts[index]!, MAX_VECTOR_CONTENT_BYTES),
           metadata: { path: file.path, language: file.language, hash: file.hash },
         })),
       );
@@ -765,6 +853,9 @@ export class TypedCodeGraph {
   private async load(): Promise<TypedCodeGraphSnapshot | undefined> {
     if (this.snapshot) return this.snapshot;
     try {
+      const stat = await fs.lstat(this.indexFile);
+      if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+      if (stat.size > (this.options.maxCacheBytes ?? 64 * 1024 * 1024)) return undefined;
       const parsed = JSON.parse(
         await fs.readFile(this.indexFile, "utf8"),
       ) as TypedCodeGraphSnapshot;
@@ -779,7 +870,11 @@ export class TypedCodeGraph {
     await fs.mkdir(path.dirname(this.indexFile), { recursive: true, mode: 0o700 });
     const temporary = `${this.indexFile}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await fs.writeFile(temporary, JSON.stringify(snapshot) + "\n", { mode: 0o600, flag: "wx" });
+      const serialized = JSON.stringify(snapshot) + "\n";
+      if (Buffer.byteLength(serialized) > (this.options.maxCacheBytes ?? 64 * 1024 * 1024)) {
+        throw new Error("Typed-code-graph cache exceeds its configured size limit");
+      }
+      await fs.writeFile(temporary, serialized, { mode: 0o600, flag: "wx" });
       await fs.rename(temporary, this.indexFile);
       await fs.chmod(this.indexFile, 0o600);
     } finally {

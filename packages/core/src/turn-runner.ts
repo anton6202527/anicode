@@ -12,19 +12,36 @@
  * 另提供 streamText：摘要等杂活的纯文本流（小模型优先，失败回退主模型）。
  */
 
-import type { ChatMessage, Effort, Provider, ToolDefinition, Usage } from "./types.js";
+import type { ChatMessage, Effort, Provider, StreamEvent, ToolDefinition, Usage } from "./types.js";
 import { emptyUsage } from "./types.js";
 import type { AgentEvent, AgentModelInfo, AgentResolvedModel, RetryConfig } from "./agent.js";
 import { noTelemetry, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
 
 export type TurnOutcome =
   | { type: "ok"; message: ChatMessage; stopReason: string; usage: Usage }
-  | { type: "error"; message: string; cause?: unknown; partial: boolean };
+  | { type: "error"; message: string; cause?: unknown; partial: boolean; usage?: Usage };
+
+export interface ModelCallReservation {
+  /** Undefined preserves provider-native defaults while the ledger reserves conservatively. */
+  maxTokens?: number;
+  commit(usage: Usage): Promise<void>;
+  /** Conservatively charge the full reservation when a dispatched request has no trusted usage. */
+  consume(): Promise<void>;
+  cancel(): Promise<void>;
+}
+
+export type ReserveModelCall = (request: {
+  estimatedInputTokens: number;
+  requestedMaxTokens?: number;
+  cost?: AgentModelInfo["cost"];
+  model: string;
+}) => ModelCallReservation | Promise<ModelCallReservation>;
 
 /** 当前生效的模型（per-prompt 覆盖 / 降级会改；base 永不变）。 */
 interface ActiveModel {
   provider: Provider;
   model: string;
+  cost?: AgentModelInfo["cost"];
   supportsTools: boolean;
   /** 模型是否支持视觉；未知能力按 false（宁可降级为文本，也不要整轮请求被拒）。 */
   supportsImages: boolean;
@@ -42,7 +59,7 @@ export interface TurnRunnerOptions {
   maxTokens?: number;
   effort?: Effort;
   /** 摘要等杂活用的小模型；未配置或解析失败时等于主 provider/model。 */
-  small: { provider: Provider; model: string };
+  small: { provider: Provider; model: string; cost?: AgentModelInfo["cost"] };
   telemetry?: Telemetry;
   /** 当前 drive 的上游 trace；用 getter 读取以支持 per-send parent。 */
   parent?: () => SpanContext | undefined;
@@ -57,7 +74,7 @@ export class TurnRunner {
   private readonly resolveModelFn: ((spec: string) => AgentResolvedModel) | undefined;
   private readonly maxTokens: number | undefined;
   private readonly effort: Effort | undefined;
-  private readonly small: { provider: Provider; model: string };
+  private readonly small: { provider: Provider; model: string; cost?: AgentModelInfo["cost"] };
   private readonly telemetry: Telemetry;
   private readonly parent: (() => SpanContext | undefined) | undefined;
 
@@ -65,6 +82,7 @@ export class TurnRunner {
     this.base = {
       provider: opts.provider,
       model: opts.model,
+      ...(opts.modelInfo?.cost ? { cost: opts.modelInfo.cost } : {}),
       supportsTools: opts.modelInfo?.capabilities.tools ?? true,
       supportsImages: opts.modelInfo?.capabilities.images ?? false,
     };
@@ -97,6 +115,13 @@ export class TurnRunner {
     return this.resolveModelFn !== undefined;
   }
 
+  get smallModelCost(): AgentModelInfo["cost"] | undefined {
+    return this.small.cost;
+  }
+  get activeModelCost(): AgentModelInfo["cost"] | undefined {
+    return this.active.cost;
+  }
+
   /** per-prompt 模型覆盖：本次 drive 全程用覆盖模型。解析失败抛错（调用方转 error 事件）。 */
   override(spec: string): void {
     if (!this.resolveModelFn) throw new Error("resolveModel not configured");
@@ -104,6 +129,7 @@ export class TurnRunner {
     this.active = {
       provider: resolved.provider,
       model: resolved.model,
+      ...(resolved.modelInfo?.cost ? { cost: resolved.modelInfo.cost } : {}),
       supportsTools: resolved.modelInfo?.capabilities.tools ?? true,
       supportsImages: resolved.modelInfo?.capabilities.images ?? false,
     };
@@ -126,6 +152,8 @@ export class TurnRunner {
     messages: ChatMessage[];
     toolDefs: ToolDefinition[];
     signal: AbortSignal;
+    estimatedInputTokens?: number;
+    reserveModelCall?: ReserveModelCall;
   }): AsyncGenerator<AgentEvent, TurnOutcome> {
     for (let attempt = 0; ; attempt++) {
       const res = yield* this.streamOnce(req);
@@ -181,6 +209,7 @@ export class TurnRunner {
         this.active = {
           provider: resolved.provider,
           model: resolved.model,
+          ...(resolved.modelInfo?.cost ? { cost: resolved.modelInfo.cost } : {}),
           supportsTools: resolved.modelInfo?.capabilities.tools ?? true,
           supportsImages: resolved.modelInfo?.capabilities.images ?? false,
         };
@@ -198,6 +227,8 @@ export class TurnRunner {
     messages: ChatMessage[];
     toolDefs: ToolDefinition[];
     signal: AbortSignal;
+    estimatedInputTokens?: number;
+    reserveModelCall?: ReserveModelCall;
   }): AsyncGenerator<AgentEvent, TurnOutcome> {
     const span = this.telemetry.startSpan(
       "anicode.model.stream",
@@ -212,18 +243,62 @@ export class TurnRunner {
     let stopReason = "";
     let usage: Usage = emptyUsage();
     let partial = false;
+    let receivedTerminal = false;
+    let reservation: ModelCallReservation | undefined;
+    let reservationCommitted = false;
+    let requestDispatched = false;
     const toolNames = new Map<string, string>(); // 流式期间 id → 工具名
 
     try {
-      for await (const ev of this.active.provider.stream({
+      reservation = await req.reserveModelCall?.({
+        estimatedInputTokens:
+          req.estimatedInputTokens ??
+          estimateRequestTokens(
+            req.messages,
+            req.system,
+            this.active.supportsTools ? req.toolDefs : [],
+          ),
+        ...(this.maxTokens !== undefined ? { requestedMaxTokens: this.maxTokens } : {}),
+        ...(this.active.cost ? { cost: this.active.cost } : {}),
         model: this.active.model,
-        system: req.system,
-        messages: req.messages,
-        ...(this.active.supportsTools ? { tools: req.toolDefs } : {}),
-        ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
-        ...(this.effort ? { effort: this.effort } : {}),
-        signal: req.signal,
-      })) {
+      });
+    } catch (error) {
+      span
+        .recordException(error)
+        .setStatus({ code: "error", message: errText(error) })
+        .end();
+      return { type: "error", message: errText(error), cause: error, partial: false };
+    }
+    if (req.signal.aborted) {
+      await reservation?.cancel();
+      const error = abortReason(req.signal);
+      span.recordException(error).setStatus({ code: "error", message: error.message }).end();
+      return { type: "error", message: error.message, cause: error, partial: false };
+    }
+
+    let iterator: AsyncIterator<StreamEvent> | undefined;
+
+    try {
+      requestDispatched = true;
+      iterator = this.active.provider
+        .stream({
+          model: this.active.model,
+          system: req.system,
+          messages: req.messages,
+          ...(this.active.supportsTools ? { tools: req.toolDefs } : {}),
+          ...(reservation?.maxTokens !== undefined
+            ? { maxTokens: reservation.maxTokens }
+            : this.maxTokens !== undefined
+              ? { maxTokens: this.maxTokens }
+              : {}),
+          ...(this.effort ? { effort: this.effort } : {}),
+          signal: req.signal,
+        })
+        [Symbol.asyncIterator]();
+      while (true) {
+        const next = await nextWithSignal(iterator.next(), req.signal);
+        if (next.done) break;
+        const ev = next.value;
         if (ev.type === "text_delta") {
           partial = true;
           yield { type: "text", text: ev.text };
@@ -242,20 +317,43 @@ export class TurnRunner {
             delta: ev.argsText,
           };
         } else if (ev.type === "done") {
+          if (!validUsage(ev.usage)) {
+            throw new Error("provider 返回了无效 usage（必须为非负安全整数）");
+          }
           finalMessage = ev.message;
           stopReason = ev.stopReason;
           usage = ev.usage;
+          receivedTerminal = true;
+          await reservation?.commit(ev.usage);
+          reservationCommitted = true;
           span
             .setAttribute("gen_ai.response.finish_reasons", [ev.stopReason])
             .setAttribute("gen_ai.usage.input_tokens", ev.usage.inputTokens)
             .setAttribute("gen_ai.usage.output_tokens", ev.usage.outputTokens)
             .setStatus({ code: "ok" });
+          // `done` is the provider contract's terminal event. Do not wait for a buggy iterator
+          // to return afterwards: that would let an otherwise complete turn hang past deadline.
+          break;
         }
       }
     } catch (err) {
       span.recordException(err).setStatus({ code: "error", message: errText(err) });
-      return { type: "error", message: errText(err), cause: err, partial };
+      return {
+        type: "error",
+        message: errText(err),
+        cause: err,
+        partial,
+        ...(receivedTerminal ? { usage } : {}),
+      };
     } finally {
+      if (!reservationCommitted) {
+        if (requestDispatched) await reservation?.consume();
+        else await reservation?.cancel();
+      }
+      if (iterator) {
+        if (receivedTerminal) drainIteratorAfterTerminal(iterator);
+        else closeIterator(iterator);
+      }
       span.end();
     }
     if (!finalMessage) {
@@ -270,30 +368,39 @@ export class TurnRunner {
   async *streamText(
     messages: ChatMessage[],
     system: string,
+    signal?: AbortSignal,
+    onUsage?: (usage: Usage, cost: AgentModelInfo["cost"] | undefined) => void,
+    reserveModelCall?: ReserveModelCall,
   ): AsyncIterable<{ type: string; text?: string }> {
     const maxTokens = Math.min(2000, this.maxTokens ?? 2000);
     const usingSmall =
       this.small.provider !== this.active.provider || this.small.model !== this.active.model;
     try {
-      for await (const ev of this.small.provider.stream({
-        model: this.small.model,
-        system,
+      yield* streamPlainText(
+        this.small.provider,
+        this.small.model,
         messages,
+        system,
         maxTokens,
-      })) {
-        if (ev.type === "text_delta") yield { type: "text", text: ev.text };
-      }
+        signal,
+        (usage) => onUsage?.(usage, this.small.cost),
+        reserveModelCall,
+        this.small.cost,
+      );
     } catch (err) {
-      if (!usingSmall) throw err;
+      if (!usingSmall || signal?.aborted) throw err;
       // 小模型失败（如额度/网络）→ 用主模型重来一次，保证压缩不因杂活模型而失败。
-      for await (const ev of this.active.provider.stream({
-        model: this.active.model,
-        system,
+      yield* streamPlainText(
+        this.active.provider,
+        this.active.model,
         messages,
+        system,
         maxTokens,
-      })) {
-        if (ev.type === "text_delta") yield { type: "text", text: ev.text };
-      }
+        signal,
+        (usage) => onUsage?.(usage, this.active.cost),
+        reserveModelCall,
+        this.active.cost,
+      );
     }
   }
 }
@@ -302,6 +409,137 @@ export class TurnRunner {
 
 function errText(err: unknown): string {
   return String((err as { message?: unknown })?.message ?? err);
+}
+
+/**
+ * Promise.race at the async-iterator boundary is the hard deadline. Providers are asked to honour
+ * AbortSignal, but production safety cannot depend on that: an adapter may ignore it forever.
+ */
+function nextWithSignal<T>(
+  next: Promise<IteratorResult<T>>,
+  signal?: AbortSignal,
+): Promise<IteratorResult<T>> {
+  if (!signal) return next;
+  if (signal.aborted) {
+    void next.catch(() => undefined);
+    return Promise.reject(abortReason(signal));
+  }
+  return new Promise<IteratorResult<T>>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void next.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
+function closeIterator(iterator: AsyncIterator<unknown>): void {
+  if (!iterator.return) return;
+  // Never await return(): a non-cooperative async generator can block it behind its pending next().
+  void Promise.resolve(iterator.return()).catch(() => undefined);
+}
+
+function drainIteratorAfterTerminal(iterator: AsyncIterator<unknown>): void {
+  // Resume once without awaiting so provider cleanup immediately after `yield done` can run, while
+  // a buggy provider that hangs after its terminal event cannot hold the Agent open.
+  void iterator.next().then(
+    (next) => {
+      if (!next.done) closeIterator(iterator);
+    },
+    () => undefined,
+  );
+}
+
+async function* streamPlainText(
+  provider: Provider,
+  model: string,
+  messages: ChatMessage[],
+  system: string,
+  maxTokens: number,
+  signal: AbortSignal | undefined,
+  onUsage: (usage: Usage) => void,
+  reserveModelCall: ReserveModelCall | undefined,
+  cost: AgentModelInfo["cost"] | undefined,
+): AsyncIterable<{ type: string; text?: string }> {
+  const reservation = await reserveModelCall?.({
+    estimatedInputTokens: estimateRequestTokens(messages, system, []),
+    requestedMaxTokens: maxTokens,
+    ...(cost ? { cost } : {}),
+    model,
+  });
+  if (signal?.aborted) {
+    await reservation?.cancel();
+    throw abortReason(signal);
+  }
+  let requestDispatched = false;
+  let iterator: AsyncIterator<StreamEvent> | undefined;
+  let receivedTerminal = false;
+  let reservationCommitted = false;
+  try {
+    requestDispatched = true;
+    iterator = provider
+      .stream({
+        model,
+        system,
+        messages,
+        maxTokens: reservation?.maxTokens ?? maxTokens,
+        ...(signal ? { signal } : {}),
+      })
+      [Symbol.asyncIterator]();
+    while (true) {
+      const next = await nextWithSignal(iterator.next(), signal);
+      if (next.done) break;
+      const ev = next.value;
+      if (ev.type === "text_delta") yield { type: "text", text: ev.text };
+      if (ev.type === "done") {
+        if (signal?.aborted) throw abortReason(signal);
+        if (!validUsage(ev.usage)) {
+          throw new Error("provider 返回了无效 usage（必须为非负安全整数）");
+        }
+        onUsage(ev.usage);
+        receivedTerminal = true;
+        await reservation?.commit(ev.usage);
+        reservationCommitted = true;
+        break;
+      }
+    }
+  } finally {
+    if (!reservationCommitted) {
+      if (requestDispatched) await reservation?.consume();
+      else await reservation?.cancel();
+    }
+    if (iterator) {
+      if (receivedTerminal) drainIteratorAfterTerminal(iterator);
+      else closeIterator(iterator);
+    }
+  }
+}
+
+function estimateRequestTokens(
+  messages: ChatMessage[],
+  system: string,
+  tools: ToolDefinition[],
+): number {
+  let bytes = utf8Bytes(system) + utf8Bytes(JSON.stringify(tools));
+  for (const message of messages) bytes += utf8Bytes(JSON.stringify(message));
+  // UTF-8 bytes are intentionally conservative across CJK/code/tool schemas; char/4 can undercount
+  // them by several times and is unsuitable for a hard pre-dispatch reservation.
+  return Math.max(1, bytes);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function validUsage(usage: Usage): boolean {
+  return [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+  ].every((value) => Number.isSafeInteger(value) && value >= 0);
 }
 
 /** 判定 provider 错误是否值得重试（限流/服务端/网络层；4xx 业务错误不重试） */

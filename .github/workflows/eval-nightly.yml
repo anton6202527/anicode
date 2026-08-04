@@ -16,14 +16,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
       - name: Require an enabled, reviewable production gate
         env:
           ENABLED: ${{ vars.ANICODE_EVAL_ENABLED }}
           MODEL: ${{ vars.ANICODE_EVAL_MODEL }}
+          TRUSTED_KEYS: ${{ vars.ANICODE_EVAL_BASELINE_TRUSTED_KEYS }}
+          ANICODE_EVAL_BASELINE_TRUSTED_KEYS: ${{ vars.ANICODE_EVAL_BASELINE_TRUSTED_KEYS }}
         run: |
           test "$ENABLED" = "true" || { echo "ANICODE_EVAL_ENABLED must be true" >&2; exit 1; }
           test -n "$MODEL" || { echo "ANICODE_EVAL_MODEL is required" >&2; exit 1; }
+          test -n "$TRUSTED_KEYS" || { echo "ANICODE_EVAL_BASELINE_TRUSTED_KEYS is required" >&2; exit 1; }
           test -f packages/eval/baseline.json || { echo "Reviewed eval baseline is missing" >&2; exit 1; }
+          test -f packages/eval/baseline.manifest.json || { echo "Reviewed eval baseline manifest is missing" >&2; exit 1; }
+          npm run eval:baseline --workspace @anicode/eval -- verify \
+            --baseline packages/eval/baseline.json \
+            --manifest packages/eval/baseline.manifest.json \
+            --expect-model "$MODEL" --expect-suite offline --expect-trials 3
 
   eval:
     needs: readiness
@@ -55,11 +68,14 @@ jobs:
           ANICODE_VAULT_ROLE: ${{ vars.ANICODE_VAULT_ROLE }}
           ANICODE_VAULT_PREFIX: ${{ vars.ANICODE_VAULT_PREFIX || 'anicode' }}
           ANICODE_CREDENTIAL_KEYS: ${{ vars.ANICODE_CREDENTIAL_KEYS }}
+          ANICODE_EVAL_BASELINE_TRUSTED_KEYS: ${{ vars.ANICODE_EVAL_BASELINE_TRUSTED_KEYS }}
           ANICODE_NETWORK_ALLOW_DOMAINS: ${{ vars.ANICODE_EVAL_NETWORK_ALLOW_DOMAINS }}
         run: >-
           npm run eval --workspace @anicode/eval --
           --model "${{ vars.ANICODE_EVAL_MODEL }}"
+          --trials 3
           --baseline packages/eval/baseline.json
+          --baseline-manifest packages/eval/baseline.manifest.json
           --json eval-result.json
 
       - name: Upload result

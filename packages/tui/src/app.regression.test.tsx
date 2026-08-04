@@ -1,6 +1,6 @@
 /**
  * TUI 交互回归测试：把近期提交沉淀的行为固化住——输入编辑快捷键（Ctrl+E/U/K）、
- * PageUp/PageDown 回看、斜杠菜单 ↑/↓ 选择、/model 选择器搜索过滤、/plan 计划模式、
+ * PageUp/PageDown 回看、斜杠菜单 ↑/↓ 选择、/model 选择器搜索过滤、权限模式边界、
  * /undo 接线。全离线（假 SessionHost），防止下次重构 app.tsx 悄悄打碎这些行为。
  */
 
@@ -13,6 +13,7 @@ import React from "react";
 import { render } from "ink-testing-library";
 import type {
   PendingPermission,
+  PermissionMode,
   ProviderDescriptor,
   SessionEvent,
   SessionHost,
@@ -123,6 +124,7 @@ function makeHost(
   options: {
     eventsBeforeSnapshot?: SessionEvent[];
     pendingPermissions?: PendingPermission[];
+    permissionMode?: PermissionMode;
     cwd?: string;
     workspaceTrusted?: boolean;
     workspaceTrustReason?: WorkspaceTrustReason;
@@ -131,7 +133,7 @@ function makeHost(
     onOpen?: (listener: (event: SessionEvent) => void) => void;
     onPermission?: (decision: "allow" | "allow_remember" | "allow_always" | "deny") => void;
     undo?: (sessionId: string, arg?: string) => Promise<{ restored: number; deleted: number }>;
-    setPermissionMode?: (sessionId: string, mode: string) => Promise<void>;
+    setPermissionMode?: (sessionId: string, mode: PermissionMode) => Promise<void>;
     setPermissionProfile?: (sessionId: string, name: string) => Promise<"plan" | "default">;
   } = {},
 ): SessionHost {
@@ -169,6 +171,7 @@ function makeHost(
           usage: zeroUsage,
           running: false,
           pendingPermissions: options.pendingPermissions ?? [],
+          ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
           ...(options.workspaceTrusted === undefined
             ? {}
             : {
@@ -309,7 +312,7 @@ test("TUI 受限工作区: 初始与新权限请求均可逐项允许或拒绝",
   }
 });
 
-test("TUI 检查失败: 初始状态严格只读、read ask 可答复且 mode 锁定 plan", async () => {
+test("TUI 检查失败: 初始状态启用严格只读安全锁且 read ask 可答复", async () => {
   const modeCalls: string[] = [];
   const decisions: string[] = [];
   const host = makeHost({
@@ -328,8 +331,9 @@ test("TUI 检查失败: 初始状态严格只读、read ask 可答复且 mode �
   try {
     const initial = view.lastFrame() ?? "";
     assert.match(initial, /工作区检查失败/);
-    assert.match(initial, /仅可使用内置 read\/glob\/grep[\s\S]*与计划模式/);
-    assert.match(initial, /计划模式 · 只读/);
+    assert.match(initial, /严格只读安全锁/);
+    assert.match(initial, /仅可使用内置 read\/glob\/grep/);
+    assert.doesNotMatch(initial, /\/plan|计划模式|\bplan\b/i);
     assert.match(initial, /授权请求: read/);
     assert.doesNotMatch(initial, /仍可逐项授权/);
 
@@ -338,14 +342,11 @@ test("TUI 检查失败: 初始状态严格只读、read ask 可答复且 mode �
     assert.deepEqual(decisions, ["deny"]);
     assert.doesNotMatch(view.lastFrame() ?? "", /授权请求/);
 
-    for (const ch of "/plan off") view.stdin.write(ch);
-    view.stdin.write("\r");
-    await tick(80);
-    assert.match(view.lastFrame() ?? "", /无法退出严格只读计划模式/);
-
     view.stdin.write("\u001b[Z");
     await tick(60);
-    assert.match(view.lastFrame() ?? "", /权限模式已锁定为严格只读计划模式/);
+    const locked = view.lastFrame() ?? "";
+    assert.match(locked, /严格只读安全锁无法切换/);
+    assert.doesNotMatch(locked, /\/plan|计划模式|\bplan\b/i);
     assert.deepEqual(modeCalls, [], "strict mode must never request default/accept/bypass");
   } finally {
     view.unmount();
@@ -392,7 +393,8 @@ test("TUI 检查失败事件: 同为 untrusted 的 reason 升级也进入严格�
     await tick(80);
     const strict = view.lastFrame() ?? "";
     assert.match(strict, /工作区检查失败/);
-    assert.match(strict, /计划模式 · 只读/);
+    assert.match(strict, /严格只读安全锁/);
+    assert.doesNotMatch(strict, /\/plan|计划模式|\bplan\b/i);
     assert.doesNotMatch(strict, /授权请求/);
 
     emit?.({
@@ -966,7 +968,7 @@ test("TUI 回归: /model 选择器键入即过滤，Enter 选中过滤后的首�
   }
 });
 
-test("TUI 回归: /plan 开关计划模式——调用 setPermissionMode 并显示只读指示", async () => {
+test("TUI 回归: /plan 不再暴露，直接执行按未知命令处理", async () => {
   const calls: [string, string][] = [];
   const host = makeHost({
     setPermissionMode: async (sessionId, mode) => {
@@ -976,28 +978,22 @@ test("TUI 回归: /plan 开关计划模式——调用 setPermissionMode 并显�
   const view = mount(host);
   await tick();
   try {
-    for (const ch of "/plan on") view.stdin.write(ch);
+    for (const ch of "/help") view.stdin.write(ch);
     view.stdin.write("\r");
     await tick(80);
-    const on = view.lastFrame() ?? "";
-    assert.match(on, /计划模式/);
-    assert.match(on, /只读/);
-    assert.deepEqual(calls, [["s_reg", "plan"]]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /\/plan/);
 
-    for (const ch of "/plan off") view.stdin.write(ch);
+    for (const ch of "/plan") view.stdin.write(ch);
     view.stdin.write("\r");
     await tick(80);
-    assert.match(view.lastFrame() ?? "", /已退出计划模式/);
-    assert.deepEqual(calls, [
-      ["s_reg", "plan"],
-      ["s_reg", "default"],
-    ]);
+    assert.match(view.lastFrame() ?? "", /未知命令: \/plan/);
+    assert.deepEqual(calls, []);
   } finally {
     view.unmount();
   }
 });
 
-test("TUI 受限工作区: /plan 与 Shift+Tab 仅在 default↔plan 间切换", async () => {
+test("TUI 受限工作区: Shift+Tab 不切换模式也不调用宿主", async () => {
   const calls: string[] = [];
   const host = makeHost({
     workspaceTrusted: false,
@@ -1008,45 +1004,75 @@ test("TUI 受限工作区: /plan 与 Shift+Tab 仅在 default↔plan 间切换",
   const view = mount(host, { requireWorkspaceTrust: true });
   await tick(100);
   try {
-    for (const ch of "/plan on") view.stdin.write(ch);
-    view.stdin.write("\r");
-    await tick(80);
-    assert.match(view.lastFrame() ?? "", /计划模式 · 只读/);
-
-    for (const ch of "/plan off") view.stdin.write(ch);
-    view.stdin.write("\r");
-    await tick(80);
-
-    const SHIFT_TAB = "\u001b[Z";
-    view.stdin.write(SHIFT_TAB);
+    view.stdin.write("\u001b[Z");
     await tick(60);
-    assert.match(view.lastFrame() ?? "", /计划模式 · 只读/);
-    view.stdin.write(SHIFT_TAB);
-    await tick(60);
-
-    assert.deepEqual(calls, ["plan", "default", "plan", "default"]);
-    assert.equal(calls.includes("acceptEdits"), false);
-    assert.equal(calls.includes("bypass"), false);
+    const frame = view.lastFrame() ?? "";
+    assert.match(frame, /受限工作区中权限模式固定，无法切换/);
+    assert.doesNotMatch(frame, /\/plan|计划模式|\bplan\b/i);
+    assert.deepEqual(calls, []);
   } finally {
     view.unmount();
   }
 });
 
-test("TUI 回归: host 不支持运行时计划模式时 /plan 给出明确提示", async () => {
-  const host = makeHost(); // 无 setPermissionMode
+test("TUI 回归: snapshot 权威模式为 bypass，状态立即同步且首次 Shift+Tab 回到普通模式", async () => {
+  const calls: PermissionMode[] = [];
+  const host = makeHost({
+    permissionMode: "bypass",
+    setPermissionMode: async (_sessionId, mode) => {
+      calls.push(mode);
+    },
+  });
   const view = mount(host);
-  await tick();
+  await tick(80);
   try {
-    for (const ch of "/plan") view.stdin.write(ch);
-    view.stdin.write("\r");
-    await tick(80);
-    assert.match(view.lastFrame() ?? "", /不支持运行时计划模式/);
+    assert.match(view.lastFrame() ?? "", /跳过所有授权/);
+    view.stdin.write("\u001b[Z");
+    await tick(60);
+    assert.deepEqual(calls, ["default"]);
+    assert.match(view.lastFrame() ?? "", /权限模式：普通/);
   } finally {
     view.unmount();
   }
 });
 
-test("TUI 回归: Shift+Tab 轮换权限模式 default→acceptEdits→plan→bypass→default 并刷新指示", async () => {
+test("TUI 回归: 授权卡打开时 Shift+Tab 仍可切模式且不会误裁决当前请求", async () => {
+  const calls: PermissionMode[] = [];
+  const answers: string[] = [];
+  const host = makeHost({
+    permissionMode: "default",
+    pendingPermissions: [
+      {
+        permId: "perm_shift_tab",
+        toolName: "bash",
+        ruleKey: "curl -s wttr.in/Wuhu",
+        risk: "medium",
+      },
+    ],
+    setPermissionMode: async (_sessionId, mode) => {
+      calls.push(mode);
+    },
+    onPermission: (decision) => answers.push(decision),
+  });
+  const view = mount(host);
+  await tick(80);
+  try {
+    const initial = view.lastFrame() ?? "";
+    assert.match(initial, /授权请求/);
+    assert.match(initial, /Shift\+Tab 切模式/i);
+
+    view.stdin.write("\u001b[Z");
+    await tick(60);
+    assert.deepEqual(calls, ["acceptEdits"]);
+    assert.deepEqual(answers, []);
+    assert.match(view.lastFrame() ?? "", /自动接受编辑/);
+    assert.match(view.lastFrame() ?? "", /授权请求/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: Shift+Tab 轮换权限模式 default→acceptEdits→bypass→default 并刷新指示", async () => {
   const calls: string[] = [];
   const host = makeHost({
     setPermissionMode: async (_sessionId, mode) => {
@@ -1063,10 +1089,6 @@ test("TUI 回归: Shift+Tab 轮换权限模式 default→acceptEdits→plan→by
 
     view.stdin.write(SHIFT_TAB);
     await tick(60);
-    assert.match(view.lastFrame() ?? "", /计划模式/);
-
-    view.stdin.write(SHIFT_TAB);
-    await tick(60);
     assert.match(view.lastFrame() ?? "", /跳过所有授权/);
 
     view.stdin.write(SHIFT_TAB);
@@ -1074,7 +1096,8 @@ test("TUI 回归: Shift+Tab 轮换权限模式 default→acceptEdits→plan→by
     // 回到 default：给出"普通"回执（历史里保留旧回执，故只断言新回执出现 + 调用序列）。
     assert.match(view.lastFrame() ?? "", /权限模式：普通/);
 
-    assert.deepEqual(calls, ["acceptEdits", "plan", "bypass", "default"]);
+    assert.deepEqual(calls, ["acceptEdits", "bypass", "default"]);
+    assert.equal(calls.includes("plan"), false);
   } finally {
     view.unmount();
   }
@@ -1093,7 +1116,38 @@ test("TUI 回归: host 不支持权限模式时 Shift+Tab 给出明确提示", a
   }
 });
 
-test("TUI 回归: /profile 无参列档位，带参切换并同步只读指示", async () => {
+test("TUI 远端客户端: 宿主管理的权限模式与档位不可在本地切换", async () => {
+  const modeCalls: PermissionMode[] = [];
+  const profileCalls: string[] = [];
+  const host = makeHost({
+    workspaceTrusted: true,
+    setPermissionMode: async (_sessionId, mode) => {
+      modeCalls.push(mode);
+    },
+    setPermissionProfile: async (_sessionId, name) => {
+      profileCalls.push(name);
+      return "default";
+    },
+  });
+  const view = mount(host, { requireWorkspaceTrust: true, allowPermissionControls: false });
+  await tick(80);
+  try {
+    view.stdin.write("\u001b[Z");
+    await tick(60);
+    assert.match(view.lastFrame() ?? "", /权限设置由宿主管理，当前客户端无法切换/);
+
+    for (const ch of "/profile full") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /权限档位由宿主管理，当前客户端无法切换/);
+    assert.deepEqual(modeCalls, []);
+    assert.deepEqual(profileCalls, []);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI 回归: /profile 隐藏并拒绝只读档位，其他档位仍可切换", async () => {
   const calls: [string, string][] = [];
   const host = makeHost({
     setPermissionProfile: async (sessionId, name) => {
@@ -1110,17 +1164,21 @@ test("TUI 回归: /profile 无参列档位，带参切换并同步只读指示",
     await tick(80);
     const list = view.lastFrame() ?? "";
     assert.match(list, /可用权限档位/);
-    assert.match(list, /readonly/);
     assert.match(list, /full/);
+    assert.doesNotMatch(list, /readonly|read-only|→ plan|计划模式/i);
 
-    // 切 readonly → 模式 plan → 只读指示出现
+    // 即使知道内部档位名称，也必须在调用宿主前拒绝。
     for (const ch of "/profile readonly") view.stdin.write(ch);
     view.stdin.write("\r");
     await tick(80);
-    const on = view.lastFrame() ?? "";
-    assert.match(on, /已切换权限档位：readonly/);
-    assert.match(on, /计划模式|只读/);
-    assert.deepEqual(calls, [["s_reg", "readonly"]]);
+    assert.match(view.lastFrame() ?? "", /TUI 不提供只读权限档位/);
+    assert.deepEqual(calls, []);
+
+    for (const ch of "/profile full") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await tick(80);
+    assert.match(view.lastFrame() ?? "", /已切换权限档位：full/);
+    assert.deepEqual(calls, [["s_reg", "full"]]);
   } finally {
     view.unmount();
   }

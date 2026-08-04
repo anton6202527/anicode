@@ -89,8 +89,11 @@ export class PluginRuntime {
 
   private async reconcile(): Promise<void> {
     if (this.suspended) {
-      for (const conn of this.connections.values())
-        conn.clients.forEach((client) => client.close());
+      await Promise.allSettled(
+        [...this.connections.values()].flatMap((conn) =>
+          conn.clients.map((client) => client.close()),
+        ),
+      );
       this.connections.clear();
       this.status.clear();
       return;
@@ -102,7 +105,7 @@ export class PluginRuntime {
     // 断开不再启用的 MCP。
     for (const [id, conn] of [...this.connections]) {
       if (!enabledIds.has(id)) {
-        conn.clients.forEach((c) => c.close());
+        await Promise.allSettled(conn.clients.map((client) => client.close()));
         this.connections.delete(id);
         this.status.delete(id);
       }
@@ -180,10 +183,20 @@ export class PluginRuntime {
     });
   }
 
-  dispose(): void {
-    for (const conn of this.connections.values()) conn.clients.forEach((c) => c.close());
+  async dispose(): Promise<void> {
+    const results = await Promise.allSettled(
+      [...this.connections.values()].flatMap((conn) =>
+        conn.clients.map((client) => client.close()),
+      ),
+    );
     this.connections.clear();
     this.status.clear();
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Failed to close MCP plugin process trees");
+    }
   }
 }
 

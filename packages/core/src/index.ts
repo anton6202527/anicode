@@ -21,6 +21,7 @@ export {
 export { DebugProvider, type DebugProviderOptions } from "./provider/debug.js";
 export {
   createProvider,
+  bindProviderRegistry,
   configureProviderCredentialBroker,
   configureProviderNetworkProxy,
   diagnoseProvider,
@@ -49,6 +50,8 @@ export {
   type ResolvedModel,
   type CreatedModel,
   type OpenAICompatibleProviderRegistration,
+  type ProviderRuntimeBindings,
+  type BoundProviderRegistry,
 } from "./provider/registry.js";
 
 export { probeEndpoint, probeLocalProviders } from "./provider/probe.js";
@@ -56,6 +59,7 @@ export { probeEndpoint, probeLocalProviders } from "./provider/probe.js";
 export {
   Agent,
   repairHistory,
+  validateRunBudgetSnapshot,
   type AgentEvent,
   type AgentOptions,
   type AgentModelInfo,
@@ -63,7 +67,10 @@ export {
   type PersistenceConfig,
   type AgentSnapshot,
   type RetryConfig,
+  type RunBudgetConfig,
+  type RunBudgetSnapshot,
 } from "./agent.js";
+export type { ToolExecutionFenceRequest } from "./tool-executor.js";
 export {
   HookRunner,
   type HookEventName,
@@ -84,6 +91,8 @@ export {
   type TaskTools,
   type TaskRecord,
   type TaskStatus,
+  type PersistedTaskRecord,
+  type TaskUsageCredit,
 } from "./subagent.js";
 export { Chan } from "./chan.js";
 export {
@@ -129,6 +138,14 @@ export {
   type PermissionAnswer,
   type PendingPermission,
 } from "./session-manager.js";
+export {
+  createProductionSessionManager,
+  createProductionSessionManagerAsync,
+  ProductionSessionManagerConstructionError,
+  productionSessionManagerOptions,
+  type ProductionSessionManagerInput,
+  type ProductionSessionManagerComposition,
+} from "./production-session-manager.js";
 export { SnapshotStore, type Snapshot, type RestoreResult } from "./snapshot.js";
 export {
   buildAuthUrl,
@@ -381,6 +398,7 @@ export {
   DurableOutbox,
   MemoryOutboxStore,
   FileOutboxStore,
+  CommandIdempotencyConflictError,
   type DurableCommand,
   type CommandStatus,
   type AcceptCommandInput,
@@ -431,11 +449,14 @@ export {
   type TelemetryFromEnvOptions,
 } from "./runtime/telemetry.js";
 export {
+  DisabledExecutionRuntime,
   IsolatedRuntime,
+  terminateProcessTree,
   type ExecutionRuntime,
   type IsolatedRuntimeOptions,
   type IsolatedRunRequest,
   type IsolatedRunResult,
+  type ProcessTreeTerminationOptions,
   type PreparedIsolatedCommand,
 } from "./runtime/isolated-runtime.js";
 export {
@@ -444,6 +465,7 @@ export {
 } from "./runtime/container-runtime.js";
 export {
   TransactionalExecutionRuntime,
+  withDiscardedWorkspace,
   type TransactionalExecutionRuntimeOptions,
 } from "./runtime/transactional-runtime.js";
 export {
@@ -580,17 +602,24 @@ export {
 export {
   createLocalRuntimeStack,
   createConfiguredLocalRuntimeStack,
+  resolveLocalExecutionMode,
   telemetryForLocalStack,
+  type LocalExecutionMode,
   type LocalRuntimeStack,
 } from "./runtime/local-stack.js";
 export {
   defaultTools,
+  foregroundOnlyBash,
+  foregroundOnlyBashTool,
+  LOCAL_PROCESS_TOOL_NAMES,
+  PERSISTENT_PROCESS_TOOL_NAMES,
   readTool,
   writeTool,
   editTool,
   globTool,
   grepTool,
   bashTool,
+  createWebFetchTool,
   webFetchTool,
   htmlToText,
   createWebSearchTool,
@@ -618,11 +647,14 @@ export {
   createBrowserTool,
   type BrowserToolOptions,
 } from "./tools/index.js";
+export { sanitizedShellEnv } from "./tools/shell-spawn.js";
 export {
   Browser,
+  BrowserRegistry,
   Page,
   resolveChromePath,
   closeAllBrowsers,
+  type BrowserResource,
   type NavigateResult,
   type ConsoleEntry,
 } from "./browser/cdp.js";

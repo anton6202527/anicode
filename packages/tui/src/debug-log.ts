@@ -541,11 +541,8 @@ export function withDebugLogging(host: SessionHost, logger: DebugLogger): Sessio
         }
       : {}),
     dispose: () => {
-      try {
-        logger.log("host.dispose");
-      } finally {
-        host.dispose();
-      }
+      logger.log("host.dispose");
+      return host.dispose();
     },
   };
 }

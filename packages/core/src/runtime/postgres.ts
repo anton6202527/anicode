@@ -7,7 +7,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { Artifact, ArtifactInput, ArtifactRecord, ArtifactStore } from "./artifacts.js";
-import type { CommandInboxStore, DurableCommand, OutboxMessage, OutboxStore } from "./commands.js";
+import {
+  CommandIdempotencyConflictError,
+  type CommandInboxStore,
+  type DurableCommand,
+  type OutboxMessage,
+  type OutboxStore,
+} from "./commands.js";
 import type { ISessionStore, SessionData, SessionMeta } from "../session.js";
 import type { ChatMessage } from "../types.js";
 import type {
@@ -1186,38 +1192,6 @@ async function insertCommandRow(client: PoolClient, command: DurableCommand): Pr
   );
 }
 
-async function updateCommandRow(client: PoolClient, command: DurableCommand): Promise<void> {
-  await client.query(
-    `UPDATE anicode_commands
-     SET status = $3, lease_owner = $4, lease_expires_at = $5,
-         fencing_token = $6, data = $7::jsonb, updated_at = $8
-     WHERE session_id = $1 AND id = $2`,
-    [
-      command.sessionId,
-      command.id,
-      command.status,
-      command.leaseOwner ?? null,
-      command.leaseExpiresAt ?? null,
-      command.fencingToken ?? 0,
-      JSON.stringify(command),
-      command.updatedAt,
-    ],
-  );
-}
-
-async function lockedCommand(
-  client: PoolClient,
-  sessionId: string,
-  commandId: string,
-): Promise<DurableCommand> {
-  const selected = await client.query(
-    "SELECT * FROM anicode_commands WHERE session_id = $1 AND id = $2 FOR UPDATE",
-    [sessionId, commandId],
-  );
-  if (!selected.rows[0]) throw new Error(`Unknown durable command: ${commandId}`);
-  return commandFromRow(selected.rows[0] as Row);
-}
-
 function outboxFromRow(row: Row): OutboxMessage {
   const message = clone(row.data as OutboxMessage);
   message.status = String(row.status) as OutboxMessage["status"];
@@ -1253,46 +1227,6 @@ async function insertOutboxRow(client: PoolClient, message: OutboxMessage): Prom
      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)`,
     outboxParams(message),
   );
-}
-
-async function updateOutboxRow(client: PoolClient, message: OutboxMessage): Promise<void> {
-  await client.query(
-    `UPDATE anicode_outbox
-     SET status = $2, lease_owner = $3, lease_expires_at = $4,
-         fencing_token = $5, data = $6::jsonb, updated_at = $7
-     WHERE id = $1`,
-    [
-      message.id,
-      message.status,
-      message.leaseOwner ?? null,
-      message.leaseExpiresAt ?? null,
-      message.fencingToken ?? 0,
-      JSON.stringify(message),
-      message.updatedAt,
-    ],
-  );
-}
-
-async function lockedOutbox(client: PoolClient, id: string): Promise<OutboxMessage> {
-  const selected = await client.query("SELECT * FROM anicode_outbox WHERE id = $1 FOR UPDATE", [
-    id,
-  ]);
-  if (!selected.rows[0]) throw new Error(`Unknown outbox message: ${id}`);
-  return outboxFromRow(selected.rows[0] as Row);
-}
-
-function assertOutboxLease(
-  message: OutboxMessage,
-  owner: string,
-  fencingToken: number | undefined,
-): void {
-  if (
-    message.leaseOwner !== owner ||
-    fencingToken === undefined ||
-    message.fencingToken !== fencingToken
-  ) {
-    throw new Error(`Stale fencing token for outbox message ${message.id}`);
-  }
 }
 
 export class PostgresCommandInboxStore implements CommandInboxStore {
@@ -1360,7 +1294,11 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
       [command.sessionId, command.idempotencyKey],
     );
     if (!duplicate.rows[0]) throw new Error("Command idempotency conflict disappeared");
-    return commandFromRow(duplicate.rows[0] as Row);
+    const existing = commandFromRow(duplicate.rows[0] as Row);
+    if (existing.text !== command.text || existing.model !== command.model) {
+      throw new CommandIdempotencyConflictError(command.idempotencyKey);
+    }
+    return existing;
   }
 
   claimCommand(
@@ -1368,31 +1306,47 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
     commandId: string,
     owner: string,
     leaseMs: number,
-    now: number,
+    _now: number,
   ): Promise<DurableCommand> {
     return this.database.transaction(async (client) => {
+      // PostgreSQL owns lease time. The caller's wall clock is intentionally ignored so a skewed
+      // application host cannot steal a live command or extend a lease from the wrong epoch.
+      const claimed = await client.query(
+        `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+         UPDATE anicode_commands AS command
+         SET status = 'running',
+             lease_owner = $3,
+             lease_expires_at = db_clock.value + ($4::bigint * interval '1 millisecond'),
+             fencing_token = command.fencing_token + 1,
+             updated_at = db_clock.value,
+             data = (command.data - 'leaseExpiresAt') || jsonb_build_object(
+               'status', 'running',
+               'attempts', COALESCE((command.data->>'attempts')::integer, 0) + 1,
+               'fencingToken', command.fencing_token + 1,
+               'leaseOwner', $3::text,
+               'updatedAt', db_clock.value,
+               'leaseExpiresAt', db_clock.value + ($4::bigint * interval '1 millisecond')
+             )
+         FROM db_clock
+         WHERE command.session_id = $1 AND command.id = $2
+           AND (command.status = 'accepted' OR
+                (command.status = 'running' AND
+                 (command.lease_expires_at IS NULL OR command.lease_expires_at <= db_clock.value)))
+         RETURNING command.*`,
+        [sessionId, commandId, owner, Math.max(1_000, leaseMs)],
+      );
+      if (claimed.rows[0]) return commandFromRow(claimed.rows[0] as Row);
+
       const selected = await client.query(
-        "SELECT * FROM anicode_commands WHERE session_id = $1 AND id = $2 FOR UPDATE",
+        "SELECT status, lease_owner FROM anicode_commands WHERE session_id = $1 AND id = $2",
         [sessionId, commandId],
       );
-      if (!selected.rows[0]) throw new Error(`Unknown durable command: ${commandId}`);
-      const command = commandFromRow(selected.rows[0] as Row);
-      const leaseActive =
-        command.leaseExpiresAt !== undefined && Date.parse(command.leaseExpiresAt) > now;
-      if (command.status === "running" && leaseActive && command.leaseOwner !== owner) {
-        throw new Error(`Durable command ${commandId} is leased by ${command.leaseOwner}`);
+      const row = selected.rows[0] as Row | undefined;
+      if (!row) throw new Error(`Unknown durable command: ${commandId}`);
+      if (String(row.status) === "running") {
+        throw new Error(`Durable command ${commandId} is leased by ${String(row.lease_owner)}`);
       }
-      if (!(["accepted", "running"] as string[]).includes(command.status)) {
-        throw new Error(`Durable command ${commandId} is already ${command.status}`);
-      }
-      command.status = "running";
-      command.attempts++;
-      command.fencingToken = (command.fencingToken ?? 0) + 1;
-      command.leaseOwner = owner;
-      command.leaseExpiresAt = new Date(now + Math.max(1_000, leaseMs)).toISOString();
-      command.updatedAt = new Date(now).toISOString();
-      await updateCommandRow(client, command);
-      return command;
+      throw new Error(`Durable command ${commandId} is already ${String(row.status)}`);
     });
   }
 
@@ -1403,18 +1357,28 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
     leaseMs: number,
     fencingToken?: number,
   ): Promise<void> {
-    return this.database.transaction(async (client) => {
-      const command = await lockedCommand(client, sessionId, commandId);
-      if (command.status !== "running" || command.leaseOwner !== owner) {
-        throw new Error(`Cannot heartbeat unowned command ${commandId}`);
-      }
-      if (fencingToken !== undefined && command.fencingToken !== fencingToken) {
-        throw new Error(`Stale fencing token for command ${commandId}`);
-      }
-      command.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
-      command.updatedAt = new Date().toISOString();
-      await updateCommandRow(client, command);
-    });
+    return this.database.pool
+      .query(
+        `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+         UPDATE anicode_commands AS command
+         SET lease_expires_at = db_clock.value + ($4::bigint * interval '1 millisecond'),
+             updated_at = db_clock.value,
+             data = (command.data - 'leaseExpiresAt') || jsonb_build_object(
+               'updatedAt', db_clock.value,
+               'leaseExpiresAt', db_clock.value + ($4::bigint * interval '1 millisecond')
+             )
+         FROM db_clock
+         WHERE command.session_id = $1 AND command.id = $2
+           AND command.status = 'running' AND command.lease_owner = $3
+           AND command.lease_expires_at > db_clock.value
+           AND ($5::bigint IS NULL OR command.fencing_token = $5)`,
+        [sessionId, commandId, owner, Math.max(1_000, leaseMs), fencingToken ?? null],
+      )
+      .then((result) => {
+        if ((result.rowCount ?? 0) !== 1) {
+          throw new Error(`Cannot heartbeat unowned or expired command ${commandId}`);
+        }
+      });
   }
 
   finishCommand(
@@ -1424,22 +1388,41 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
     error?: string,
     lease?: { owner: string; fencingToken: number },
   ): Promise<void> {
-    return this.database.transaction(async (client) => {
-      const command = await lockedCommand(client, sessionId, commandId);
-      if (
-        lease &&
-        (command.leaseOwner !== lease.owner || command.fencingToken !== lease.fencingToken)
-      ) {
-        throw new Error(`Stale fencing token for command ${commandId}`);
-      }
-      command.status = status;
-      command.updatedAt = new Date().toISOString();
-      delete command.leaseOwner;
-      delete command.leaseExpiresAt;
-      if (error) command.error = error;
-      else delete command.error;
-      await updateCommandRow(client, command);
-    });
+    return this.database.pool
+      .query(
+        `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+         UPDATE anicode_commands AS command
+         SET status = $3,
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             updated_at = db_clock.value,
+             data = (command.data - 'leaseOwner' - 'leaseExpiresAt' - 'error') ||
+               jsonb_build_object('status', $3::text, 'updatedAt', db_clock.value) ||
+               CASE WHEN $6::text IS NULL THEN '{}'::jsonb
+                    ELSE jsonb_build_object('error', $6::text) END
+         FROM db_clock
+         WHERE command.session_id = $1 AND command.id = $2
+           AND (($4::text IS NULL AND
+                 (command.status IN ('accepted', 'running') OR
+                  (command.status = $3 AND
+                   COALESCE(command.data->>'error', '') = COALESCE($6::text, '')))) OR
+                ($4::text IS NOT NULL AND command.status = 'running'
+                 AND command.lease_owner = $4 AND command.fencing_token = $5
+                 AND command.lease_expires_at > db_clock.value))`,
+        [
+          sessionId,
+          commandId,
+          status,
+          lease?.owner ?? null,
+          lease?.fencingToken ?? null,
+          error ?? null,
+        ],
+      )
+      .then((result) => {
+        if ((result.rowCount ?? 0) !== 1) {
+          throw new Error(`Stale fencing token for command ${commandId}`);
+        }
+      });
   }
 
   async getCommand(sessionId: string, commandId: string): Promise<DurableCommand | undefined> {
@@ -1450,13 +1433,15 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
     return result.rows[0] ? commandFromRow(result.rows[0] as Row) : undefined;
   }
 
-  async recoverableCommands(sessionId: string, now: number): Promise<DurableCommand[]> {
+  async recoverableCommands(sessionId: string, _now: number): Promise<DurableCommand[]> {
     const result = await this.database.pool.query(
       `SELECT * FROM anicode_commands
        WHERE session_id = $1
-         AND (status = 'accepted' OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= $2)))
+         AND (status = 'accepted' OR
+              (status = 'running' AND
+               (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())))
        ORDER BY created_at, id`,
-      [sessionId, new Date(now).toISOString()],
+      [sessionId],
     );
     return result.rows.map((row) => commandFromRow(row as Row));
   }
@@ -1521,49 +1506,78 @@ export class PostgresOutboxStore implements OutboxStore {
   }
 
   claimMessage(owner: string, leaseMs: number): Promise<OutboxMessage | undefined> {
-    return this.database.transaction(async (client) => {
-      const selected = await client.query(
-        `SELECT * FROM anicode_outbox
-         WHERE status = 'pending' AND (lease_expires_at IS NULL OR lease_expires_at <= now())
-         ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1`,
-      );
-      if (!selected.rows[0]) return undefined;
-      const message = outboxFromRow(selected.rows[0] as Row);
-      message.leaseOwner = owner;
-      message.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
-      message.fencingToken = (message.fencingToken ?? 0) + 1;
-      message.updatedAt = new Date().toISOString();
-      await updateOutboxRow(client, message);
-      return message;
-    });
+    return this.database.pool
+      .query(
+        `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value),
+         candidate AS MATERIALIZED (
+           SELECT outbox.id
+           FROM anicode_outbox AS outbox, db_clock
+           WHERE outbox.status = 'pending'
+             AND (outbox.lease_expires_at IS NULL OR outbox.lease_expires_at <= db_clock.value)
+           ORDER BY outbox.created_at, outbox.id
+           FOR UPDATE OF outbox SKIP LOCKED
+           LIMIT 1
+         )
+         UPDATE anicode_outbox AS outbox
+         SET lease_owner = $1,
+             lease_expires_at = db_clock.value + ($2::bigint * interval '1 millisecond'),
+             fencing_token = outbox.fencing_token + 1,
+             updated_at = db_clock.value,
+             data = (outbox.data - 'leaseExpiresAt') || jsonb_build_object(
+               'leaseOwner', $1::text,
+               'leaseExpiresAt', db_clock.value + ($2::bigint * interval '1 millisecond'),
+               'fencingToken', outbox.fencing_token + 1,
+               'updatedAt', db_clock.value
+             )
+         FROM candidate, db_clock
+         WHERE outbox.id = candidate.id
+         RETURNING outbox.*`,
+        [owner, Math.max(1_000, leaseMs)],
+      )
+      .then((result) => (result.rows[0] ? outboxFromRow(result.rows[0] as Row) : undefined));
   }
 
-  markSent(message: OutboxMessage, owner: string, sentEventId: string): Promise<void> {
-    return this.database.transaction(async (client) => {
-      const current = await lockedOutbox(client, message.id);
-      assertOutboxLease(current, owner, message.fencingToken);
-      current.status = "sent";
-      current.sentEventId = sentEventId;
-      current.attempts++;
-      current.updatedAt = new Date().toISOString();
-      delete current.error;
-      delete current.leaseOwner;
-      delete current.leaseExpiresAt;
-      await updateOutboxRow(client, current);
-    });
+  async markSent(message: OutboxMessage, owner: string, sentEventId: string): Promise<void> {
+    const result = await this.database.pool.query(
+      `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+       UPDATE anicode_outbox AS outbox
+       SET status = 'sent', lease_owner = NULL, lease_expires_at = NULL,
+           updated_at = db_clock.value,
+           data = (outbox.data - 'leaseOwner' - 'leaseExpiresAt' - 'error') ||
+             jsonb_build_object(
+               'status', 'sent',
+               'sentEventId', $4::text,
+               'attempts', COALESCE((outbox.data->>'attempts')::integer, 0) + 1,
+               'updatedAt', db_clock.value
+             )
+       FROM db_clock
+       WHERE outbox.id = $1 AND outbox.status = 'pending' AND outbox.lease_owner = $2
+         AND outbox.fencing_token = $3 AND outbox.lease_expires_at > db_clock.value`,
+      [message.id, owner, message.fencingToken ?? null, sentEventId],
+    );
+    if ((result.rowCount ?? 0) !== 1) {
+      throw new Error(`Stale or expired fencing token for outbox message ${message.id}`);
+    }
   }
 
-  markFailed(message: OutboxMessage, owner: string, error: string): Promise<void> {
-    return this.database.transaction(async (client) => {
-      const current = await lockedOutbox(client, message.id);
-      assertOutboxLease(current, owner, message.fencingToken);
-      current.attempts++;
-      current.error = error;
-      current.updatedAt = new Date().toISOString();
-      delete current.leaseOwner;
-      delete current.leaseExpiresAt;
-      await updateOutboxRow(client, current);
-    });
+  async markFailed(message: OutboxMessage, owner: string, error: string): Promise<void> {
+    const result = await this.database.pool.query(
+      `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+       UPDATE anicode_outbox AS outbox
+       SET lease_owner = NULL, lease_expires_at = NULL, updated_at = db_clock.value,
+           data = (outbox.data - 'leaseOwner' - 'leaseExpiresAt') || jsonb_build_object(
+             'attempts', COALESCE((outbox.data->>'attempts')::integer, 0) + 1,
+             'error', $4::text,
+             'updatedAt', db_clock.value
+           )
+       FROM db_clock
+       WHERE outbox.id = $1 AND outbox.status = 'pending' AND outbox.lease_owner = $2
+         AND outbox.fencing_token = $3 AND outbox.lease_expires_at > db_clock.value`,
+      [message.id, owner, message.fencingToken ?? null, error],
+    );
+    if ((result.rowCount ?? 0) !== 1) {
+      throw new Error(`Stale or expired fencing token for outbox message ${message.id}`);
+    }
   }
 
   async getMessage(id: string): Promise<OutboxMessage | undefined> {
@@ -1865,30 +1879,35 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
 
   acquireWorktree(worktree: string, owner: string, leaseMs: number) {
     return this.database.transaction(async (client) => {
-      const selected = await client.query(
-        "SELECT * FROM anicode_worktree_leases WHERE worktree = $1 FOR UPDATE",
-        [worktree],
-      );
-      const current = selected.rows[0] as Row | undefined;
-      if (
-        current?.owner &&
-        String(current.owner) !== owner &&
-        current.lease_expires_at &&
-        new Date(String(current.lease_expires_at)).getTime() > Date.now()
-      ) {
-        throw new Error(`Worktree is owned by ${String(current.owner)}: ${worktree}`);
-      }
       const result = await client.query(
-        `INSERT INTO anicode_worktree_leases
-         (worktree, owner, lease_expires_at, fencing_token, updated_at)
-         VALUES ($1, $2, now() + ($3::bigint * interval '1 millisecond'), 1, now())
+        `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+         INSERT INTO anicode_worktree_leases
+           (worktree, owner, lease_expires_at, fencing_token, updated_at)
+         SELECT $1, $2, db_clock.value + ($3::bigint * interval '1 millisecond'), 1,
+                db_clock.value
+         FROM db_clock
          ON CONFLICT(worktree) DO UPDATE SET
-           owner = excluded.owner, lease_expires_at = excluded.lease_expires_at,
-           fencing_token = anicode_worktree_leases.fencing_token + 1, updated_at = now()
+           owner = excluded.owner,
+           lease_expires_at = excluded.lease_expires_at,
+           fencing_token = anicode_worktree_leases.fencing_token + 1,
+           updated_at = excluded.updated_at
+         WHERE anicode_worktree_leases.owner IS NULL
+            OR anicode_worktree_leases.owner = excluded.owner
+            OR anicode_worktree_leases.lease_expires_at IS NULL
+            OR anicode_worktree_leases.lease_expires_at <= excluded.updated_at
          RETURNING lease_expires_at, fencing_token`,
         [worktree, owner, Math.max(1_000, leaseMs)],
       );
-      const row = result.rows[0] as Row;
+      const row = result.rows[0] as Row | undefined;
+      if (!row) {
+        const selected = await client.query(
+          "SELECT owner FROM anicode_worktree_leases WHERE worktree = $1",
+          [worktree],
+        );
+        throw new Error(
+          `Worktree is owned by ${String((selected.rows[0] as Row | undefined)?.owner)}: ${worktree}`,
+        );
+      }
       return {
         worktree,
         owner,
@@ -1898,12 +1917,21 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
     });
   }
 
-  async heartbeatWorktree(worktree: string, owner: string, leaseMs: number): Promise<void> {
+  async heartbeatWorktree(
+    worktree: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void> {
     const result = await this.database.pool.query(
-      `UPDATE anicode_worktree_leases
-       SET lease_expires_at = now() + ($3::bigint * interval '1 millisecond'), updated_at = now()
-       WHERE worktree = $1 AND owner = $2 AND lease_expires_at > now()`,
-      [worktree, owner, Math.max(1_000, leaseMs)],
+      `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+       UPDATE anicode_worktree_leases AS lease
+       SET lease_expires_at = db_clock.value + ($3::bigint * interval '1 millisecond'),
+           updated_at = db_clock.value
+       FROM db_clock
+       WHERE lease.worktree = $1 AND lease.owner = $2 AND lease.lease_expires_at > db_clock.value
+         AND ($4::bigint IS NULL OR fencing_token = $4)`,
+      [worktree, owner, Math.max(1_000, leaseMs), fencingToken ?? null],
     );
     if ((result.rowCount ?? 0) !== 1)
       throw new Error(`Cannot heartbeat unowned worktree: ${worktree}`);
@@ -1911,9 +1939,12 @@ export class PostgresWorkerQueueStore implements WorkerQueueStore {
 
   async releaseWorktree(worktree: string, owner: string, fencingToken?: number): Promise<void> {
     const result = await this.database.pool.query(
-      `UPDATE anicode_worktree_leases
-       SET owner = NULL, lease_expires_at = NULL, updated_at = now()
-       WHERE worktree = $1 AND owner = $2
+      `WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS value)
+       UPDATE anicode_worktree_leases AS lease
+       SET owner = NULL, lease_expires_at = NULL, updated_at = db_clock.value
+       FROM db_clock
+       WHERE lease.worktree = $1 AND lease.owner = $2
+         AND lease.lease_expires_at > db_clock.value
          AND ($3::bigint IS NULL OR fencing_token = $3)`,
       [worktree, owner, fencingToken ?? null],
     );

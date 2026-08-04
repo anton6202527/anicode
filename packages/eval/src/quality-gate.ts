@@ -1,10 +1,16 @@
-import type { Summary } from "./report.js";
+import { assertComparableSummaries, type Summary } from "./report.js";
 
 export interface QualityGatePolicy {
   maxPassRateDrop?: number;
   maxEditFailureRateIncrease?: number;
   maxAverageTurnsIncrease?: number;
   maxAverageInputTokensIncrease?: number;
+  maxStablePassRateDrop?: number;
+  maxFlakyTaskRateIncrease?: number;
+  maxToolFailureRateIncrease?: number;
+  maxTerminalCompletionRateDrop?: number;
+  maxFinalResponseMissingRateIncrease?: number;
+  maxFalseCompletionClaimRateIncrease?: number;
   requireNoNewTaskFailures?: boolean;
 }
 
@@ -31,11 +37,18 @@ export function evaluateQualityGate(
   baseline: Summary,
   policy: QualityGatePolicy = {},
 ): QualityGateResult {
+  assertComparableSummaries(current, baseline);
   const limits: Required<QualityGatePolicy> = {
     maxPassRateDrop: policy.maxPassRateDrop ?? 0.06,
     maxEditFailureRateIncrease: policy.maxEditFailureRateIncrease ?? 0.05,
     maxAverageTurnsIncrease: policy.maxAverageTurnsIncrease ?? 0.25,
     maxAverageInputTokensIncrease: policy.maxAverageInputTokensIncrease ?? 0.3,
+    maxStablePassRateDrop: policy.maxStablePassRateDrop ?? 0.06,
+    maxFlakyTaskRateIncrease: policy.maxFlakyTaskRateIncrease ?? 0.05,
+    maxToolFailureRateIncrease: policy.maxToolFailureRateIncrease ?? 0.05,
+    maxTerminalCompletionRateDrop: policy.maxTerminalCompletionRateDrop ?? 0,
+    maxFinalResponseMissingRateIncrease: policy.maxFinalResponseMissingRateIncrease ?? 0.02,
+    maxFalseCompletionClaimRateIncrease: policy.maxFalseCompletionClaimRateIncrease ?? 0,
     requireNoNewTaskFailures: policy.requireNoNewTaskFailures ?? true,
   };
   const violations: QualityGateViolation[] = [];
@@ -81,13 +94,90 @@ export function evaluateQualityGate(
       message: `average input tokens increased ${(tokenIncrease * 100).toFixed(1)}%`,
     });
   }
+  const stablePassDrop = baseline.stability.stablePassRate - current.stability.stablePassRate;
+  if (stablePassDrop > limits.maxStablePassRateDrop) {
+    violations.push({
+      metric: "stablePassRate",
+      baseline: baseline.stability.stablePassRate,
+      current: current.stability.stablePassRate,
+      limit: limits.maxStablePassRateDrop,
+      message: `stable pass rate dropped ${(stablePassDrop * 100).toFixed(1)} percentage points`,
+    });
+  }
+  const flakyIncrease = current.stability.flakyTaskRate - baseline.stability.flakyTaskRate;
+  if (flakyIncrease > limits.maxFlakyTaskRateIncrease) {
+    violations.push({
+      metric: "flakyTaskRate",
+      baseline: baseline.stability.flakyTaskRate,
+      current: current.stability.flakyTaskRate,
+      limit: limits.maxFlakyTaskRateIncrease,
+      message: `flaky task rate increased ${(flakyIncrease * 100).toFixed(1)} percentage points`,
+    });
+  }
+  const toolFailureIncrease =
+    current.trajectory.toolFailureRate - baseline.trajectory.toolFailureRate;
+  if (toolFailureIncrease > limits.maxToolFailureRateIncrease) {
+    violations.push({
+      metric: "toolFailureRate",
+      baseline: baseline.trajectory.toolFailureRate,
+      current: current.trajectory.toolFailureRate,
+      limit: limits.maxToolFailureRateIncrease,
+      message: `tool failure rate increased ${(toolFailureIncrease * 100).toFixed(1)} percentage points`,
+    });
+  }
+  const terminalDrop =
+    baseline.trajectory.terminalCompletionRate - current.trajectory.terminalCompletionRate;
+  if (terminalDrop > limits.maxTerminalCompletionRateDrop) {
+    violations.push({
+      metric: "terminalCompletionRate",
+      baseline: baseline.trajectory.terminalCompletionRate,
+      current: current.trajectory.terminalCompletionRate,
+      limit: limits.maxTerminalCompletionRateDrop,
+      message: `terminal completion rate dropped ${(terminalDrop * 100).toFixed(1)} percentage points`,
+    });
+  }
+  const missingResponseIncrease =
+    current.finalResponse.missingRate - baseline.finalResponse.missingRate;
+  if (missingResponseIncrease > limits.maxFinalResponseMissingRateIncrease) {
+    violations.push({
+      metric: "finalResponseMissingRate",
+      baseline: baseline.finalResponse.missingRate,
+      current: current.finalResponse.missingRate,
+      limit: limits.maxFinalResponseMissingRateIncrease,
+      message: `final-response missing rate increased ${(missingResponseIncrease * 100).toFixed(1)} percentage points`,
+    });
+  }
+  const falseClaimIncrease =
+    current.finalResponse.falseCompletionClaimRate -
+    baseline.finalResponse.falseCompletionClaimRate;
+  if (falseClaimIncrease > limits.maxFalseCompletionClaimRateIncrease) {
+    violations.push({
+      metric: "falseCompletionClaimRate",
+      baseline: baseline.finalResponse.falseCompletionClaimRate,
+      current: current.finalResponse.falseCompletionClaimRate,
+      limit: limits.maxFalseCompletionClaimRateIncrease,
+      message: `false completion-claim rate increased ${(falseClaimIncrease * 100).toFixed(1)} percentage points`,
+    });
+  }
   if (limits.requireNoNewTaskFailures) {
-    const baselinePassed = new Set(
-      baseline.results.filter((result) => result.passed).map((result) => result.id),
-    );
-    const regressed = current.results
-      .filter((result) => baselinePassed.has(result.id) && !result.passed && !result.skipped)
-      .map((result) => result.id);
+    const taskPassRates = (summary: Summary): Map<string, number> => {
+      const grouped = new Map<string, { passed: number; total: number }>();
+      for (const result of summary.results) {
+        if (result.skipped) continue;
+        const value = grouped.get(result.id) ?? { passed: 0, total: 0 };
+        value.total++;
+        if (result.passed) value.passed++;
+        grouped.set(result.id, value);
+      }
+      return new Map(
+        [...grouped].map(([id, value]) => [id, value.total ? value.passed / value.total : 0]),
+      );
+    };
+    const baselineRates = taskPassRates(baseline);
+    const currentRates = taskPassRates(current);
+    const regressed = [...baselineRates]
+      .filter(([id, rate]) => rate === 1 && (currentRates.get(id) ?? 0) < 1)
+      .map(([id]) => id);
     if (regressed.length) {
       violations.push({
         metric: "taskRegression",

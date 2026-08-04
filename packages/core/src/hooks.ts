@@ -43,6 +43,8 @@ export type HookEventName =
 export interface HookPayload {
   event: HookEventName;
   cwd: string;
+  /** Root task cancellation/deadline. Hooks should stop external work promptly when aborted. */
+  signal?: AbortSignal;
   /** UserPromptSubmit：用户输入原文 */
   prompt?: string;
   /** PreToolUse / PermissionRequest / PostToolUse；Subagent* 事件里是子 agent 类型名 */
@@ -91,7 +93,21 @@ export interface HookRegistration {
    * PostToolUse 匹配工具名；对 SubagentStart/SubagentStop 匹配子 agent 类型名。
    */
   matcher?: string;
+  /** Conservatively marks the workspace dirty whenever this hook is invoked. */
+  mutatesWorkspace?: boolean;
   handler: HookHandler;
+}
+
+/**
+ * A command hook lost its process isolation/cancellation proof. Unlike an ordinary user hook
+ * exception this must escape the best-effort hook boundary: continuing could overlap a still-live
+ * workspace-write process with later agent actions.
+ */
+export class HookExecutionBoundaryError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "HookExecutionBoundaryError";
+  }
 }
 
 /** 一个事件跑完全部命中 hook 后的聚合结论 */
@@ -102,14 +118,19 @@ export interface HookOutcome {
   reason?: string;
   updatedInput?: Record<string, unknown>;
   additionalContext?: string;
+  /** At least one invoked registration declared mutation capability. */
+  mutatedWorkspace: boolean;
 }
 
-const PASS: HookOutcome = { blocked: false, allowed: false };
+const PASS: HookOutcome = { blocked: false, allowed: false, mutatedWorkspace: false };
 
 export class HookRunner {
   private regs: HookRegistration[];
 
-  constructor(regs: HookRegistration[] = []) {
+  constructor(
+    regs: HookRegistration[] = [],
+    private readonly onWorkspaceMutation?: () => void,
+  ) {
     this.regs = regs;
   }
 
@@ -128,24 +149,36 @@ export class HookRunner {
     if (hits.length === 0) return PASS;
 
     let allowed = false;
+    let mutatedWorkspace = false;
     let updatedInput: Record<string, unknown> | undefined;
     const contexts: string[] = [];
 
     for (const reg of hits) {
+      if (payload.signal?.aborted) break;
+      if (reg.mutatesWorkspace) {
+        mutatedWorkspace = true;
+        // Mark before invocation: a command may write and then hang/exit non-zero/lose its lease.
+        this.onWorkspaceMutation?.();
+      }
       let res: HookResult | void;
       try {
         res = await reg.handler({
           ...payload,
           ...(updatedInput ? { toolInput: updatedInput } : {}),
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof HookExecutionBoundaryError) throw error;
         continue; // hook 异常按无操作处理
       }
+      // A late non-cooperative hook result is observationally inert: do not apply it or start the
+      // next hook after the root task has ended.
+      if (payload.signal?.aborted) break;
       if (!res) continue;
       if (res.decision === "block") {
         return {
           blocked: true,
           allowed: false,
+          mutatedWorkspace,
           reason: res.reason ?? "被 hook 拦截",
           ...(contexts.length ? { additionalContext: contexts.join("\n") } : {}),
         };
@@ -158,6 +191,7 @@ export class HookRunner {
     return {
       blocked: false,
       allowed,
+      mutatedWorkspace,
       ...(updatedInput ? { updatedInput } : {}),
       ...(contexts.length ? { additionalContext: contexts.join("\n") } : {}),
     };

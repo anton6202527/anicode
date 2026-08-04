@@ -2,12 +2,14 @@
  * diagnostics 工具：通过 LSP 池取某文件的语言服务器诊断，喂给 agent 自查改动。
  */
 import * as path from "node:path";
-import { type Tool, type ToolContext } from "./tool.js";
-import { type LspPool } from "../lsp.js";
+import { promises as fs } from "node:fs";
+import { type Tool, type ToolContext, ToolError } from "./tool.js";
+import { canonicalLspWorkspaceFile, type LspPool } from "../lsp.js";
 import { t } from "../i18n.js";
 
 export function createDiagnosticsTool(pool: LspPool): Tool {
   return {
+    capabilities: ["filesystem-read", "process", "persistent-process"],
     readOnly: true,
     def: {
       name: "diagnostics",
@@ -29,13 +31,18 @@ export function createDiagnosticsTool(pool: LspPool): Tool {
     },
     ruleKey: (i) => String(i["path"] ?? ""),
     async run(input, ctx: ToolContext) {
-      const rel = String(input["path"] ?? "");
-      const abs = path.resolve(ctx.cwd, rel);
-      const ext = path.extname(abs);
-      const client = pool.clientFor(ext);
-      if (!client) {
+      const requested = String(input["path"] ?? "");
+      const ext = path.extname(requested);
+      if (!pool.hasServerFor(ext)) {
         return `没有为 ${ext || "该文件"} 配置语言服务器（在 anicode.json 的 lsp 里添加）。`;
       }
+      const abs = await canonicalLspWorkspaceFile(ctx.cwd, requested).catch((error: unknown) => {
+        throw new ToolError(
+          `LSP 文件不可访问: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+      const rel = path.relative(await fs.realpath(ctx.cwd), abs) || ".";
+      const client = pool.clientFor(ext)!;
       const diags = await client.diagnose(abs);
       if (diags.length === 0) return `${rel}: 无诊断（干净）。`;
       return diags

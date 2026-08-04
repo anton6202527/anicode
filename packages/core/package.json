@@ -13,7 +13,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
+    "test": "cross-env ANICODE_LANG=zh node --import tsx --test --test-concurrency=4 'src/**/*.test.ts'",
     "demo": "tsx src/demo.ts",
     "daemon": "tsx src/daemon/launch.ts",
     "remote": "tsx src/runtime/remote-launch.ts",

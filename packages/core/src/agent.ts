@@ -26,8 +26,8 @@ import {
   type PermissionProfile,
 } from "./permission.js";
 import { ToolRegistry, type Tool } from "./tools/tool.js";
-import { ToolExecutor } from "./tool-executor.js";
-import { TurnRunner } from "./turn-runner.js";
+import { ToolExecutor, type ToolExecutionFenceRequest } from "./tool-executor.js";
+import { TurnRunner, type ModelCallReservation, type ReserveModelCall } from "./turn-runner.js";
 import { SteeringInbox } from "./steering.js";
 import { defaultTools } from "./tools/index.js";
 import { createWebSearchTool, type WebSearchBackend } from "./tools/web-search.js";
@@ -40,8 +40,10 @@ import { HookRunner, type HookRegistration } from "./hooks.js";
 import {
   createTaskTools,
   TaskRegistry,
+  type PersistedTaskRecord,
   type SubagentDefinition,
   type TaskRecord,
+  type TaskUsageCredit,
 } from "./subagent.js";
 import { discoverSubagents } from "./agents-fs.js";
 import {
@@ -63,6 +65,7 @@ import {
 } from "./context-assembler.js";
 import { SnapshotStore } from "./snapshot.js";
 import { Conversation, reminder, type PersistenceConfig } from "./conversation.js";
+import type { SessionMeta } from "./session.js";
 import type { WorktreeOwnership } from "./runtime/worker.js";
 import type { NetworkProxy } from "./runtime/network-proxy.js";
 import { ContextCompiler, type ContextSource } from "./runtime/context-compiler.js";
@@ -102,6 +105,39 @@ export interface RetryConfig {
   maxRetries?: number;
   /** 首次退避毫秒数（指数递增 + 抖动），默认 500 */
   baseDelayMs?: number;
+}
+
+/**
+ * 一次 send/drive 的硬执行预算。所有值都是单次用户任务维度，不会把历史会话已经
+ * 消耗的额度重复计算。预算同时约束模型轮、子 agent 汇入的用量和工具执行。
+ */
+export interface RunBudgetConfig {
+  /** 单次任务最大墙钟时间，默认 30 分钟。 */
+  maxWallTimeMs?: number;
+  /** 单次任务输入+输出+缓存 token 总量，默认 1,000,000。 */
+  maxTotalTokens?: number;
+  /** 已知模型价格时的单次任务成本上限（美元），默认 25。 */
+  maxCostUSD?: number;
+  /** 单次任务最多执行的工具调用数，默认 500。 */
+  maxToolCalls?: number;
+  /** 同一批只读工具的最大并发，默认 8。 */
+  maxConcurrentTools?: number;
+  /** 单个工具的统一执行超时，默认 10 分钟。 */
+  toolTimeoutMs?: number;
+}
+
+/** Durable, monotonic checkpoint for one logical root command across process recovery. */
+export interface RunBudgetSnapshot {
+  version: 1;
+  revision: number;
+  startedAt: number;
+  chargedUsage: Usage;
+  chargedCostUSD: number;
+  reservedTokens: number;
+  reservedCostUSD: number;
+  toolCalls: number;
+  /** Persisted hard-stop cause; recovery must never reopen a terminal logical command. */
+  terminalReason?: string;
 }
 
 /** Agent 运行时真正需要的模型能力子集；registry 的 ProviderModelInfo 与其结构兼容。 */
@@ -170,8 +206,31 @@ export interface AgentOptions {
    * 下一次 send 开始时注入。运行中完成的通知不走此回调（直接在 turn 边界注入）。
    */
   onTaskNotice?: (text: string) => void;
+  /** Child-agent transcript used only when explicitly resuming a durable subagent. */
+  initialMessages?: ChatMessage[];
+  /** Child-agent cumulative usage restored with initialMessages. Internal subagent resume input. */
+  initialUsage?: Usage;
+  /** Durable background-task checkpoints recovered by SessionManager. */
+  recoveredTasks?: PersistedTaskRecord[];
+  /** Called whenever a task reaches a new durable checkpoint. */
+  onTaskState?: (record: PersistedTaskRecord) => void;
+  /** Called once when the in-memory task cap evicts a terminal task; host removes its artifacts. */
+  onTaskEvicted?: (taskId: string) => void;
+  /** Durable root-usage credit emitted exactly once after each subagent run is accumulated. */
+  onTaskUsageCredited?: (credit: TaskUsageCredit) => void | Promise<void>;
+  /** Durable command ownership gate checked at the final boundary before side-effecting tools. */
+  beforeToolExecution?: (request: ToolExecutionFenceRequest) => void | Promise<void>;
+  /**
+   * Internal mandatory fence layered after the command-bound/fallback fence. Worktree subagents
+   * use it for their exact lease generation; hosts should use beforeToolExecution instead.
+   */
+  internalBeforeToolExecution?: (request: ToolExecutionFenceRequest) => void | Promise<void>;
   maxTurns?: number;
   maxTokens?: number;
+  /** 单次用户任务的统一墙钟/token/成本/工具预算。 */
+  runBudget?: RunBudgetConfig;
+  /** Persist each budget mutation before its associated provider/tool side effect proceeds. */
+  onRunBudgetCheckpoint?: (snapshot: RunBudgetSnapshot) => void | Promise<void>;
   /**
    * 便宜快速模型 spec（`provider/model`），用于压缩摘要等杂活（对齐 Claude Code
    * 「大量调用走小模型」的成本策略）。需要 resolveModel 才能实例化；解析失败静默回退主模型。
@@ -327,6 +386,14 @@ const MAX_STOP_CONTINUATIONS = 3;
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 500;
+const DEFAULT_RUN_BUDGET: Required<RunBudgetConfig> = {
+  maxWallTimeMs: 30 * 60_000,
+  maxTotalTokens: 1_000_000,
+  maxCostUSD: 25,
+  maxToolCalls: 500,
+  maxConcurrentTools: 8,
+  toolTimeoutMs: 10 * 60_000,
+};
 
 export class Agent {
   /** 模型轮执行（架构 v2：provider 流 + 重试 + 降级链 + active 模型状态）。 */
@@ -340,6 +407,8 @@ export class Agent {
   private readonly hooks: HookRunner;
   private readonly maxTurns: number;
   private readonly maxTokens: number | undefined;
+  private readonly runBudget: Required<RunBudgetConfig>;
+  private readonly requireKnownModelCost: boolean;
   private readonly worktreeOwnership?: WorktreeOwnership;
   private readonly networkProxy?: NetworkProxy;
   private readonly snapshots: SnapshotStore | null;
@@ -377,8 +446,18 @@ export class Agent {
   private readonly inbox: SteeringInbox;
   /** 工具执行调度（架构 v2：并行批 + 权限门 + Pre/PostToolUse hook）。 */
   private readonly executor: ToolExecutor;
+  /** 当前 drive 在整棵 agent tree 的共享预算 scope；工具内部模型用量也经此计入。 */
+  private activeBudget: DriveBudget | null = null;
   /** 后台子 agent 任务注册表（启用 subagents 后由 registerTaskTool 填充）。 */
   private taskRegistry: TaskRegistry | null = null;
+  private readonly onTaskUsageCredited?: (credit: TaskUsageCredit) => void | Promise<void>;
+  private readonly beforeToolExecution?: (
+    request: ToolExecutionFenceRequest,
+  ) => void | Promise<void>;
+  private readonly internalBeforeToolExecution?: (
+    request: ToolExecutionFenceRequest,
+  ) => void | Promise<void>;
+  private readonly onRunBudgetCheckpoint?: (snapshot: RunBudgetSnapshot) => void | Promise<void>;
   private changedSinceVerification = false;
   private readonly changedFiles = new Set<string>();
 
@@ -387,11 +466,13 @@ export class Agent {
     // 小模型：解析失败（拼写/缺凭证）就静默回退主模型，绝不因杂活模型而拖垮主流程。
     let smallProvider = opts.provider;
     let smallModelId = opts.model;
+    let smallModelCost = opts.modelInfo?.cost;
     if (opts.smallModel && opts.resolveModel) {
       try {
         const r = opts.resolveModel(opts.smallModel);
         smallProvider = r.provider;
         smallModelId = r.model;
+        smallModelCost = r.modelInfo?.cost;
       } catch {
         /* 回退主模型 */
       }
@@ -402,9 +483,11 @@ export class Agent {
     // Agent 拥有自己的 registry，避免启用 task/skill 时污染调用方复用的集合，
     // 也借 Tool.fork() 隔离 todo 等闭包状态。
     this.tools = opts.tools?.clone() ?? defaultTools();
-    this.hooks = new HookRunner(opts.hooks ?? []);
+    this.hooks = new HookRunner(opts.hooks ?? [], () => this.markWorkspaceDirty());
     this.maxTurns = opts.maxTurns ?? 50;
     this.maxTokens = resolveMaxTokens(opts.maxTokens, opts.modelInfo);
+    this.runBudget = normalizeRunBudget(opts.runBudget);
+    this.requireKnownModelCost = opts.runBudget?.maxCostUSD !== undefined;
     const effort = opts.modelInfo?.capabilities.reasoning === false ? undefined : opts.effort;
     const maxResult = opts.maxToolResultChars ?? 30_000;
     const maxToolResultChars = Number.isFinite(maxResult) ? Math.max(256, maxResult) : 30_000;
@@ -426,7 +509,11 @@ export class Agent {
       retry,
       ...(this.maxTokens !== undefined ? { maxTokens: this.maxTokens } : {}),
       ...(effort ? { effort } : {}),
-      small: { provider: smallProvider, model: smallModelId },
+      small: {
+        provider: smallProvider,
+        model: smallModelId,
+        ...(smallModelCost ? { cost: smallModelCost } : {}),
+      },
       telemetry: this.telemetry,
       parent: () => this.traceParent,
     });
@@ -457,8 +544,15 @@ export class Agent {
     this.permissionOpt = opts.permission;
     this.hooksOpt = opts.hooks ?? [];
     this.inbox = new SteeringInbox(opts.onTaskNotice);
+    if (opts.onTaskUsageCredited) this.onTaskUsageCredited = opts.onTaskUsageCredited;
+    if (opts.beforeToolExecution) this.beforeToolExecution = opts.beforeToolExecution;
+    if (opts.internalBeforeToolExecution) {
+      this.internalBeforeToolExecution = opts.internalBeforeToolExecution;
+    }
+    if (opts.onRunBudgetCheckpoint) this.onRunBudgetCheckpoint = opts.onRunBudgetCheckpoint;
     this.compaction = this.resolveCompaction(opts.compaction, opts.modelInfo);
-    this.conv = new Conversation(opts.persistence);
+    this.conv = new Conversation(opts.persistence, opts.initialMessages ?? []);
+    if (opts.initialUsage) this.conv.accumulate(normalizeUsage(opts.initialUsage));
     this.contextCompiler = opts.contextCompiler ?? new ContextCompiler();
     this.verifier = opts.verifier ?? null;
     this.verificationMaxAttempts = Math.max(1, Math.floor(opts.verificationMaxAttempts ?? 2));
@@ -496,6 +590,17 @@ export class Agent {
         includeProject:
           typeof sub !== "object" || Array.isArray(sub) || sub.includeProject !== false,
       };
+      this.taskRegistry = new TaskRegistry(
+        opts.recoveredTasks ?? [],
+        opts.onTaskState,
+        opts.onTaskEvicted,
+      );
+      void this.taskRegistry.persistRecoveredNormalization().catch(() => undefined);
+      for (const interrupted of this.taskRegistry.interruptedAfterRestart()) {
+        this.inbox.holdNotice(
+          `<task-notification id="${interrupted.id}">\n后台子 agent 因宿主重启而停止；其耐久上下文已恢复，可用 task_send 继续。\n</task-notification>`,
+        );
+      }
       if (!this.subagentsOpt.discover) this.registerTaskTool(definitions);
     }
     // PermissionRequest hook：权限门确定要询问用户时先过 hook —— allow 自动批准、
@@ -505,13 +610,16 @@ export class Agent {
       baseConfirm &&
       (async (req: PermissionRequest): Promise<PermissionDecision> => {
         if (this.hooks.has("PermissionRequest")) {
-          const h = await this.hooks.run({
+          const hook = this.hooks.run({
             event: "PermissionRequest",
             cwd: this.cwd,
             toolName: req.toolName,
             toolInput: req.input,
             ruleKey: req.ruleKey,
+            ...(req.signal ? { signal: req.signal } : {}),
           });
+          const h = req.signal ? await raceWithSignal(hook, req.signal) : await hook;
+          if (req.signal?.aborted) return { behavior: "deny", message: "授权请求已取消" };
           if (h.blocked) {
             return { behavior: "deny", message: h.reason ?? "被 PermissionRequest hook 拒绝" };
           }
@@ -519,22 +627,30 @@ export class Agent {
         }
         // Notification（观察性）：即将弹授权确认，用户可能不在屏幕前 —— 外接提醒的时机。
         if (this.hooks.has("Notification")) {
-          await this.hooks.run({
+          const notification = this.hooks.run({
             event: "Notification",
             cwd: this.cwd,
             notificationType: "permission_request",
             toolName: req.toolName,
             ruleKey: req.ruleKey,
             message: req.ruleKey,
+            ...(req.signal ? { signal: req.signal } : {}),
           });
+          if (req.signal) await raceWithSignal(notification, req.signal);
+          else await notification;
         }
-        return baseConfirm(req);
+        if (req.signal?.aborted) return { behavior: "deny", message: "授权请求已取消" };
+        const decision = Promise.resolve(baseConfirm(req));
+        return req.signal ? raceWithSignal(decision, req.signal) : decision;
       });
     // 只读/编辑类工具名并入权限引擎：只读自动放行，编辑类供 acceptEdits 决策
     this.perm = new PermissionEngine({
       ...opts.permission,
       ...(confirm ? { confirm } : {}),
-      readOnlyTools: [...(opts.permission?.readOnlyTools ?? []), ...this.tools.readOnlyNames()],
+      readOnlyTools: [
+        ...(opts.permission?.readOnlyTools ?? []),
+        ...this.tools.permissionReadOnlyNames(),
+      ],
       editTools: [...(opts.permission?.editTools ?? []), ...this.tools.editNames()],
     });
     this.permissionProfiles = { ...BUILTIN_PROFILES, ...opts.permissionProfiles };
@@ -551,16 +667,32 @@ export class Agent {
         !this.hooks.has("PreToolUse") &&
         !(opts.permission?.confirm && (opts.permission.askRules?.length ?? 0) > 0),
       supportsImages: () => this.runner.supportsImages,
-      addUsage: (usage) => this.conv.accumulate(usage),
+      addUsage: (usage) => {
+        // Tool implementations are an untrusted accounting boundary. Charge the hard ledger first
+        // so malformed/overflowing usage aborts the drive without poisoning Conversation totals.
+        this.activeBudget?.addUsage(usage, this.runner.activeModelCost);
+        this.conv.accumulate(usage);
+      },
+      maxConcurrentTools: this.runBudget.maxConcurrentTools,
+      toolTimeoutMs: this.runBudget.toolTimeoutMs,
       ...(this.isolatedRuntime ? { isolatedRuntime: this.isolatedRuntime } : {}),
       ...(this.networkProxy ? { networkProxy: this.networkProxy } : {}),
       ...(this.securityPolicy ? { securityPolicy: this.securityPolicy } : {}),
       telemetry: this.telemetry,
       traceParent: () => this.traceParent,
       onFilesChanged: (paths) => {
-        this.changedSinceVerification = true;
-        for (const changedPath of paths) this.changedFiles.add(changedPath);
+        for (const changedPath of paths) this.markWorkspaceDirty(changedPath);
       },
+      beforeToolExecution: async (request) => {
+        // A per-send command lease is captured by the shared tree ledger and replaces the
+        // constructor-level host fallback. Mandatory local guards (notably worktree fencing) are
+        // always layered last so neither form can bypass them.
+        const commandBound = await this.activeBudget?.beforeToolExecution(request);
+        if (!commandBound) await this.beforeToolExecution?.(request);
+        await this.internalBeforeToolExecution?.(request);
+      },
+      acquireToolExecutionSlot: (signal) =>
+        this.activeBudget?.acquireToolSlot(signal) ?? Promise.resolve(() => undefined),
     });
   }
 
@@ -571,7 +703,7 @@ export class Agent {
     const childHooks = this.hooksOpt.filter(
       (hook) => hook.event === "PreToolUse" || hook.event === "PostToolUse",
     );
-    const registry = new TaskRegistry();
+    const registry = this.taskRegistry ?? new TaskRegistry();
     this.taskRegistry = registry;
     const taskTools = createTaskTools({
       makeAgent: (o) => new Agent(o),
@@ -587,6 +719,14 @@ export class Agent {
       telemetry: this.telemetry,
       ...(this.verifier ? { verifier: this.verifier } : {}),
       contextCompiler: this.contextCompiler,
+      runBudget: this.runBudget,
+      getRunBudgetLedger: () => this.activeBudget?.ledger,
+      recordUsage: (usage) => this.conv.accumulate(usage),
+      ...(this.onTaskUsageCredited ? { onTaskUsageCredited: this.onTaskUsageCredited } : {}),
+      ...(this.beforeToolExecution ? { beforeToolExecution: this.beforeToolExecution } : {}),
+      ...(this.internalBeforeToolExecution
+        ? { internalBeforeToolExecution: this.internalBeforeToolExecution }
+        : {}),
       ...(this.worktreeOwnership ? { worktreeOwnership: this.worktreeOwnership } : {}),
       ...(this.networkProxy ? { networkProxy: this.networkProxy } : {}),
       ...(this.permissionOpt ? { permission: this.permissionOpt } : {}),
@@ -605,6 +745,11 @@ export class Agent {
     this.inbox.deliverNotice(text, this.running);
   }
 
+  private markWorkspaceDirty(path = this.cwd): void {
+    this.changedSinceVerification = true;
+    this.changedFiles.add(path);
+  }
+
   /** 后台子 agent 任务一览（UI/宿主观测用）。 */
   get backgroundTasks(): readonly TaskRecord[] {
     return this.taskRegistry?.list() ?? [];
@@ -613,6 +758,38 @@ export class Agent {
   /** 停止全部运行中的后台子 agent 任务（会话销毁/删除时调用）。返回停掉的数量。 */
   stopBackgroundTasks(): number {
     return this.taskRegistry?.stopAll() ?? 0;
+  }
+
+  /** 等待后台 runner 完成 finally / usage / durable state checkpoint。 */
+  async awaitBackgroundTasksIdle(signal?: AbortSignal): Promise<void> {
+    await this.taskRegistry?.awaitIdle(signal);
+    await this.conv.whenPersisted(signal);
+  }
+
+  /** Wait for all ordered conversation append/rewrite operations. */
+  async awaitPersistenceIdle(signal?: AbortSignal): Promise<void> {
+    await this.conv.whenPersisted(signal);
+  }
+
+  /** Wait for raw tool bodies which may have outlived their timeout/abort result. */
+  async awaitToolExecutionsIdle(): Promise<void> {
+    await this.executor.awaitIdle();
+  }
+
+  /** Close resources owned by this Agent's tool instances after all executions are drained. */
+  async closeToolResources(): Promise<void> {
+    await this.executor.awaitIdle();
+    await this.tools.closeAll();
+  }
+
+  /** Serialize a host-requested full rewrite with every Agent append/compaction rewrite. */
+  async rewritePersistence(signal?: AbortSignal): Promise<void> {
+    await this.conv.rewritePersistence(signal);
+  }
+
+  /** Serialize metadata updates (notably auto-title) with the Conversation persistence queue. */
+  async updatePersistenceMeta(meta: SessionMeta, signal?: AbortSignal): Promise<void> {
+    await this.conv.updatePersistenceMeta(meta, signal);
   }
 
   // ---------- 只读访问 ----------
@@ -661,32 +838,57 @@ export class Agent {
       );
     if (!this.compaction)
       throw new Error(t("Compaction is not enabled for this session", "该会话未启用上下文压缩"));
-    if (this.hooks.has("PreCompact")) {
-      await this.hooks.run({
-        event: "PreCompact",
-        cwd: this.cwd,
-        tokens: this.conv.lastInputTokens,
-      });
-    }
-    const res = await maybeCompact(this.conv.raw(), this.compaction, this.conv.lastInputTokens, {
-      force: true,
-    });
-    if (res.compacted) {
-      await this.conv.replaceAll(res.messages);
-      if (this.hooks.has("PostCompact")) {
-        await this.hooks.run({
-          event: "PostCompact",
-          cwd: this.cwd,
-          beforeTokens: res.beforeTokens,
-          afterTokens: res.afterTokens,
-        });
+    const budget = new RunBudgetLedger(this.runBudget, this.requireKnownModelCost).retain();
+    const linked = linkedRunSignal(undefined, budget.signal);
+    this.activeBudget = budget;
+    try {
+      if (this.hooks.has("PreCompact")) {
+        await raceWithSignal(
+          this.hooks.run({
+            event: "PreCompact",
+            cwd: this.cwd,
+            tokens: this.conv.lastInputTokens,
+            signal: linked.signal,
+          }),
+          linked.signal,
+        );
       }
+      const res = await raceWithSignal(
+        maybeCompact(this.conv.raw(), this.compaction, this.conv.lastInputTokens, {
+          force: true,
+          signal: linked.signal,
+        }),
+        linked.signal,
+      );
+      throwIfAborted(linked.signal);
+      if (res.compacted) {
+        await this.conv.replaceAll(res.messages, linked.signal);
+        if (this.hooks.has("PostCompact")) {
+          await raceWithSignal(
+            this.hooks.run({
+              event: "PostCompact",
+              cwd: this.cwd,
+              beforeTokens: res.beforeTokens,
+              afterTokens: res.afterTokens,
+              signal: linked.signal,
+            }),
+            linked.signal,
+          );
+        }
+      }
+      return {
+        compacted: res.compacted,
+        beforeTokens: res.beforeTokens,
+        afterTokens: res.afterTokens,
+      };
+    } finally {
+      this.activeBudget = null;
+      linked.dispose();
+      // Tool-internal usage checkpoints may have been scheduled from a synchronous callback.
+      // Drain them before releasing this drive; a failure has already aborted the ledger.
+      await budget.whenCheckpointed(budget.signal).catch(() => undefined);
+      budget.dispose();
     }
-    return {
-      compacted: res.compacted,
-      beforeTokens: res.beforeTokens,
-      afterTokens: res.afterTokens,
-    };
   }
 
   /**
@@ -703,7 +905,7 @@ export class Agent {
     return this.conv.rewind(messageCount);
   }
 
-  /** 运行时切换权限模式（如 /plan 进入/退出计划模式）；下一轮工具授权即按新模式判定。 */
+  /** 运行时切换权限模式；下一轮工具授权即按新模式判定。 */
   setPermissionMode(mode: PermissionMode): void {
     this.perm.setMode(mode);
   }
@@ -748,7 +950,19 @@ export class Agent {
   async *send(
     userText: string,
     signal?: AbortSignal,
-    opts?: { model?: string; resume?: boolean; parent?: SpanContext },
+    opts?: {
+      model?: string;
+      resume?: boolean;
+      parent?: SpanContext;
+      /** Internal: subagents share the root task's bounded tree ledger. */
+      budget?: RunBudgetLedger;
+      /** Durable state for this exact root command when resuming after a process crash. */
+      runBudgetSnapshot?: RunBudgetSnapshot;
+      /** Exact durable-command fence captured by this drive and all of its detached children. */
+      beforeToolExecution?: (request: ToolExecutionFenceRequest) => void | Promise<void>;
+      /** Exact durable-command budget sink captured by this drive and all detached children. */
+      onRunBudgetCheckpoint?: (snapshot: RunBudgetSnapshot) => void | Promise<void>;
+    },
   ): AsyncGenerator<AgentEvent> {
     if (this.running)
       throw new Error(
@@ -765,6 +979,18 @@ export class Agent {
     this.traceParent = opts?.parent;
     // 降级链每次 drive 重置：上一轮的降级不该让本轮少一个候选。
     this.runner.resetFallbacks();
+    const ledger =
+      opts?.budget ??
+      new RunBudgetLedger(
+        this.runBudget,
+        this.requireKnownModelCost,
+        opts?.runBudgetSnapshot,
+        opts?.onRunBudgetCheckpoint ?? this.onRunBudgetCheckpoint,
+        opts?.beforeToolExecution,
+      );
+    const budget = ledger.retain();
+    const linked = linkedRunSignal(signal, budget.signal);
+    this.activeBudget = budget;
     try {
       // per-prompt 模型覆盖：本次 drive 全程（含工具后的后续 turn）用覆盖模型，
       // 结束由 finally 的 restore() 还原。send 不可重入（running 护栏），是安全的。
@@ -792,12 +1018,28 @@ export class Agent {
           return;
         }
       }
-      yield* this.drive(userText, signal ?? new AbortController().signal, opts?.resume ?? false);
+      try {
+        yield* this.drive(userText, linked.signal, opts?.resume ?? false, budget);
+      } catch (error) {
+        if (!linked.signal.aborted) throw error;
+        this.inbox.close();
+        yield {
+          type: "error",
+          message: budget.violation() ?? errorText(error) ?? "会话已中断",
+        };
+      }
     } finally {
+      // A non-cooperative in-process Tool can outlive the model-visible timeout result. Retain the
+      // run budget and command fence until its raw Promise has settled, so no late side effect can
+      // happen after the durable command is acknowledged terminal.
+      await this.executor.awaitIdle();
       // per-prompt 覆盖与降级都是 drive 局部的：结束还原主模型。
       this.runner.restore();
       this.inbox.clear();
       this.traceParent = savedTraceParent;
+      this.activeBudget = null;
+      linked.dispose();
+      budget.dispose();
       this.running = false;
       // drive 收尾窗口到达、没赶上 turn 边界的任务通知：改走空闲投递（回调或积压）。
       this.inbox.flushLeftover();
@@ -824,8 +1066,9 @@ export class Agent {
     userText: string,
     signal: AbortSignal,
     recovering = false,
+    budget?: DriveBudget,
   ): AsyncGenerator<AgentEvent> {
-    await this.ensureMemory(userText);
+    await this.ensureMemory(userText, signal);
 
     // rewind 需要「本轮开始前」的消息数；必须在 pushUser 之前取。
     const preTurnCount = this.conv.length;
@@ -836,7 +1079,7 @@ export class Agent {
       this.pushInternalUser(userText);
     } else {
       // UserPromptSubmit hook：可拦截输入，或注入 UI 不展示的内部上下文。
-      const prepared = await this.prepareUserInput(userText);
+      const prepared = await this.prepareUserInput(userText, signal);
       if (prepared.blocked) {
         this.inbox.close();
         yield { type: "error", message: `输入被 hook 拦截: ${prepared.reason}` };
@@ -848,14 +1091,17 @@ export class Agent {
     if (this.inbox.promotePending()) {
       yield* this.drainNotices();
     }
-    await this.conv.flush();
+    await this.conv.flush(signal);
     // 主输入已经正式进入历史，从这里开始同一 drive 才可接受 steering。
     // interrupt 可能发生在异步 hook / 持久化期间；closing 不得重新回到 active。
     this.inbox.open(!signal.aborted);
 
     // 工作区快照：在模型动手前记一份，供用户 undo 回滚本轮的文件改动。尽力而为，失败不影响主流程。
     if (this.snapshots && !recovering) {
-      const snap = await this.snapshots.take(userText.replace(/\s+/g, " ").trim().slice(0, 60));
+      const snap = await raceWithSignal(
+        this.snapshots.take(userText.replace(/\s+/g, " ").trim().slice(0, 60)),
+        signal,
+      );
       if (snap) {
         yield {
           type: "checkpoint",
@@ -870,6 +1116,12 @@ export class Agent {
     let stopContinuations = 0;
     let verificationAttempts = 0;
     for (let turn = 1; turn <= this.maxTurns; turn++) {
+      const preTurnBudgetError = budget?.violation();
+      if (preTurnBudgetError) {
+        this.inbox.close();
+        yield { type: "error", message: preTurnBudgetError };
+        return;
+      }
       // 压缩：每轮 provider 调用前检查历史规模
       if (this.compaction) {
         // PreCompact：达到触发线才响（与 maybeCompact 同一判定），观察性 hook。
@@ -877,23 +1129,35 @@ export class Agent {
           this.hooks.has("PreCompact") &&
           compactionPending(this.conv.raw(), this.compaction, this.conv.lastInputTokens)
         ) {
-          await this.hooks.run({
-            event: "PreCompact",
-            cwd: this.cwd,
-            tokens: this.conv.lastInputTokens,
-          });
+          await raceWithSignal(
+            this.hooks.run({
+              event: "PreCompact",
+              cwd: this.cwd,
+              tokens: this.conv.lastInputTokens,
+              signal,
+            }),
+            signal,
+          );
         }
-        const res = await maybeCompact(this.conv.raw(), this.compaction, this.conv.lastInputTokens);
+        const res = await raceWithSignal(
+          maybeCompact(this.conv.raw(), this.compaction, this.conv.lastInputTokens, { signal }),
+          signal,
+        );
+        throwIfAborted(signal);
         if (res.compacted) {
-          await this.conv.replaceAll(res.messages); // 历史被改写，整文件重写
+          await this.conv.replaceAll(res.messages, signal); // 历史被改写，整文件重写
           yield { type: "compacted", beforeTokens: res.beforeTokens, afterTokens: res.afterTokens };
           if (this.hooks.has("PostCompact")) {
-            await this.hooks.run({
-              event: "PostCompact",
-              cwd: this.cwd,
-              beforeTokens: res.beforeTokens,
-              afterTokens: res.afterTokens,
-            });
+            await raceWithSignal(
+              this.hooks.run({
+                event: "PostCompact",
+                cwd: this.cwd,
+                beforeTokens: res.beforeTokens,
+                afterTokens: res.afterTokens,
+                signal,
+              }),
+              signal,
+            );
           }
         }
       }
@@ -903,51 +1167,103 @@ export class Agent {
         messages: this.conv.raw(),
         toolDefs: this.tools.definitions(),
         signal,
+        reserveModelCall: (request) => budget!.reserveModelCall(request),
       });
       if (outcome.type === "error") {
+        if (outcome.usage) {
+          this.conv.accumulate(outcome.usage);
+          this.conv.noteRealInput(outcome.usage);
+          yield { type: "turn_end", usage: outcome.usage };
+        }
         // 已经接受的 steering 不可留到下一次 send 后乱序；先按原顺序入历史，
         // 再结束本轮。它们会在下一次显式 send 时与历史一同交给模型。
         while (this.inbox.hasQueued()) {
-          yield* this.drainQueued();
-          await this.conv.flush();
+          yield* this.drainQueued(signal);
+          await this.conv.flush(signal);
         }
         this.inbox.close();
-        yield { type: "error", message: outcome.message };
+        yield { type: "error", message: budget?.violation() ?? outcome.message };
         return;
       }
       // Provider 实现可能忽略 AbortSignal 并在退出后仍返回工具调用。此处是
       // Agent 自己的最后一道副作用闸门：被中断的响应绝不能进入 history/执行工具。
       if (signal.aborted) {
+        // A terminal provider response can cross the budget exactly while commit() aborts the
+        // drive. It must not enter replay history, but the billed usage is still real and must be
+        // retained for parent/task durability and accounting.
+        this.conv.accumulate(outcome.usage);
+        this.conv.noteRealInput(outcome.usage);
+        yield { type: "turn_end", usage: outcome.usage };
         this.inbox.close();
         yield { type: "turn_reset" };
-        yield { type: "error", message: "会话已中断" };
+        yield { type: "error", message: budget?.violation() ?? "会话已中断" };
         return;
       }
 
       this.conv.pushAssistant(outcome.message);
-      await this.conv.flush();
+      await this.conv.flush(signal);
       this.conv.accumulate(outcome.usage);
       // 真实上下文规模（压缩触发依据）的口径见 Conversation.noteRealInput。
       this.conv.noteRealInput(outcome.usage);
       yield { type: "turn_end", usage: outcome.usage };
 
       const calls = toolCallsOf(outcome.message);
+      const postTurnBudgetError = budget?.violation();
+      if (postTurnBudgetError && (outcome.stopReason !== "tool_use" || calls.length === 0)) {
+        this.inbox.close();
+        yield { type: "error", message: postTurnBudgetError };
+        return;
+      }
       if (outcome.stopReason !== "tool_use" || calls.length === 0) {
         // 后台任务在模型收尾前完成 → 通知注入并继续 loop（模型当轮消化结果）
         if (this.inbox.hasNotices()) {
           const n = yield* this.drainNotices();
           if (n > 0) {
-            await this.conv.flush();
+            await this.conv.flush(signal);
             continue;
           }
         }
         // steering 队列非空 → 注入并继续 loop（模型收尾了但用户还有话说）
         if (this.inbox.hasQueued()) {
-          const added = yield* this.drainQueued();
+          const added = yield* this.drainQueued(signal);
           if (added > 0) {
-            await this.conv.flush();
+            await this.conv.flush(signal);
             continue;
           }
+        }
+        // Mutation-capable lifecycle hooks must run before deterministic verification. A command
+        // Stop/Notification hook can write the workspace even when it returns no structured result.
+        if (this.hooks.has("Stop")) {
+          const h = await raceWithSignal(
+            this.hooks.run({ event: "Stop", cwd: this.cwd, stopContinuations, signal }),
+            signal,
+          );
+          if (h.blocked && stopContinuations < MAX_STOP_CONTINUATIONS) {
+            stopContinuations++;
+            this.pushInternalUser(reminder(`Stop hook 要求继续: ${h.reason}`).trim());
+            await this.conv.flush(signal);
+            continue;
+          }
+        }
+        // Stop hook await 期间也可能收到 steering；必须在决定 done 前再检查一次。
+        if (this.inbox.hasQueued()) {
+          const added = yield* this.drainQueued(signal);
+          if (added > 0) {
+            await this.conv.flush(signal);
+            continue;
+          }
+        }
+        if (this.hooks.has("Notification")) {
+          await raceWithSignal(
+            this.hooks.run({
+              event: "Notification",
+              cwd: this.cwd,
+              notificationType: "turn_done",
+              message: lastAssistantHead(this.conv.raw()),
+              signal,
+            }),
+            signal,
+          );
         }
         // Verifier 是完成条件的一部分：发生文件编辑后，必须由确定性检查给出证据。
         // 失败会作为内部上下文回灌，让模型继续修复；达到返修上限则明确失败而非假装 done。
@@ -963,11 +1279,14 @@ export class Agent {
           );
           let report: VerificationReport;
           try {
-            report = await this.verifier.verify({
-              cwd: this.cwd,
-              changedFiles: [...this.changedFiles],
+            report = await raceWithSignal(
+              this.verifier.verify({
+                cwd: this.cwd,
+                changedFiles: [...this.changedFiles],
+                signal,
+              }),
               signal,
-            });
+            );
             verificationSpan
               .setAttribute("anicode.verification.status", report.status)
               .setAttribute("anicode.verification.checks", report.checks.length)
@@ -978,17 +1297,22 @@ export class Agent {
           }
           verificationSpan.end();
           yield { type: "verification", report };
-          if (report.status === "failed") {
+          if (report.status !== "passed") {
             // 保持 dirty：模型若未作任何修复就再次宣告完成，仍会重跑并最终失败，
             // 不能因“一次验证过”而把失败误当成已验证。
             this.changedSinceVerification = true;
+            if (report.status === "cancelled") {
+              this.inbox.close();
+              yield { type: "error", message: "验证已取消" };
+              return;
+            }
             if (verificationAttempts < this.verificationMaxAttempts) {
               this.pushInternalUser(
                 reminder(
                   `Deterministic verification failed. Fix the failures before finishing.\n${renderVerificationReport(report)}`,
                 ).trim(),
               );
-              await this.conv.flush();
+              await this.conv.flush(signal);
               continue;
             }
             this.inbox.close();
@@ -1000,40 +1324,8 @@ export class Agent {
           }
           this.changedSinceVerification = false;
           this.changedFiles.clear();
-          if (report.status === "cancelled") {
-            this.inbox.close();
-            yield { type: "error", message: "验证已取消" };
-            return;
-          }
-        }
-        // Stop hook：可要求继续（配额有限，防死循环）
-        if (this.hooks.has("Stop")) {
-          const h = await this.hooks.run({ event: "Stop", cwd: this.cwd, stopContinuations });
-          if (h.blocked && stopContinuations < MAX_STOP_CONTINUATIONS) {
-            stopContinuations++;
-            this.pushInternalUser(reminder(`Stop hook 要求继续: ${h.reason}`).trim());
-            await this.conv.flush();
-            continue;
-          }
-        }
-        // Stop hook await 期间也可能收到 steering；必须在决定 done 前再检查一次。
-        if (this.inbox.hasQueued()) {
-          const added = yield* this.drainQueued();
-          if (added > 0) {
-            await this.conv.flush();
-            continue;
-          }
         }
         this.inbox.close();
-        // Notification（观察性）：一次 drive 收尾，供外接桌面通知/提示音。
-        if (this.hooks.has("Notification")) {
-          await this.hooks.run({
-            event: "Notification",
-            cwd: this.cwd,
-            notificationType: "turn_done",
-            message: lastAssistantHead(this.conv.raw()),
-          });
-        }
         {
           const costUSD = this.estimatedCostUSD;
           yield {
@@ -1046,29 +1338,60 @@ export class Agent {
         return;
       }
 
+      const toolBudgetError = await budget?.reserveToolCalls(calls.length);
+      if (toolBudgetError) {
+        const results = calls.map((call) => ({
+          type: "tool_result" as const,
+          toolCallId: call.id,
+          toolName: call.name,
+          content: toolBudgetError,
+          isError: true,
+        }));
+        for (const call of calls) {
+          yield {
+            type: "tool_result",
+            id: call.id,
+            name: call.name,
+            content: toolBudgetError,
+            isError: true,
+          };
+        }
+        this.conv.pushToolRound(results, []);
+        await this.conv.flush(signal);
+        this.inbox.close();
+        yield { type: "error", message: toolBudgetError };
+        return;
+      }
+
       const { results, images } = yield* this.executor.run(calls, signal);
       // tool_result 必须在前（Anthropic 的硬性要求），工具附带的图片紧随其后。
       this.conv.pushToolRound(results, images);
-      await this.conv.flush();
+      await this.conv.flush(signal);
       if (signal.aborted) {
         this.inbox.close();
-        yield { type: "error", message: "会话已中断" };
+        yield { type: "error", message: budget?.violation() ?? "会话已中断" };
+        return;
+      }
+      const postToolBudgetError = budget?.violation();
+      if (postToolBudgetError) {
+        this.inbox.close();
+        yield { type: "error", message: postToolBudgetError };
         return;
       }
       // 工具轮之后是注入 steering / 任务通知的天然边界
       if (this.inbox.hasNotices()) {
         const n = yield* this.drainNotices();
-        if (n > 0) await this.conv.flush();
+        if (n > 0) await this.conv.flush(signal);
       }
       if (this.inbox.hasQueued()) {
-        const added = yield* this.drainQueued();
-        if (added > 0) await this.conv.flush();
+        const added = yield* this.drainQueued(signal);
+        if (added > 0) await this.conv.flush(signal);
       }
     }
 
     while (this.inbox.hasQueued()) {
-      yield* this.drainQueued();
-      await this.conv.flush();
+      yield* this.drainQueued(signal);
+      await this.conv.flush(signal);
     }
     this.inbox.close();
     yield { type: "error", message: `达到最大轮数 ${this.maxTurns}，已停止` };
@@ -1089,9 +1412,13 @@ export class Agent {
 
   private async prepareUserInput(
     text: string,
+    signal: AbortSignal,
   ): Promise<{ blocked: false; additionalContext?: string } | { blocked: true; reason: string }> {
     if (!this.hooks.has("UserPromptSubmit")) return { blocked: false };
-    const h = await this.hooks.run({ event: "UserPromptSubmit", cwd: this.cwd, prompt: text });
+    const h = await raceWithSignal(
+      this.hooks.run({ event: "UserPromptSubmit", cwd: this.cwd, prompt: text, signal }),
+      signal,
+    );
     if (h.blocked) return { blocked: true, reason: h.reason ?? "被 UserPromptSubmit hook 拦截" };
     return {
       blocked: false,
@@ -1111,11 +1438,11 @@ export class Agent {
     return added;
   }
 
-  private async *drainQueued(): AsyncGenerator<AgentEvent, number> {
+  private async *drainQueued(signal: AbortSignal): AsyncGenerator<AgentEvent, number> {
     let added = 0;
     while (this.inbox.hasQueued()) {
       const text = this.inbox.shiftQueued()!;
-      const prepared = await this.prepareUserInput(text);
+      const prepared = await this.prepareUserInput(text, signal);
       if (prepared.blocked) {
         yield { type: "error", message: `排队输入被 hook 拦截: ${prepared.reason}` };
         continue;
@@ -1136,8 +1463,14 @@ export class Agent {
     modelInfo: AgentModelInfo | undefined,
   ): CompactionConfig | null {
     if (!cfg) return null;
-    const defaultSummarizer = providerSummarizer((messages, system) =>
-      this.runner.streamText(messages, system),
+    const defaultSummarizer = providerSummarizer((messages, system, signal) =>
+      this.runner.streamText(
+        messages,
+        system,
+        signal,
+        (usage) => this.conv.accumulate(usage),
+        this.activeBudget ? (request) => this.activeBudget!.reserveModelCall(request) : undefined,
+      ),
     );
     const safeTrigger = compactionTrigger(modelInfo, this.maxTokens);
     if (cfg === true) {
@@ -1165,9 +1498,8 @@ export class Agent {
    * 段落顺序由 assembler 的 provider 顺序决定（env → 记忆 → repo map → skills →
    * browser 指引），subagent 发现夹在中间（不贡献段落），SessionStart hook 收尾。
    */
-  private async ensureMemory(query: string): Promise<void> {
+  private async ensureMemory(query: string, signal: AbortSignal): Promise<void> {
     if (this.memoryLoaded) return;
-    this.memoryLoaded = true;
     const span = this.telemetry.startSpan("anicode.context.compile", undefined, this.traceParent);
     const ctx = {
       cwd: this.cwd,
@@ -1176,22 +1508,29 @@ export class Agent {
       markReadOnly: (names: string[]) => this.perm.addReadOnlyTools(names),
     };
     try {
-      const contributions = await this.assembler.collectContributions(ctx);
+      const contributions = await raceWithSignal(this.assembler.collectContributions(ctx), signal);
       // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
       // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。
       if (this.subagentsOpt?.discover) {
         let discovered: SubagentDefinition[] = [];
         try {
-          discovered = await discoverSubagents(this.cwd, this.subagentsOpt.dirs, {
-            includeProject: this.subagentsOpt.includeProject,
-          });
-        } catch {
+          discovered = await raceWithSignal(
+            discoverSubagents(this.cwd, this.subagentsOpt.dirs, {
+              includeProject: this.subagentsOpt.includeProject,
+            }),
+            signal,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
           /* 发现失败不影响主流程；仍注册内置类型 */
         }
+        throwIfAborted(signal);
         this.registerTaskTool([...discovered, ...this.subagentsOpt.definitions]);
       }
       // SessionStart hook：会话装配的最后一步，additionalContext 注入 system。
-      contributions.push(...(await this.postAssembler.collectContributions(ctx)));
+      contributions.push(
+        ...(await raceWithSignal(this.postAssembler.collectContributions(ctx), signal)),
+      );
       const presets: Record<string, Pick<ContextSource, "kind" | "priority" | "required">> = {
         env: { kind: "environment", priority: 90, required: true },
         "project-memory": { kind: "memory", priority: 100, required: true },
@@ -1207,6 +1546,7 @@ export class Agent {
       }));
       if (sources.length > 0) {
         const compiled = this.contextCompiler.compile({ query, sources });
+        throwIfAborted(signal);
         this.system = composeSystem(this.baseSystem, compiled.text);
         span
           .setAttribute("anicode.context.sources", compiled.selected.length)
@@ -1214,6 +1554,7 @@ export class Agent {
           .setAttribute("anicode.context.tokens", compiled.estimatedTokens)
           .setAttribute("anicode.context.digest", compiled.digest);
       }
+      this.memoryLoaded = true;
       span.setStatus({ code: "ok" });
     } catch (error) {
       span.recordException(error).setStatus({ code: "error" });
@@ -1222,6 +1563,660 @@ export class Agent {
       span.end();
     }
   }
+}
+
+function normalizeUsage(usage: Usage): Usage {
+  const field = (value: number): number =>
+    Number.isSafeInteger(Math.floor(value)) && value >= 0 ? Math.floor(value) : 0;
+  return {
+    inputTokens: field(usage.inputTokens),
+    outputTokens: field(usage.outputTokens),
+    cacheReadTokens: field(usage.cacheReadTokens),
+    cacheWriteTokens: field(usage.cacheWriteTokens),
+  };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
+/** Hard stop for lifecycle hooks, context work and verifiers that ignore AbortSignal. */
+function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason ?? new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+function normalizeRunBudget(input: RunBudgetConfig | undefined): Required<RunBudgetConfig> {
+  return {
+    maxWallTimeMs: runBudgetNumber(
+      "maxWallTimeMs",
+      input?.maxWallTimeMs,
+      DEFAULT_RUN_BUDGET.maxWallTimeMs,
+      10,
+    ),
+    maxTotalTokens: runBudgetNumber(
+      "maxTotalTokens",
+      input?.maxTotalTokens,
+      DEFAULT_RUN_BUDGET.maxTotalTokens,
+      1,
+      true,
+    ),
+    maxCostUSD: runBudgetNumber(
+      "maxCostUSD",
+      input?.maxCostUSD,
+      DEFAULT_RUN_BUDGET.maxCostUSD,
+      0.000001,
+    ),
+    maxToolCalls: runBudgetNumber(
+      "maxToolCalls",
+      input?.maxToolCalls,
+      DEFAULT_RUN_BUDGET.maxToolCalls,
+      1,
+      true,
+    ),
+    maxConcurrentTools: runBudgetNumber(
+      "maxConcurrentTools",
+      input?.maxConcurrentTools,
+      DEFAULT_RUN_BUDGET.maxConcurrentTools,
+      1,
+      true,
+    ),
+    toolTimeoutMs: runBudgetNumber(
+      "toolTimeoutMs",
+      input?.toolTimeoutMs,
+      DEFAULT_RUN_BUDGET.toolTimeoutMs,
+      1_000,
+    ),
+  };
+}
+
+function runBudgetNumber(
+  name: keyof RunBudgetConfig,
+  value: number | undefined,
+  fallback: number,
+  minimum: number,
+  integer = false,
+): number {
+  if (value === undefined) return fallback;
+  if (
+    !Number.isFinite(value) ||
+    value < minimum ||
+    value > Number.MAX_SAFE_INTEGER ||
+    (integer && !Number.isSafeInteger(value))
+  ) {
+    throw new Error(`runBudget.${name} 必须是 ${minimum} 以上的${integer ? "安全整数" : "有限数"}`);
+  }
+  return value;
+}
+
+/** Shared by every foreground and detached child that belongs to one root send. */
+export class RunBudgetLedger {
+  private readonly startedAt: number;
+  private readonly controller = new AbortController();
+  private readonly timer: ReturnType<typeof setTimeout>;
+  private usage: Usage;
+  private toolCalls: number;
+  private estimatedCostUSD: number;
+  private reservedTokens: number;
+  private reservedCostUSD: number;
+  private revision: number;
+  private reason: string | null = null;
+  private references = 0;
+  private closed = false;
+  private checkpointTail: Promise<void> = Promise.resolve();
+  private activeTools = 0;
+  private readonly toolWaiters: Array<{
+    signal: AbortSignal;
+    resolve: (release: () => void) => void;
+    reject: (error: unknown) => void;
+    cleanup: () => void;
+  }> = [];
+
+  constructor(
+    private readonly limits: Required<RunBudgetConfig>,
+    private readonly requireKnownCost = false,
+    resume?: RunBudgetSnapshot,
+    private readonly onCheckpoint?: (snapshot: RunBudgetSnapshot) => void | Promise<void>,
+    private readonly commandToolFence?: (
+      request: ToolExecutionFenceRequest,
+    ) => void | Promise<void>,
+  ) {
+    const restored = resume ? validateRunBudgetSnapshot(resume) : undefined;
+    this.startedAt = restored?.startedAt ?? Date.now();
+    this.usage = restored ? { ...restored.chargedUsage } : emptyRunUsage();
+    this.toolCalls = restored?.toolCalls ?? 0;
+    this.estimatedCostUSD = restored?.chargedCostUSD ?? 0;
+    this.reservedTokens = restored?.reservedTokens ?? 0;
+    this.reservedCostUSD = restored?.reservedCostUSD ?? 0;
+    this.revision = restored?.revision ?? 0;
+    this.reason = restored?.terminalReason ?? null;
+    const elapsed = Math.max(0, Date.now() - this.startedAt);
+    const remaining = Math.max(0, this.limits.maxWallTimeMs - elapsed);
+    this.timer = setTimeout(() => {
+      this.fail(`任务达到最大执行时间 ${this.limits.maxWallTimeMs}ms，已停止`);
+    }, remaining);
+    this.timer.unref?.();
+    if (this.reason) {
+      clearTimeout(this.timer);
+      this.controller.abort(new Error(this.reason));
+    } else {
+      void this.violation();
+    }
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  retain(): DriveBudget {
+    this.acquireReference();
+    return new DriveBudget(this);
+  }
+
+  /** Reserve the tree deadline before scheduling a detached async generator. */
+  hold(): () => void {
+    this.acquireReference();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.release();
+    };
+  }
+
+  private acquireReference(): void {
+    if (this.closed) throw new Error("任务预算作用域已结束，不能重新派生后台工作");
+    this.references++;
+  }
+
+  addUsage(usage: Usage, cost: AgentModelInfo["cost"] | undefined): void {
+    try {
+      this.applyUsage(usage, cost);
+      this.revision++;
+      void this.checkpoint().catch((error: unknown) => {
+        this.fail(`预算 checkpoint 失败: ${errorText(error)}`);
+      });
+      void this.violation();
+    } catch (error) {
+      throw new Error(this.fail(errorText(error)), { cause: error });
+    }
+  }
+
+  private applyUsage(usage: Usage, cost: AgentModelInfo["cost"] | undefined): void {
+    if (!validUsage(usage)) throw new Error("usage 必须由四个非负安全整数字段组成");
+    if (cost && !validModelCost(cost)) throw new Error("模型价格配置无效，成本门禁已 fail-closed");
+    if (this.requireKnownCost && !cost) {
+      throw new Error("模型没有可信价格信息，无法执行显式成本硬上限");
+    }
+    const nextUsage = {
+      inputTokens: this.usage.inputTokens + usage.inputTokens,
+      outputTokens: this.usage.outputTokens + usage.outputTokens,
+      cacheReadTokens: this.usage.cacheReadTokens + usage.cacheReadTokens,
+      cacheWriteTokens: this.usage.cacheWriteTokens + usage.cacheWriteTokens,
+    };
+    if (!validUsage(nextUsage)) throw new Error("累计 usage 超出安全整数范围");
+    const additionalCost = estimateUsageCost(usage, cost) ?? 0;
+    const nextCost = this.estimatedCostUSD + additionalCost;
+    if (!finiteNonNegative(additionalCost) || !finiteNonNegative(nextCost)) {
+      throw new Error("累计模型成本不是有限非负数");
+    }
+    this.usage = nextUsage;
+    this.estimatedCostUSD = nextCost;
+  }
+
+  async reserveModelCall(request: Parameters<ReserveModelCall>[0]): Promise<ModelCallReservation> {
+    const existing = this.violation();
+    if (existing) throw new Error(existing);
+    if (request.cost && !validModelCost(request.cost)) {
+      throw new Error(this.fail(`模型 ${request.model} 的价格配置无效，成本门禁已 fail-closed`));
+    }
+    const cost = request.cost && validModelCost(request.cost) ? request.cost : undefined;
+    if (this.requireKnownCost && !cost) {
+      throw new Error(
+        this.fail(
+          `模型 ${request.model} 没有可信价格信息，无法执行显式成本硬上限；请配置模型价格或移除 maxCostUSD`,
+        ),
+      );
+    }
+
+    if (!finiteSafePositive(request.estimatedInputTokens)) {
+      throw new Error(this.fail("模型请求的 input token 估算无效，预算门禁已 fail-closed"));
+    }
+    if (
+      request.requestedMaxTokens !== undefined &&
+      !finiteSafePositive(request.requestedMaxTokens)
+    ) {
+      throw new Error(this.fail("模型请求的 maxTokens 无效，预算门禁已 fail-closed"));
+    }
+    const estimatedInputTokens = Math.max(1, Math.ceil(request.estimatedInputTokens));
+    const committedTokens = totalUsageTokens(this.usage);
+    const availableTokens = this.limits.maxTotalTokens - committedTokens - this.reservedTokens;
+    if (availableTokens <= estimatedInputTokens) {
+      throw new Error(
+        this.fail(
+          `任务达到 Token 上限 ${this.limits.maxTotalTokens}：剩余 ${Math.max(0, availableTokens)}，不足以发送预计 ${estimatedInputTokens} Token 的请求`,
+        ),
+      );
+    }
+
+    const providerMaxTokens =
+      request.requestedMaxTokens === undefined
+        ? undefined
+        : Math.min(
+            Math.max(1, Math.floor(request.requestedMaxTokens)),
+            availableTokens - estimatedInputTokens,
+          );
+    // A provider-native/unbounded output cannot be estimated into a hard cap. Reserve every
+    // remaining token, but preserve `maxTokens: undefined` so unknown endpoints keep their native
+    // request shape. Any dispatched failure consequently consumes the whole remaining allowance.
+    let reservedOutputTokens = providerMaxTokens ?? availableTokens - estimatedInputTokens;
+    let reservedCost = 0;
+    if (cost) {
+      const remainingCost = this.limits.maxCostUSD - this.estimatedCostUSD - this.reservedCostUSD;
+      const worstInputRate = Math.max(
+        cost.input,
+        cost.cacheRead ?? cost.input * 0.1,
+        cost.cacheWrite ?? cost.input * 1.25,
+      );
+      const inputCost = (estimatedInputTokens * worstInputRate) / 1_000_000;
+      if (inputCost >= remainingCost) {
+        throw new Error(
+          this.fail(
+            `任务剩余成本预算 $${Math.max(0, remainingCost).toFixed(4)} 不足以发送模型请求`,
+          ),
+        );
+      }
+      if (this.requireKnownCost && providerMaxTokens === undefined && cost.output > 0) {
+        throw new Error(
+          this.fail(
+            `模型 ${request.model} 没有可信输出上限，无法执行成本硬上限；请配置 maxOutputTokens`,
+          ),
+        );
+      }
+      // Only a provider-enforced output bound can turn the pre-dispatch estimate into a hard
+      // cost reservation. The built-in default budget remains compatible with priced proxy/local
+      // endpoints whose metadata omits maxOutputTokens: reserve their known input cost here and
+      // charge the provider's actual usage on commit. An explicitly configured maxCostUSD takes
+      // the fail-closed branch above instead.
+      if (cost.output > 0 && providerMaxTokens !== undefined) {
+        const costBound = Math.floor(((remainingCost - inputCost) * 1_000_000) / cost.output);
+        reservedOutputTokens = Math.min(reservedOutputTokens, costBound);
+      }
+      if (reservedOutputTokens < 1) {
+        throw new Error(this.fail(`任务成本预算不足以保留 1 个输出 Token`));
+      }
+      reservedCost =
+        inputCost +
+        (providerMaxTokens === undefined ? 0 : (reservedOutputTokens * cost.output) / 1_000_000);
+    }
+
+    if (reservedOutputTokens < 1) {
+      throw new Error(this.fail(`任务 Token 预算不足以保留 1 个输出 Token`));
+    }
+    const tokenReservation = estimatedInputTokens + reservedOutputTokens;
+    this.reservedTokens += tokenReservation;
+    this.reservedCostUSD += reservedCost;
+    this.revision++;
+    await this.checkpointOrFail();
+    let settled = false;
+    const release = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      this.reservedTokens -= tokenReservation;
+      this.reservedCostUSD -= reservedCost;
+      return true;
+    };
+    return {
+      ...(providerMaxTokens !== undefined ? { maxTokens: reservedOutputTokens } : {}),
+      commit: async (usage) => {
+        if (!release()) return;
+        if (!validUsage(usage)) {
+          this.usage = {
+            ...this.usage,
+            inputTokens: this.usage.inputTokens + estimatedInputTokens,
+            outputTokens: this.usage.outputTokens + reservedOutputTokens,
+          };
+          this.estimatedCostUSD += reservedCost;
+          this.revision++;
+          await this.checkpointOrFail();
+          throw new Error(this.fail("provider 返回了无效 usage，已按完整 reservation 扣账并停止"));
+        }
+        try {
+          this.applyUsage(usage, cost);
+        } catch (error) {
+          throw new Error(this.fail(errorText(error)), { cause: error });
+        }
+        const reportedTokens = totalUsageTokens(usage);
+        this.revision++;
+        await this.checkpointOrFail();
+        if (reportedTokens > tokenReservation) {
+          throw new Error(
+            this.fail(
+              `provider 报告 usage ${reportedTokens} 超过预留 ${tokenReservation}，预算门禁已停止`,
+            ),
+          );
+        }
+        const violation = this.violation();
+        if (violation) throw new Error(violation);
+      },
+      consume: async () => {
+        if (!release()) return;
+        this.usage = {
+          ...this.usage,
+          inputTokens: this.usage.inputTokens + estimatedInputTokens,
+          outputTokens: this.usage.outputTokens + reservedOutputTokens,
+        };
+        this.estimatedCostUSD += reservedCost;
+        this.revision++;
+        await this.checkpointOrFail();
+        void this.violation();
+      },
+      cancel: async () => {
+        if (!release()) return;
+        this.revision++;
+        await this.checkpointOrFail();
+      },
+    };
+  }
+
+  async reserveToolCalls(count: number): Promise<string | undefined> {
+    if (!finiteSafePositive(count)) return this.fail("工具调用计数无效，预算门禁已停止");
+    if (this.toolCalls + count > this.limits.maxToolCalls) {
+      return this.fail(`任务达到工具调用上限 ${this.limits.maxToolCalls}，未执行本批工具`);
+    }
+    this.toolCalls += count;
+    this.revision++;
+    await this.checkpointOrFail();
+    return this.violation();
+  }
+
+  /** Tree-global FIFO semaphore shared by root, child and detached child ToolExecutors. */
+  async acquireToolSlot(signal: AbortSignal): Promise<() => void> {
+    throwIfAborted(signal);
+    const violation = this.violation();
+    if (violation) throw new Error(violation);
+    if (this.activeTools < this.limits.maxConcurrentTools) {
+      this.activeTools++;
+      return this.toolSlotRelease();
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      let waiter: (typeof this.toolWaiters)[number];
+      const rejectWaiter = () => {
+        const index = this.toolWaiters.indexOf(waiter);
+        if (index >= 0) this.toolWaiters.splice(index, 1);
+        waiter.cleanup();
+        reject(signal.aborted ? signal.reason : this.controller.signal.reason);
+      };
+      const cleanup = () => {
+        signal.removeEventListener("abort", rejectWaiter);
+        this.controller.signal.removeEventListener("abort", rejectWaiter);
+      };
+      waiter = { signal, resolve, reject, cleanup };
+      this.toolWaiters.push(waiter);
+      signal.addEventListener("abort", rejectWaiter, { once: true });
+      this.controller.signal.addEventListener("abort", rejectWaiter, { once: true });
+    });
+  }
+
+  /** Run the exact root-command guard captured when this shared tree ledger was constructed. */
+  async beforeToolExecution(request: ToolExecutionFenceRequest): Promise<boolean> {
+    if (!this.commandToolFence) return false;
+    await this.commandToolFence(request);
+    return true;
+  }
+
+  private toolSlotRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeTools = Math.max(0, this.activeTools - 1);
+      while (this.toolWaiters.length > 0 && !this.controller.signal.aborted) {
+        const waiter = this.toolWaiters.shift()!;
+        waiter.cleanup();
+        if (waiter.signal.aborted) {
+          waiter.reject(waiter.signal.reason);
+          continue;
+        }
+        this.activeTools++;
+        waiter.resolve(this.toolSlotRelease());
+        break;
+      }
+    };
+  }
+
+  snapshot(): RunBudgetSnapshot {
+    return {
+      version: 1,
+      revision: this.revision,
+      startedAt: this.startedAt,
+      chargedUsage: { ...this.usage },
+      chargedCostUSD: this.estimatedCostUSD,
+      reservedTokens: this.reservedTokens,
+      reservedCostUSD: this.reservedCostUSD,
+      toolCalls: this.toolCalls,
+      ...(this.reason ? { terminalReason: this.reason } : {}),
+    };
+  }
+
+  async whenCheckpointed(signal?: AbortSignal): Promise<void> {
+    if (signal) await raceWithSignal(this.checkpointTail, signal);
+    else await this.checkpointTail;
+  }
+
+  private async checkpoint(): Promise<void> {
+    const pending = this.enqueueCheckpoint(this.snapshot());
+    await raceWithSignal(pending, this.controller.signal);
+  }
+
+  private enqueueCheckpoint(snapshot: RunBudgetSnapshot): Promise<void> {
+    if (!this.onCheckpoint) return Promise.resolve();
+    const pending = this.checkpointTail.then(() => this.onCheckpoint!(snapshot));
+    this.checkpointTail = pending;
+    return pending;
+  }
+
+  private async checkpointOrFail(): Promise<void> {
+    try {
+      await this.checkpoint();
+    } catch (error) {
+      throw new Error(this.fail(`预算 checkpoint 失败: ${errorText(error)}`), { cause: error });
+    }
+  }
+
+  violation(): string | undefined {
+    if (this.reason) return this.reason;
+    if (Date.now() - this.startedAt >= this.limits.maxWallTimeMs) {
+      return this.fail(`任务达到最大执行时间 ${this.limits.maxWallTimeMs}ms，已停止`);
+    }
+    const totalTokens = totalUsageTokens(this.usage) + this.reservedTokens;
+    if (totalTokens > this.limits.maxTotalTokens) {
+      return this.fail(`任务达到 Token 上限 ${this.limits.maxTotalTokens}，已停止`);
+    }
+    if (this.estimatedCostUSD + this.reservedCostUSD > this.limits.maxCostUSD) {
+      return this.fail(`任务达到成本上限 $${this.limits.maxCostUSD.toFixed(4)}，已停止`);
+    }
+    return undefined;
+  }
+
+  private fail(message: string): string {
+    if (!this.reason) {
+      this.reason = (message.trim() || "预算门禁已停止").slice(0, 4_096);
+      // Terminal protocol/config/tool-count failures are not always inferable from charged totals.
+      // Persist the stop itself so a crash between rejection and command ACK cannot reopen budget.
+      this.revision++;
+      void this.enqueueCheckpoint(this.snapshot()).catch(() => undefined);
+      this.controller.abort(new Error(message));
+    }
+    return this.reason;
+  }
+
+  release(): void {
+    if (this.references <= 0) return;
+    this.references--;
+    if (this.references === 0) {
+      this.closed = true;
+      clearTimeout(this.timer);
+      if (!this.controller.signal.aborted) {
+        this.controller.abort(new Error("任务预算作用域已结束"));
+      }
+    }
+  }
+}
+
+class DriveBudget {
+  private released = false;
+
+  constructor(readonly ledger: RunBudgetLedger) {}
+
+  get signal(): AbortSignal {
+    return this.ledger.signal;
+  }
+
+  addUsage(usage: Usage, cost: AgentModelInfo["cost"] | undefined): void {
+    this.ledger.addUsage(usage, cost);
+  }
+
+  reserveModelCall(request: Parameters<ReserveModelCall>[0]): Promise<ModelCallReservation> {
+    return this.ledger.reserveModelCall(request);
+  }
+
+  reserveToolCalls(count: number): Promise<string | undefined> {
+    return this.ledger.reserveToolCalls(count);
+  }
+
+  acquireToolSlot(signal: AbortSignal): Promise<() => void> {
+    return this.ledger.acquireToolSlot(signal);
+  }
+
+  beforeToolExecution(request: ToolExecutionFenceRequest): Promise<boolean> {
+    return this.ledger.beforeToolExecution(request);
+  }
+
+  whenCheckpointed(signal?: AbortSignal): Promise<void> {
+    return this.ledger.whenCheckpointed(signal);
+  }
+
+  violation(): string | undefined {
+    return this.ledger.violation();
+  }
+
+  dispose(): void {
+    if (this.released) return;
+    this.released = true;
+    this.ledger.release();
+  }
+}
+
+function estimateUsageCost(
+  usage: Usage,
+  cost: AgentModelInfo["cost"] | undefined,
+): number | undefined {
+  if (!cost || !validModelCost(cost)) return undefined;
+  const per = 1 / 1_000_000;
+  return (
+    usage.inputTokens * cost.input * per +
+    usage.outputTokens * cost.output * per +
+    usage.cacheReadTokens * (cost.cacheRead ?? cost.input * 0.1) * per +
+    usage.cacheWriteTokens * (cost.cacheWrite ?? cost.input * 1.25) * per
+  );
+}
+
+function validModelCost(cost: NonNullable<AgentModelInfo["cost"]>): boolean {
+  return (
+    finiteNonNegative(cost.input) &&
+    finiteNonNegative(cost.output) &&
+    (cost.cacheRead === undefined || finiteNonNegative(cost.cacheRead)) &&
+    (cost.cacheWrite === undefined || finiteNonNegative(cost.cacheWrite))
+  );
+}
+
+function finiteNonNegative(value: number): boolean {
+  return Number.isFinite(value) && value >= 0;
+}
+
+function finiteSafePositive(value: number): boolean {
+  return Number.isSafeInteger(Math.ceil(value)) && value > 0;
+}
+
+function validUsage(usage: Usage): boolean {
+  return [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+  ].every((value) => Number.isSafeInteger(value) && value >= 0);
+}
+
+function emptyRunUsage(): Usage {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+}
+
+export function validateRunBudgetSnapshot(snapshot: RunBudgetSnapshot): RunBudgetSnapshot {
+  if (
+    snapshot.version !== 1 ||
+    !Number.isSafeInteger(snapshot.revision) ||
+    snapshot.revision < 0 ||
+    !Number.isSafeInteger(snapshot.startedAt) ||
+    snapshot.startedAt < 0 ||
+    snapshot.startedAt > Date.now() + 60_000 ||
+    !validUsage(snapshot.chargedUsage) ||
+    !finiteNonNegative(snapshot.chargedCostUSD) ||
+    !Number.isSafeInteger(snapshot.reservedTokens) ||
+    snapshot.reservedTokens < 0 ||
+    !finiteNonNegative(snapshot.reservedCostUSD) ||
+    !Number.isSafeInteger(snapshot.toolCalls) ||
+    snapshot.toolCalls < 0 ||
+    (snapshot.terminalReason !== undefined &&
+      (typeof snapshot.terminalReason !== "string" ||
+        snapshot.terminalReason.length < 1 ||
+        snapshot.terminalReason.length > 4_096))
+  ) {
+    throw new Error("无效的 durable run budget snapshot，已 fail-closed");
+  }
+  return {
+    ...snapshot,
+    chargedUsage: { ...snapshot.chargedUsage },
+  };
+}
+
+function totalUsageTokens(usage: Usage): number {
+  return usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+}
+
+function linkedRunSignal(
+  parent: AbortSignal | undefined,
+  budget: AbortSignal,
+): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const sources = [parent, budget].filter((value): value is AbortSignal => Boolean(value));
+  const listeners = new Map<AbortSignal, () => void>();
+  for (const source of sources) {
+    const abort = () => controller.abort(source.reason ?? new Error("aborted"));
+    if (source.aborted) abort();
+    else {
+      source.addEventListener("abort", abort, { once: true });
+      listeners.set(source, abort);
+    }
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const [source, listener] of listeners) source.removeEventListener("abort", listener);
+    },
+  };
 }
 
 // ---------- 模块级辅助 ----------

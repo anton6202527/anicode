@@ -83,9 +83,10 @@ test("typed graph: LSP definition 精确覆盖同名启发式引用边", async (
   const caller = path.join(root, "caller.ts");
   await fs.writeFile(target, "export function resolveUser() { return 1; }\n");
   await fs.writeFile(caller, "export const value = resolveUser();\n");
+  const canonicalTarget = await fs.realpath(target);
   const client = {
     documentSymbols: async () => [],
-    definition: async () => [{ path: target, line: 1, column: 17 }],
+    definition: async () => [{ path: canonicalTarget, line: 1, column: 17 }],
   };
   const lspPool = {
     clientFor: () => client,
@@ -115,12 +116,13 @@ test("typed graph: target 迁移会失效并重建复用 caller 的 LSP 边", as
   const caller = path.join(root, "caller.ts");
   await fs.writeFile(firstTarget, "export function resolveUser() { return 1; }\n");
   await fs.writeFile(caller, "export const value = resolveUser();\n");
-  let definitionTarget = firstTarget;
+  const canonicalCaller = await fs.realpath(caller);
+  let definitionTarget = await fs.realpath(firstTarget);
   let callerDefinitions = 0;
   const client = {
     documentSymbols: async () => [],
     definition: async (file: string) => {
-      if (file === caller) callerDefinitions++;
+      if (file === canonicalCaller) callerDefinitions++;
       return [{ path: definitionTarget, line: 1, column: 17 }];
     },
   };
@@ -133,7 +135,7 @@ test("typed graph: target 迁移会失效并重建复用 caller 的 LSP 边", as
     assert.ok(callerDefinitions > 0);
     callerDefinitions = 0;
     await fs.rename(firstTarget, secondTarget);
-    definitionTarget = secondTarget;
+    definitionTarget = await fs.realpath(secondTarget);
     const snapshot = await graph.refresh();
     const target = snapshot.files["target-new.ts"]?.symbols.find(
       (symbol) => symbol.name === "resolveUser",
@@ -149,4 +151,16 @@ test("typed graph: target 迁移会失效并重建复用 caller 的 LSP 边", as
     await graph.close();
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("typed graph: 拒绝把显式缓存放回 workspace（含 .anicode host-state 面）", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-typed-cache-boundary-"));
+  assert.throws(
+    () =>
+      new TypedCodeGraph(root, {
+        indexFile: path.join(root, ".anicode", "graph.json"),
+      }),
+    /caches must live outside the workspace/,
+  );
+  await fs.rm(root, { recursive: true, force: true });
 });

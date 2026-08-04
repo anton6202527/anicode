@@ -166,7 +166,29 @@ export interface CreatedModel extends ResolvedModel {
   diagnostics: ProviderDiagnostics;
 }
 
-type Factory = () => Provider;
+export interface ProviderRuntimeBindings {
+  /** Per-host credential boundary. Production callers must bind this instead of using globals. */
+  broker?: CredentialBroker;
+  /** Per-host controlled egress. Cloud providers fail closed when it is absent. */
+  networkProxy?: NetworkProxy;
+  /** Environment used for non-secret endpoint configuration and compatibility credentials. */
+  environment?: NodeJS.ProcessEnv;
+  /** Disabled by production stacks after credentials have moved into the broker. */
+  allowEnvironmentFallback?: boolean;
+}
+
+export interface BoundProviderRegistry {
+  resolveProvider(spec: string): CreatedModel;
+  diagnoseProvider(spec: string): ProviderDiagnostics;
+  resolveDefaultModel(): string;
+  discoverModels(
+    providerId: string,
+    timeoutMs?: number,
+    fetchImpl?: typeof fetch,
+  ): Promise<string[] | undefined>;
+}
+
+type Factory = (bindings?: ProviderRuntimeBindings) => Provider;
 
 interface RegisteredProvider {
   descriptor: ProviderDescriptor;
@@ -201,6 +223,15 @@ const canonical = new Map<string, RegisteredProvider>();
 let providerCredentialBroker: CredentialBroker | undefined;
 let providerNetworkProxy: NetworkProxy | undefined;
 let providerEnvironmentFallback = true;
+
+function legacyRuntimeBindings(): ProviderRuntimeBindings {
+  return {
+    ...(providerCredentialBroker ? { broker: providerCredentialBroker } : {}),
+    ...(providerNetworkProxy ? { networkProxy: providerNetworkProxy } : {}),
+    environment: process.env,
+    allowEnvironmentFallback: providerEnvironmentFallback,
+  };
+}
 
 const MAX_MODEL_DISCOVERY_BODY_BYTES = 1024 * 1024;
 const MAX_DISCOVERED_MODELS = 500;
@@ -623,8 +654,8 @@ export function registerOpenAICompatibleProvider(
   install({
     descriptor: d,
     directCredential: Boolean(input.apiKey),
-    factory: () => {
-      const runtime = runtimeConfig(d, input.apiKey);
+    factory: (bindings = legacyRuntimeBindings()) => {
+      const runtime = runtimeConfig(d, input.apiKey, bindings);
       const directLoopback = Boolean(
         d.local && runtime.baseURL && isLoopbackProviderURL(runtime.baseURL),
       );
@@ -634,10 +665,10 @@ export function registerOpenAICompatibleProvider(
         // 始终显式传入（包括空串），禁止 SDK 回退到 OPENAI_API_KEY。
         apiKey: runtime.apiKey,
         maxRetries: 0,
-        ...(!directLoopback && providerNetworkProxy
+        ...(!directLoopback && bindings.networkProxy
           ? {
               fetch: ((input: string | URL | Request, init?: RequestInit) =>
-                providerNetworkProxy!.fetch(
+                bindings.networkProxy!.fetch(
                   typeof input === "string" || input instanceof URL ? input : input.url,
                   init,
                 )) as typeof fetch,
@@ -728,6 +759,7 @@ export async function discoverProviderModels(
   providerId: string,
   timeoutMs = 2_000,
   fetchImpl: typeof fetch = fetch,
+  bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
 ): Promise<string[] | undefined> {
   const safeProviderId = sanitizeProviderId(providerId);
   if (!safeProviderId) return undefined;
@@ -736,7 +768,7 @@ export async function discoverProviderModels(
   const d = entry.descriptor;
   if (d.kind === "debug") return sanitizeDiscoveredModels(d.catalog.map((model) => model.model));
   if (d.kind !== "openai-compatible") return undefined;
-  const runtime = runtimeConfig(d);
+  const runtime = runtimeConfig(d, undefined, bindings);
   if (!runtime.baseURL || (d.requiresApiKey && !runtime.apiKey)) return undefined;
   // A descriptor marked local never gets to turn its proxy exception into cloud egress.
   if (d.local && !isLoopbackProviderURL(runtime.baseURL)) return undefined;
@@ -750,10 +782,10 @@ export async function discoverProviderModels(
       const directLoopback = d.local && isLoopbackProviderURL(runtime.baseURL);
       // Cloud discovery carries credentials and must never silently bypass the production egress
       // boundary. Loopback discovery is the only direct-fetch exception.
-      if (!directLoopback && !providerNetworkProxy) return undefined;
+      if (!directLoopback && !bindings.networkProxy) return undefined;
       const request = directLoopback
         ? fetchImpl
-        : providerNetworkProxy!.fetch.bind(providerNetworkProxy);
+        : bindings.networkProxy!.fetch.bind(bindings.networkProxy);
       const response = await request(modelsURL, {
         signal: controller.signal,
         redirect: "error",
@@ -775,22 +807,67 @@ export async function discoverProviderModels(
 }
 
 export function createProvider(spec: string): CreatedModel {
+  return createProviderWithBindings(spec, legacyRuntimeBindings());
+}
+
+function createProviderWithBindings(spec: string, bindings: ProviderRuntimeBindings): CreatedModel {
   const parsed = resolveSpec(spec);
   const descriptorCopy = cloneDescriptor(parsed.entry.descriptor);
   return {
-    provider: parsed.entry.factory(),
+    provider: parsed.entry.factory(bindings),
     model: parsed.model,
     providerId: parsed.entry.descriptor.id,
     descriptor: descriptorCopy,
     modelInfo: resolveModelInfo(parsed.entry.descriptor, parsed.model),
-    diagnostics: diagnosticsFor(parsed.entry, parsed.model),
+    diagnostics: diagnosticsFor(parsed.entry, parsed.model, bindings),
   };
 }
 
 /** 启动前诊断，无网络请求，也不会实例化 SDK client。 */
 export function diagnoseProvider(spec: string): ProviderDiagnostics {
   const parsed = resolveSpec(spec);
-  return diagnosticsFor(parsed.entry, parsed.model);
+  return diagnosticsFor(parsed.entry, parsed.model, legacyRuntimeBindings());
+}
+
+/**
+ * Create an immutable per-host provider facade. No request made through this object observes a
+ * later global configureProvider* call or another LocalRuntimeStack's credentials/proxy.
+ */
+export function bindProviderRegistry(bindings: ProviderRuntimeBindings): BoundProviderRegistry {
+  const bound: ProviderRuntimeBindings = {
+    ...(bindings.broker ? { broker: bindings.broker } : {}),
+    ...(bindings.networkProxy ? { networkProxy: bindings.networkProxy } : {}),
+    environment: { ...(bindings.environment ?? {}) },
+    allowEnvironmentFallback: bindings.allowEnvironmentFallback ?? false,
+  };
+  const diagnose = (spec: string) => {
+    const parsed = resolveSpec(spec);
+    return diagnosticsFor(parsed.entry, parsed.model, bound);
+  };
+  return Object.freeze({
+    resolveProvider(spec: string) {
+      const result = createProviderWithBindings(spec, bound);
+      if (result.diagnostics.requiresApiKey && !result.diagnostics.hasCredentials) {
+        throw new Error(result.diagnostics.warnings.join("; "));
+      }
+      return result;
+    },
+    diagnoseProvider: diagnose,
+    resolveDefaultModel() {
+      for (const spec of DEFAULT_MODEL_PREFERENCES) {
+        try {
+          const diagnostics = diagnose(spec);
+          if (diagnostics.requiresApiKey && diagnostics.hasCredentials) return spec;
+        } catch {
+          // Optional provider unavailable in this registry.
+        }
+      }
+      return "debug/demo";
+    },
+    discoverModels(providerId: string, timeoutMs = 2_000, fetchImpl: typeof fetch = fetch) {
+      return discoverProviderModels(providerId, timeoutMs, fetchImpl, bound);
+    },
+  });
 }
 
 function install(entry: RegisteredProvider): void {
@@ -858,10 +935,12 @@ function validId(value: string): string {
 function runtimeConfig(
   d: ProviderDescriptor,
   directApiKey?: string,
+  bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
 ): { baseURL?: string; apiKey: string } {
-  const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv) : undefined;
+  const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv, bindings.environment) : undefined;
   const credential =
-    directApiKey ?? findCredential(d.apiKeyEnv, `provider:${d.id}`, envBase ?? d.baseURL)?.value;
+    directApiKey ??
+    findCredential(d.apiKeyEnv, `provider:${d.id}`, envBase ?? d.baseURL, bindings)?.value;
   return {
     ...((envBase ?? d.baseURL) ? { baseURL: envBase ?? d.baseURL } : {}),
     // 本地匿名服务仍给 SDK 一个无敏感性的占位 key；云端缺 key 用空串尽早失败。
@@ -869,11 +948,15 @@ function runtimeConfig(
   };
 }
 
-function diagnosticsFor(entry: RegisteredProvider, model: string): ProviderDiagnostics {
+function diagnosticsFor(
+  entry: RegisteredProvider,
+  model: string,
+  bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
+): ProviderDiagnostics {
   const d = entry.descriptor;
-  const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv) : undefined;
+  const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv, bindings.environment) : undefined;
   const baseURL = envBase ?? d.baseURL;
-  const credential = findCredential(d.apiKeyEnv, `provider:${d.id}`, baseURL);
+  const credential = findCredential(d.apiKeyEnv, `provider:${d.id}`, baseURL, bindings);
   const warnings: string[] = [];
   // Third-party subscription OAuth is intentionally not accepted as production credentials.
   const hasCredentials = Boolean(credential) || Boolean(entry.directCredential);
@@ -915,10 +998,11 @@ function findCredential(
   names: readonly string[],
   audience?: string,
   baseURL?: string,
+  bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
 ): { name: string; value: string } | undefined {
   for (const name of names) {
     const brokerId = `env:${name}`;
-    if (providerCredentialBroker?.has(brokerId) && audience) {
+    if (bindings.broker?.has(brokerId) && audience) {
       let host: string | undefined;
       try {
         host = baseURL ? new URL(baseURL).hostname : undefined;
@@ -928,7 +1012,7 @@ function findCredential(
       try {
         return {
           name,
-          value: providerCredentialBroker.trustedValue(brokerId, {
+          value: bindings.broker.trustedValue(brokerId, {
             audience,
             ...(host ? { host } : {}),
           }),
@@ -937,16 +1021,19 @@ function findCredential(
         continue;
       }
     }
-    if (providerEnvironmentFallback) {
-      const value = nonEmptyEnv(name);
+    if (bindings.allowEnvironmentFallback ?? false) {
+      const value = nonEmptyEnv(name, bindings.environment);
       if (value !== undefined) return { name, value };
     }
   }
   return undefined;
 }
 
-function nonEmptyEnv(name: string): string | undefined {
-  const value = process.env[name];
+function nonEmptyEnv(
+  name: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const value = environment[name];
   return value && value.trim() ? value : undefined;
 }
 

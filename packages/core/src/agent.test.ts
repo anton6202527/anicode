@@ -137,6 +137,72 @@ test("Agent: 权限拒绝 → 错误结果回传给模型", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("Agent: 单次任务 Token 预算是硬终态，不会在超额后宣告 done", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-budget-token-"));
+  try {
+    const agent = new Agent({
+      provider: scriptedProvider([
+        [{ role: "assistant", content: [{ type: "text", text: "这次输出会超过预算" }] }],
+      ]),
+      model: "x",
+      cwd: dir,
+      permission: { mode: "auto" },
+      runBudget: { maxTotalTokens: 10 },
+    });
+    const events = await collect(agent, "执行任务");
+    assert.equal(
+      events.some((event) => event.type === "done"),
+      false,
+    );
+    const error = events.find((event) => event.type === "error");
+    assert.ok(error?.type === "error");
+    assert.match(error.message, /Token 上限 10/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Agent: 工具调用预算不足时为整批调用生成配对错误且不执行副作用", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-budget-tools-"));
+  try {
+    const agent = new Agent({
+      provider: scriptedProvider([
+        [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_call",
+                id: "write-a",
+                name: "write",
+                args: { path: "a.txt", content: "a" },
+              },
+              {
+                type: "tool_call",
+                id: "write-b",
+                name: "write",
+                args: { path: "b.txt", content: "b" },
+              },
+            ],
+          },
+        ],
+      ]),
+      model: "x",
+      cwd: dir,
+      permission: { mode: "auto" },
+      runBudget: { maxToolCalls: 1 },
+    });
+    const events = await collect(agent, "写两个文件");
+    const results = events.filter((event) => event.type === "tool_result");
+    assert.equal(results.length, 2);
+    assert.ok(results.every((event) => event.type === "tool_result" && event.isError));
+    await assert.rejects(fs.access(path.join(dir, "a.txt")));
+    await assert.rejects(fs.access(path.join(dir, "b.txt")));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Agent: 并发护栏 —— send 重入抛错，不破坏历史", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   // 用一个可控延迟的 provider，让第一次 send 卡在流式中

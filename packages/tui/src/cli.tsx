@@ -22,8 +22,7 @@ import {
   listProviderDetails,
   listModelCatalog,
   SessionManager,
-  SessionStore,
-  MigratingSessionStore,
+  createProductionSessionManager,
   LocalSessionHost,
   DaemonClient,
   DEFAULT_HTTP_DAEMON_PORT,
@@ -40,24 +39,16 @@ import {
   type PluginDirs,
   loadProjectEnv,
   resolveDefaultModel,
-  commandHooksFromConfig,
   toMcpServerConfigs,
-  toSubagentDefinitions,
   toLspServers,
-  browserToolOptions,
   connectMcpServers,
   DEVELOPMENT_MCP_CATALOG,
   findDevelopmentMcp,
   loadCommands,
-  defaultTools,
   createDiagnosticsTool,
   LspPool,
   AuthStore,
-  createLocalRuntimeStack,
   createConfiguredLocalRuntimeStack,
-  ContextCompiler,
-  Verifier,
-  SecurityPolicyEngine,
   telemetryFromEnv,
   telemetryForLocalStack,
   ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
@@ -340,7 +331,9 @@ export interface CliArgs {
   httpToken?: string;
   /** Preferred over command-line tokens, which may be visible in shell history/process listings. */
   httpTokenFile?: string;
-  permissionMode: "default" | "acceptEdits" | "auto";
+  permissionMode: "default" | "acceptEdits" | "auto" | "bypass";
+  /** True only when the user explicitly selected --auto or --accept-edits. */
+  permissionModeExplicit: boolean;
   /** 配置档名（anicode.json 的 profiles 键，对齐 Codex --profile）。 */
   profile?: string;
   socket: string;
@@ -626,6 +619,7 @@ export function parseArgs(argv: string[]): CliArgs {
         }
       : {}),
     permissionMode,
+    permissionModeExplicit: seen.has("--auto") || seen.has("--accept-edits"),
     ...(profile ? { profile } : {}),
     socket,
     sessionsDir,
@@ -651,6 +645,10 @@ export function helpText(): string {
     t(
       `Default: standalone local process with embedded SQLite; no AniCode backend/server or external database required.\n\n`,
       `默认：本地单进程 + 内置 SQLite，无需 AniCode 后端服务或外部数据库。\n\n`,
+    ) +
+    t(
+      `A trusted standalone TUI defaults to full automatic tool approval (explicit deny/ask rules, sandbox, network policy and workspace scope still apply). Shift+Tab changes permission modes. Restricted, headless and remote modes stay conservative.\n\n`,
+      `已信任的本地独立 TUI 默认自动批准工具（显式 deny/ask 规则、sandbox、网络策略与工作区边界仍然生效）；按 Shift+Tab 可切换权限模式。受限、无头与远端模式仍采用保守默认值。\n\n`,
     ) +
     t(
       `  --demo                    Use the zero-key deterministic debug model\n`,
@@ -793,11 +791,12 @@ export function validateArgs(args: CliArgs): void {
       ),
     );
   }
-  if (args.daemon && args.sessionsExplicit) {
+  if ((args.daemon || args.http) && args.sessionsExplicit) {
+    const transport = args.daemon ? "daemon" : "HTTP";
     throw new Error(
       t(
-        "--sessions cannot be used with a --daemon client: the session directory is managed by the daemon",
-        "--sessions 不能用于 --daemon 客户端：会话目录由 daemon 管理",
+        `--sessions cannot be used with a ${transport} client: the session directory is managed by the host`,
+        `--sessions 不能用于 ${transport} 客户端：会话目录由宿主管理`,
       ),
     );
   }
@@ -809,24 +808,95 @@ export function validateArgs(args: CliArgs): void {
       ),
     );
   }
-  if (args.daemon && args.permissionMode !== "default") {
+  if ((args.daemon || args.http) && args.permissionMode !== "default") {
+    const transport = args.daemon ? "daemon" : "HTTP";
     const flag = args.permissionMode === "auto" ? "--auto" : "--accept-edits";
     throw new Error(
       t(
-        `${flag} cannot be used with a --daemon client: the permission policy is decided uniformly by the daemon process.`,
-        `${flag} 不能用于 --daemon 客户端：权限策略由 daemon 进程统一决定。`,
+        `${flag} cannot be used with a ${transport} client: the permission policy is decided uniformly by the host process.`,
+        `${flag} 不能用于 ${transport} 客户端：权限策略由宿主进程统一决定。`,
       ) +
         t(
-          `Pass ${flag} when starting anicode-daemon; the policy of an already-running daemon will not be modified by the current connection.`,
-          `请在启动 anicode-daemon 时传入 ${flag}；已运行 daemon 的策略不会被当前连接修改。`,
+          `Configure the policy when starting the host; an already-running host will not be modified by the current connection.`,
+          `请在启动宿主时配置权限策略；当前连接不会修改已运行宿主的策略。`,
         ),
     );
   }
 }
 
+/** Only a trusted, standalone, implicitly configured TUI receives the local full-auto default. */
+export function resolveInteractivePermissionMode(
+  args: Pick<CliArgs, "daemon" | "http" | "permissionMode" | "permissionModeExplicit">,
+  workspaceTrusted: boolean,
+): CliArgs["permissionMode"] {
+  if (
+    workspaceTrusted &&
+    !args.daemon &&
+    !args.http &&
+    !args.permissionModeExplicit &&
+    args.permissionMode === "default"
+  ) {
+    return "bypass";
+  }
+  return args.permissionMode;
+}
+
+interface StartupProviderDiagnostics {
+  requiresApiKey: boolean;
+  hasCredentials: boolean;
+  warnings: readonly string[];
+}
+
+interface StartupProviderRegistry {
+  diagnoseProvider(model: string): StartupProviderDiagnostics;
+  resolveDefaultModel(): string;
+}
+
+export interface StartupModelSelection {
+  model: string;
+  /** Present only when an implicit configured model was unusable and a safe fallback was chosen. */
+  fallbackFrom?: string;
+  fallbackReason?: string;
+}
+
+/**
+ * Resolve an implicit startup model against the provider registry bound to this runtime stack.
+ * Explicit `--model` and `--demo` choices are never rewritten; their normal validation remains
+ * fail-fast. Unknown configured providers also remain errors instead of being silently hidden.
+ */
+export function selectStartupModel(
+  args: Pick<CliArgs, "model" | "modelExplicit" | "demo">,
+  configuredModel: string | undefined,
+  providers: StartupProviderRegistry,
+): StartupModelSelection {
+  if (args.modelExplicit || args.demo) return { model: args.model };
+  const configured = configuredModel?.trim();
+  if (!configured) return { model: providers.resolveDefaultModel() };
+
+  const diagnostics = providers.diagnoseProvider(configured);
+  if (!diagnostics.requiresApiKey || diagnostics.hasCredentials) return { model: configured };
+  return {
+    model: providers.resolveDefaultModel(),
+    fallbackFrom: configured,
+    fallbackReason: diagnostics.warnings.join("; "),
+  };
+}
+
+function startupModelFallbackWarning(selection: StartupModelSelection): string | undefined {
+  if (!selection.fallbackFrom) return undefined;
+  const reason = selection.fallbackReason?.trim() || t("credentials unavailable", "凭证不可用");
+  return t(
+    `${DISPLAY_NAME}: configured model ${selection.fallbackFrom} is unavailable (${reason}); using ${selection.model} for this run. Pass --model to require a specific model.`,
+    `${DISPLAY_NAME}: 配置模型 ${selection.fallbackFrom} 当前不可用（${reason}）；本次已回退到 ${selection.model}。如需强制指定模型，请传入 --model。`,
+  );
+}
+
 /** 本地交互入口要求云端凭证已就绪；core registry 本身仍保持可离线解析。 */
-export function assertProviderConfigured(model: string): void {
-  const diagnostics = diagnoseProvider(model);
+export function assertProviderConfigured(
+  model: string,
+  diagnose: (model: string) => StartupProviderDiagnostics = diagnoseProvider,
+): void {
+  const diagnostics = diagnose(model);
   if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
     throw new Error(
       t(`${diagnostics.warnings.join("；")}.`, `${diagnostics.warnings.join("；")}。`) +
@@ -841,6 +911,41 @@ export function assertProviderConfigured(model: string): void {
 export function resolveConfiguredProvider(model: string) {
   assertProviderConfigured(model);
   return createProvider(model);
+}
+
+type CliRuntimeResources = Pick<
+  LocalRuntimeStack,
+  "isolatedRuntime" | "artifacts" | "networkProxy" | "database"
+>;
+
+/** Close every resource owned by a CLI-created runtime, even when an earlier close step fails. */
+export async function disposeCliRuntimeResources(
+  runtimeStack: CliRuntimeResources | undefined,
+  telemetry?: Telemetry,
+): Promise<void> {
+  const failures: unknown[] = [];
+  const attempt = async (close: () => void | Promise<void>): Promise<void> => {
+    try {
+      await close();
+    } catch (error) {
+      failures.push(error);
+    }
+  };
+  if (telemetry) {
+    await attempt(async () => {
+      if (telemetry.shutdown) await telemetry.shutdown();
+      else await telemetry.forceFlush?.();
+    });
+  }
+  if (runtimeStack) {
+    await attempt(async () => runtimeStack.isolatedRuntime.shutdown?.());
+    await attempt(async () => runtimeStack.artifacts.close?.());
+    await attempt(() => runtimeStack.networkProxy.close());
+    await attempt(() => runtimeStack.database.close());
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to dispose CLI runtime resources");
+  }
 }
 
 function inferredHttpTokenFile(baseUrl: string): string | undefined {
@@ -870,6 +975,8 @@ export async function buildHost(
     runtimeStack?: LocalRuntimeStack;
     telemetry?: Telemetry;
     workspaceTrust?: WorkspaceTrustSource;
+    /** Enables the audited per-action developer surface after a local interactive trust downgrade. */
+    allowRestrictedWorkspaceDevelopment?: boolean;
     onWorkspaceTrustChange?: (change: {
       sessionId: string;
       cwd: string;
@@ -910,7 +1017,10 @@ export async function buildHost(
       token,
     });
   }
-  return new LocalSessionHost(buildManager(args, extras));
+  const manager = buildManager(args, extras);
+  return extras.runtimeStack
+    ? new LocalSessionHost(manager, extras.runtimeStack.discoverModels)
+    : new LocalSessionHost(manager);
 }
 
 /** 本地 SessionManager 构造：LocalSessionHost 与 `anicode serve` 共用同一套装配。 */
@@ -923,6 +1033,8 @@ export function buildManager(
     runtimeStack?: LocalRuntimeStack;
     telemetry?: Telemetry;
     workspaceTrust?: WorkspaceTrustSource;
+    /** Explicit host intent; do not infer an authorization UI from the selected permission mode. */
+    allowRestrictedWorkspaceDevelopment?: boolean;
     onWorkspaceTrustChange?: (change: {
       sessionId: string;
       cwd: string;
@@ -934,94 +1046,27 @@ export function buildManager(
   } = {},
 ): SessionManager {
   const config = extras.config ?? {};
-  // 配置里的自定义 agents + 文件系统发现（.claude/agents/*.md + 插件 agents/，首次 send 时扫描）；
-  // 程序化（config）定义同名覆盖文件定义，内置 general/explore 始终可用。
-  const configAgents = toSubagentDefinitions(config);
-  const subagents = {
-    discover: true,
-    definitions: configAgents,
-    ...(extras.plugins?.agents.length ? { dirs: extras.plugins.agents } : {}),
-  };
-  const skills = extras.plugins?.skills.length ? { dirs: extras.plugins.skills } : true;
-  const extraTools = extras.extraTools ?? [];
-  const deferredTools = extras.deferredTools ?? [];
-  const runtimeStack =
-    extras.runtimeStack ?? createLocalRuntimeStack(path.dirname(args.sessionsDir));
-  const configuredBrowser = browserToolOptions(config);
-  const securedBrowser =
-    configuredBrowser === false
-      ? false
-      : {
-          ...configuredBrowser,
-          ...(process.env.ANICODE_NETWORK_PROXY_URL
-            ? { proxyUrl: process.env.ANICODE_NETWORK_PROXY_URL }
-            : {}),
-          requireProxy: true,
-        };
-  const manager = new SessionManager({
-    store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(args.sessionsDir)),
-    runtime: runtimeStack.runtime,
-    artifacts: runtimeStack.artifacts,
-    commandInbox: runtimeStack.commandInbox,
-    outbox: runtimeStack.outbox,
-    networkProxy: runtimeStack.networkProxy,
-    worktreeOwnership: runtimeStack.worktreeOwnership,
-    contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
-    verifier: new Verifier({ autoDiscover: true }),
-    securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
-    telemetry: extras.telemetry ?? telemetryForLocalStack(runtimeStack),
-    isolatedRuntime: runtimeStack.isolatedRuntime,
-    workspaceScope: args.cwd,
+  return createProductionSessionManager({
+    cwd: args.cwd,
+    sessionsDir: args.sessionsDir,
+    permissionMode: args.permissionMode,
+    config,
+    ...(extras.runtimeStack ? { runtimeStack: extras.runtimeStack } : {}),
+    ...(extras.telemetry ? { telemetry: extras.telemetry } : {}),
     ...(extras.workspaceTrust ? { workspaceTrust: extras.workspaceTrust } : {}),
+    ...(extras.allowRestrictedWorkspaceDevelopment !== undefined
+      ? {
+          allowRestrictedWorkspaceDevelopment: extras.allowRestrictedWorkspaceDevelopment,
+        }
+      : {}),
     ...(extras.onWorkspaceTrustChange
       ? { onWorkspaceTrustChange: extras.onWorkspaceTrustChange }
       : {}),
-    resolveProvider: resolveConfiguredProvider,
-    compaction: true,
-    permission: {
-      mode: args.permissionMode,
-      // anicode.json / .anicode/settings.local.json 的基础权限规则（deny 永远最先）
-      ...(config.permissions?.allow?.length ? { allowRules: config.permissions.allow } : {}),
-      ...(config.permissions?.deny?.length ? { denyRules: config.permissions.deny } : {}),
-      ...(config.permissions?.ask?.length ? { askRules: config.permissions.ask } : {}),
-    },
-    persistPermissions: true, // allow_always 写回项目 .anicode/settings.local.json
-    // 配置里的权限档位：自定义档位表 + 启动即生效的档位名（/profile 运行时可再切）。
-    ...(config.permissionProfiles ? { permissionProfiles: config.permissionProfiles } : {}),
-    ...(config.permissionProfile ? { permissionProfile: config.permissionProfile } : {}),
-    skills,
-    subagents,
-    checkpoints: true, // 每轮前记工作区 git 快照，支持 /undo 回滚文件改动
-    repoMap: true, // 会话开始注入代码骨架（repo map），帮模型少盲 grep、首次定位更准
-    // 内置 browser 工具：写完前端自动开页验证。默认开启，config.browser=false 可关。
-    browser: securedBrowser,
-
-    // MCP / diagnostics 等附加工具与内置工具合流；无附加工具时沿用默认工具集。
-    // deferredTools（大量 MCP）延迟暴露：schema 不进请求，模型经 tool_search 按需激活。
-    ...(extraTools.length > 0 || deferredTools.length > 0
-      ? {
-          tools: () => {
-            const reg = defaultTools();
-            for (const t of extraTools) reg.register(t);
-            for (const t of deferredTools) reg.register(t, { deferred: true });
-            return reg;
-          },
-        }
-      : {}),
-    smallModel: config.smallModel ?? true, // 摘要等杂活自动走便宜模型
-    // 模型降级链：主模型限流/过载时按序切换（anicode.json 的 fallbackModels）。
-    ...(config.fallbackModels?.length ? { fallbackModels: config.fallbackModels } : {}),
-    // 命令式 hooks（anicode.json 的 hooks 键）：payload JSON 走 stdin，exit 2=block。
-    ...(config.hooks?.length
-      ? {
-          hooks: commandHooksFromConfig(config.hooks, {
-            executionRuntime: runtimeStack.isolatedRuntime,
-          }),
-        }
-      : {}),
-    autoTitle: true, // 首轮后用小模型给无标题会话起名（失败静默）
-  });
-  return manager;
+    ...(extras.extraTools?.length ? { extraTools: extras.extraTools } : {}),
+    ...(extras.deferredTools?.length ? { deferredTools: extras.deferredTools } : {}),
+    ...(extras.plugins?.skills.length ? { skillDirs: extras.plugins.skills } : {}),
+    ...(extras.plugins?.agents.length ? { subagentDirs: extras.plugins.agents } : {}),
+  }).manager;
 }
 
 /**
@@ -1086,16 +1131,18 @@ export async function runServeCommand(
   for (const warning of warnings) out.write(`${terminalSafe(warning)}\n`);
   const bearerToken = token === undefined ? generateDaemonAuthToken() : token;
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
+  const telemetry = telemetryForLocalStack(runtimeStack);
   let manager: SessionManager | undefined;
   let server: HttpDaemonServer | undefined;
   let resourcesClosed = false;
   const closeResources = async (): Promise<void> => {
     if (resourcesClosed) return;
     resourcesClosed = true;
-    manager?.dispose();
-    await Promise.resolve(runtimeStack.artifacts.close?.()).catch(() => undefined);
-    await runtimeStack.networkProxy.close().catch(() => undefined);
-    await runtimeStack.database.close().catch(() => undefined);
+    try {
+      await manager?.shutdown();
+    } finally {
+      await disposeCliRuntimeResources(runtimeStack, telemetry);
+    }
   };
   try {
     manager = buildManager(
@@ -1103,12 +1150,14 @@ export async function runServeCommand(
       {
         config,
         runtimeStack,
+        telemetry,
         workspaceTrust: workspaceTrustStore,
       },
     );
     server = new HttpDaemonServer({
       manager,
       token: bearerToken,
+      discoverModels: runtimeStack.discoverModels,
       onClose: closeResources,
     });
     // Publish the credential only after the port is successfully bound. Rotating the
@@ -1251,8 +1300,8 @@ export async function runTrustCommand(
       );
     }
     const prompt = t(
-      `Type the exact workspace path to trust it: ${preview.identity.canonicalRoot}\n> `,
-      `请输入完整工作区路径以确认信任: ${preview.identity.canonicalRoot}\n> `,
+      `Trust enables project-provided capabilities. A standalone interactive TUI then defaults to automatic tool approval; explicit deny/ask rules, sandbox, network policy and workspace scope still apply.\nType the exact workspace path to trust it: ${preview.identity.canonicalRoot}\n> `,
+      `授信会启用项目提供的能力；之后本地交互式 TUI 默认自动批准工具，但显式 deny/ask 规则、sandbox、网络策略与工作区边界仍然生效。\n请输入完整工作区路径以确认信任: ${preview.identity.canonicalRoot}\n> `,
     );
     const readline = createInterface({ input, output, terminal: true });
     try {
@@ -1288,7 +1337,7 @@ export async function runTrustCommand(
 export async function runMcpCommand(
   argv: string[],
   io: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {},
-): Promise<{ close(): void }> {
+): Promise<{ close(): Promise<void> }> {
   let cwd = process.cwd();
   let model: string | undefined;
   let sessionsDir = path.join(os.homedir(), ".anicode", "sessions");
@@ -1311,7 +1360,7 @@ export async function runMcpCommand(
       throw new Error(t(`Unknown mcp argument: ${arg}`, `mcp 未知参数: ${arg}`));
     }
   }
-  if (!(["default", "acceptEdits", "auto"] as const).includes(permissionMode)) {
+  if (!(["default", "acceptEdits", "auto"] as readonly string[]).includes(permissionMode)) {
     throw new Error(
       t(`Invalid MCP permission mode: ${permissionMode}`, `MCP 权限模式无效: ${permissionMode}`),
     );
@@ -1321,16 +1370,22 @@ export async function runMcpCommand(
   await loadProjectEnv({ cwd, workspaceTrust: initialWorkspaceTrust });
   const { config } = await loadConfig({ cwd, workspaceTrust: initialWorkspaceTrust });
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(sessionsDir));
+  const telemetry = telemetryForLocalStack(runtimeStack);
   let manager: SessionManager | undefined;
   let server: ReturnType<typeof serveMcp> | undefined;
   try {
+    // Headless automation must not silently turn a declared cloud model into debug/demo.
+    // With no declared model at all, the registry may still choose its documented zero-config
+    // default; an explicit/configured model remains fail-fast.
+    const selectedModel = model ?? config.model ?? runtimeStack.providers.resolveDefaultModel();
+    assertProviderConfigured(selectedModel, runtimeStack.providers.diagnoseProvider);
     manager = buildManager(
       { cwd, sessionsDir, permissionMode },
-      { config, runtimeStack, workspaceTrust: workspaceTrustStore },
+      { config, runtimeStack, telemetry, workspaceTrust: workspaceTrustStore },
     );
     server = serveMcp({
       manager,
-      model: model ?? config.model ?? resolveDefaultModel(),
+      model: selectedModel,
       cwd,
       ...(io.input ? { input: io.input } : {}),
       ...(io.output ? { output: io.output } : {}),
@@ -1338,11 +1393,9 @@ export async function runMcpCommand(
     });
   } catch (error) {
     try {
-      manager?.dispose();
+      await manager?.shutdown();
     } finally {
-      await Promise.resolve(runtimeStack.artifacts.close?.()).catch(() => undefined);
-      await runtimeStack.networkProxy.close().catch(() => undefined);
-      await runtimeStack.database.close().catch(() => undefined);
+      await disposeCliRuntimeResources(runtimeStack, telemetry).catch(() => undefined);
     }
     throw error;
   }
@@ -1355,11 +1408,9 @@ export async function runMcpCommand(
         server.close();
       } finally {
         try {
-          manager.dispose();
+          await manager.shutdown();
         } finally {
-          await Promise.resolve(runtimeStack.artifacts.close?.()).catch(() => undefined);
-          await runtimeStack.networkProxy.close().catch(() => undefined);
-          await runtimeStack.database.close().catch(() => undefined);
+          await disposeCliRuntimeResources(runtimeStack, telemetry);
         }
       }
     },
@@ -1753,8 +1804,8 @@ export async function runExecCommand(
     warn(
       workspaceTrust.reason === "inspection-failed"
         ? t(
-            `Workspace inspection failed; AniCode is restricted to read/glob/grep in plan mode, and project-provided capabilities are disabled. This headless run remains fail-closed. Resolve the inspection error, then review Workspace Trust for ${args.cwd}.`,
-            `工作区检查失败；AniCode 已严格限制为 plan 模式下的 read/glob/grep，并禁用项目提供的能力。本次无头运行继续 fail closed。请先修复检查错误，再审查 ${args.cwd} 的 Workspace Trust。`,
+            `Workspace inspection failed; AniCode is restricted to read/glob/grep by a strict read-only safety policy, and project-provided capabilities are disabled. This headless run remains fail-closed. Resolve the inspection error, then review Workspace Trust for ${args.cwd}.`,
+            `工作区检查失败；AniCode 已由严格只读安全策略限制为 read/glob/grep，并禁用项目提供的能力。本次无头运行继续 fail closed。请先修复检查错误，再审查 ${args.cwd} 的 Workspace Trust。`,
           )
         : t(
             `Workspace is restricted (${workspaceTrust.reason}); project environment/execution configuration, MCP, hooks, skills, network extensions, and the PatchSet workflow are disabled. Interactive default mode can approve built-in development tools one action at a time, but this headless run fails closed for permission requests; --auto/--accept-edits cannot bypass the untrusted-workspace boundary. Run anicode trust grant --cwd ${args.cwd} in an interactive terminal to review project-provided capabilities.`,
@@ -1762,19 +1813,31 @@ export async function runExecCommand(
           ),
     );
   }
-  if (!args.modelExplicit && !args.demo) args.model = config.model ?? resolveDefaultModel();
-  if (!args.daemon && !args.http && !args.resume) assertProviderConfigured(args.model);
-
   const runtimeStack =
     !args.daemon && !args.http
       ? await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir))
       : undefined;
-  const telemetry = runtimeStack ? telemetryForLocalStack(runtimeStack) : telemetryFromEnv();
   let mcpClients: McpClient[] = [];
   let lspPool: LspPool | undefined;
   let host: SessionHost | undefined;
   let debugLogger: DebugLogger | undefined;
+  let telemetry: Telemetry | undefined;
   try {
+    if (!args.modelExplicit && !args.demo) {
+      if (runtimeStack) {
+        // Unlike the interactive TUI, headless exec must never report success after silently
+        // replacing a configured production model with debug/demo.
+        args.model = config.model ?? runtimeStack.providers.resolveDefaultModel();
+      } else {
+        // Remote hosts own their credentials. Preserve the configured/built-in model spec and let
+        // the authoritative host validate it instead of consulting this client's credentials.
+        args.model = config.model ?? args.model;
+      }
+    }
+    if (runtimeStack && !args.resume) {
+      assertProviderConfigured(args.model, runtimeStack.providers.diagnoseProvider);
+    }
+    telemetry = runtimeStack ? telemetryForLocalStack(runtimeStack) : telemetryFromEnv();
     let mcpTools: Tool[] = [];
     if (runtimeStack && workspaceTrust.trusted) {
       const mcpConfigs = toMcpServerConfigs(config);
@@ -1821,11 +1884,11 @@ export async function runExecCommand(
       workspaceTrust: workspaceTrustStore,
       onWorkspaceTrustChange: async ({ current }) => {
         if (current.trusted) return;
-        for (const client of mcpClients.splice(0)) client.close();
+        await Promise.allSettled(mcpClients.splice(0).map((client) => client.close()));
         mcpTools.length = 0;
         extraTools.length = 0;
         deferredTools.length = 0;
-        lspPool?.closeAll();
+        await lspPool?.closeAll();
         lspPool = undefined;
       },
     });
@@ -1890,25 +1953,24 @@ export async function runExecCommand(
     if (!parsed.jsonl && wroteText) output.write("\n");
   } finally {
     try {
-      host?.dispose();
+      await host?.dispose();
     } catch {
       // Continue releasing independent resources.
     }
     await debugLogger?.close().catch(() => undefined);
     try {
-      lspPool?.closeAll();
+      await lspPool?.closeAll();
     } catch {
       // Continue releasing independent resources.
     }
     for (const client of mcpClients) {
       try {
-        client.close();
+        await client.close();
       } catch {
         // Cleanup is best-effort; preserve the command's real result.
       }
     }
-    await runtimeStack?.networkProxy.close().catch(() => undefined);
-    await runtimeStack?.database.close().catch(() => undefined);
+    await disposeCliRuntimeResources(runtimeStack, telemetry).catch(() => undefined);
   }
 }
 
@@ -2025,6 +2087,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     workspaceTrust: initialWorkspaceTrust,
   });
   const workspaceTrust = loadedWorkspaceTrust ?? initialWorkspaceTrust;
+  args.permissionMode = resolveInteractivePermissionMode(args, workspaceTrust.trusted);
   for (const w of configWarnings)
     console.error(
       terminalSafe(t(`${DISPLAY_NAME} config warning: ${w}`, `${DISPLAY_NAME} 配置告警: ${w}`)),
@@ -2034,8 +2097,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       terminalSafe(
         workspaceTrust.reason === "inspection-failed"
           ? t(
-              `${DISPLAY_NAME}: workspace inspection failed; only read/glob/grep are available in plan mode, and project-provided capabilities are disabled. Resolve the inspection error before reviewing Workspace Trust for ${args.cwd}.`,
-              `${DISPLAY_NAME}: 工作区检查失败；当前仅可在 plan 模式使用 read/glob/grep，项目提供的能力均已禁用。请先修复检查错误，再审查 ${args.cwd} 的 Workspace Trust。`,
+              `${DISPLAY_NAME}: workspace inspection failed; a strict read-only safety policy permits only read/glob/grep, and project-provided capabilities are disabled. Resolve the inspection error before reviewing Workspace Trust for ${args.cwd}.`,
+              `${DISPLAY_NAME}: 工作区检查失败；严格只读安全策略当前仅允许 read/glob/grep，项目提供的能力均已禁用。请先修复检查错误，再审查 ${args.cwd} 的 Workspace Trust。`,
             )
           : t(
               `${DISPLAY_NAME}: restricted workspace (${workspaceTrust.reason}); project environment/execution configuration, MCP, hooks, skills, network extensions, and the PatchSet workflow are disabled. With the normal interactive default mode, built-in read/glob/grep/write/edit/apply_patch/bash, shell-lifecycle, and todo_write tools remain available and every write or command requires an explicit decision; --auto/--accept-edits cannot bypass this boundary. Run anicode trust grant --cwd ${args.cwd} to review project-provided capabilities.`,
@@ -2055,22 +2118,30 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   let lspPool: LspPool | undefined;
   let host: SessionHost | undefined;
   let debugLogger: DebugLogger | undefined;
+  let telemetry: Telemetry | undefined;
   try {
-    const telemetry = localRuntimeStack
-      ? telemetryForLocalStack(localRuntimeStack)
-      : telemetryFromEnv();
+    telemetry = localRuntimeStack ? telemetryForLocalStack(localRuntimeStack) : telemetryFromEnv();
 
-    // 未显式指定模型时挑默认：配置 model → 已配置凭证的 DeepSeek → 零网络 debug/demo。
-    // 绝不因缺 DEEPSEEK_API_KEY 报错退出。
+    // 本地模式必须通过绑定到当前 Credential Broker 的 registry 选择/诊断模型；
+    // 不能在密钥迁出 process.env 后再读取全局 registry，否则会把有效凭证误判为缺失。
     if (!args.modelExplicit && !args.demo) {
-      args.model = config.model ?? resolveDefaultModel();
+      if (localRuntimeStack) {
+        const selection = selectStartupModel(args, config.model, localRuntimeStack.providers);
+        args.model = selection.model;
+        const fallbackWarning = startupModelFallbackWarning(selection);
+        if (fallbackWarning) console.error(terminalSafe(fallbackWarning));
+      } else {
+        // daemon/HTTP 的凭证属于远端 host；保留配置/内置 spec，由权威 host 校验，
+        // 客户端不能按本机凭证状态改写模型。
+        args.model = config.model ?? args.model;
+      }
     }
 
     // 校验 provider（本地模式下尽早报错）。仅当用户显式选了缺 key 的模型才会抛错。
     if (!args.daemon && !args.http && !args.resume) {
       try {
         // 这里只做无副作用诊断；真正创建 provider 由 createSession 唯一执行。
-        assertProviderConfigured(args.model);
+        assertProviderConfigured(args.model, localRuntimeStack!.providers.diagnoseProvider);
       } catch (err) {
         throw new Error(
           t(
@@ -2229,13 +2300,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ...(localRuntimeStack ? { runtimeStack: localRuntimeStack } : {}),
       telemetry,
       workspaceTrust: workspaceTrustStore,
+      // Keep entry intent separate from the effective bypass mode. If trust is revoked later,
+      // this local interactive host can safely fall back to per-action authorization.
+      allowRestrictedWorkspaceDevelopment: !args.permissionModeExplicit,
       onWorkspaceTrustChange: async ({ current }) => {
         if (current.trusted) return;
-        for (const client of mcpClients.splice(0)) client.close();
+        await Promise.allSettled(mcpClients.splice(0).map((client) => client.close()));
         mcpTools.length = 0;
         extraTools.length = 0;
         deferredTools.length = 0;
-        lspPool?.closeAll();
+        await lspPool?.closeAll();
         lspPool = undefined;
       },
     }).catch((err) => {
@@ -2331,6 +2405,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             workspaceTrusted={!args.daemon && !args.http && workspaceTrust.trusted}
             requireWorkspaceTrust
             canInspectWorkspace={!args.daemon && !args.http}
+            allowPermissionControls={!args.daemon && !args.http}
             mouse={mouse}
             experimentalOverlay={experimentalOverlay}
             terminalCaret={terminalCaret.controller}
@@ -2370,25 +2445,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   } finally {
     try {
-      host?.dispose();
+      await host?.dispose();
     } catch {
       // Continue releasing independent resources.
     }
     await debugLogger?.close().catch(() => undefined);
     try {
-      lspPool?.closeAll();
+      await lspPool?.closeAll();
     } catch {
       // Continue releasing independent resources.
     }
     for (const c of mcpClients) {
       try {
-        c.close();
+        await c.close();
       } catch {
         // 关闭 MCP 子进程失败不影响退出
       }
     }
-    await localRuntimeStack?.networkProxy.close().catch(() => undefined);
-    await localRuntimeStack?.database.close().catch(() => undefined);
+    await disposeCliRuntimeResources(localRuntimeStack, telemetry).catch(() => undefined);
   }
 }
 

@@ -30,6 +30,7 @@ export type WebSearchBackend = (query: string, opts: WebSearchQuery) => Promise<
 const DEFAULT_COUNT = 5;
 const MAX_COUNT = 10;
 const MAX_SNIPPET = 500;
+const MAX_SEARCH_RESPONSE_BYTES = 1024 * 1024;
 
 /** 把结果渲染成模型友好的文本：编号 + 标题 + URL + 摘要，并提示可用 webfetch 深读。 */
 export function formatSearchResults(query: string, results: WebSearchResult[]): string {
@@ -57,6 +58,7 @@ function clip(s: string, max: number): string {
 export function createWebSearchTool(backend: WebSearchBackend): Tool {
   return {
     readOnly: true,
+    capabilities: ["network"],
     isConcurrencySafe: () => true,
     def: {
       name: "web_search",
@@ -142,7 +144,7 @@ export function tavilyBackend(opts: {
       }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    return parseTavilyResponse(await res.json());
+    return parseTavilyResponse(await readBoundedSearchJson(res));
   };
 }
 
@@ -181,7 +183,7 @@ export function braveBackend(opts: {
       },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    return parseBraveResponse(await res.json());
+    return parseBraveResponse(await readBoundedSearchJson(res));
   };
 }
 
@@ -233,9 +235,46 @@ export function webSearchBackendFromBroker(opts: BrokerWebSearchOptions): WebSea
         : {}),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    const payload = await response.json();
+    const payload = await readBoundedSearchJson(response);
     return opts.provider === "tavily" ? parseTavilyResponse(payload) : parseBraveResponse(payload);
   };
+}
+
+async function readBoundedSearchJson(response: Response): Promise<unknown> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_SEARCH_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`search response exceeds ${MAX_SEARCH_RESPONSE_BYTES} bytes`);
+  }
+  if (!response.body) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let complete = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        break;
+      }
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_SEARCH_RESPONSE_BYTES) {
+        throw new Error(`search response exceeds ${MAX_SEARCH_RESPONSE_BYTES} bytes`);
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(
+      Buffer.concat(
+        chunks.map((chunk) => Buffer.from(chunk)),
+        total,
+      ).toString("utf8"),
+    );
+  } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 // ---------- 环境变量解析 ----------

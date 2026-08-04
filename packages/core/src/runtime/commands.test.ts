@@ -18,11 +18,19 @@ test("command inbox: 幂等接收、租约过期恢复与终态持久化", async
     });
     const duplicate = await inbox.accept({
       sessionId: "s_1",
-      text: "不会覆盖",
+      text: "修复测试",
       idempotencyKey: "request-1",
     });
     assert.equal(duplicate.id, first.id);
     assert.equal(duplicate.text, "修复测试");
+    await assert.rejects(
+      inbox.accept({
+        sessionId: "s_1",
+        text: "不能偷换的请求",
+        idempotencyKey: "request-1",
+      }),
+      /different prompt or model/,
+    );
 
     const running = await inbox.claim("s_1", first.id, "worker-a", 1_000);
     assert.equal(running.status, "running");
@@ -32,6 +40,11 @@ test("command inbox: 幂等接收、租约过期恢复与终态持久化", async
 
     await inbox.claim("s_1", first.id, "worker-b", 1_000, Date.now() + 2_000);
     await inbox.finish("s_1", first.id, "completed");
+    await inbox.finish("s_1", first.id, "completed");
+    await assert.rejects(
+      inbox.finish("s_1", first.id, "failed", "late overwrite"),
+      /already completed/,
+    );
     const reloaded = new CommandInbox(new FileCommandInboxStore(path.join(dir, "commands")));
     assert.equal((await reloaded.get("s_1", first.id))?.status, "completed");
     assert.equal((await reloaded.recoverable("s_1", Date.now() + 10_000)).length, 0);

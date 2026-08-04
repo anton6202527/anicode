@@ -7,7 +7,13 @@ import {
   resolveSandboxPolicy,
   resolveSandboxNetwork,
   sandboxBinaryAvailable,
+  resolveSandboxBinary,
+  sensitiveHostReadPaths,
+  sandboxHostReadBoundary,
 } from "./sandbox.js";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 test("sandbox: workspace-write 只放行工作区+临时目录写入并断网", () => {
   const p = buildSeatbeltProfile({ policy: "workspace-write", cwd: "/proj/app" });
@@ -19,7 +25,7 @@ test("sandbox: workspace-write 只放行工作区+临时目录写入并断网", 
 
 test("sandbox: read-only 不放行工作区写入", () => {
   const p = buildSeatbeltProfile({ policy: "read-only", cwd: "/proj/app" });
-  assert.doesNotMatch(p, /subpath "\/proj\/app"/);
+  assert.doesNotMatch(p, /allow file-write[^\n]+subpath "\/proj\/app"/);
   assert.match(p, /\(deny network\*\)/);
   assert.match(p, /subpath "\/dev"/); // 仍允许写 /dev
 });
@@ -67,6 +73,19 @@ test("sandbox(linux): bubblewrap 整盘只读 + 工作区可写 + .git 回只读
   assert.ok(args.includes("--bind") && args.includes("/proj/app"), "工作区应可写 rebind");
   assert.match(joined, /--ro-bind-try \/proj\/app\/\.git \/proj\/app\/\.git/); // .git 回只读
   assert.ok(args.includes("--unshare-net"), "断网");
+  for (const boundary of [
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--new-session",
+  ]) {
+    assert.ok(args.includes(boundary), `${boundary} 必须存在`);
+  }
+  assert.match(joined, /--tmpfs \/run/);
+  assert.match(joined, /--tmpfs \/tmp/);
+  assert.match(joined, /--tmpfs \/var\/tmp/);
+  assert.doesNotMatch(joined, /--bind(?:-try)? \/tmp \/tmp/);
   assert.match(joined, /--chdir \/proj\/app/);
 });
 
@@ -116,4 +135,97 @@ test("sandbox: sandboxBinaryAvailable 命中 PATH 中的可执行文件", () => 
   // /bin/sh 几乎必然存在且可执行；用自定义 env 避免污染默认缓存。
   assert.equal(sandboxBinaryAvailable("sh", { PATH: "/bin" }), true);
   assert.equal(sandboxBinaryAvailable("definitely-not-a-real-binary-xyz", { PATH: "/bin" }), false);
+});
+
+test("sandbox: 安全边界二进制不接受 PATH 前置的工作区伪造文件", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-fake-sandbox-"));
+  const fake = path.join(root, "sandbox-exec");
+  await fs.writeFile(fake, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const resolved = resolveSandboxBinary("sandbox-exec", { PATH: root }, "darwin");
+  assert.notEqual(resolved, fake);
+  assert.ok(resolved === null || resolved === "/usr/bin/sandbox-exec");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("sandbox: Seatbelt 显式拒绝读取宿主凭据文件和目录", () => {
+  const p = buildSeatbeltProfile({
+    policy: "workspace-write",
+    cwd: "/Users/dev/project",
+    deniedReadPaths: [
+      { path: "/Users/dev/.ssh", kind: "directory" },
+      { path: "/Users/dev/.npmrc", kind: "file" },
+    ],
+  });
+  assert.match(p, /\(deny file-read\* \(subpath "\/Users\/dev\/\.ssh"\)\)/);
+  assert.match(p, /\(deny file-read\* \(literal "\/Users\/dev\/\.npmrc"\)\)/);
+});
+
+test("sandbox(linux): bubblewrap 在工作区 rebind 后遮蔽宿主凭据", () => {
+  const args = buildBubblewrapArgs({
+    policy: "workspace-write",
+    cwd: "/Users/dev",
+    deniedReadPaths: [
+      { path: "/Users/dev/.ssh", kind: "directory" },
+      { path: "/Users/dev/.npmrc", kind: "file" },
+    ],
+  });
+  const workspaceAt = args.indexOf("/Users/dev");
+  const secretAt = args.lastIndexOf("/Users/dev/.ssh");
+  assert.ok(secretAt > workspaceAt, "凭据遮蔽必须晚于工作区可写 rebind");
+  assert.match(args.join(" "), /--tmpfs \/Users\/dev\/\.ssh/);
+  assert.match(args.join(" "), /--ro-bind \/dev\/null \/Users\/dev\/\.npmrc/);
+});
+
+test("sandbox: sensitiveHostReadPaths 只返回存在路径并区分文件与目录", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sensitive-home-"));
+  await fs.mkdir(path.join(home, ".ssh"));
+  await fs.writeFile(path.join(home, ".npmrc"), "token=secret\n");
+  const paths = sensitiveHostReadPaths(home);
+  const canonicalHome = await fs.realpath(home);
+  assert.deepEqual(
+    paths.map((item) => ({ path: path.relative(canonicalHome, item.path), kind: item.kind })),
+    [
+      { path: ".ssh", kind: "directory" },
+      { path: ".npmrc", kind: "file" },
+    ],
+  );
+  await fs.rm(home, { recursive: true, force: true });
+});
+
+test("sandbox: 真实 HOME 整体 deny，随后只回挂工作区，最后凭据路径再次 deny", () => {
+  const p = buildSeatbeltProfile({
+    policy: "workspace-write",
+    cwd: "/Users/dev/work/app",
+    hiddenReadRoots: ["/Users/dev"],
+    readableRoots: ["/Users/dev/.nvm/versions"],
+    deniedReadPaths: [{ path: "/Users/dev/work/app/.env", kind: "file" }],
+  });
+  const homeDeny = p.indexOf('(deny file-read* (subpath "/Users/dev"))');
+  const workspaceAllow = p.indexOf('(allow file-read* (subpath "/Users/dev/work/app"))');
+  const credentialDeny = p.indexOf('(deny file-read* (literal "/Users/dev/work/app/.env"))');
+  assert.ok(homeDeny >= 0 && workspaceAllow > homeDeny && credentialDeny > workspaceAllow);
+});
+
+test("sandbox(linux): HOME tmpfs 先于工作区回挂，宿主其它项目不可见", () => {
+  const args = buildBubblewrapArgs({
+    policy: "workspace-write",
+    cwd: "/home/dev/current",
+    hiddenReadRoots: ["/home/dev"],
+    readableRoots: ["/home/dev/.nvm/versions"],
+  });
+  const homeMask = args.indexOf("/home/dev");
+  const workspaceBind = args.lastIndexOf("/home/dev/current");
+  assert.ok(homeMask >= 0 && workspaceBind > homeMask);
+  assert.match(args.join(" "), /--tmpfs \/home\/dev/);
+});
+
+test("sandbox: sandboxHostReadBoundary 仅回挂存在的工具链，不回挂配置目录", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-read-boundary-"));
+  await fs.mkdir(path.join(home, ".nvm", "versions"), { recursive: true });
+  await fs.mkdir(path.join(home, ".config", "gh"), { recursive: true });
+  const boundary = sandboxHostReadBoundary(home);
+  const canonicalHome = await fs.realpath(home);
+  assert.deepEqual(boundary.hiddenReadRoots, [canonicalHome]);
+  assert.deepEqual(boundary.readableRoots, [path.join(canonicalHome, ".nvm", "versions")]);
+  await fs.rm(home, { recursive: true, force: true });
 });

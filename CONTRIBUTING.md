@@ -1,7 +1,8 @@
 # Contributing
 
-AniCode supports current Node.js 22 and 24 runtimes; Node 24 is used for release builds. Install the
-locked dependency graph with `npm ci`.
+AniCode supports Node.js 22.15+ and 24.x; Node 24 is selected by `.nvmrc` and used for release
+builds. Development and CI support npm 10.9.2 through 11.x; the release gate requires npm 11.5.1+.
+Run `nvm use` before installing the locked dependency graph with `npm ci`.
 
 Before opening a pull request, run:
 

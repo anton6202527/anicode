@@ -188,18 +188,140 @@ test(
         (
           await inbox.accept({
             sessionId,
-            text: "duplicate",
+            text: "durable",
             idempotencyKey: `command-${suffix}`,
           })
         ).id,
         command.id,
+      );
+      await assert.rejects(
+        inbox.accept({
+          sessionId,
+          text: "different",
+          idempotencyKey: `command-${suffix}`,
+        }),
+        /different prompt or model/,
       );
       const commandLease = await inbox.claim(sessionId, command.id, "command-worker", 5_000);
       await inbox.finish(sessionId, command.id, "completed", undefined, {
         owner: "command-worker",
         fencingToken: commandLease.fencingToken!,
       });
+      await inbox.finish(sessionId, command.id, "completed");
+      await assert.rejects(
+        inbox.finish(sessionId, command.id, "failed", "late overwrite"),
+        /Stale fencing token/,
+      );
       assert.equal((await inbox.get(sessionId, command.id))?.status, "completed");
+
+      // PostgreSQL—not the Node host—owns every lease comparison. Explicit caller timestamps and
+      // a monkey-patched application clock must neither steal live work nor revive expired work.
+      const skewedCommand = await inbox.accept({
+        sessionId,
+        text: "clock-skew",
+        idempotencyKey: `clock-skew-${suffix}`,
+      });
+      const skewedLease = await inbox.claim(
+        sessionId,
+        skewedCommand.id,
+        "clock-owner-a",
+        5_000,
+        Number.MIN_SAFE_INTEGER,
+      );
+      await assert.rejects(
+        inbox.claim(sessionId, skewedCommand.id, "clock-owner-b", 5_000, Number.MAX_SAFE_INTEGER),
+        /leased/,
+      );
+      assert.equal(
+        (await inbox.recoverable(sessionId, Number.MAX_SAFE_INTEGER)).some(
+          (candidate) => candidate.id === skewedCommand.id,
+        ),
+        false,
+      );
+
+      const postgresOutboxStore = new PostgresOutboxStore(database);
+      const skewRuntime = new DurableRuntime(new PostgresRuntimeEventStore(database));
+      const skewOutbox = new DurableOutbox(postgresOutboxStore, skewRuntime);
+      const skewMessage = await skewOutbox.enqueue({
+        streamId: sessionId,
+        type: "clock.pending",
+        data: {},
+        idempotencyKey: `clock-outbox-${suffix}`,
+      });
+      const outboxLease = await postgresOutboxStore.claimMessage("outbox-owner-a", 5_000);
+      assert.equal(outboxLease?.id, skewMessage.id);
+
+      const skewWorktree = `/tmp/anicode-postgres-clock-${suffix}`;
+      const skewOwnership = new WorktreeOwnership(workerStore);
+      const skewWorktreeLease = await skewOwnership.acquire(skewWorktree, "clock-owner-a", 5_000);
+      const originalDateNow = Date.now;
+      Date.now = () => originalDateNow() + 365 * 24 * 60 * 60_000;
+      try {
+        await inbox.heartbeat(
+          sessionId,
+          skewedCommand.id,
+          "clock-owner-a",
+          5_000,
+          skewedLease.fencingToken,
+        );
+        await assert.rejects(
+          () => skewOwnership.acquire(skewWorktree, "clock-owner-b", 5_000),
+          /owned by clock-owner-a/,
+        );
+        await skewOwnership.heartbeat(
+          skewWorktree,
+          "clock-owner-a",
+          5_000,
+          skewWorktreeLease.fencingToken,
+        );
+        assert.equal(await postgresOutboxStore.claimMessage("outbox-owner-b", 5_000), undefined);
+        await postgresOutboxStore.markFailed(outboxLease!, "outbox-owner-a", "retry");
+      } finally {
+        Date.now = originalDateNow;
+      }
+
+      const reclaimedOutbox = await postgresOutboxStore.claimMessage("outbox-owner-b", 5_000);
+      assert.equal(reclaimedOutbox?.id, skewMessage.id);
+      await database.pool.query(
+        "UPDATE anicode_outbox SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+        [skewMessage.id],
+      );
+      await assert.rejects(
+        postgresOutboxStore.markSent(reclaimedOutbox!, "outbox-owner-b", "too-late"),
+        /expired fencing token/,
+      );
+      const finalOutboxLease = await postgresOutboxStore.claimMessage("outbox-owner-c", 5_000);
+      assert.equal(finalOutboxLease?.id, skewMessage.id);
+      await postgresOutboxStore.markSent(
+        finalOutboxLease!,
+        "outbox-owner-c",
+        "clock-skew-test-sent",
+      );
+
+      await database.pool.query(
+        "UPDATE anicode_commands SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = $1 AND id = $2",
+        [sessionId, skewedCommand.id],
+      );
+      await assert.rejects(
+        inbox.finish(sessionId, skewedCommand.id, "completed", undefined, {
+          owner: "clock-owner-a",
+          fencingToken: skewedLease.fencingToken!,
+        }),
+        /Stale fencing token/,
+      );
+
+      await database.pool.query(
+        "UPDATE anicode_worktree_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE worktree = $1",
+        [skewWorktree],
+      );
+      await assert.rejects(
+        skewOwnership.release(skewWorktree, "clock-owner-a", skewWorktreeLease.fencingToken),
+        /Cannot release unowned worktree/,
+      );
+      assert.equal(
+        (await skewOwnership.acquire(skewWorktree, "clock-owner-b", 5_000)).fencingToken,
+        skewWorktreeLease.fencingToken + 1,
+      );
 
       const runtime = new DurableRuntime(
         new PostgresRuntimeEventStore(database),

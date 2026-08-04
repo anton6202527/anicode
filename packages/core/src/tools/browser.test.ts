@@ -8,7 +8,13 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { setLang, clearLangOverride } from "../i18n.js";
 import { createBrowserTool, formatReport } from "./browser.js";
-import { resolveChromePath, closeAllBrowsers, type NavigateResult } from "../browser/cdp.js";
+import {
+  BrowserRegistry,
+  resolveChromePath,
+  closeAllBrowsers,
+  type BrowserResource,
+  type NavigateResult,
+} from "../browser/cdp.js";
 
 const base = (over: Partial<NavigateResult> = {}): NavigateResult => ({
   finalUrl: "http://localhost:3000/",
@@ -84,15 +90,16 @@ test("formatReport: 选择器与脚本结果并入报告", () => {
   }
 });
 
-test("browser 工具元数据：只读（自动放行）、必填 url、ruleKey 取 url", () => {
+test("browser 工具元数据：工作区只读但声明网络/持久进程边界", () => {
   const tool = createBrowserTool();
-  assert.equal(tool.readOnly, true, "只读工具才会被权限引擎自动放行（默认免授权）");
+  assert.equal(tool.readOnly, true);
+  assert.deepEqual(tool.capabilities, ["network", "process", "persistent-process"]);
   assert.equal(tool.def.name, "browser");
   assert.deepEqual((tool.def.parameters as any).required, ["url"]);
   assert.equal(tool.ruleKey({ url: "http://localhost:3000" }), "http://localhost:3000");
 });
 
-test("browser 工具: 自动放行边界拒绝 file/data/about 等本地或内部协议", async () => {
+test("browser 工具: URL 边界拒绝 file/data/about 等本地或内部协议", async () => {
   const tool = createBrowserTool();
   const ctx = { cwd: process.cwd(), signal: new AbortController().signal } as any;
   for (const url of [
@@ -104,6 +111,38 @@ test("browser 工具: 自动放行边界拒绝 file/data/about 等本地或内�
   ]) {
     await assert.rejects(tool.run({ url }, ctx), /HTTP\(S\)|HTTP\(S\) URL/);
   }
+});
+
+test("browser registry: manager-scoped close 不会关闭其它 manager 的实例", async () => {
+  const first = new BrowserRegistry();
+  const second = new BrowserRegistry();
+  let firstClosed = 0;
+  let secondClosed = 0;
+  await first.add({ close: async () => void firstClosed++ });
+  await second.add({ close: async () => void secondClosed++ });
+  await first.closeAll();
+  assert.equal(firstClosed, 1);
+  assert.equal(secondClosed, 0);
+  await second.closeAll();
+  assert.equal(secondClosed, 1);
+});
+
+test("browser registry: close 与迟到 launch adoption 竞态时 fail closed", async () => {
+  const registry = new BrowserRegistry();
+  await registry.closeAll();
+  let closed = 0;
+  const late: BrowserResource = { close: async () => void closed++ };
+  await assert.rejects(() => registry.add(late), /closed/);
+  assert.equal(closed, 1);
+});
+
+test("browser tool: close 是实例级且会封住共享给 fork 的 owner", async () => {
+  const tool = createBrowserTool();
+  const fork = tool.fork?.();
+  assert.ok(tool.close && fork);
+  await tool.close!();
+  const ctx = { cwd: process.cwd(), signal: new AbortController().signal } as any;
+  await assert.rejects(fork!.run({ url: "http://127.0.0.1" }, ctx), /closed/);
 });
 
 // —— 真·端到端：仅在本机可解析 Chrome 时运行 ——

@@ -8,12 +8,15 @@
 
 import { spawn } from "node:child_process";
 import * as path from "node:path";
-import type {
-  ExecutionRuntime,
-  IsolatedRunRequest,
-  IsolatedRunResult,
+import {
+  assertBoundedStdin,
+  terminateProcessTree,
+  type ExecutionRuntime,
+  type IsolatedRunRequest,
+  type IsolatedRunResult,
 } from "./isolated-runtime.js";
 import { TransactionalExecutionRuntime } from "./transactional-runtime.js";
+import { sanitizedShellEnv } from "../tools/shell-spawn.js";
 
 const OUTPUT_LIMIT = 1024 * 1024;
 
@@ -27,11 +30,15 @@ function required(name: string): string {
 class PodProcessRuntime implements ExecutionRuntime {
   run(request: IsolatedRunRequest): Promise<IsolatedRunResult> {
     const started = Date.now();
+    request.signal?.throwIfAborted();
+    assertBoundedStdin(request.stdin);
     return new Promise((resolve, reject) => {
       const child = spawn("/bin/sh", ["-lc", request.command], {
         cwd: request.cwd,
-        env: request.env ?? process.env,
-        stdio: ["ignore", "pipe", "pipe"],
+        env: sanitizedShellEnv({ ...process.env, ...request.env }),
+        stdio: [request.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+        windowsHide: true,
       });
       let output = "";
       let timedOut = false;
@@ -40,17 +47,27 @@ class PodProcessRuntime implements ExecutionRuntime {
           output += chunk.toString().slice(0, OUTPUT_LIMIT - output.length);
         }
       };
-      child.stdout.on("data", capture);
-      child.stderr.on("data", capture);
+      child.stdout?.on("data", capture);
+      child.stderr?.on("data", capture);
+      if (child.stdin) {
+        child.stdin.on("error", () => undefined);
+        child.stdin.end(request.stdin);
+      }
+      let termination: Promise<void> | undefined;
+      const stop = () => {
+        termination ??= terminateProcessTree(child);
+        void termination.catch(reject);
+      };
       const timeout = setTimeout(
         () => {
           timedOut = true;
-          child.kill("SIGKILL");
+          stop();
         },
         Math.max(1_000, request.timeoutMs ?? 120_000),
       );
-      const abort = () => child.kill("SIGKILL");
+      const abort = () => stop();
       request.signal?.addEventListener("abort", abort, { once: true });
+      if (request.signal?.aborted) abort();
       child.once("error", (error) => {
         clearTimeout(timeout);
         request.signal?.removeEventListener("abort", abort);
@@ -59,13 +76,19 @@ class PodProcessRuntime implements ExecutionRuntime {
       child.once("close", (exitCode) => {
         clearTimeout(timeout);
         request.signal?.removeEventListener("abort", abort);
-        resolve({
-          exitCode,
-          output,
-          timedOut,
-          sandboxed: true,
-          durationMs: Date.now() - started,
-        });
+        void (async () => {
+          if (!termination && process.platform !== "win32") {
+            termination = terminateProcessTree(child);
+          }
+          await termination;
+          resolve({
+            exitCode,
+            output,
+            timedOut,
+            sandboxed: true,
+            durationMs: Date.now() - started,
+          });
+        })().catch(reject);
       });
     });
   }
@@ -103,7 +126,7 @@ export async function main(): Promise<void> {
       network: process.env.ANICODE_JOB_NETWORK === "1",
       timeoutMs: Number(process.env.ANICODE_JOB_TIMEOUT_MS ?? 120_000),
       signal: controller.signal,
-      env: process.env,
+      env: sanitizedShellEnv(),
     });
     process.stdout.write(result.output);
     process.exitCode = result.exitCode ?? 1;

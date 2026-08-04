@@ -8,10 +8,11 @@
  * 服务器由配置提供（命令 + 负责的扩展名），未配置则该能力静默关闭——不绑定具体语言。
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import { sanitizedShellEnv } from "./tools/shell-spawn.js";
+import { terminateProcessTree, type ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
 export interface LspServerConfig {
   /** 服务器可执行文件，如 "typescript-language-server" */
@@ -41,6 +42,38 @@ const SEVERITY: Record<number, Diagnostic["severity"]> = {
 };
 const MAX_LSP_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_LSP_BUFFER_BYTES = MAX_LSP_FRAME_BYTES + 64 * 1024;
+const MAX_LSP_RESULT_ITEMS = 1_000;
+export const MAX_LSP_DOCUMENT_BYTES = MAX_LSP_FRAME_BYTES;
+
+function isInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return (
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+  );
+}
+
+/**
+ * Resolve an LSP-visible path to a canonical, regular workspace file.  This is deliberately used
+ * for both model-supplied paths and server-returned file URIs: an LSP server is a child process,
+ * not an authority that may expand the agent's host read boundary.
+ */
+export async function canonicalLspWorkspaceFile(
+  workspaceRoot: string,
+  candidate: string,
+): Promise<string> {
+  const root = await fs.realpath(path.resolve(workspaceRoot));
+  const requested = path.resolve(root, candidate);
+  const canonical = await fs.realpath(requested);
+  if (!isInside(root, canonical))
+    throw new Error("LSP path escapes the workspace through a symlink");
+  const stat = await fs.stat(canonical);
+  if (!stat.isFile()) throw new Error("LSP path is not a regular file");
+  if (stat.size > MAX_LSP_DOCUMENT_BYTES) {
+    throw new Error("LSP document exceeds the 8 MiB limit");
+  }
+  return canonical;
+}
 
 /** 一处代码位置（跳转/引用结果）。line/column 均 1 起，path 为绝对路径。 */
 export interface LspLocation {
@@ -101,7 +134,7 @@ function posToLine(range: any): { line: number; column: number } {
 /** textDocument/definition|references 结果（Location | Location[] | LocationLink[]）归一。 */
 function toLocations(res: any): LspLocation[] {
   if (!res) return [];
-  const arr = Array.isArray(res) ? res : [res];
+  const arr = (Array.isArray(res) ? res : [res]).slice(0, MAX_LSP_RESULT_ITEMS);
   return arr
     .map((item) => {
       const uri: string | undefined = item?.uri ?? item?.targetUri;
@@ -117,8 +150,10 @@ function toLocations(res: any): LspLocation[] {
 function toSymbols(res: any, defaultPath?: string): LspSymbol[] {
   if (!Array.isArray(res)) return [];
   const out: LspSymbol[] = [];
-  const walk = (items: any[], container?: string): void => {
+  const walk = (items: any[], container?: string, depth = 0): void => {
+    if (depth > 64 || out.length >= MAX_LSP_RESULT_ITEMS) return;
     for (const s of items) {
+      if (out.length >= MAX_LSP_RESULT_ITEMS) return;
       const kind = SYMBOL_KIND[s?.kind] ?? String(s?.kind ?? "");
       if (s?.location) {
         // SymbolInformation / WorkspaceSymbol（扁平，带 location）
@@ -143,7 +178,7 @@ function toSymbols(res: any, defaultPath?: string): LspSymbol[] {
           ...(container ? { container } : {}),
         });
         if (Array.isArray(s?.children) && s.children.length)
-          walk(s.children, String(s?.name ?? ""));
+          walk(s.children, String(s?.name ?? ""), depth + 1);
       }
     }
   };
@@ -181,6 +216,7 @@ export class LspClient {
   private diagWaiters = new Map<string, ((d: Diagnostic[]) => void)[]>();
   private opened = new Set<string>();
   private initialized: Promise<void>;
+  private termination: Promise<void> | undefined;
 
   private constructor(
     proc: ChildProcessWithoutNullStreams,
@@ -190,6 +226,10 @@ export class LspClient {
     this.proc = proc;
     this.proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
     this.proc.stderr.on("data", () => {}); // 语言服务器的 stderr 噪声忽略
+    this.proc.on("error", (error) => this.failProtocol(error));
+    this.proc.on("exit", () =>
+      this.failProtocol(new Error(`LSP server exited: ${this.cfg.command}`)),
+    );
     this.initialized = this.handshake();
   }
 
@@ -198,9 +238,12 @@ export class LspClient {
     cfg: LspServerConfig,
     executionRuntime?: ExecutionRuntime,
   ): LspClient {
+    const canonicalRoot = realpathSync(path.resolve(rootPath));
+    if (!statSync(canonicalRoot).isDirectory())
+      throw new Error("LSP workspace root is not a directory");
     const prepared = executionRuntime?.prepare?.({
       command: shellCommand(cfg.command, cfg.args ?? []),
-      cwd: rootPath,
+      cwd: canonicalRoot,
       policy: "read-only",
       network: false,
     });
@@ -208,11 +251,13 @@ export class LspClient {
       throw new Error("Persistent LSP requires an execution runtime with prepare() support");
     }
     const proc = spawn(prepared?.file ?? cfg.command, prepared?.args ?? cfg.args ?? [], {
-      cwd: prepared?.cwd ?? rootPath,
-      ...(prepared ? { env: prepared.env } : {}),
+      cwd: prepared?.cwd ?? canonicalRoot,
+      env: prepared?.env ?? sanitizedShellEnv(),
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
     });
-    return new LspClient(proc, rootPath, cfg);
+    return new LspClient(proc, canonicalRoot, cfg);
   }
 
   private async handshake(): Promise<void> {
@@ -312,11 +357,7 @@ export class LspClient {
     this.buffer = Buffer.alloc(0);
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
-    try {
-      this.proc.kill();
-    } catch {
-      // already exited
-    }
+    void this.stopProcess().catch(() => undefined);
   }
 
   private dispatch(msg: any): void {
@@ -335,19 +376,33 @@ export class LspClient {
     }
     if (msg.method === "textDocument/publishDiagnostics") {
       const uri: string = msg.params.uri;
-      const diags: Diagnostic[] = (msg.params.diagnostics ?? []).map((d: any) => ({
-        line: (d.range?.start?.line ?? 0) + 1,
-        column: (d.range?.start?.character ?? 0) + 1,
-        severity: SEVERITY[d.severity] ?? "info",
-        message: d.message ?? "",
-        ...(d.source ? { source: d.source } : {}),
-      }));
-      this.diagnostics.set(uri, diags);
-      const waiters = this.diagWaiters.get(uri);
-      if (waiters) {
-        this.diagWaiters.delete(uri);
-        for (const w of waiters) w(diags);
-      }
+      const diags: Diagnostic[] = (msg.params.diagnostics ?? [])
+        .slice(0, MAX_LSP_RESULT_ITEMS)
+        .map((d: any) => ({
+          line: (d.range?.start?.line ?? 0) + 1,
+          column: (d.range?.start?.character ?? 0) + 1,
+          severity: SEVERITY[d.severity] ?? "info",
+          message: String(d.message ?? "").slice(0, 16 * 1024),
+          ...(d.source ? { source: String(d.source).slice(0, 256) } : {}),
+        }));
+      void this.acceptDiagnostics(uri, diags);
+    }
+  }
+
+  private async acceptDiagnostics(uri: string, diags: Diagnostic[]): Promise<void> {
+    let canonicalUri: string;
+    try {
+      canonicalUri = pathToFileURL(
+        await canonicalLspWorkspaceFile(this.rootPath, safeFsPath(uri)),
+      ).href;
+    } catch {
+      return;
+    }
+    this.diagnostics.set(canonicalUri, diags);
+    const waiters = this.diagWaiters.get(canonicalUri);
+    if (waiters) {
+      this.diagWaiters.delete(canonicalUri);
+      for (const w of waiters) w(diags);
     }
   }
 
@@ -358,12 +413,10 @@ export class LspClient {
   /** 打开（或同步）文件，返回其 uri —— 语言请求前置：服务器需先知道文件内容。 */
   private async ensureOpen(absPath: string): Promise<string> {
     await this.initialized;
-    const uri = pathToFileURL(absPath).href;
-    const ext = path.extname(absPath).toLowerCase();
-    const text = await fs.readFile(absPath, "utf8");
-    if (Buffer.byteLength(text, "utf8") > MAX_LSP_FRAME_BYTES) {
-      throw new Error("LSP document exceeds the 8 MiB frame limit");
-    }
+    const canonical = await canonicalLspWorkspaceFile(this.rootPath, absPath);
+    const uri = pathToFileURL(canonical).href;
+    const ext = path.extname(canonical).toLowerCase();
+    const text = await fs.readFile(canonical, "utf8");
     const languageId = this.cfg.languageId ?? guessLanguageId(ext);
     if (this.opened.has(uri)) {
       this.notify("textDocument/didChange", {
@@ -386,7 +439,7 @@ export class LspClient {
   ): Promise<LspLocation[]> {
     const uri = await this.ensureOpen(absPath);
     const res = await this.request("textDocument/definition", { textDocument: { uri }, position });
-    return toLocations(res);
+    return this.workspaceLocations(res);
   }
 
   /** 查找引用（含声明）。position 为 0 起。 */
@@ -400,21 +453,58 @@ export class LspClient {
       position,
       context: { includeDeclaration: true },
     });
-    return toLocations(res);
+    return this.workspaceLocations(res);
   }
 
   /** 文件大纲（该文件内所有符号）。 */
   async documentSymbols(absPath: string): Promise<LspSymbol[]> {
     const uri = await this.ensureOpen(absPath);
     const res = await this.request("textDocument/documentSymbol", { textDocument: { uri } });
-    return toSymbols(res, absPath);
+    return this.workspaceSymbolsFromResult(
+      res,
+      await canonicalLspWorkspaceFile(this.rootPath, absPath),
+    );
   }
 
   /** 工作区符号搜索（按名字跨文件找定义）。 */
   async workspaceSymbols(query: string): Promise<LspSymbol[]> {
     await this.initialized;
     const res = await this.request("workspace/symbol", { query });
-    return toSymbols(res);
+    return this.workspaceSymbolsFromResult(res);
+  }
+
+  private async workspaceLocations(result: unknown): Promise<LspLocation[]> {
+    const accepted: LspLocation[] = [];
+    for (const location of toLocations(result)) {
+      try {
+        accepted.push({
+          ...location,
+          path: await canonicalLspWorkspaceFile(this.rootPath, location.path),
+        });
+      } catch {
+        // A compromised/misconfigured server cannot widen the workspace read boundary.
+      }
+    }
+    return accepted;
+  }
+
+  private async workspaceSymbolsFromResult(
+    result: unknown,
+    defaultPath?: string,
+  ): Promise<LspSymbol[]> {
+    const accepted: LspSymbol[] = [];
+    for (const symbol of toSymbols(result, defaultPath)) {
+      if (!symbol.path) continue;
+      try {
+        accepted.push({
+          ...symbol,
+          path: await canonicalLspWorkspaceFile(this.rootPath, symbol.path),
+        });
+      } catch {
+        // Ignore server-returned host paths and stale/non-file locations.
+      }
+    }
+    return accepted;
   }
 
   /** 打开文件并等待其诊断（超时返回当前已知/空）。 */
@@ -442,12 +532,13 @@ export class LspClient {
     });
   }
 
-  close(): void {
-    try {
-      this.proc.kill();
-    } catch {
-      // 忽略
-    }
+  close(): Promise<void> {
+    return this.stopProcess();
+  }
+
+  private stopProcess(): Promise<void> {
+    this.termination ??= terminateProcessTree(this.proc);
+    return this.termination;
   }
 }
 
@@ -470,6 +561,10 @@ export class LspPool {
     private readonly servers: LspServerConfig[],
     private readonly executionRuntime?: ExecutionRuntime,
   ) {}
+
+  hasServerFor(ext: string): boolean {
+    return Boolean(pickLspServer(this.servers, ext));
+  }
 
   clientFor(ext: string): LspClient | undefined {
     const e = ext.toLowerCase();
@@ -494,10 +589,17 @@ export class LspPool {
     return this.clients;
   }
 
-  closeAll(): void {
-    for (const c of this.clients) c.close();
+  async closeAll(): Promise<void> {
+    const clients = this.clients;
     this.clients = [];
     this.byExt.clear();
+    const results = await Promise.allSettled(clients.map((client) => client.close()));
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Failed to close LSP process trees");
+    }
   }
 }
 

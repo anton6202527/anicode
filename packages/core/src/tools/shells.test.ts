@@ -97,6 +97,27 @@ test("ShellRegistry: kill 能停掉长跑进程并标记 killed", async () => {
   reg.killAll();
 });
 
+test(
+  "ShellRegistry: killAndWait 清理整棵后台进程树，孙进程不能延迟写入",
+  { skip: process.platform === "win32" ? "requires POSIX shell process groups" : false },
+  async () => {
+    const dir = await scratch("anicode-shell-tree-");
+    const marker = path.join(dir, "orphan-marker");
+    const reg = new ShellRegistry();
+    const id = reg.start({
+      command: "background child",
+      cwd: dir,
+      file: "/bin/sh",
+      args: ["-c", `(sleep 0.7; printf orphan > '${marker}') & wait`],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(await reg.killAndWait(id), true);
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await assert.rejects(fs.access(marker), /ENOENT/);
+    await fs.rm(dir, { recursive: true, force: true });
+  },
+);
+
 test("ShellRegistry: 未知 id 读取返回 null", () => {
   const reg = new ShellRegistry();
   assert.equal(reg.read("bash_missing"), null);

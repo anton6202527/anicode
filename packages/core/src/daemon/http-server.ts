@@ -38,6 +38,7 @@ import {
 import { PartsProjector, messagesToParts } from "../parts.js";
 import { createId } from "../id.js";
 import { PatchSetConflictError, type PatchSetChangeInput } from "../runtime/patchset.js";
+import { CommandIdempotencyConflictError } from "../runtime/commands.js";
 import {
   generateOpenApi,
   PROTOCOL_VERSION,
@@ -528,6 +529,8 @@ export class HttpDaemonServer {
               code: err.code,
               ...(err.details !== undefined ? { details: err.details } : {}),
             });
+          } else if (err instanceof CommandIdempotencyConflictError) {
+            json(res, 409, { error: err.message, code: err.code });
           } else {
             json(res, 500, { error: err instanceof Error ? err.message : String(err) });
           }

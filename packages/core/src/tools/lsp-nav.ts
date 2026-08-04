@@ -12,7 +12,13 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { type Tool, type ToolContext, ToolError } from "./tool.js";
 import { resolveInside } from "./fs.js";
-import type { LspPool, LspClient, LspLocation, LspSymbol } from "../lsp.js";
+import {
+  canonicalLspWorkspaceFile,
+  type LspPool,
+  type LspClient,
+  type LspLocation,
+  type LspSymbol,
+} from "../lsp.js";
 import { t } from "../i18n.js";
 
 /** 单次结果里最多读取多少个位置的上下文行（每个都要读一次文件，设界防炸）。 */
@@ -30,12 +36,17 @@ interface ResolvedPos {
  */
 async function resolvePosition(cwd: string, input: Record<string, unknown>): Promise<ResolvedPos> {
   const abs = await resolveInside(cwd, input["path"]);
-  const rel = path.relative(cwd, abs) || ".";
+  const canonical = await canonicalLspWorkspaceFile(cwd, abs).catch((error: unknown) => {
+    throw new ToolError(
+      `LSP 文件不可访问: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  const rel = path.relative(cwd, canonical) || ".";
   const line = Math.max(1, Math.floor(Number(input["line"] ?? 0)));
   if (!Number.isFinite(line) || line < 1) throw new ToolError("需要 1 起的 line");
   let text: string;
   try {
-    text = await fs.readFile(abs, "utf8");
+    text = await fs.readFile(canonical, "utf8");
   } catch (e: any) {
     throw new ToolError(`读取失败: ${e?.code ?? e?.message ?? e}`);
   }
@@ -60,7 +71,7 @@ async function resolvePosition(cwd: string, input: Record<string, unknown>): Pro
       t("provide symbol or character", "需要提供 symbol 或 character 其一来定位"),
     );
   }
-  return { abs, rel, position: { line: line - 1, character } };
+  return { abs: canonical, rel, position: { line: line - 1, character } };
 }
 
 /** 读取每个位置所在行的文本，渲染成 `rel:line:col: <代码行>`。位置数设上限。 */
@@ -69,15 +80,21 @@ async function formatLocations(cwd: string, locs: LspLocation[]): Promise<string
   const lineCache = new Map<string, string[]>();
   const out: string[] = [];
   for (const loc of shown) {
-    const rel = path.relative(cwd, loc.path) || loc.path;
-    let lines = lineCache.get(loc.path);
+    let canonical: string;
+    try {
+      canonical = await canonicalLspWorkspaceFile(cwd, loc.path);
+    } catch {
+      continue;
+    }
+    const rel = path.relative(cwd, canonical) || canonical;
+    let lines = lineCache.get(canonical);
     if (!lines) {
       try {
-        lines = (await fs.readFile(loc.path, "utf8")).split("\n");
+        lines = (await fs.readFile(canonical, "utf8")).split("\n");
       } catch {
         lines = [];
       }
-      lineCache.set(loc.path, lines);
+      lineCache.set(canonical, lines);
     }
     const code = (lines[loc.line - 1] ?? "").trim();
     out.push(`${rel}:${loc.line}:${loc.column}${code ? `: ${code}` : ""}`);
@@ -92,14 +109,23 @@ async function formatLocations(cwd: string, locs: LspLocation[]): Promise<string
   return body;
 }
 
-function formatSymbols(cwd: string, symbols: LspSymbol[]): string {
+async function formatSymbols(cwd: string, symbols: LspSymbol[]): Promise<string> {
   const shown = symbols.slice(0, MAX_LOCATIONS);
-  const out = shown.map((s) => {
-    const rel = s.path ? path.relative(cwd, s.path) || s.path : "";
+  const out: string[] = [];
+  for (const s of shown) {
+    let canonical = "";
+    if (s.path) {
+      try {
+        canonical = await canonicalLspWorkspaceFile(cwd, s.path);
+      } catch {
+        continue;
+      }
+    }
+    const rel = canonical ? path.relative(cwd, canonical) || canonical : "";
     const where = rel ? `${rel}:${s.line}:${s.column}` : `${s.line}:${s.column}`;
     const container = s.container ? ` (${s.container})` : "";
-    return `[${s.kind}] ${s.name}${container} — ${where}`;
-  });
+    out.push(`[${s.kind}] ${s.name}${container} — ${where}`);
+  }
   let body = out.join("\n");
   if (symbols.length > shown.length) {
     body += t(
@@ -142,6 +168,7 @@ const POSITION_PARAMS = {
 /** definition：跳到符号定义处。 */
 export function createDefinitionTool(pool: LspPool): Tool {
   return {
+    capabilities: ["filesystem-read", "process", "persistent-process"],
     readOnly: true,
     isConcurrencySafe: () => true,
     def: {
@@ -175,6 +202,7 @@ export function createDefinitionTool(pool: LspPool): Tool {
 /** references：找符号的所有引用。 */
 export function createReferencesTool(pool: LspPool): Tool {
   return {
+    capabilities: ["filesystem-read", "process", "persistent-process"],
     readOnly: true,
     isConcurrencySafe: () => true,
     def: {
@@ -208,6 +236,7 @@ export function createReferencesTool(pool: LspPool): Tool {
 /** symbols：query→工作区符号搜索；path→文件大纲。 */
 export function createSymbolsTool(pool: LspPool): Tool {
   return {
+    capabilities: ["filesystem-read", "process", "persistent-process"],
     readOnly: true,
     isConcurrencySafe: () => true,
     def: {
@@ -234,7 +263,12 @@ export function createSymbolsTool(pool: LspPool): Tool {
     ruleKey: (i) => (i["query"] ? `query:${String(i["query"])}` : String(i["path"] ?? "")),
     async run(input, ctx: ToolContext) {
       if (input["path"]) {
-        const abs = await resolveInside(ctx.cwd, input["path"]);
+        const requested = await resolveInside(ctx.cwd, input["path"]);
+        const abs = await canonicalLspWorkspaceFile(ctx.cwd, requested).catch((error: unknown) => {
+          throw new ToolError(
+            `LSP 文件不可访问: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
         const client = clientForPath(pool, abs);
         const syms = await client.documentSymbols(abs);
         if (syms.length === 0)
@@ -242,7 +276,7 @@ export function createSymbolsTool(pool: LspPool): Tool {
             `(no symbols in ${path.relative(ctx.cwd, abs) || "."})`,
             `(${path.relative(ctx.cwd, abs) || "."} 无符号)`,
           );
-        return formatSymbols(ctx.cwd, syms);
+        return await formatSymbols(ctx.cwd, syms);
       }
       const query = String(input["query"] ?? "").trim();
       if (!query) throw new ToolError(t("provide path or query", "需要提供 path 或 query 其一"));
@@ -269,7 +303,7 @@ export function createSymbolsTool(pool: LspPool): Tool {
       }
       if (merged.length === 0)
         return t(`(no symbols matching "${query}")`, `(没有匹配 "${query}" 的符号)`);
-      return formatSymbols(ctx.cwd, merged);
+      return await formatSymbols(ctx.cwd, merged);
     },
   };
 }

@@ -81,7 +81,12 @@ export interface WorkerQueueStore {
   listJobs?(): Promise<WorkerJob[]>;
   get?(jobId: string): Promise<WorkerJob | undefined>;
   acquireWorktree?(worktree: string, owner: string, leaseMs: number): Promise<WorktreeLease>;
-  heartbeatWorktree?(worktree: string, owner: string, leaseMs: number): Promise<void>;
+  heartbeatWorktree?(
+    worktree: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void>;
   releaseWorktree?(worktree: string, owner: string, fencingToken?: number): Promise<void>;
 }
 
@@ -644,17 +649,31 @@ export class WorktreeOwnership {
     });
   }
 
-  async heartbeat(worktree: string, owner: string, leaseMs = 60_000): Promise<void> {
+  async heartbeat(
+    worktree: string,
+    owner: string,
+    leaseMs = 60_000,
+    fencingToken?: number,
+  ): Promise<void> {
     const resolved = path.resolve(worktree);
     if (this.store.heartbeatWorktree) {
-      await this.store.heartbeatWorktree(resolved, owner, leaseMs);
+      await this.store.heartbeatWorktree(resolved, owner, leaseMs, fencingToken);
       return;
     }
     await this.store.transact(async (rows) => {
       const type = `__worktree__:${resolved}`;
       const row = rows.find((job) => job.type === type);
-      if (!row || row.status !== "leased" || row.leaseOwner !== owner) {
+      if (
+        !row ||
+        row.status !== "leased" ||
+        row.leaseOwner !== owner ||
+        !row.leaseExpiresAt ||
+        Date.parse(row.leaseExpiresAt) <= Date.now()
+      ) {
         throw new Error(`Cannot heartbeat unowned worktree: ${worktree}`);
+      }
+      if (fencingToken !== undefined && row.fencingToken !== fencingToken) {
+        throw new Error(`Stale fencing token for worktree: ${worktree}`);
       }
       row.leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseMs)).toISOString();
       row.updatedAt = new Date().toISOString();

@@ -31,6 +31,36 @@ function handle(msg) {
         ],
       },
     });
+  } else if (msg.method === "textDocument/definition") {
+    writeFrame({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: [
+        {
+          uri: msg.params.textDocument.uri,
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        },
+        {
+          uri: "file:///etc/hosts",
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        },
+      ],
+    });
+  } else if (msg.method === "workspace/symbol") {
+    writeFrame({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: [
+        {
+          name: "outside-canary",
+          kind: 12,
+          location: {
+            uri: "file:///etc/hosts",
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+          },
+        },
+      ],
+    });
   }
 }
 

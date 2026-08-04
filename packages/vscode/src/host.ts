@@ -7,19 +7,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   SessionManager,
-  SessionStore,
-  MigratingSessionStore,
+  createProductionSessionManager,
+  createProductionSessionManagerAsync,
   createProvider,
   diagnoseProvider,
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
-  createLocalRuntimeStack,
-  ContextCompiler,
-  Verifier,
-  SecurityPolicyEngine,
-  telemetryForLocalStack,
   t,
+  type AnicodeConfig,
+  type ProductionSessionManagerComposition,
   type WorkspaceTrustSource,
 } from "@anicode/core";
 
@@ -41,30 +38,40 @@ export function buildManager(
   sessionsDir?: string,
   workspaceTrust?: WorkspaceTrustSource,
   workspaceScope?: string,
+  config?: AnicodeConfig,
 ): SessionManager {
+  return buildManagerComposition(sessionsDir, workspaceTrust, workspaceScope, config).manager;
+}
+
+/** Shared production composition; the extension keeps the result so owned SQLite/proxy resources close. */
+export function buildManagerComposition(
+  sessionsDir?: string,
+  workspaceTrust?: WorkspaceTrustSource,
+  workspaceScope?: string,
+  config?: AnicodeConfig,
+): ProductionSessionManagerComposition {
   const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
-  const runtimeStack = createLocalRuntimeStack(path.dirname(dir));
-  return new SessionManager({
-    store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(dir)),
-    runtime: runtimeStack.runtime,
-    artifacts: runtimeStack.artifacts,
-    commandInbox: runtimeStack.commandInbox,
-    outbox: runtimeStack.outbox,
-    networkProxy: runtimeStack.networkProxy,
-    worktreeOwnership: runtimeStack.worktreeOwnership,
-    contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
-    verifier: new Verifier({ autoDiscover: true }),
-    securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
-    telemetry: telemetryForLocalStack(runtimeStack),
-    isolatedRuntime: runtimeStack.isolatedRuntime,
-    ...(workspaceScope ? { workspaceScope } : {}),
-    resolveProvider: resolveConfiguredProvider,
-    compaction: true,
-    permission: { mode: "default" },
+  return createProductionSessionManager({
+    cwd: workspaceScope ?? path.dirname(dir),
+    sessionsDir: dir,
+    config: config ?? {},
     ...(workspaceTrust ? { workspaceTrust } : {}),
-    skills: true,
-    subagents: true,
-    smallModel: true, // 摘要等杂活自动走便宜模型
+  });
+}
+
+/** VS Code activation is async, so construction failures wait for owned resource rollback. */
+export async function buildManagerCompositionAsync(
+  sessionsDir?: string,
+  workspaceTrust?: WorkspaceTrustSource,
+  workspaceScope?: string,
+  config?: AnicodeConfig,
+): Promise<ProductionSessionManagerComposition> {
+  const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
+  return createProductionSessionManagerAsync({
+    cwd: workspaceScope ?? path.dirname(dir),
+    sessionsDir: dir,
+    config: config ?? {},
+    ...(workspaceTrust ? { workspaceTrust } : {}),
   });
 }
 

@@ -31,13 +31,21 @@ diff 等前端无关的纯逻辑集中在 `@anicode/shared`，三端共用、单
 最短路径：
 
 ```bash
+nvm install
+nvm use
 npm install
 npm run dev:tui
 ```
 
+`.nvmrc` 固定开发主版本为 Node 24；仓库只把 Node 22.15+ 与 24.x 纳入 CI 和发布门禁。如果当前终端是
+Node 23、25、26 等未验证版本，推荐先执行 `nvm use`；源码调试入口只会告警并继续运行，但这些版本
+不能用于正式发布。日常开发与 CI 支持 npm 10.9.2–11.x；release gate 仍强制要求 Node 22/24 与
+npm 11.5.1+。
+
 启动时会先评估 Workspace Trust。已信任工作区会读取项目根目录的 `.env.local` / `.env` 和
 `anicode.json` / `.anicode/anicode.json`；未信任工作区不加载项目环境或可执行配置，只保留模型与
-TUI 偏好。若没有可用云端凭证则回退到零网络的 `debug/demo`。
+TUI 偏好。隐式配置的云端模型若没有可用凭证，会给出告警并选择另一个凭证就绪的默认模型；若没有
+任何可用云端凭证，则回退到零网络的 `debug/demo`。显式 `--model` 仍会 fail-fast。
 
 CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite，凭证存在本机 OS Keychain，不需要 AniCode 后端服务、PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。使用云端模型时仍需对应 provider 的 API key 或官方支持的企业凭证；这不是 AniCode 自身的后端依赖。
 
@@ -68,13 +76,13 @@ npm run dev:tui:demo
 ### 工作区信任与默认权限
 
 首次打开、工作区目录被替换或项目执行配置发生变化时，AniCode 会进入 restricted mode。在交互式
-`default` 入口中，这不是“只读模式”，也不会强制切到 `plan`：内置
+`default` 入口中，这不是“只读模式”，也不会强制进入内部严格只读策略：内置
 `read / glob / grep / write / edit / apply_patch / bash / todo_write` 以及后台 shell 生命周期工具
 `bash_output / write_stdin / list_shells / kill_shell` 仍会提供给 Agent。每次写入、启动命令或向后台进程
 写 stdin 都必须由用户明确授权；受限 `bash` 固定使用 workspace-write sandbox，且没有联网参数。
 
 如果原因是 `inspection-failed`（例如 trust store、realpath 或执行面检查失败），AniCode 无法证明上述边界，
-因此会进一步 fail closed：只保留 plan 模式下的 `read / glob / grep`，不提供写入或 shell。应先修复检查错误，
+因此会进一步 fail closed 到严格只读安全边界：只保留 `read / glob / grep`，不提供写入或 shell。应先修复检查错误，
 再重新评估工作区，而不是把检查失败当成普通的“尚未授信”。
 
 restricted mode 仍会禁用项目环境与执行配置、MCP、hooks、skills、联网扩展，以及会话级
@@ -84,13 +92,17 @@ PatchSet prepare/apply/recovery 工作流；这里的内置 `apply_patch` 是受
 fail closed。
 
 ```bash
+npm run dev:trust:status                     # 仓库源码调试快捷命令
+npm run dev:trust                            # 交互式逐字确认，不会由 dev:tui 自动执行
 anicode trust status --cwd "$PWD"          # 查看真实路径、原因与执行来源；可加 --json
 anicode trust grant --cwd "$PWD"           # 交互式逐字确认 canonical path
 anicode trust revoke --cwd "$PWD"
 ```
 
-授信只允许加载已审查的项目能力，不代表自动批准工具，也不会放宽权限引擎、sandbox、网络策略或
-workspace scope。
+Workspace Trust 只决定能否加载已审查的项目能力，本身不是 shell sandbox 或批准规则。受信任的本地交互
+TUI 采用明确的宿主默认：以最高权限启动并自动批准；它仍服从显式 `deny` / `ask` 规则、权限引擎、
+sandbox、网络策略与 workspace scope。`Shift+Tab` 可在普通、自动接受编辑与跳过授权之间轮换，不包含
+用户可选的计划档。无头 `exec`、daemon/HTTP 或远端客户端以及未信任工作区继续保持保守默认值。
 
 高安全联网模式先启动本地出口，再把 browser/联网命令绑定到它；provider 与 HTTP MCP 本身会直接复用同一策略代理：
 
@@ -102,6 +114,24 @@ HOST=127.0.0.1 PORT=8787 ANICODE_NETWORK_ALLOW_DOMAINS=api.github.com,github.com
 # 终端 2
 ANICODE_NETWORK_PROXY_URL=http://127.0.0.1:8787 npm run dev:tui
 ```
+
+### Windows 的安全执行模式
+
+AniCode 目前只为 macOS 和 Linux 提供原生 OS sandbox。原生 Windows 不会静默回退到裸 PowerShell/
+`cmd.exe`：生产装配会进入 host restricted mode，从模型 schema 移除 `bash` 及后台 shell、LSP 和本地
+browser，并关闭项目命令 hooks、自动 verifier、git checkpoint 与 worktree subagent。stdio MCP/LSP
+收到的是一个无 `prepare()` 的明确拒绝 runtime，不能绕过边界；HTTP MCP 和文件工具仍可用。
+
+Windows 需要执行命令时，请启用 Docker/Podman OCI 后端并使用固定 digest 的镜像：
+
+```powershell
+$env:ANICODE_EXECUTION_BACKEND = "container"
+$env:ANICODE_RUNTIME_IMAGE = "ghcr.io/OWNER/anicode-runner@sha256:<digest>"
+npm run dev:tui
+```
+
+OCI 模式当前支持前台 `bash`；因为容器是单次临时执行，后台 shell、命令 hooks、stdio MCP、LSP 和本地
+Chrome 仍保持关闭。详细边界见[本轮 P0/P1 闭环](docs/architecture/2026-08-03-p0-p1-closure.md#windows-与非原生隔离宿主)。
 
 默认长期凭证后端是 OS Keychain；也可设置 `ANICODE_CREDENTIAL_BACKEND=vault|kms`，通过 OIDC/workload identity 读取后端中的 `env:NAME`。完整配置、Remote Runtime 与验收边界见[第三轮生产化归档](docs/architecture/2026-07-29-runtime-hardening-round-3.md)。
 
@@ -118,7 +148,6 @@ TUI 内可用命令：
 /resume <sessionId>
 /new [标题]
 /undo                     # 撤销上一轮文件改动（对话不回滚）
-/plan [on|off]            # 只读规划模式
 /tool [id]                # 展开/收起完整工具输出（Ctrl+O）
 /editor                   # 用 $EDITOR 编辑多行提示词（Ctrl+G）
 /reconnect                # 重连远端事件流（Ctrl+R）
@@ -126,7 +155,7 @@ TUI 内可用命令：
 /exit
 ```
 
-运行中按 Enter 可追加 steering 指令，按 Esc 中断。Shift/Ctrl+Enter 插入换行；bracketed paste
+运行中按 Enter 可追加 steering 指令，按 Esc 中断。`Shift+Tab` 在普通、自动接受编辑与跳过授权之间全局轮换；Shift/Ctrl+Enter 插入换行；bracketed paste
 保留多行且绝不自动提交。授权卡片固定在输入框上方，支持方向键/Enter、`y/a/p/n`，高风险默认选中拒绝，
 永久授权只需一次确认。默认关闭完整鼠标跟踪，可直接拖拽选择和复制文字；备用屏滚轮以及 `PageUp`/`PageDown` 都能回看固定输入框上方的结果。只有需要鼠标点击弹框时才用 `--mouse` 或 `/mouse on` 开启完整跟踪；`/mouse off` 随时恢复原生框选。短会话或输入框已有内容时，`↑`/`↓` 浏览已提交的 prompt 历史；长会话的空输入框中，方向键与滚轮一起回看结果。POSIX 终端中 `Ctrl+Z` 会正确挂起并在 `fg` 后恢复，默认 `Ctrl+Q` 退出；快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
 
@@ -312,7 +341,7 @@ registerOpenAICompatibleProvider({
 - **ripgrep 后端检索**：检测到 `rg` 时 grep/glob 走 ripgrep（尊重 .gitignore、跳过二进制、按 mtime 排序），无 rg 自动回退纯 JS。grep 支持 `output_mode`（content/files_with_matches/count）、`ignore_case`、`context` 前后行、`path`/`glob` 限定。
 - **read 加固**：NUL 字节识别二进制（不返回乱码）、超长单行截断（防炸上下文）。
 - **重试尊重 `Retry-After`**：429/503 带该头时按服务端节流等待（与指数退避取较大值，封顶 60s）。
-- 权限模式：`default / acceptEdits / auto / bypass / plan`，支持 allow/ask/deny glob 规则和运行时记忆；`plan` 只放行只读工具。
+- Core/宿主协议兼容 `default / acceptEdits / auto / bypass / plan` 权限状态，并支持 allow/ask/deny glob 规则和运行时记忆；内部 `plan` 只放行只读工具，用于安全降级与兼容，不作为 TUI 的用户可选档位。
 - 每轮可创建 git 工作区快照，TUI 用 `/undo` 恢复文件；macOS Seatbelt 与 Linux bubblewrap 可为 Bash 提供 OS 级沙箱。
 - 项目记忆：向上发现 `AGENTS.md` / `CLAUDE.md`，止于 `.git` 边界。
 - 两级 compaction：先清理旧工具输出，再在安全边界生成摘要，保持 tool call/result 配对。

@@ -67,3 +67,19 @@ test("repomap: gatherRepoMap 跳过 node_modules 等目录，只收源文件", a
 
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("repomap: .anicode symlink 不得把派生索引写入宿主目标", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-repomap-boundary-"));
+  const host = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-repomap-host-"));
+  await fs.writeFile(path.join(dir, "keep.ts"), "export function keep() {}\n");
+  await fs.writeFile(path.join(host, "HOST_CANARY"), "unchanged\n");
+  await fs.symlink(host, path.join(dir, ".anicode"));
+
+  const map = await gatherRepoMap(dir);
+  assert.match(map, /keep\.ts:/);
+  assert.deepEqual(await fs.readdir(host), ["HOST_CANARY"]);
+  assert.equal(await fs.readFile(path.join(host, "HOST_CANARY"), "utf8"), "unchanged\n");
+
+  await fs.rm(dir, { recursive: true, force: true });
+  await fs.rm(host, { recursive: true, force: true });
+});

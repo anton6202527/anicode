@@ -8,7 +8,12 @@
  */
 import { type Tool, type ToolContext, ToolError } from "./tool.js";
 import { t } from "../i18n.js";
-import { Browser, type ConsoleEntry, type NavigateResult } from "../browser/cdp.js";
+import {
+  Browser,
+  BrowserRegistry,
+  type ConsoleEntry,
+  type NavigateResult,
+} from "../browser/cdp.js";
 
 export interface BrowserToolOptions {
   executablePath?: string;
@@ -19,6 +24,10 @@ export interface BrowserToolOptions {
   /** Chrome 的唯一 HTTP(S) 出口；生产宿主同时启用 requireProxy。 */
   proxyUrl?: string;
   requireProxy?: boolean;
+  /** Production hosts require a root/system-owned, non-writable browser executable. */
+  requireTrustedExecutable?: boolean;
+  /** Host ownership scope; disposing it does not affect another manager's browsers. */
+  registry?: BrowserRegistry;
 }
 
 const MAX_SHOT_BYTES = 5 * 1024 * 1024; // 截图超 5MB 不附（避免撑爆请求）。
@@ -26,10 +35,22 @@ const WAIT_MODES = ["load", "domcontentloaded", "networkidle"] as const;
 
 /** 创建 browser 工具。宿主按 config.browser 决定是否启用及浏览器路径。 */
 export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
+  const registry = opts.registry ?? new BrowserRegistry();
+  return createOwnedBrowserTool({ ...opts, registry }, registry, opts.registry === undefined);
+}
+
+function createOwnedBrowserTool(
+  opts: BrowserToolOptions & { registry: BrowserRegistry },
+  registry: BrowserRegistry,
+  ownsRegistry: boolean,
+): Tool {
   let browser: Browser | null = null;
   let launching: Promise<Browser> | null = null;
+  let closed = false;
+  let closePromise: Promise<void> | undefined;
 
   const ensureBrowser = async (): Promise<Browser> => {
+    if (closed) throw new Error("Browser tool is closed");
     if (browser) return browser;
     if (!launching) {
       if (opts.requireProxy && !opts.proxyUrl) {
@@ -37,24 +58,30 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
       }
       const proxy = opts.proxyUrl ? new URL(opts.proxyUrl) : undefined;
       // 进程退出时的收尸由 cdp 模块的全局 LIVE 集合统一处理（见 closeAllBrowsers）。
-      launching = Browser.launch({
-        ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
-        ...(opts.headless !== undefined ? { headless: opts.headless } : {}),
-        ...(opts.launchTimeoutMs ? { launchTimeoutMs: opts.launchTimeoutMs } : {}),
-        ...(opts.commandTimeoutMs ? { commandTimeoutMs: opts.commandTimeoutMs } : {}),
-        ...(proxy
-          ? {
-              args: [
-                `--proxy-server=${proxy.toString()}`,
-                // Chrome 默认绕过 loopback；显式撤销，localhost 同样必须过策略出口。
-                "--proxy-bypass-list=<-loopback>",
-                `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE ${proxy.hostname}`,
-                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-              ],
-            }
-          : {}),
-      })
-        .then((b) => {
+      launching = registry
+        .launch({
+          ...(opts.executablePath ? { executablePath: opts.executablePath } : {}),
+          ...(opts.headless !== undefined ? { headless: opts.headless } : {}),
+          ...(opts.launchTimeoutMs ? { launchTimeoutMs: opts.launchTimeoutMs } : {}),
+          ...(opts.commandTimeoutMs ? { commandTimeoutMs: opts.commandTimeoutMs } : {}),
+          ...(opts.requireTrustedExecutable ? { requireTrustedExecutable: true } : {}),
+          ...(proxy
+            ? {
+                args: [
+                  `--proxy-server=${proxy.toString()}`,
+                  // Chrome 默认绕过 loopback；显式撤销，localhost 同样必须过策略出口。
+                  "--proxy-bypass-list=<-loopback>",
+                  `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE ${proxy.hostname}`,
+                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                ],
+              }
+            : {}),
+        })
+        .then(async (b) => {
+          if (closed) {
+            await b.close();
+            throw new Error("Browser tool is closed");
+          }
           browser = b;
           return b;
         })
@@ -65,8 +92,21 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
     return launching;
   };
 
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closed = true;
+    closePromise = (async () => {
+      await launching?.catch(() => undefined);
+      if (ownsRegistry) await registry.closeAll();
+      else await browser?.close();
+      browser = null;
+    })();
+    return closePromise;
+  };
+
   return {
     readOnly: true,
+    capabilities: ["network", "process", "persistent-process"],
     isConcurrencySafe: () => false, // 单浏览器进程有内部状态，串行更稳。
     def: {
       name: "browser",
@@ -125,8 +165,11 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
     ruleKey: (i) => String(i["url"] ?? ""),
 
     fork() {
-      return createBrowserTool(opts);
+      // Forked agents get their own browser process, but remain inside the same ownership scope.
+      return createOwnedBrowserTool(opts, registry, false);
     },
+
+    close,
 
     async run(input, ctx: ToolContext) {
       const url = normalizeUrl(String(input["url"] ?? "").trim());
@@ -139,7 +182,10 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
         );
       }
       const waitUntil = WAIT_MODES.find((m) => m === input["waitUntil"]);
-      const timeoutMs = Number(input["timeoutMs"]) || 30_000;
+      const requestedTimeout = Number(input["timeoutMs"]);
+      const timeoutMs = Number.isFinite(requestedTimeout)
+        ? Math.max(1_000, Math.min(5 * 60_000, Math.floor(requestedTimeout)))
+        : 30_000;
 
       let b: Browser;
       try {
@@ -151,7 +197,10 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
       }
 
       const page = await b.newPage();
+      const onAbort = () => page.close();
+      ctx.signal.addEventListener("abort", onAbort, { once: true });
       try {
+        if (ctx.signal.aborted) throw ctx.signal.reason ?? new ToolError("browser 已中断");
         const vp = opts.viewport;
         if (vp) await page.setViewport(vp.width, vp.height).catch(() => {});
         const result = await page.navigate(url, {
@@ -208,6 +257,7 @@ export function createBrowserTool(opts: BrowserToolOptions = {}): Tool {
           }) + shotNote
         );
       } finally {
+        ctx.signal.removeEventListener("abort", onAbort);
         page.close();
       }
     },

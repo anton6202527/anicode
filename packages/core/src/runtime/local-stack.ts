@@ -1,10 +1,7 @@
 /** 生产宿主共用装配：持久事件/快照/inbox/outbox、Broker、受控网络与 worker。 */
 
 import * as path from "node:path";
-import {
-  configureProviderCredentialBroker,
-  configureProviderNetworkProxy,
-} from "../provider/registry.js";
+import { bindProviderRegistry, type BoundProviderRegistry } from "../provider/registry.js";
 import {
   CredentialBroker,
   credentialBrokerFromBackend,
@@ -22,7 +19,11 @@ import { configuredS3ArtifactStoreFromEnv, type ArtifactStore } from "./artifact
 import type { ISessionStore } from "../session.js";
 import { DurableRuntime } from "./durable.js";
 import { ContainerIsolatedRuntime } from "./container-runtime.js";
-import { IsolatedRuntime, type ExecutionRuntime } from "./isolated-runtime.js";
+import {
+  DisabledExecutionRuntime,
+  IsolatedRuntime,
+  type ExecutionRuntime,
+} from "./isolated-runtime.js";
 import { NetworkProxy } from "./network-proxy.js";
 import {
   SqliteArtifactStore,
@@ -55,9 +56,36 @@ export interface LocalRuntimeStack {
   commandInbox: CommandInbox;
   outbox: DurableOutbox;
   networkProxy: NetworkProxy;
+  /** Host execution capability selected before any model-visible tools are assembled. */
+  executionMode: LocalExecutionMode;
   isolatedRuntime: ExecutionRuntime;
   workerQueue: DurableWorkerQueue;
   worktreeOwnership: WorktreeOwnership;
+  /** Provider operations permanently bound to this stack's broker and network policy. */
+  providers: BoundProviderRegistry;
+  resolveProvider: BoundProviderRegistry["resolveProvider"];
+  discoverModels: BoundProviderRegistry["discoverModels"];
+}
+
+/**
+ * `restricted` is the production-safe fallback when the host has no supported native sandbox.
+ * It is deliberately distinct from workspace trust's restricted mode: this capability cannot be
+ * enlarged by a permission answer or by trusting project files.
+ */
+export type LocalExecutionMode = "native-isolated" | "container" | "restricted";
+
+export function resolveLocalExecutionMode(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): LocalExecutionMode {
+  const backend = env.ANICODE_EXECUTION_BACKEND?.trim() || "native";
+  if (backend === "container") return "container";
+  if (backend !== "native") {
+    throw new Error(`Unsupported ANICODE_EXECUTION_BACKEND: ${backend}`);
+  }
+  // Seatbelt and the Linux namespace sandbox are the only native production backends today.
+  // In particular, Windows must never degrade to an unrestricted cmd.exe/PowerShell spawn.
+  return platform === "darwin" || platform === "linux" ? "native-isolated" : "restricted";
 }
 
 /** OTLP exporter 复用本地安全栈：网络策略 + Broker credential reference。 */
@@ -93,7 +121,14 @@ export function createLocalRuntimeStack(
     ...(backend ? { backend } : {}),
     onAudit: credentialAudit(database),
   });
-  return assembleLocalRuntimeStack(root, env, database, broker);
+  try {
+    return assembleLocalRuntimeStack(root, env, database, broker);
+  } catch (error) {
+    // Synchronous factory compatibility: construction itself has no pending database work, so
+    // close begins immediately; attach a rejection handler because the error must escape now.
+    void database.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
@@ -165,76 +200,104 @@ function assembleLocalRuntimeStack(
   database: SqliteRuntimeDatabase,
   broker: CredentialBroker,
 ): LocalRuntimeStack {
-  configureProviderCredentialBroker(broker);
-  const runtime = new DurableRuntime(
-    new SqliteRuntimeEventStore(database),
-    new SqliteRuntimeSnapshotStore(database),
-  );
-  const networkProxy = new NetworkProxy({
-    broker,
-    policy: {
-      allowDomains: csv(env.ANICODE_NETWORK_ALLOW_DOMAINS, ["*"]),
-      denyDomains: csv(env.ANICODE_NETWORK_DENY_DOMAINS, []),
-      allowPrivateAddresses: env.ANICODE_NETWORK_ALLOW_PRIVATE === "1",
-      allowPorts: csv(env.ANICODE_NETWORK_ALLOW_PORTS, ["80", "443"])
-        .map(Number)
-        .filter((port) => Number.isInteger(port) && port > 0),
-    },
-    onAudit: (event) =>
-      database.audit({
-        category: "network",
-        action: "authorize",
-        subject: event.host,
-        decision: event.decision,
-        metadata: { url: event.url, reason: event.reason, addresses: event.addresses ?? [] },
-      }),
-  });
-  configureProviderNetworkProxy(networkProxy);
-  const workerStore = new SqliteWorkerQueueStore(database);
-  const executionBackend: ExecutionRuntime =
-    env.ANICODE_EXECUTION_BACKEND === "container"
-      ? new ContainerIsolatedRuntime({
-          image:
-            env.ANICODE_RUNTIME_IMAGE ??
-            (() => {
-              throw new Error("ANICODE_RUNTIME_IMAGE is required for container execution");
-            })(),
-          broker,
-          ...(env.ANICODE_CONTAINER_NETWORK
-            ? { internalNetwork: env.ANICODE_CONTAINER_NETWORK }
-            : {}),
-          ...(env.ANICODE_CONTAINER_PROXY_URL ? { proxyUrl: env.ANICODE_CONTAINER_PROXY_URL } : {}),
-          requirePinnedImage: env.ANICODE_ALLOW_UNPINNED_RUNTIME_IMAGE !== "1",
-        })
-      : new IsolatedRuntime({
-          failClosed: env.ANICODE_SANDBOX_FAIL_CLOSED !== "0",
-          broker,
-          ...(env.ANICODE_NETWORK_PROXY_URL ? { proxyUrl: env.ANICODE_NETWORK_PROXY_URL } : {}),
-          requireProxy: true,
-        });
-  const isolatedRuntime: ExecutionRuntime =
-    env.ANICODE_TRANSACTIONAL_SHELL === "0"
-      ? executionBackend
-      : new TransactionalExecutionRuntime(executionBackend, {
-          maxFiles: Number(env.ANICODE_TRANSACTIONAL_SHELL_MAX_FILES ?? 200_000),
-          maxChangedBytes: Number(
-            env.ANICODE_TRANSACTIONAL_SHELL_MAX_CHANGED_BYTES ?? 100 * 1024 * 1024,
-          ),
-        });
-  return {
-    runtime,
-    database,
-    broker,
-    artifacts:
+  let artifacts: ArtifactStore | undefined;
+  let networkProxy: NetworkProxy | undefined;
+  let isolatedRuntime: ExecutionRuntime | undefined;
+  try {
+    const runtime = new DurableRuntime(
+      new SqliteRuntimeEventStore(database),
+      new SqliteRuntimeSnapshotStore(database),
+    );
+    networkProxy = new NetworkProxy({
+      broker,
+      policy: {
+        allowDomains: csv(env.ANICODE_NETWORK_ALLOW_DOMAINS, ["*"]),
+        denyDomains: csv(env.ANICODE_NETWORK_DENY_DOMAINS, []),
+        allowPrivateAddresses: env.ANICODE_NETWORK_ALLOW_PRIVATE === "1",
+        allowPorts: csv(env.ANICODE_NETWORK_ALLOW_PORTS, ["80", "443"])
+          .map(Number)
+          .filter((port) => Number.isInteger(port) && port > 0),
+      },
+      onAudit: (event) =>
+        database.audit({
+          category: "network",
+          action: "authorize",
+          subject: event.host,
+          decision: event.decision,
+          metadata: { url: event.url, reason: event.reason, addresses: event.addresses ?? [] },
+        }),
+    });
+    const workerStore = new SqliteWorkerQueueStore(database);
+    const executionMode = resolveLocalExecutionMode(env);
+    const executionBackend: ExecutionRuntime =
+      executionMode === "container"
+        ? new ContainerIsolatedRuntime({
+            image:
+              env.ANICODE_RUNTIME_IMAGE ??
+              (() => {
+                throw new Error("ANICODE_RUNTIME_IMAGE is required for container execution");
+              })(),
+            broker,
+            ...(env.ANICODE_CONTAINER_NETWORK
+              ? { internalNetwork: env.ANICODE_CONTAINER_NETWORK }
+              : {}),
+            ...(env.ANICODE_CONTAINER_PROXY_URL
+              ? { proxyUrl: env.ANICODE_CONTAINER_PROXY_URL }
+              : {}),
+            // The production composition never accepts a mutable tag. Embedders that intentionally
+            // need an unpinned development image can instantiate ContainerIsolatedRuntime directly.
+            requirePinnedImage: true,
+            orphanJournalPath: path.join(root, "container-orphans.json"),
+          })
+        : executionMode === "native-isolated"
+          ? new IsolatedRuntime({
+              failClosed: env.ANICODE_SANDBOX_FAIL_CLOSED !== "0",
+              broker,
+              ...(env.ANICODE_NETWORK_PROXY_URL ? { proxyUrl: env.ANICODE_NETWORK_PROXY_URL } : {}),
+              requireProxy: true,
+            })
+          : new DisabledExecutionRuntime();
+    isolatedRuntime =
+      executionMode === "restricted" || env.ANICODE_TRANSACTIONAL_SHELL === "0"
+        ? executionBackend
+        : new TransactionalExecutionRuntime(executionBackend, {
+            maxFiles: Number(env.ANICODE_TRANSACTIONAL_SHELL_MAX_FILES ?? 200_000),
+            maxChangedBytes: Number(
+              env.ANICODE_TRANSACTIONAL_SHELL_MAX_CHANGED_BYTES ?? 100 * 1024 * 1024,
+            ),
+          });
+    artifacts =
       env.ANICODE_ARTIFACT_BACKEND === "s3"
         ? configuredS3ArtifactStoreFromEnv(env)
-        : new SqliteArtifactStore(database),
-    sessions: new SqliteRuntimeSessionStore(database),
-    commandInbox: new CommandInbox(new SqliteCommandInboxStore(database)),
-    outbox: new DurableOutbox(new SqliteOutboxStore(database), runtime),
-    networkProxy,
-    isolatedRuntime,
-    workerQueue: new DurableWorkerQueue(workerStore),
-    worktreeOwnership: new WorktreeOwnership(workerStore),
-  };
+        : new SqliteArtifactStore(database);
+    const providers = bindProviderRegistry({
+      broker,
+      networkProxy,
+      environment: env,
+      allowEnvironmentFallback: false,
+    });
+    const stack: LocalRuntimeStack = {
+      runtime,
+      database,
+      broker,
+      artifacts,
+      sessions: new SqliteRuntimeSessionStore(database),
+      commandInbox: new CommandInbox(new SqliteCommandInboxStore(database)),
+      outbox: new DurableOutbox(new SqliteOutboxStore(database), runtime),
+      networkProxy,
+      executionMode,
+      isolatedRuntime,
+      workerQueue: new DurableWorkerQueue(workerStore),
+      worktreeOwnership: new WorktreeOwnership(workerStore),
+      providers,
+      resolveProvider: providers.resolveProvider,
+      discoverModels: providers.discoverModels,
+    };
+    return stack;
+  } catch (error) {
+    void Promise.resolve(isolatedRuntime?.shutdown?.()).catch(() => undefined);
+    void Promise.resolve(artifacts?.close?.()).catch(() => undefined);
+    void networkProxy?.close().catch(() => undefined);
+    throw error;
+  }
 }

@@ -88,12 +88,10 @@ test("tavilyBackend: 注入 fetch，POST 带 api_key 与 query，解析结果", 
   const fakeFetch = (async (url: any, init: any) => {
     sentUrl = String(url);
     sentBody = JSON.parse(init.body);
-    return {
-      ok: true,
-      status: 200,
-      statusText: "OK",
-      json: async () => ({ results: [{ title: "T", url: "https://t.test", content: "c" }] }),
-    } as any;
+    return new Response(
+      JSON.stringify({ results: [{ title: "T", url: "https://t.test", content: "c" }] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
   }) as typeof fetch;
   const backend = tavilyBackend({ apiKey: "k-123", fetchImpl: fakeFetch });
   const results = await backend("hello", { signal: new AbortController().signal, count: 3 });

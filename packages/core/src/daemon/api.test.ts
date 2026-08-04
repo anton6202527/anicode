@@ -47,6 +47,17 @@ test("OpenAPI 3.1.1 conformance: operationId/path params/responses 完整且唯�
   const full = document as Record<string, unknown>;
   const components = full.components as Record<string, Record<string, unknown>>;
   assert.ok((components.schemas as Record<string, unknown>).ApiError);
+  const sessionSnapshot = (components.schemas as Record<string, Record<string, unknown>>)
+    .SessionSnapshot;
+  assert.deepEqual(
+    (sessionSnapshot?.properties as Record<string, Record<string, unknown>>).permissionMode?.enum,
+    ["default", "acceptEdits", "auto", "bypass", "plan"],
+  );
+  assert.equal(
+    (sessionSnapshot?.required as string[]).includes("permissionMode"),
+    false,
+    "permissionMode must remain optional for compatibility with older snapshot producers",
+  );
   const operations = Object.values(full.paths as Record<string, Record<string, unknown>>).flatMap(
     (path) => Object.values(path),
   ) as Array<Record<string, unknown>>;

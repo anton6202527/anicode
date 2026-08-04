@@ -14,18 +14,19 @@ import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DaemonServer } from "./server.js";
 import { defaultDaemonSocketPath, isWindowsNamedPipePath } from "./socket-path.js";
-import { SessionManager } from "../session-manager.js";
-import { MigratingSessionStore, SessionStore } from "../session.js";
-import { createProvider, diagnoseProvider } from "../provider/registry.js";
 import {
   createConfiguredLocalRuntimeStack,
   telemetryForLocalStack,
+  type LocalRuntimeStack,
 } from "../runtime/local-stack.js";
-import { ContextCompiler } from "../runtime/context-compiler.js";
-import { Verifier } from "../runtime/verifier.js";
-import { SecurityPolicyEngine } from "../security/policy.js";
 import { WorkspaceTrustStore } from "../workspace-trust.js";
 import { generateDaemonAuthToken, provisionDaemonAuthToken } from "./auth-token.js";
+import {
+  createProductionSessionManager,
+  type ProductionSessionManagerComposition,
+} from "../production-session-manager.js";
+import type { SessionManagerOptions, WorkspaceTrustSource } from "../session-manager.js";
+import type { Telemetry } from "../runtime/telemetry.js";
 
 export function defaultSocketPath(): string {
   return defaultDaemonSocketPath();
@@ -132,17 +133,30 @@ export function parseDaemonArgs(argv: string[]): DaemonArgs {
   return { socketPath, sessionsDir, cwd, permissionMode, help, version };
 }
 
-function resolveConfiguredProvider(model: string) {
-  const diagnostics = diagnoseProvider(model);
-  if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
-    throw new Error(
-      t(
-        `${diagnostics.warnings.join("; ")} (configure it in the daemon process environment, or use debug/demo)`,
-        `${diagnostics.warnings.join("；")}（请在 daemon 进程环境中配置，或使用 debug/demo）`,
-      ),
-    );
-  }
-  return createProvider(model);
+export interface DaemonManagerCompositionOptions {
+  cwd: string;
+  sessionsDir: string;
+  permissionMode: DaemonArgs["permissionMode"];
+  runtimeStack: LocalRuntimeStack;
+  telemetry: Telemetry;
+  /** Test/embedding seams; the production launcher uses the authoritative defaults. */
+  resolveProvider?: SessionManagerOptions["resolveProvider"];
+  workspaceTrust?: WorkspaceTrustSource;
+}
+
+/** Daemon uses the exact same production composition contract as TUI, App and VS Code. */
+export function createDaemonManagerComposition(
+  options: DaemonManagerCompositionOptions,
+): ProductionSessionManagerComposition {
+  return createProductionSessionManager({
+    cwd: options.cwd,
+    sessionsDir: options.sessionsDir,
+    permissionMode: options.permissionMode,
+    runtimeStack: options.runtimeStack,
+    telemetry: options.telemetry,
+    ...(options.resolveProvider ? { resolveProvider: options.resolveProvider } : {}),
+    workspaceTrust: options.workspaceTrust ?? new WorkspaceTrustStore(),
+  });
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -165,29 +179,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const runtimeStack = await createConfiguredLocalRuntimeStack(path.dirname(args.sessionsDir));
   const telemetry = telemetryForLocalStack(runtimeStack);
-  const manager = new SessionManager({
-    store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(args.sessionsDir)),
-    runtime: runtimeStack.runtime,
-    artifacts: runtimeStack.artifacts,
-    commandInbox: runtimeStack.commandInbox,
-    outbox: runtimeStack.outbox,
-    networkProxy: runtimeStack.networkProxy,
-    worktreeOwnership: runtimeStack.worktreeOwnership,
-    contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
-    verifier: new Verifier({ autoDiscover: true }),
-    securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
+  const composition = createDaemonManagerComposition({
+    cwd: workspaceScope,
+    sessionsDir: args.sessionsDir,
+    permissionMode: args.permissionMode,
+    runtimeStack,
     telemetry,
-    isolatedRuntime: runtimeStack.isolatedRuntime,
-    resolveProvider: resolveConfiguredProvider,
-    compaction: true,
-    permission: { mode: args.permissionMode },
-    workspaceTrust: new WorkspaceTrustStore(),
-    skills: true,
-    subagents: { discover: true },
-    workspaceScope,
   });
+  const manager = composition.manager;
   const bearerToken = generateDaemonAuthToken();
-  const server = new DaemonServer({ manager, authToken: bearerToken });
+  const server = new DaemonServer({
+    manager,
+    authToken: bearerToken,
+    discoverModels: runtimeStack.discoverModels,
+  });
   await server.listen(args.socketPath);
   let tokenFile: string;
   try {
@@ -197,6 +202,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }));
   } catch (error) {
     await server.close();
+    await composition.dispose().catch(() => undefined);
     await runtimeStack.artifacts.close?.();
     await runtimeStack.networkProxy.close();
     await runtimeStack.database.close();
@@ -215,6 +221,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     shuttingDown = true;
     await server.close();
     try {
+      await composition.dispose();
       if (telemetry.shutdown) await telemetry.shutdown();
       else await telemetry.forceFlush?.();
     } catch {

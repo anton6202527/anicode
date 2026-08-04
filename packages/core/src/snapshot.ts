@@ -17,6 +17,18 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { terminateProcessTree } from "./runtime/isolated-runtime.js";
+import {
+  createIsolatedGitPlumbing,
+  hardenedGitArguments,
+  hardenedGitEnvironment,
+  trustedGitExecutable,
+  validateGitRepository,
+} from "./runtime/git-control.js";
+
+const SNAPSHOT_GIT_TIMEOUT_MS = 120_000;
+const SNAPSHOT_GIT_STDOUT_LIMIT = 16 * 1024 * 1024;
+const SNAPSHOT_GIT_STDERR_LIMIT = 1024 * 1024;
 
 export interface Snapshot {
   /** 游离 commit 的 sha —— 快照 id。 */
@@ -53,6 +65,11 @@ export class SnapshotStore {
   isAvailable(): Promise<boolean> {
     if (!this.availability) {
       this.availability = (async () => {
+        try {
+          await validateGitRepository(this.cwd);
+        } catch {
+          return false;
+        }
         const r = await this.git(["rev-parse", "--is-inside-work-tree"]).catch(() => null);
         return r !== null && r.code === 0 && r.stdout.trim() === "true";
       })();
@@ -66,11 +83,13 @@ export class SnapshotStore {
   async take(label: string): Promise<Snapshot | null> {
     if (!(await this.isAvailable())) return null;
     const indexFile = this.tempIndexPath();
+    let plumbing: Awaited<ReturnType<typeof createIsolatedGitPlumbing>> | undefined;
     try {
       // 空仓库（无 HEAD）也能工作：read-tree 失败就用空 index 起步。
       const head = await this.git(["rev-parse", "--verify", "-q", "HEAD"]).catch(() => null);
       const hasHead = head !== null && head.code === 0;
-      const env = { GIT_INDEX_FILE: indexFile };
+      plumbing = await createIsolatedGitPlumbing(this.cwd, indexFile);
+      const env = plumbing.environment;
       if (hasHead) await this.git(["read-tree", "HEAD"], env);
       // add -A：暂存改动/新增/删除；尊重 .gitignore，不会纳入被忽略的大目录。
       await this.git(["add", "-A"], env);
@@ -83,6 +102,7 @@ export class SnapshotStore {
     } catch {
       return null; // 快照是尽力而为，绝不因它中断主流程
     } finally {
+      await plumbing?.cleanup().catch(() => {});
       await fs.rm(indexFile, { force: true }).catch(() => {});
     }
   }
@@ -103,8 +123,10 @@ export class SnapshotStore {
       );
     const restoreIndex = this.tempIndexPath();
     const currentIndex = this.tempIndexPath();
+    let plumbing: Awaited<ReturnType<typeof createIsolatedGitPlumbing>> | undefined;
     try {
-      const env = { GIT_INDEX_FILE: restoreIndex };
+      plumbing = await createIsolatedGitPlumbing(this.cwd, restoreIndex);
+      const env = plumbing.environment;
       await this.git(["read-tree", snapshot.tree], env);
       // -a 全部、-f 覆盖已存在文件、-u 顺带更新 index（无害）。
       const checkout = await this.git(["checkout-index", "-a", "-f"], env);
@@ -121,7 +143,7 @@ export class SnapshotStore {
       );
 
       // 当前工作树快照 tree（复用同一套 seed→add→write-tree），对比出「新增」文件删掉。
-      const cEnv = { GIT_INDEX_FILE: currentIndex };
+      const cEnv = { ...plumbing.environment, GIT_INDEX_FILE: currentIndex };
       const head = await this.git(["rev-parse", "--verify", "-q", "HEAD"]).catch(() => null);
       if (head && head.code === 0) await this.git(["read-tree", "HEAD"], cEnv);
       await this.git(["add", "-A"], cEnv);
@@ -132,6 +154,7 @@ export class SnapshotStore {
         const added = (
           await this.git([
             "diff",
+            "--no-ext-diff",
             "--name-only",
             "--diff-filter=A",
             "-z",
@@ -148,6 +171,7 @@ export class SnapshotStore {
       }
       return { restored, deleted };
     } finally {
+      await plumbing?.cleanup().catch(() => {});
       await fs.rm(restoreIndex, { force: true }).catch(() => {});
       await fs.rm(currentIndex, { force: true }).catch(() => {});
     }
@@ -157,18 +181,67 @@ export class SnapshotStore {
     return path.join(os.tmpdir(), `anicode-index-${process.pid}-${randomUUID()}`);
   }
 
-  private git(args: string[], extraEnv?: Record<string, string>): Promise<GitResult> {
+  private git(args: string[], extraEnv?: NodeJS.ProcessEnv): Promise<GitResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn("git", args, {
-        cwd: this.cwd,
-        env: { ...process.env, ...extraEnv },
-      });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (b: Buffer) => (stdout += b.toString()));
-      child.stderr.on("data", (b: Buffer) => (stderr += b.toString()));
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      void (async () => {
+        const executable = await trustedGitExecutable();
+        const child = spawn(executable, hardenedGitArguments(args, this.cwd), {
+          cwd: this.cwd,
+          env: hardenedGitEnvironment(extraEnv),
+          detached: process.platform !== "win32",
+          windowsHide: true,
+        });
+        let stdout = "";
+        let stderr = "";
+        let stdoutBytes = 0;
+        let stderrBytes = 0;
+        let settled = false;
+        let termination: Promise<void> | undefined;
+        const finish = (result: GitResult | Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (result instanceof Error) reject(result);
+          else resolve(result);
+        };
+        const terminateWith = (error: Error) => {
+          if (termination) return;
+          termination = terminateProcessTree(child);
+          void termination.then(
+            () => finish(error),
+            (failure) => finish(failure instanceof Error ? failure : new Error(String(failure))),
+          );
+        };
+        child.stdout.on("data", (b: Buffer) => {
+          stdoutBytes += b.length;
+          if (stdoutBytes > SNAPSHOT_GIT_STDOUT_LIMIT) {
+            terminateWith(new Error(`git stdout exceeds ${SNAPSHOT_GIT_STDOUT_LIMIT} bytes`));
+            return;
+          }
+          stdout += b.toString();
+        });
+        child.stderr.on("data", (b: Buffer) => {
+          stderrBytes += b.length;
+          if (stderrBytes > SNAPSHOT_GIT_STDERR_LIMIT) {
+            terminateWith(new Error(`git stderr exceeds ${SNAPSHOT_GIT_STDERR_LIMIT} bytes`));
+            return;
+          }
+          stderr += b.toString();
+        });
+        child.on("error", (error) => finish(error));
+        child.on("close", (code) => {
+          void (async () => {
+            if (!termination && process.platform !== "win32") {
+              termination = terminateProcessTree(child);
+            }
+            await termination;
+            finish({ code: code ?? -1, stdout, stderr });
+          })().catch((error) => finish(error instanceof Error ? error : new Error(String(error))));
+        });
+        const timer = setTimeout(() => {
+          terminateWith(new Error(`git ${args[0] ?? "command"} timed out`));
+        }, SNAPSHOT_GIT_TIMEOUT_MS);
+      })().catch((error) => reject(error));
     });
   }
 }

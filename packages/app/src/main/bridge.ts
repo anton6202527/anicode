@@ -11,24 +11,21 @@ import { randomUUID } from "node:crypto";
 import type { IpcMain, IpcMainInvokeEvent, WebContents } from "electron";
 import {
   SessionManager,
-  SessionStore,
-  MigratingSessionStore,
-  createProvider,
+  createProductionSessionManager,
   diagnoseProvider,
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
   resolveDefaultModel,
   createLocalRuntimeStack,
-  ContextCompiler,
-  Verifier,
-  SecurityPolicyEngine,
+  closeAllBrowsers,
   telemetryForLocalStack,
   t,
   type LocalRuntimeStack,
   type OpenHandle,
   type PermissionDecisionKind,
   type Telemetry,
+  type AnicodeConfig,
   type WorkspaceTrustSource,
 } from "@anicode/core";
 import { applyPluginToggle, PLUGIN_CATALOG, type PluginEntry } from "../shared/plugins.js";
@@ -45,6 +42,8 @@ export interface BridgeOptions {
   appVersion: string;
   /** 项目配置指定的默认模型；缺省时按已配置凭证自动选择。 */
   defaultModel?: string;
+  /** 与 CLI/VS Code 共用的 Agent、权限、hook、browser 与 fallback 配置。 */
+  config?: AnicodeConfig;
   /** 可注入的 MCP 连接器与环境（测试用）；默认走 core 的真实实现与 process.env。 */
   mcpConnector?: McpConnector;
   env?: NodeJS.ProcessEnv;
@@ -54,6 +53,15 @@ export interface BridgeOptions {
   workspaceTrusted?: boolean;
   /** Main-frame allowlist owned by the BrowserWindow lifecycle. */
   isTrustedSender: (event: IpcMainInvokeEvent) => boolean;
+}
+
+class BridgeConstructionError extends Error {
+  constructor(
+    cause: unknown,
+    readonly cleanup: Promise<void>,
+  ) {
+    super("Failed to construct app bridge", { cause });
+  }
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -98,20 +106,6 @@ function parseUserModel(value: unknown): UserModel {
   };
 }
 
-/** 本地资源解析：debug/本地 provider 免 key；云端缺 key 时给出清晰错误。 */
-function resolveConfiguredProvider(model: string) {
-  const diagnostics = diagnoseProvider(model);
-  if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
-    throw new Error(
-      t(
-        `${diagnostics.warnings.join("；")}. You can configure the key in settings, or switch to a key-free model like debug/demo.`,
-        `${diagnostics.warnings.join("；")}。可在设置里配置密钥，或改用 debug/demo 等免 key 模型。`,
-      ),
-    );
-  }
-  return createProvider(model);
-}
-
 const EVENT_CHANNEL = "anicode:event";
 
 export class Bridge {
@@ -128,54 +122,90 @@ export class Bridge {
   /** subId → 订阅句柄与目标 webContents，open 时建立，close/销毁时释放。 */
   private readonly subscriptions = new Map<string, { handle: OpenHandle; sender: WebContents }>();
 
+  static async create(options: BridgeOptions): Promise<Bridge> {
+    try {
+      return new Bridge(options);
+    } catch (error) {
+      if (!(error instanceof BridgeConstructionError)) throw error;
+      try {
+        await error.cleanup;
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error.cause ?? error, cleanupError],
+          "App bridge construction and rollback failed",
+          { cause: cleanupError },
+        );
+      }
+      throw error.cause ?? error;
+    }
+  }
+
   constructor(private readonly options: BridgeOptions) {
-    const runtimeStack = createLocalRuntimeStack(
-      path.dirname(options.sessionsDir),
-      options.env ?? process.env,
-    );
-    const telemetry = telemetryForLocalStack(runtimeStack, options.env ?? process.env);
-    this.runtimeStack = runtimeStack;
-    this.telemetry = telemetry;
-    this.plugins = new PluginRuntime(options.mcpConnector, options.env, runtimeStack.broker, {
-      telemetry,
-      networkProxy: runtimeStack.networkProxy,
-      credentialBroker: runtimeStack.broker,
-      executionRuntime: runtimeStack.isolatedRuntime,
-    });
-    this.manager = new SessionManager({
-      store: new MigratingSessionStore(
-        runtimeStack.sessions,
-        new SessionStore(options.sessionsDir),
-      ),
-      runtime: runtimeStack.runtime,
-      artifacts: runtimeStack.artifacts,
-      commandInbox: runtimeStack.commandInbox,
-      outbox: runtimeStack.outbox,
-      networkProxy: runtimeStack.networkProxy,
-      worktreeOwnership: runtimeStack.worktreeOwnership,
-      contextCompiler: new ContextCompiler({ tokenBudget: 12_000 }),
-      verifier: new Verifier({ autoDiscover: true }),
-      securityPolicy: SecurityPolicyEngine.workspaceBoundary(),
-      telemetry,
-      isolatedRuntime: runtimeStack.isolatedRuntime,
-      workspaceScope: options.cwd,
-      resolveProvider: resolveConfiguredProvider,
-      compaction: true,
-      permission: { mode: "default" },
-      ...(options.workspaceTrust ? { workspaceTrust: options.workspaceTrust } : {}),
-      ...(options.workspaceTrust
-        ? {
-            onWorkspaceTrustChange: async ({ current }) => {
-              await this.reconcileWorkspaceTrust(current.trusted);
-            },
+    let runtimeStack: LocalRuntimeStack | undefined;
+    let telemetry: Telemetry | undefined;
+    let plugins: PluginRuntime | undefined;
+    try {
+      runtimeStack = createLocalRuntimeStack(
+        path.dirname(options.sessionsDir),
+        options.env ?? process.env,
+      );
+      telemetry = telemetryForLocalStack(runtimeStack, options.env ?? process.env);
+      plugins = new PluginRuntime(options.mcpConnector, options.env, runtimeStack.broker, {
+        telemetry,
+        networkProxy: runtimeStack.networkProxy,
+        credentialBroker: runtimeStack.broker,
+        executionRuntime: runtimeStack.isolatedRuntime,
+      });
+      this.runtimeStack = runtimeStack;
+      this.telemetry = telemetry;
+      this.plugins = plugins;
+      this.manager = createProductionSessionManager({
+        cwd: options.cwd,
+        sessionsDir: options.sessionsDir,
+        config: options.config ?? {},
+        runtimeStack,
+        telemetry,
+        env: options.env ?? process.env,
+        ...(options.workspaceTrust ? { workspaceTrust: options.workspaceTrust } : {}),
+        ...(options.workspaceTrust
+          ? {
+              onWorkspaceTrustChange: async ({ current }) => {
+                await this.reconcileWorkspaceTrust(current.trusted);
+              },
+            }
+          : {}),
+        disabledSkills: this.disabledSkills,
+        // 每次新建会话都据当前插件状态构建工具集：停用的内建工具移除、启用的 MCP 工具注入。
+        tools: () => this.plugins.buildToolRegistry(),
+      }).manager;
+    } catch (error) {
+      const cleanup = (async () => {
+        const failures: unknown[] = [];
+        const attempt = async (close: () => void | Promise<void>) => {
+          try {
+            await close();
+          } catch (cleanupError) {
+            failures.push(cleanupError);
           }
-        : {}),
-      skills: { disabled: this.disabledSkills },
-      subagents: true,
-      smallModel: true, // 摘要等杂活自动走便宜模型
-      // 每次新建会话都据当前插件状态构建工具集：停用的内建工具移除、启用的 MCP 工具注入。
-      tools: () => this.plugins.buildToolRegistry(),
-    });
+        };
+        if (plugins) await attempt(() => plugins!.dispose());
+        if (telemetry) {
+          await attempt(async () => {
+            if (telemetry!.shutdown) await telemetry!.shutdown();
+            else await telemetry!.forceFlush?.();
+          });
+        }
+        if (runtimeStack) {
+          await attempt(async () => runtimeStack!.isolatedRuntime.shutdown?.());
+          await attempt(async () => runtimeStack!.artifacts.close?.());
+          await attempt(() => runtimeStack!.networkProxy.close());
+          await attempt(() => runtimeStack!.database.close());
+        }
+        if (failures.length > 0) throw new AggregateError(failures, "Bridge rollback failed");
+      })();
+      void cleanup.catch(() => undefined);
+      throw new BridgeConstructionError(error, cleanup);
+    }
   }
 
   /** 启动时发现文件系统技能、读取已保存的插件状态并连接已启用的 MCP，需在处理请求前调用。 */
@@ -513,12 +543,14 @@ export class Bridge {
         await attempt(() => this.closeSubscription(subId));
       }
       await attempt(() => this.plugins.dispose());
-      await attempt(() => this.manager.dispose());
+      await attempt(() => this.manager.shutdown());
+      await attempt(() => closeAllBrowsers());
       await attempt(async () => {
         if (this.telemetry.shutdown) await this.telemetry.shutdown();
         else await this.telemetry.forceFlush?.();
       });
       await attempt(async () => this.runtimeStack.artifacts.close?.());
+      await attempt(async () => this.runtimeStack.isolatedRuntime.shutdown?.());
       await attempt(() => this.runtimeStack.networkProxy.close());
       await attempt(() => this.runtimeStack.database.close());
 

@@ -6,10 +6,42 @@ import * as path from "node:path";
 import {
   configureProviderCredentialBroker,
   configureProviderNetworkProxy,
+  registerOpenAICompatibleProvider,
 } from "../provider/registry.js";
-import { createLocalRuntimeStack } from "./local-stack.js";
-import { createConfiguredLocalRuntimeStack } from "./local-stack.js";
+import {
+  createConfiguredLocalRuntimeStack,
+  createLocalRuntimeStack,
+  resolveLocalExecutionMode,
+} from "./local-stack.js";
 import type { SecretBackend } from "../security/secret-backends.js";
+import { DisabledExecutionRuntime } from "./isolated-runtime.js";
+
+test("LocalRuntimeStack: unsupported native hosts fail closed unless a container is selected", async () => {
+  assert.equal(resolveLocalExecutionMode({}, "win32"), "restricted");
+  assert.equal(
+    resolveLocalExecutionMode({ ANICODE_EXECUTION_BACKEND: "native" }, "win32"),
+    "restricted",
+  );
+  assert.equal(
+    resolveLocalExecutionMode({ ANICODE_EXECUTION_BACKEND: "container" }, "win32"),
+    "container",
+  );
+  assert.throws(
+    () => resolveLocalExecutionMode({ ANICODE_EXECUTION_BACKEND: "powershell" }, "win32"),
+    /Unsupported ANICODE_EXECUTION_BACKEND/,
+  );
+
+  const runtime = new DisabledExecutionRuntime("windows process execution blocked");
+  assert.equal("prepare" in runtime, false);
+  await assert.rejects(
+    () =>
+      runtime.run({
+        command: "whoami",
+        cwd: process.cwd(),
+      }),
+    /windows process execution blocked/,
+  );
+});
 
 test("LocalRuntimeStack: 密钥迁入 Broker，运行态在 SQLite 严格事务持久化", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-stack-"));
@@ -77,5 +109,65 @@ test("ConfiguredLocalRuntimeStack: Vault/KMS 风格后端发现 env:* 并清理�
     configureProviderCredentialBroker(undefined);
     configureProviderNetworkProxy(undefined);
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("LocalRuntimeStack: parallel stacks keep provider credentials and discovery egress isolated", async () => {
+  registerOpenAICompatibleProvider({
+    id: "stack-isolation",
+    baseURL: "https://models.example.test/v1",
+    apiKeyEnv: "STACK_ISOLATION_API_KEY",
+  });
+  const [rootA, rootB] = await Promise.all([
+    fs.mkdtemp(path.join(os.tmpdir(), "anicode-stack-a-")),
+    fs.mkdtemp(path.join(os.tmpdir(), "anicode-stack-b-")),
+  ]);
+  const stackA = createLocalRuntimeStack(rootA, {
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    STACK_ISOLATION_API_KEY: "secret-stack-a",
+  });
+  const stackB = createLocalRuntimeStack(rootB, {
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    STACK_ISOLATION_API_KEY: "secret-stack-b",
+  });
+  const observedA: string[] = [];
+  const observedB: string[] = [];
+  stackA.networkProxy.fetch = (async (_url: string | URL, init?: RequestInit) => {
+    observedA.push(new Headers(init?.headers).get("authorization") ?? "");
+    return Response.json({ data: [{ id: "model-a" }] });
+  }) as typeof stackA.networkProxy.fetch;
+  stackB.networkProxy.fetch = (async (_url: string | URL, init?: RequestInit) => {
+    observedB.push(new Headers(init?.headers).get("authorization") ?? "");
+    return Response.json({ data: [{ id: "model-b" }] });
+  }) as typeof stackB.networkProxy.fetch;
+
+  try {
+    const [modelsA, modelsB] = await Promise.all([
+      stackA.discoverModels("stack-isolation"),
+      stackB.discoverModels("stack-isolation"),
+    ]);
+    assert.deepEqual(modelsA, ["model-a"]);
+    assert.deepEqual(modelsB, ["model-b"]);
+    assert.deepEqual(observedA, ["Bearer secret-stack-a"]);
+    assert.deepEqual(observedB, ["Bearer secret-stack-b"]);
+    assert.equal(
+      stackA.resolveProvider("stack-isolation/model-a").diagnostics.hasCredentials,
+      true,
+    );
+    assert.equal(
+      stackB.resolveProvider("stack-isolation/model-b").diagnostics.hasCredentials,
+      true,
+    );
+  } finally {
+    await Promise.all([
+      stackA.networkProxy.close(),
+      stackB.networkProxy.close(),
+      stackA.database.close(),
+      stackB.database.close(),
+    ]);
+    await Promise.all([
+      fs.rm(rootA, { recursive: true, force: true }),
+      fs.rm(rootB, { recursive: true, force: true }),
+    ]);
   }
 });

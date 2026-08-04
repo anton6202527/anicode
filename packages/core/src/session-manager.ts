@@ -15,11 +15,18 @@
  */
 
 import { t } from "./i18n.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import type { ChatMessage, Provider, Usage } from "./types.js";
-import { Agent, type AgentEvent, type AgentOptions, type AgentResolvedModel } from "./agent.js";
+import type { ChatMessage, Usage } from "./types.js";
+import {
+  Agent,
+  validateRunBudgetSnapshot,
+  type AgentEvent,
+  type AgentOptions,
+  type AgentResolvedModel,
+  type RunBudgetSnapshot,
+} from "./agent.js";
 import type { ToolRegistry } from "./tools/tool.js";
 import {
   defaultTools,
@@ -32,6 +39,7 @@ import type { WebSearchBackend } from "./tools/web-search.js";
 import { LspPool, type LspServerConfig } from "./lsp.js";
 import { newSessionId, type ISessionStore, type SessionMeta } from "./session.js";
 import { defaultSmallModel } from "./provider/registry.js";
+import type { BrowserRegistry } from "./browser/cdp.js";
 import { appendLocalAllowRules } from "./permission-store.js";
 import type {
   PermissionConfig,
@@ -76,6 +84,11 @@ import type { SecurityPolicyEngine } from "./security/policy.js";
 import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 import type { WorktreeOwnership } from "./runtime/worker.js";
 import type { NetworkProxy } from "./runtime/network-proxy.js";
+import {
+  parsePersistedTaskRecord,
+  type PersistedTaskRecord,
+  type TaskUsageCredit,
+} from "./subagent.js";
 import { revalidateWorkspaceTrust, type WorkspaceTrustAssessment } from "./workspace-trust.js";
 import {
   PatchSetService,
@@ -153,6 +166,8 @@ export interface SessionSnapshot {
   /** 会话累计成本估算（美元）；模型无内置价格信息时缺省。 */
   costUSD?: number;
   running: boolean;
+  /** 当前 Agent 的权限模式；可选以兼容旧版快照生产者。 */
+  permissionMode?: PermissionMode;
   /** 订阅时仍待裁决的权限请求（重连场景不至于卡死） */
   pendingPermissions: PendingPermission[];
   /** 后台子 agent 任务一览（无 task 工具或无任务时为空数组/缺省）。 */
@@ -191,10 +206,25 @@ export interface SessionManagerOptions {
   store: ISessionStore;
   /** 传入即为所有会话启用工具集（默认 Agent 内置默认工具） */
   tools?: () => ToolRegistry;
+  /**
+   * Host-capability override for the interactive workspace-trust restricted tool surface.
+   * Production composition uses this when the OS cannot enforce native process isolation; project
+   * trust and permission answers must not be able to re-introduce process tools.
+   */
+  restrictedDevelopmentTools?: () => ToolRegistry;
   /** 每会话默认开启压缩 */
   compaction?: Partial<CompactionConfig> | boolean;
   /** 会话权限策略；confirm 始终由 SessionManager 接管并广播给前端。 */
   permission?: Omit<PermissionConfig, "confirm">;
+  /**
+   * Host intent for an interactive permission UI in an otherwise untrusted workspace.
+   *
+   * When true, a verifiably untrusted workspace receives the audited restricted development
+   * registry in `default` mode so every side effect can be confirmed by the host. This never
+   * applies to `inspection-failed`, which remains strict read-only. When omitted, the historical
+   * behaviour is preserved: only a requested `default` permission mode opts into this surface.
+   */
+  allowRestrictedWorkspaceDevelopment?: boolean;
   /** 自定义权限档位（叠加内置 readonly/default/workspace/full），/profile 运行时可切。 */
   permissionProfiles?: AgentOptions["permissionProfiles"];
   /** 新会话启动时应用的档位名（如配置 permissionProfile: "workspace"）。 */
@@ -248,6 +278,8 @@ export interface SessionManagerOptions {
   smallModel?: boolean | string;
   /** 模型降级链：主模型重试仍失败时按序切换（对齐 Claude Code fallbackModel）。 */
   fallbackModels?: string[];
+  /** 单次用户任务的墙钟/token/成本/工具统一硬预算。 */
+  runBudget?: AgentOptions["runBudget"];
   /**
    * 首轮结束后自动为无标题会话起名（小模型总结首条输入，对齐 Codex/Claude Code
    * 的会话自动命名）。失败静默。默认关。
@@ -274,6 +306,8 @@ export interface SessionManagerOptions {
    * 传 false 关闭，传 BrowserToolOptions 自定义浏览器路径/视口。见 browserToolOptions()。
    */
   browser?: AgentOptions["browser"];
+  /** Instance-bound browser ownership scope; shutdown closes only this manager's browsers. */
+  browserRegistry?: BrowserRegistry;
   /** 生成会话 id 的时钟/随机源（测试可注入） */
   now?: () => number;
   rand?: () => number;
@@ -299,6 +333,12 @@ export interface SessionManagerOptions {
   sessionLifecycleLeaseMs?: number;
   /** Durable deletion drain poll interval. Production default 25ms. */
   sessionLifecyclePollMs?: number;
+  /**
+   * Absolute host-shutdown deadline. Once exceeded the manager permanently fences late
+   * projections and rejects shutdown so the process supervisor can escalate to resource/process
+   * termination instead of hanging forever on an uncooperative backend. Default 30 seconds.
+   */
+  shutdownTimeoutMs?: number;
 }
 
 interface PendingPerm {
@@ -336,6 +376,18 @@ interface SendOutcome {
   error?: Error;
 }
 
+interface CommandLeaseHeartbeat {
+  assertOwned(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+interface RecoveredSessionProjection {
+  checkpoints: Checkpoint[];
+  usage?: Usage;
+  lastInputTokens?: number;
+  tasks?: PersistedTaskRecord[];
+}
+
 interface PendingSend extends SendWaiter {
   text: string;
   /** per-prompt 模型覆盖：仅这一次 drive 用该模型。 */
@@ -343,14 +395,79 @@ interface PendingSend extends SendWaiter {
   /** 崩溃恢复：输入是内部续跑指令，不重复原始用户 prompt。 */
   resume?: boolean;
   traceParent?: SpanContext;
+  /** Durable ledger state for exactly this root command; steering shares the current ledger. */
+  runBudgetSnapshot?: RunBudgetSnapshot;
+  beforeToolExecution?: AgentOptions["beforeToolExecution"];
+  onRunBudgetCheckpoint?: AgentOptions["onRunBudgetCheckpoint"];
 }
 
 type ResolvedProvider = ReturnType<SessionManagerOptions["resolveProvider"]>;
 
 const SESSION_OPERATION_LEASE_MS = 30_000;
 const SESSION_LIFECYCLE_POLL_MS = 25;
+const SESSION_MANAGER_SHUTDOWN_TIMEOUT_MS = 30_000;
 const DELETED_SESSION_RECONCILIATION_INTERVAL_MS = 60_000;
 const DELETED_SESSION_RECONCILIATION_BATCH = 100;
+const MAX_SUBAGENT_STATE_BYTES = 32_000_000;
+const MAX_SUBAGENT_STATE_SESSION_BYTES = 128_000_000;
+const SUBAGENT_STATE_MEDIA_TYPE = "application/vnd.anicode.subagent-state+json";
+const SUBAGENT_CHECKPOINTS_PER_TASK = 2;
+const MAX_RUNTIME_FAILURES_PER_SESSION = 128;
+const MAX_DURABILITY_FAILURE_DETAILS = 64;
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : undefined;
+}
+
+function usageValue(value: unknown): Usage | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const inputTokens = nonNegativeInteger(input["inputTokens"]);
+  const outputTokens = nonNegativeInteger(input["outputTokens"]);
+  const cacheReadTokens = nonNegativeInteger(input["cacheReadTokens"]);
+  const cacheWriteTokens = nonNegativeInteger(input["cacheWriteTokens"]);
+  if (
+    inputTokens === undefined ||
+    outputTokens === undefined ||
+    cacheReadTokens === undefined ||
+    cacheWriteTokens === undefined
+  ) {
+    return undefined;
+  }
+  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+}
+
+function addUsage(current: Usage | undefined, delta: Usage): Usage {
+  return {
+    inputTokens: (current?.inputTokens ?? 0) + delta.inputTokens,
+    outputTokens: (current?.outputTokens ?? 0) + delta.outputTokens,
+    cacheReadTokens: (current?.cacheReadTokens ?? 0) + delta.cacheReadTokens,
+    cacheWriteTokens: (current?.cacheWriteTokens ?? 0) + delta.cacheWriteTokens,
+  };
+}
+
+function checkpointValue(data: Record<string, unknown>): Checkpoint | undefined {
+  const id = data["id"];
+  const tree = data["tree"];
+  const label = data["label"];
+  const messageCount = nonNegativeInteger(data["messageCount"]);
+  if (
+    typeof id !== "string" ||
+    !id ||
+    typeof tree !== "string" ||
+    !tree ||
+    typeof label !== "string" ||
+    messageCount === undefined
+  ) {
+    return undefined;
+  }
+  return { id, tree, label, messageCount };
+}
+
+function isInternalArtifact(artifact: Artifact): boolean {
+  return artifact.mediaType === SUBAGENT_STATE_MEDIA_TYPE;
+}
 
 // ---------- 一个受管会话 ----------
 
@@ -363,7 +480,7 @@ class ManagedSession {
   private abort: AbortController | null = null;
   private permSeq = 0;
   private driving = false;
-  private checkpoints: Checkpoint[] = [];
+  private checkpoints: Checkpoint[];
   private pendingSends: PendingSend[] = [];
   private currentWaiters: SendWaiter[] = [];
   private idleWaiters = new Set<() => void>();
@@ -375,9 +492,11 @@ class ManagedSession {
     private readonly onEvent?: (event: SessionEvent) => void,
     private readonly workspaceTrust?: WorkspaceTrustAssessment,
     private readonly restrictedWorkspaceDevelopment = false,
+    initialCheckpoints: readonly Checkpoint[] = [],
     private readonly listeners: Set<SessionListener> = new Set<SessionListener>(),
   ) {
     this.meta = meta;
+    this.checkpoints = initialCheckpoints.map((checkpoint) => ({ ...checkpoint }));
     this.agent = makeAgent((r) => this.onConfirm(r));
   }
 
@@ -400,6 +519,7 @@ class ManagedSession {
       usage: s.usage,
       ...(costUSD !== undefined ? { costUSD } : {}),
       running: this.running,
+      permissionMode: this.agent.getPermissionMode(),
       pendingPermissions: [...this.pending.entries()].map(([permId, p]) => ({
         permId,
         toolName: p.toolName,
@@ -525,7 +645,14 @@ class ManagedSession {
    */
   send(
     text: string,
-    opts?: { model?: string; resume?: boolean; traceParent?: SpanContext },
+    opts?: {
+      model?: string;
+      resume?: boolean;
+      traceParent?: SpanContext;
+      runBudgetSnapshot?: RunBudgetSnapshot;
+      beforeToolExecution?: AgentOptions["beforeToolExecution"];
+      onRunBudgetCheckpoint?: AgentOptions["onRunBudgetCheckpoint"];
+    },
   ): Promise<SendOutcome> {
     if (this.closed) {
       return Promise.reject(new Error(t("Session is being deleted", "会话正在删除")));
@@ -548,6 +675,11 @@ class ManagedSession {
         ...(opts?.model ? { model: opts.model } : {}),
         ...(opts?.resume ? { resume: true } : {}),
         ...(opts?.traceParent ? { traceParent: opts.traceParent } : {}),
+        ...(opts?.runBudgetSnapshot ? { runBudgetSnapshot: opts.runBudgetSnapshot } : {}),
+        ...(opts?.beforeToolExecution ? { beforeToolExecution: opts.beforeToolExecution } : {}),
+        ...(opts?.onRunBudgetCheckpoint
+          ? { onRunBudgetCheckpoint: opts.onRunBudgetCheckpoint }
+          : {}),
       });
       if (!this.driving) void this.pump();
     });
@@ -567,11 +699,23 @@ class ManagedSession {
           for await (const ev of this.agent.send(
             next.text,
             this.abort.signal,
-            next.model || next.resume || next.traceParent
+            next.model ||
+              next.resume ||
+              next.traceParent ||
+              next.runBudgetSnapshot ||
+              next.beforeToolExecution ||
+              next.onRunBudgetCheckpoint
               ? {
                   ...(next.model ? { model: next.model } : {}),
                   ...(next.resume ? { resume: true } : {}),
                   ...(next.traceParent ? { parent: next.traceParent } : {}),
+                  ...(next.runBudgetSnapshot ? { runBudgetSnapshot: next.runBudgetSnapshot } : {}),
+                  ...(next.beforeToolExecution
+                    ? { beforeToolExecution: next.beforeToolExecution }
+                    : {}),
+                  ...(next.onRunBudgetCheckpoint
+                    ? { onRunBudgetCheckpoint: next.onRunBudgetCheckpoint }
+                    : {}),
                 }
               : undefined,
           )) {
@@ -612,6 +756,44 @@ class ManagedSession {
   /** 停止本会话全部后台子 agent 任务（删除/宿主销毁时用；普通 interrupt 不动它们）。 */
   stopBackgroundTasks(): number {
     return this.agent.stopBackgroundTasks();
+  }
+
+  /** Wait until detached runners have finished cleanup and emitted their final durable checkpoint. */
+  whenBackgroundTasksIdle(): Promise<void> {
+    return this.agent.awaitBackgroundTasksIdle();
+  }
+
+  runningBackgroundTaskIds(): string[] {
+    return this.agent.backgroundTasks
+      .filter((task) => task.background && task.status === "running")
+      .map((task) => task.id);
+  }
+
+  backgroundTaskFailure(taskIds: readonly string[]): Error | undefined {
+    const selected = new Set(taskIds);
+    const failures = this.agent.backgroundTasks.filter(
+      (task) => selected.has(task.id) && (task.status === "error" || task.status === "stopped"),
+    );
+    if (failures.length === 0) return undefined;
+    return new Error(
+      failures
+        .map((task) => `${task.id} ${task.status}${task.error ? `: ${task.error}` : ""}`)
+        .join("; "),
+    );
+  }
+
+  /** Ordered Conversation append/rewrite fence, including writes whose caller already aborted. */
+  whenPersistenceIdle(): Promise<void> {
+    return this.agent.awaitPersistenceIdle();
+  }
+
+  /** Late-side-effect fence for in-process tools that ignored timeout/abort. */
+  whenToolExecutionsIdle(): Promise<void> {
+    return this.agent.awaitToolExecutionsIdle();
+  }
+
+  closeToolResources(): Promise<void> {
+    return this.agent.closeToolResources();
   }
 
   /** Permanently fence new drives, then abort and drain the current one. */
@@ -736,6 +918,14 @@ class ManagedSession {
     this.emit({ type: "title", title });
   }
 
+  /** Serialize metadata rewrite with every Conversation append/rewrite; publish only after commit. */
+  async updateTitle(title: string): Promise<void> {
+    const next = { ...this.meta, title };
+    await this.agent.updatePersistenceMeta(next);
+    this.meta.title = title;
+    this.announceTitle(title);
+  }
+
   /** 手动压缩上下文（/compact）：立即压缩一次并广播 compacted 事件。运行中拒绝。 */
   async compact(): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
     if (this.driving)
@@ -765,41 +955,22 @@ class ManagedSession {
   }
 }
 
-/** 调一次模型把首条输入总结成短标题；清洗引号/换行并截断。失败返回 null。 */
-async function generateSessionTitle(
-  provider: Provider,
-  model: string,
-  firstUserText: string,
-): Promise<string | null> {
-  let out = "";
-  try {
-    for await (const ev of provider.stream({
-      model,
-      system: t(
-        "Summarize the user's task as a session title in at most 8 words. Output ONLY the title, no quotes, no punctuation at the end.",
-        "把用户的任务概括成会话标题，不超过 12 个字。只输出标题本身，不要引号，结尾不要标点。",
-      ),
-      messages: [{ role: "user", content: [{ type: "text", text: firstUserText.slice(0, 2000) }] }],
-      maxTokens: 60,
-    })) {
-      if (ev.type === "done") {
-        out = ev.message.content
-          .filter((p): p is { type: "text"; text: string } => p.type === "text")
-          .map((p) => p.text)
-          .join("");
-      }
-    }
-  } catch {
-    return null;
-  }
-  const title = out
-    .split("\n")
-    .map((l) => l.trim())
-    .find(Boolean)
-    ?.replace(/^["'「『]|["'」』]$/g, "")
-    .replace(/[。.!！]$/g, "")
-    .trim()
-    .slice(0, 40);
+/**
+ * Billing-free, deterministic title derivation. Auto-title runs after the root budget is closed;
+ * starting another provider stream there would bypass the task ledger and can hang command ACKs.
+ */
+function localSessionTitle(firstUserText: string): string | null {
+  const normalized = firstUserText.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  const firstClause = normalized
+    .split(/[\n。！？!?，,；;]/u)
+    .find((part) => part.trim())
+    ?.trim();
+  const title = [...(firstClause || normalized)]
+    .slice(0, 40)
+    .join("")
+    .replace(/^["'「『]|["'」』]$/gu, "")
+    .trim();
   return title || null;
 }
 
@@ -852,6 +1023,8 @@ export class SessionManager {
   /** 每会话按 cwd 建的 LSP 池；进程销毁时统一关闭，避免遗留语言服务器进程。 */
   private lspPools = new Set<LspPool>();
   private sessionLspPools = new Map<string, LspPool>();
+  private readonly lspTerminationTasks = new Map<string, Set<Promise<void>>>();
+  private readonly lspTerminationFailures = new Map<string, unknown[]>();
   /** firehose 订阅者：收所有 live 会话的事件（见 subscribeAll）。 */
   private globalListeners = new Set<GlobalListener>();
   readonly runtime: DurableRuntime;
@@ -861,16 +1034,49 @@ export class SessionManager {
   private readonly lifecycle: SessionLifecycleStore;
   private readonly sessionLifecycleLeaseMs: number;
   private readonly sessionLifecyclePollMs: number;
+  private readonly shutdownTimeoutMs: number;
   private readonly telemetry: Telemetry;
   private readonly workerId = `runtime_${process.pid}_${randomUUID().slice(0, 8)}`;
   private readonly activeCommands = new Map<string, Map<string, DurableCommand>>();
+  /**
+   * Commands deliberately fenced by a user interrupt. Losing their durable command lease is the
+   * expected cancellation path, not evidence that this worker became stale. Keep that distinction
+   * explicit so the old drive cannot retire/close the live session that already owns the next
+   * interrupt generation.
+   */
+  private readonly interruptedCommands = new Map<string, Set<string>>();
   /** Synchronous ordering fence: sends invoked before an interrupt cannot arrive after its awaits. */
   private readonly interruptEpochs = new Map<string, number>();
+  /** Durable cancellation barrier joined by the next interrupt generation and the aborted drive. */
+  private readonly interruptTasks = new Map<string, Promise<void>>();
   private readonly recoveringCommands = new Map<string, Promise<number>>();
   /** 同一工作区、同一会话的并发 resume 只执行一次 PatchSet journal 恢复。 */
   private readonly recoveringPatchSets = new Map<string, Promise<PatchSet[]>>();
   /** UI→runtime 的投影按会话隔离；一个卡住的 stream 不能阻塞其他会话或其删除。 */
-  private readonly runtimeWrites = new Map<string, Set<Promise<unknown>>>();
+  private readonly runtimeWrites = new Map<string, Map<number, Promise<unknown>>>();
+  private readonly runtimeWriteSequences = new Map<string, number>();
+  /** Rejections stay observable until a producer/shutdown barrier consumes them. */
+  private readonly runtimeWriteFailures = new Map<string, Map<number, unknown>>();
+  private readonly runtimeWriteFailureOverflow = new Map<
+    string,
+    { firstSequence: number; count: number }
+  >();
+  /** A durability failure remains part of shutdown health even after an individual send observed it. */
+  private readonly durabilityFailures: unknown[] = [];
+  private durabilityFailureCount = 0;
+  /**
+   * All task checkpoints in one session share a queue: retention/quota accounting and the
+   * Artifact→outbox commit sequence must be serializable across different task ids as well.
+   */
+  private readonly subagentStateWrites = new Map<string, Promise<void>>();
+  /** Preserve the public Agent event order across async preflight/lease acquisition. */
+  private readonly sessionProjectionTails = new Map<string, Promise<void>>();
+  /** Best-effort local title persistence is detached from command acknowledgement but drained. */
+  private readonly autoTitleTasks = new Map<string, Promise<void>>();
+  /** Old Agent generations retiring after an authoritative command lease loss. */
+  private readonly retiringSessions = new Map<string, Promise<void>>();
+  /** Root commands whose detached task tree still owns budget/lease callbacks after UI completion. */
+  private readonly backgroundCommandFinalizations = new Map<string, Promise<void>>();
   /**
    * A deletion mark is installed synchronously and retained for this manager's lifetime. It is a
    * lifecycle fence: no new load/send/persistence operation may race behind the final purge.
@@ -882,6 +1088,8 @@ export class SessionManager {
   private readonly deletionWorkspaces = new Map<string, ScopedWorkspaceIdentity>();
   /** Sends and other session-scoped mutations which must drain before content is purged. */
   private readonly activeSessionOperations = new Map<string, Set<Promise<unknown>>>();
+  /** Manager-wide reads/recovery scans which are not tied to an already-known session id. */
+  private readonly activeManagerOperations = new Set<Promise<unknown>>();
   /** Open payload readers are synchronously revoked when a session enters the deletion fence. */
   private readonly activeArtifactReaders = new Map<string, Set<ActiveArtifactReader>>();
   /** Absolute spelling captured at construction; canonicalization is async and shared. */
@@ -892,6 +1100,10 @@ export class SessionManager {
   private deletedReconciliationTask: Promise<void> | undefined;
   private deletedReconciliationTimer: ReturnType<typeof setInterval> | undefined;
   private disposed = false;
+  /** Set only after the absolute shutdown deadline; late callbacks must become side-effect free. */
+  private shutdownTimedOut = false;
+  private shutdownTask: Promise<void> | undefined;
+  private startupRecoveryTask: Promise<number> | undefined;
 
   constructor(opts: SessionManagerOptions) {
     this.opts = opts;
@@ -909,6 +1121,7 @@ export class SessionManager {
     this.lifecycle = this.runtime.lifecycle;
     this.sessionLifecycleLeaseMs = opts.sessionLifecycleLeaseMs ?? SESSION_OPERATION_LEASE_MS;
     this.sessionLifecyclePollMs = opts.sessionLifecyclePollMs ?? SESSION_LIFECYCLE_POLL_MS;
+    this.shutdownTimeoutMs = opts.shutdownTimeoutMs ?? SESSION_MANAGER_SHUTDOWN_TIMEOUT_MS;
     if (
       !Number.isInteger(this.sessionLifecycleLeaseMs) ||
       this.sessionLifecycleLeaseMs < 100 ||
@@ -922,6 +1135,13 @@ export class SessionManager {
       this.sessionLifecyclePollMs > 1_000
     ) {
       throw new TypeError("sessionLifecyclePollMs must be an integer from 1 to 1000");
+    }
+    if (
+      !Number.isInteger(this.shutdownTimeoutMs) ||
+      this.shutdownTimeoutMs < 10 ||
+      this.shutdownTimeoutMs > 5 * 60 * 1_000
+    ) {
+      throw new TypeError("shutdownTimeoutMs must be an integer from 10 to 300000");
     }
     this.artifacts = opts.artifacts ?? new MemoryArtifactStore();
     this.commandInbox = opts.commandInbox ?? new CommandInbox(new MemoryCommandInboxStore());
@@ -937,11 +1157,29 @@ export class SessionManager {
     this.deletedReconciliationTimer.unref?.();
     if (opts.recoverCommands !== false) {
       // 宿主启动即扫描 inbox，不依赖用户先打开旧会话才恢复。
-      queueMicrotask(() => void this.recoverAllCommands().catch(() => 0));
+      queueMicrotask(() => {
+        if (this.disposed) return;
+        const recovery = this.recoverAllCommands();
+        this.startupRecoveryTask = recovery;
+        void recovery
+          .finally(() => {
+            if (this.startupRecoveryTask === recovery) this.startupRecoveryTask = undefined;
+          })
+          .catch(() => undefined);
+      });
     }
   }
 
-  async listSessions(): Promise<SessionSummary[]> {
+  listSessions(): Promise<SessionSummary[]> {
+    try {
+      this.assertManagerActive();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.trackManagerOperation(this.listSessionsInternal());
+  }
+
+  private async listSessionsInternal(): Promise<SessionSummary[]> {
     // Resolve the configured root even for an empty store. A misspelled/inaccessible scope must
     // be observable as a host configuration error, never look like a valid empty workspace.
     if (this.workspaceScopePath) await this.resolveCanonicalWorkspaceScope();
@@ -980,6 +1218,7 @@ export class SessionManager {
     model: string;
     title?: string;
   }): Promise<SessionSummary> {
+    this.assertManagerActive();
     // Scope validation is deliberately the first async operation. In particular, provider
     // construction, persistence and runtime events must not run for a foreign cwd. A brand-new
     // session never recovers workspace-wide journals: only an existing owning session may do so.
@@ -1109,7 +1348,16 @@ export class SessionManager {
     }
     this.assertSessionAvailable(sessionId);
     const resolved = this.opts.resolveProvider(meta.model);
-    const session = this.instantiate(meta, data.messages, resolved, workspaceTrust, listeners);
+    const recovered = await this.recoverSessionProjection(meta.id);
+    this.assertSessionAvailable(sessionId);
+    const session = this.instantiate(
+      meta,
+      data.messages,
+      resolved,
+      workspaceTrust,
+      listeners,
+      recovered,
+    );
     return session;
   }
 
@@ -1143,6 +1391,12 @@ export class SessionManager {
     interruptEpoch = this.interruptEpochs.get(sessionId) ?? 0,
   ): Promise<void> {
     this.assertSendGeneration(sessionId, interruptEpoch);
+    const interruptTask = this.interruptTasks.get(sessionId);
+    if (interruptTask) await interruptTask;
+    this.assertSendGeneration(sessionId, interruptEpoch);
+    const backgroundFinalization = this.backgroundCommandFinalizations.get(sessionId);
+    if (backgroundFinalization) await backgroundFinalization;
+    this.assertSendGeneration(sessionId, interruptEpoch);
     // Steering and a new drive share the same authoritative trust refresh. A running Agent may
     // still own shell/MCP capabilities from the previous assessment, so bypassing ensureLive here
     // would let a trust revocation keep those capabilities until the drive happened to finish.
@@ -1163,103 +1417,275 @@ export class SessionManager {
       ...(opts?.model ? { model: opts.model } : {}),
       ...(context ? { traceParent: context } : {}),
     };
-    // 运行中输入必须同步进入 Agent steering 队列，保持 interrupt 同 tick 的既有语义。
-    // 首条 command 仍严格遵循 inbox accepted/claimed 后才开始执行。
-    const steering = session.running ? session.send(text, sendOptions) : undefined;
-    const command = await this.commandInbox.accept({
-      sessionId,
-      text,
-      ...(opts?.model ? { model: opts.model } : {}),
-      ...(context ? { traceparent: traceparent(context) } : {}),
-      ...(opts?.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
-      messageCountBefore: session.snapshot().messages.length,
-    });
-    if (command.status === "completed") {
-      span.setStatus({ code: "ok" }).end();
-      return;
-    }
-    const claimed = await this.commandInbox.claim(sessionId, command.id, this.workerId);
-    this.activateCommand(claimed);
-    const stopHeartbeat = this.startCommandHeartbeat(claimed);
-    const accepted = await this.outbox.publish({
-      streamId: sessionId,
-      type: "prompt.accepted",
-      data: {
-        commandId: command.id,
-        chars: text.length,
-        model: opts?.model ?? session.meta.model,
-      },
-      idempotencyKey: `command:${command.id}:accepted`,
-      ...(context ? { traceId: context.traceId, spanId: context.spanId } : {}),
-    });
-    let commandCompleted = false;
+    let command: DurableCommand;
+    let claimed: DurableCommand;
     try {
-      const outcome = await (steering ?? session.send(text, sendOptions));
+      command = await this.commandInbox.accept({
+        sessionId,
+        text,
+        ...(opts?.model ? { model: opts.model } : {}),
+        ...(context ? { traceparent: traceparent(context) } : {}),
+        ...(opts?.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+        messageCountBefore: session.snapshot().messages.length,
+      });
+      if (command.status === "completed") {
+        await this.publishCommandTerminalEvent(command);
+        span.setStatus({ code: "ok" }).end();
+        return;
+      }
+      if (command.status === "failed" || command.status === "cancelled") {
+        await this.publishCommandTerminalEvent(command);
+        await this.waitForCommandTerminal(command, interruptEpoch);
+        return; // waitForCommandTerminal throws for non-success terminal states.
+      }
+      try {
+        claimed = await this.commandInbox.claim(sessionId, command.id, this.workerId);
+      } catch (claimError) {
+        // Two HTTP/TUI retries can accept the same immutable payload concurrently. Exactly one
+        // claimant executes it; the loser joins the durable terminal result instead of surfacing a
+        // spurious lease error or (worse) starting a second provider/tool drive.
+        const latest = await this.commandInbox.get(sessionId, command.id);
+        if (latest && latest.status !== "accepted") {
+          if (
+            latest.status === "completed" ||
+            latest.status === "failed" ||
+            latest.status === "cancelled"
+          ) {
+            await this.publishCommandTerminalEvent(latest);
+          }
+          await this.waitForCommandTerminal(latest, interruptEpoch);
+          span.setStatus({ code: "ok" }).end();
+          return;
+        }
+        throw claimError;
+      }
+    } catch (error) {
+      span.recordException(error).setStatus({
+        code: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      span.end();
+      throw error;
+    }
+    this.activateCommand(claimed);
+    const heartbeat = this.startCommandHeartbeat(claimed);
+    let commandCompleted = false;
+    let ownershipTransferred = false;
+    try {
+      await this.outbox.publish({
+        streamId: sessionId,
+        type: "prompt.accepted",
+        data: {
+          commandId: command.id,
+          chars: text.length,
+          model: opts?.model ?? session.meta.model,
+        },
+        idempotencyKey: `command:${command.id}:accepted`,
+        ...(context ? { traceId: context.traceId, spanId: context.spanId } : {}),
+      });
+      // No prompt enters the model-visible steering queue before accept+claim+outbox are durable.
+      // Re-check interrupt generation after those awaits; a cancelled generation is finalized as
+      // a durable cancelled command rather than becoming an unaudited side effect.
+      this.assertSendGeneration(sessionId, interruptEpoch);
+      this.assertSessionAvailable(sessionId);
+      await heartbeat.assertOwned();
+      const runBudgetSnapshot = session.running
+        ? undefined
+        : await this.recoverRunBudgetSnapshot(sessionId, claimed);
+      const effectiveSendOptions = {
+        ...sendOptions,
+        ...(runBudgetSnapshot ? { runBudgetSnapshot } : {}),
+        beforeToolExecution: () => this.assertCommandOwnership(claimed),
+        onRunBudgetCheckpoint: (snapshot: RunBudgetSnapshot) =>
+          this.persistRunBudgetCheckpoint(claimed, snapshot),
+      };
+      const steering = session.running ? session.send(text, effectiveSendOptions) : undefined;
+      const outcome = await (steering ?? session.send(text, effectiveSendOptions));
       await this.flushRuntimeWrites(sessionId);
+      // A normal foreground drive resolves its ManagedSession waiter after abort cleanup. The
+      // interrupt operation may already have durably cancelled the command and released its lease
+      // by then. Treat that known user-cancellation as the successful completion of interrupt
+      // cleanup; asking the heartbeat to prove ownership would misclassify it as lease loss and
+      // close the session underneath a same-tick send for the next generation.
+      if (this.interruptedCommands.get(sessionId)?.has(command.id)) {
+        await this.interruptTasks.get(sessionId);
+      }
+      const interruptedTerminal = this.interruptedCommands.get(sessionId)?.has(command.id)
+        ? await this.commandInbox.get(sessionId, command.id)
+        : undefined;
+      if (interruptedTerminal?.status === "cancelled") {
+        await this.publishCommandTerminalEvent(interruptedTerminal);
+        span.setStatus({
+          code: "error",
+          message: interruptedTerminal.error ?? "cancelled",
+        });
+        return;
+      }
+      await heartbeat.assertOwned();
       const latest = await this.commandInbox.get(sessionId, command.id);
       if (latest?.status === "cancelled") {
+        await this.publishCommandTerminalEvent(latest);
         span.setStatus({ code: "error", message: latest.error ?? "cancelled" });
       } else if (outcome.error) {
         await this.commandInbox.finish(sessionId, command.id, "failed", outcome.error.message, {
           owner: this.workerId,
           fencingToken: claimed.fencingToken ?? 0,
         });
-        await this.outbox.publish({
-          streamId: sessionId,
-          type: "prompt.failed",
-          data: { commandId: command.id, error: outcome.error.message },
-          causationId: accepted.id,
-          idempotencyKey: `command:${command.id}:failed`,
+        await this.publishCommandTerminalEvent({
+          ...command,
+          status: "failed",
+          error: outcome.error.message,
         });
         span.recordException(outcome.error).setStatus({ code: "error" });
       } else {
-        await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
-          owner: this.workerId,
-          fencingToken: claimed.fencingToken ?? 0,
-        });
-        await this.outbox.publish({
-          streamId: sessionId,
-          type: "prompt.completed",
-          data: { commandId: command.id },
-          causationId: accepted.id,
-          idempotencyKey: `command:${command.id}:completed`,
-        });
+        const backgroundTaskIds = steering ? [] : session.runningBackgroundTaskIds();
+        if (backgroundTaskIds.length > 0) {
+          this.finalizeCommandAfterBackgroundTasks(session, claimed, heartbeat, backgroundTaskIds);
+          ownershipTransferred = true;
+        } else {
+          await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
+            owner: this.workerId,
+            fencingToken: claimed.fencingToken ?? 0,
+          });
+          await this.publishCommandTerminalEvent({ ...command, status: "completed" });
+          commandCompleted = true;
+        }
         span.setStatus({ code: "ok" });
-        commandCompleted = true;
       }
     } catch (error) {
+      const terminal = await this.commandInbox.get(sessionId, command.id);
+      if (
+        terminal &&
+        (terminal.status === "completed" ||
+          terminal.status === "failed" ||
+          terminal.status === "cancelled")
+      ) {
+        // Do not overwrite a committed terminal state if only its outbox enqueue failed. A retry
+        // repairs the missing event using the same deterministic idempotency key.
+        await this.publishCommandTerminalEvent(terminal);
+        span.recordException(error).setStatus({ code: "error" });
+        throw error;
+      }
       const cancelled = error instanceof Error && /interrupt|中断/i.test(error.message);
+      const terminalError = error instanceof Error ? error.message : String(error);
       await this.commandInbox.finish(
         sessionId,
         command.id,
         cancelled ? "cancelled" : "failed",
-        error instanceof Error ? error.message : String(error),
+        terminalError,
         { owner: this.workerId, fencingToken: claimed.fencingToken ?? 0 },
       );
-      await this.outbox.publish({
-        streamId: sessionId,
-        type: cancelled ? "prompt.cancelled" : "prompt.failed",
-        data: {
-          commandId: command.id,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        causationId: accepted.id,
-        idempotencyKey: `command:${command.id}:${cancelled ? "cancelled" : "failed"}`,
+      await this.publishCommandTerminalEvent({
+        ...command,
+        status: cancelled ? "cancelled" : "failed",
+        error: terminalError,
       });
       span.recordException(error).setStatus({ code: "error" });
       throw error;
     } finally {
-      stopHeartbeat();
-      this.deactivateCommand(sessionId, command.id);
+      if (!ownershipTransferred) {
+        await heartbeat.stop();
+        this.deactivateCommand(sessionId, command.id);
+      }
       span.end();
     }
-    // 自动命名：首轮结束且仍无标题时用小模型总结（对齐 Codex/Claude Code）。
-    // 放在 send 收尾而非并行，避免与本轮持久化竞争；失败静默。
+    // 自动命名是账单外的本地派生，不再启动第二个 provider stream。它与 command ACK
+    // 解耦，但由 shutdown barrier 跟踪，避免一个 UX 增强卡住用户请求。
     if (commandCompleted && this.opts.autoTitle && !session.meta.title)
-      await this.autoTitle(session);
+      this.scheduleAutoTitle(session);
   }
 
-  /** 用小模型（未配置则用会话主模型）从首条用户输入总结一个短标题。 */
+  private scheduleAutoTitle(session: ManagedSession): void {
+    if (this.autoTitleTasks.has(session.meta.id) || this.shutdownTimedOut) return;
+    const task = this.autoTitle(session).finally(() => {
+      if (this.autoTitleTasks.get(session.meta.id) === task) {
+        this.autoTitleTasks.delete(session.meta.id);
+      }
+    });
+    this.autoTitleTasks.set(session.meta.id, task);
+    void task.catch(() => undefined);
+  }
+
+  /**
+   * Detached subagents keep the exact root ledger alive after the foreground generator returns.
+   * Keep its durable command lease/fencing token active until every descendant has checkpointed
+   * and stopped; a later root send waits this barrier so two independent ledgers never overlap on
+   * one mutable session.
+   */
+  private finalizeCommandAfterBackgroundTasks(
+    session: ManagedSession,
+    command: DurableCommand,
+    heartbeat: CommandLeaseHeartbeat,
+    taskIds: readonly string[],
+  ): void {
+    const sessionId = command.sessionId;
+    if (this.backgroundCommandFinalizations.has(sessionId)) {
+      throw new Error(`Session ${sessionId} already has a detached command tree`);
+    }
+    const finalization = (async () => {
+      try {
+        await session.whenBackgroundTasksIdle();
+        await session.whenPersistenceIdle();
+        await this.flushRuntimeWrites(sessionId);
+        await heartbeat.assertOwned();
+        const current = await this.commandInbox.get(sessionId, command.id);
+        if (current?.status === "cancelled") {
+          await this.publishCommandTerminalEvent(current);
+          return;
+        }
+        const taskFailure = session.backgroundTaskFailure(taskIds);
+        if (taskFailure) {
+          await this.commandInbox.finish(sessionId, command.id, "failed", taskFailure.message, {
+            owner: this.workerId,
+            fencingToken: command.fencingToken ?? 0,
+          });
+          await this.publishCommandTerminalEvent({
+            ...command,
+            status: "failed",
+            error: taskFailure.message,
+          });
+          return;
+        }
+        await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
+          owner: this.workerId,
+          fencingToken: command.fencingToken ?? 0,
+        });
+        await this.publishCommandTerminalEvent({ ...command, status: "completed" });
+        if (this.opts.autoTitle && !session.meta.title) this.scheduleAutoTitle(session);
+      } catch (error) {
+        const terminal = await this.commandInbox.get(sessionId, command.id).catch(() => undefined);
+        if (
+          terminal &&
+          (terminal.status === "completed" ||
+            terminal.status === "failed" ||
+            terminal.status === "cancelled")
+        ) {
+          await this.publishCommandTerminalEvent(terminal);
+        } else {
+          this.retireSessionAfterCommandLeaseLoss(sessionId);
+        }
+        throw error;
+      } finally {
+        await heartbeat.stop();
+        this.deactivateCommand(sessionId, command.id);
+      }
+    })();
+    this.backgroundCommandFinalizations.set(sessionId, finalization);
+    void finalization
+      .finally(() => {
+        if (this.backgroundCommandFinalizations.get(sessionId) === finalization) {
+          this.backgroundCommandFinalizations.delete(sessionId);
+        }
+      })
+      .catch((error) => {
+        this.durabilityFailureCount++;
+        if (this.durabilityFailures.length < MAX_DURABILITY_FAILURE_DETAILS) {
+          this.durabilityFailures.push(error);
+        }
+      });
+  }
+
+  /** Derive a bounded local title; no post-budget provider call or unaccounted model usage. */
   private async autoTitle(session: ManagedSession): Promise<void> {
     try {
       const snap = session.snapshot();
@@ -1270,36 +1696,37 @@ export class SessionManager {
         .join(" ")
         .trim();
       if (!text) return;
-      const resolved = this.opts.resolveProvider(session.meta.model);
-      let provider = resolved.provider;
-      let model = resolved.model;
-      const smallSpec = this.smallModelSpec(resolved);
-      if (smallSpec) {
-        try {
-          const small = this.opts.resolveProvider(smallSpec);
-          provider = small.provider;
-          model = small.model;
-        } catch {
-          /* 小模型解析失败回退主模型 */
-        }
-      }
-      const title = await generateSessionTitle(provider, model, text);
-      if (!title || session.meta.title) return;
-      session.meta.title = title;
-      await this.opts.store.rewrite(session.meta, session.snapshot().messages);
-      session.announceTitle(title);
+      const title = localSessionTitle(text);
+      if (!title || session.meta.title || this.shutdownTimedOut) return;
+      await this.runSessionProjection(session.meta.id, async () => {
+        if (this.shutdownTimedOut || this.deletingSessions.has(session.meta.id)) return;
+        await session.updateTitle(title);
+        if (this.shutdownTimedOut || this.deletingSessions.has(session.meta.id)) return;
+      });
     } catch {
       /* 起名失败静默——标题只是 UX 加分项 */
     }
   }
 
   interrupt(sessionId: string): Promise<void> {
+    try {
+      this.assertManagerActive();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     this.interruptEpochs.set(sessionId, (this.interruptEpochs.get(sessionId) ?? 0) + 1);
     // Establish the steering boundary synchronously. Durable preflight/lease acquisition below may
     // await, but a send invoked in the next statement must already target the next generation.
-    this.sessions.get(sessionId)?.interrupt();
+    const liveSession = this.sessions.get(sessionId);
     const commands = [...(this.activeCommands.get(sessionId)?.values() ?? [])];
-    return this.runSessionOperation(sessionId, async () => {
+    if (commands.length > 0) {
+      const interrupted = this.interruptedCommands.get(sessionId) ?? new Set<string>();
+      for (const command of commands) interrupted.add(command.id);
+      this.interruptedCommands.set(sessionId, interrupted);
+    }
+    if (this.backgroundCommandFinalizations.has(sessionId)) liveSession?.stopBackgroundTasks();
+    liveSession?.interrupt();
+    const interruption = this.runSessionOperation(sessionId, async () => {
       for (const command of commands) {
         const current = this.activeCommands.get(sessionId);
         if (current?.get(command.id) === command) {
@@ -1310,14 +1737,21 @@ export class SessionManager {
           owner: this.workerId,
           fencingToken: command.fencingToken ?? 0,
         });
-        await this.outbox.publish({
-          streamId: sessionId,
-          type: "prompt.cancelled",
-          data: { commandId: command.id, reason: "user interrupted" },
-          idempotencyKey: `command:${command.id}:cancelled`,
+        await this.publishCommandTerminalEvent({
+          ...command,
+          status: "cancelled",
+          error: "user interrupted",
         });
       }
     });
+    this.interruptTasks.set(sessionId, interruption);
+    const cleanup = () => {
+      if (this.interruptTasks.get(sessionId) === interruption) {
+        this.interruptTasks.delete(sessionId);
+      }
+    };
+    void interruption.then(cleanup, cleanup);
+    return interruption;
   }
 
   /** 显式触发未完成 command 的恢复；同一会话并发调用共享一次恢复。 */
@@ -1343,14 +1777,23 @@ export class SessionManager {
   }
 
   /** 启动恢复扫描：让无客户端连接的守护进程也能继续崩溃前已接收的命令。 */
-  async recoverAllCommands(): Promise<number> {
-    const sessionIds = await this.commandInbox.store.listSessions();
-    const results = await Promise.allSettled(
-      sessionIds.map((sessionId) => this.recoverCommands(sessionId)),
-    );
-    return results.reduce(
-      (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
-      0,
+  recoverAllCommands(): Promise<number> {
+    try {
+      this.assertManagerActive();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.trackManagerOperation(
+      (async () => {
+        const sessionIds = await this.commandInbox.store.listSessions();
+        const results = await Promise.allSettled(
+          sessionIds.map((sessionId) => this.recoverCommands(sessionId)),
+        );
+        return results.reduce(
+          (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+          0,
+        );
+      })(),
     );
   }
 
@@ -1384,7 +1827,7 @@ export class SessionManager {
     });
   }
 
-  /** 运行时切换会话的权限模式（如 /plan 进入/退出计划模式）。 */
+  /** 运行时切换会话的权限模式。 */
   async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
     return this.runSessionOperation(sessionId, async () => {
       const session = await this.ensureLive(sessionId);
@@ -1410,6 +1853,7 @@ export class SessionManager {
 
   /** 同步读取一个 live 会话的当前快照；未加载则返回 undefined（不触发磁盘载入）。 */
   peek(sessionId: string): SessionSnapshot | undefined {
+    this.assertManagerActive();
     return this.sessions.get(sessionId)?.snapshot();
   }
 
@@ -1418,9 +1862,20 @@ export class SessionManager {
    * 让同步客户端能观察删除，同时避免 SQLite/PostgreSQL/S3 中残留原始内容。
    */
   deleteSession(sessionId: string): Promise<void> {
+    try {
+      this.assertManagerActive();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const existing = this.deletionTasks.get(sessionId);
     if (existing) return existing;
     if (this.deletedSessions.has(sessionId)) return Promise.resolve();
+
+    // Install the process-local fence before the first durable await. A cold load that started in
+    // the previous tick may finish while claimDeletion is doing I/O; it must observe this marker
+    // and reject rather than briefly resurrecting a live Agent.
+    this.deletingSessions.add(sessionId);
+    this.fenceLocalSessionForDeletion(sessionId);
 
     // Durable state, rather than this process-local cache, owns retry/resume semantics. A second
     // manager sharing SQLite/PostgreSQL observes the same fence and can finish a partial purge.
@@ -1436,15 +1891,23 @@ export class SessionManager {
   }
 
   async putArtifact(input: ArtifactInput): Promise<Artifact> {
+    if (input.mediaType === SUBAGENT_STATE_MEDIA_TYPE) {
+      throw new Error("Reserved internal artifact media type");
+    }
     return this.runSessionOperation(input.sessionId, () => this.artifacts.put(input));
   }
 
   listArtifacts(sessionId: string): Promise<Artifact[]> {
-    return this.runSessionOperation(sessionId, () => this.artifacts.list(sessionId));
+    return this.runSessionOperation(sessionId, async () =>
+      (await this.artifacts.list(sessionId)).filter((artifact) => !isInternalArtifact(artifact)),
+    );
   }
 
   getArtifact(sessionId: string, artifactId: string): Promise<ArtifactRecord | undefined> {
-    return this.runSessionOperation(sessionId, () => this.artifacts.get(sessionId, artifactId));
+    return this.runSessionOperation(sessionId, async () => {
+      const record = await this.artifacts.get(sessionId, artifactId);
+      return record && !isInternalArtifact(record.artifact) ? record : undefined;
+    });
   }
 
   async openArtifact(
@@ -1483,6 +1946,16 @@ export class SessionManager {
             );
         const record = await waitForArtifactPromise(pending, controller.signal);
         if (!record) return undefined;
+        if (isInternalArtifact(record.artifact)) {
+          if (!controller.signal.aborted) {
+            controller.abort(new Error("Internal artifact is not publicly accessible"));
+          }
+          const hidden = record.data[Symbol.asyncIterator]();
+          // A hostile/remote store may never settle iterator.return(). The public lookup is already
+          // decided, so revoke the source and release our lease without letting it hold the caller.
+          void hidden.return?.().catch(() => undefined);
+          return undefined;
+        }
         if (controller.signal.aborted) throw controller.signal.reason;
         source = record.data[Symbol.asyncIterator]();
         return record;
@@ -1588,7 +2061,11 @@ export class SessionManager {
   }
 
   async deleteArtifact(sessionId: string, artifactId: string): Promise<boolean> {
-    return this.runSessionOperation(sessionId, () => this.artifacts.delete(sessionId, artifactId));
+    return this.runSessionOperation(sessionId, async () => {
+      const record = await this.artifacts.get(sessionId, artifactId);
+      if (!record || isInternalArtifact(record.artifact)) return false;
+      return this.artifacts.delete(sessionId, artifactId);
+    });
   }
 
   /** 准备一个可预览/审批的事务，不在此步写工作区。 */
@@ -1698,14 +2175,18 @@ export class SessionManager {
   }
 
   runtimeEvents(sessionId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
-    return this.runSessionOperation(sessionId, () => this.runtime.events(sessionId, afterSequence));
+    return this.runSessionOperation(sessionId, async () =>
+      (await this.runtime.events(sessionId, afterSequence)).filter(
+        (event) => event.type !== "subagent.state",
+      ),
+    );
   }
 
   recoverRuntime(sessionId: string): Promise<RecoveredRuntimeState> {
     return this.runSessionOperation(sessionId, () => this.runtime.recover(sessionId));
   }
 
-  /** 重命名会话标题并持久化。应在会话空闲（无进行中回合）时调用以避免与消息落盘竞争。 */
+  /** 重命名会话标题；与 Conversation append/rewrite 共用一条持久化序列。 */
   async setTitle(sessionId: string, title: string): Promise<void> {
     const trimmed = title.trim();
     if (!trimmed) return Promise.resolve();
@@ -1715,9 +2196,7 @@ export class SessionManager {
   private async setTitleInternal(sessionId: string, title: string): Promise<void> {
     const session = await this.ensureLive(sessionId);
     this.assertSessionAvailable(sessionId);
-    session.meta.title = title;
-    // rewrite 原子替换整份文件（含 meta 头），把新标题落盘。
-    await this.opts.store.rewrite(session.meta, session.snapshot().messages);
+    await session.updateTitle(title);
   }
 
   async answerPermission(
@@ -1733,6 +2212,7 @@ export class SessionManager {
 
   /** 进程内宿主销毁时停止所有 live drive；daemon 断开客户端不会调用此方法。 */
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true;
     if (this.deletedReconciliationTimer) clearInterval(this.deletedReconciliationTimer);
     this.deletedReconciliationTimer = undefined;
@@ -1742,13 +2222,142 @@ export class SessionManager {
     }
     for (const session of this.sessions.values()) {
       session.stopBackgroundTasks();
-      session.interrupt();
+      session.close();
+      // Keep the legacy synchronous dispose contract while still starting instance-bound cleanup.
+      // shutdown() awaits the same idempotent promises and reports any failure.
+      void session.closeToolResources().catch(() => undefined);
     }
-    for (const pool of this.lspPools) pool.closeAll();
-    this.lspPools.clear();
-    this.sessionLspPools.clear();
+    void this.opts.browserRegistry?.closeAll().catch(() => undefined);
+    for (const sessionId of [...this.sessionLspPools.keys()]) {
+      void this.closeSessionLspPool(sessionId);
+    }
     // dispose 保持同步契约；生产宿主还会在真正退出前显式 await，同步调用方则至少触发发送。
-    void this.telemetry.forceFlush?.();
+    void Promise.resolve(this.telemetry.forceFlush?.()).catch(() => undefined);
+  }
+
+  /**
+   * 生产宿主退出门：同步 fence 新工作后，等待 drive、runtime/outbox 与 telemetry 真正落稳。
+   * `dispose()` 保留旧同步接口；拥有进程生命周期的宿主必须 await 本方法。
+   */
+  shutdown(): Promise<void> {
+    if (this.shutdownTask) return this.shutdownTask;
+    this.dispose();
+    const drain = (async () => {
+      const failures: unknown[] = [];
+      const settle = async (operation: () => Promise<unknown>): Promise<void> => {
+        try {
+          await operation();
+        } catch (error) {
+          failures.push(error);
+        }
+      };
+      await this.waitForManagerQuiescence();
+      const sessionIds = new Set<string>([
+        ...this.sessions.keys(),
+        ...this.runtimeWrites.keys(),
+        ...this.runtimeWriteFailures.keys(),
+        ...this.lspTerminationFailures.keys(),
+        ...this.backgroundCommandFinalizations.keys(),
+      ]);
+      for (const sessionId of sessionIds) {
+        await settle(() => this.waitForLspTermination(sessionId));
+        await settle(() =>
+          this.flushRuntimeWrites(sessionId, { discardFailures: true, dynamic: true }),
+        );
+      }
+      for (const session of this.sessions.values()) {
+        await settle(() => session.closeToolResources());
+      }
+      if (this.opts.browserRegistry) await settle(() => this.opts.browserRegistry!.closeAll());
+      failures.push(...this.durabilityFailures);
+      if (this.durabilityFailureCount > this.durabilityFailures.length) {
+        failures.push(
+          new Error(
+            `${this.durabilityFailureCount - this.durabilityFailures.length} additional durability failures were suppressed`,
+          ),
+        );
+      }
+      await settle(() => this.outbox.flush());
+      await settle(() => this.telemetry.forceFlush?.() ?? Promise.resolve());
+      if (failures.length) throw new AggregateError(failures, "SessionManager shutdown failed");
+    })();
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      deadlineTimer = setTimeout(() => {
+        this.shutdownTimedOut = true;
+        reject(
+          new Error(
+            `SessionManager shutdown exceeded the ${this.shutdownTimeoutMs}ms hard deadline`,
+          ),
+        );
+      }, this.shutdownTimeoutMs);
+    });
+    this.shutdownTask = Promise.race([drain, deadline]).finally(() => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+    });
+    return this.shutdownTask;
+  }
+
+  /** Dynamic barrier: work can have been registered just before dispose installed the fence. */
+  private async waitForManagerQuiescence(): Promise<void> {
+    for (;;) {
+      const sessions = [...this.sessions.values()];
+      for (const session of sessions) {
+        session.stopBackgroundTasks();
+        session.close();
+      }
+      const pending = new Set<Promise<unknown>>();
+      for (const operation of this.activeManagerOperations) pending.add(operation);
+      for (const operations of this.activeSessionOperations.values()) {
+        for (const operation of operations) pending.add(operation);
+      }
+      for (const operation of this.loading.values()) pending.add(operation);
+      for (const operation of this.recoveringCommands.values()) pending.add(operation);
+      for (const operation of this.recoveringPatchSets.values()) pending.add(operation);
+      for (const operation of this.deletionTasks.values()) pending.add(operation);
+      for (const operations of this.runtimeWrites.values()) {
+        for (const operation of operations.values()) pending.add(operation);
+      }
+      for (const operation of this.subagentStateWrites.values()) pending.add(operation);
+      for (const operation of this.sessionProjectionTails.values()) pending.add(operation);
+      for (const operation of this.autoTitleTasks.values()) pending.add(operation);
+      for (const operation of this.retiringSessions.values()) pending.add(operation);
+      for (const operation of this.backgroundCommandFinalizations.values()) pending.add(operation);
+      for (const operations of this.lspTerminationTasks.values()) {
+        for (const operation of operations) pending.add(operation);
+      }
+      if (this.startupRecoveryTask) pending.add(this.startupRecoveryTask);
+      if (this.deletedReconciliationTask) pending.add(this.deletedReconciliationTask);
+      for (const session of sessions) {
+        pending.add(session.whenIdle());
+        pending.add(session.whenBackgroundTasksIdle());
+        pending.add(session.whenPersistenceIdle());
+        pending.add(session.whenToolExecutionsIdle());
+      }
+      if (pending.size === 0) return;
+      await Promise.allSettled(pending);
+      const stillRunning = [...this.sessions.values()].some((session) => session.running);
+      if (
+        !stillRunning &&
+        this.activeManagerOperations.size === 0 &&
+        this.activeSessionOperations.size === 0 &&
+        this.loading.size === 0 &&
+        this.recoveringCommands.size === 0 &&
+        this.recoveringPatchSets.size === 0 &&
+        this.deletionTasks.size === 0 &&
+        this.runtimeWrites.size === 0 &&
+        this.subagentStateWrites.size === 0 &&
+        this.sessionProjectionTails.size === 0 &&
+        this.autoTitleTasks.size === 0 &&
+        this.retiringSessions.size === 0 &&
+        this.backgroundCommandFinalizations.size === 0 &&
+        this.lspTerminationTasks.size === 0 &&
+        !this.startupRecoveryTask &&
+        !this.deletedReconciliationTask
+      ) {
+        return;
+      }
+    }
   }
 
   /** 为某会话 cwd 建一个 LSP 池并登记，供 dispose 统一关闭。 */
@@ -1759,12 +2368,40 @@ export class SessionManager {
     return pool;
   }
 
-  private closeSessionLspPool(sessionId: string): void {
+  private closeSessionLspPool(sessionId: string): Promise<void> {
     const pool = this.sessionLspPools.get(sessionId);
-    if (!pool) return;
-    pool.closeAll();
+    if (!pool) return Promise.resolve();
     this.sessionLspPools.delete(sessionId);
     this.lspPools.delete(pool);
+    const task = pool.closeAll();
+    const tasks = this.lspTerminationTasks.get(sessionId) ?? new Set<Promise<void>>();
+    tasks.add(task);
+    this.lspTerminationTasks.set(sessionId, tasks);
+    const cleanup = () => {
+      const current = this.lspTerminationTasks.get(sessionId);
+      current?.delete(task);
+      if (current?.size === 0) this.lspTerminationTasks.delete(sessionId);
+    };
+    void task.then(cleanup, (error) => {
+      const failures = this.lspTerminationFailures.get(sessionId) ?? [];
+      if (failures.length < MAX_DURABILITY_FAILURE_DETAILS) failures.push(error);
+      this.lspTerminationFailures.set(sessionId, failures);
+      cleanup();
+    });
+    return task;
+  }
+
+  private async waitForLspTermination(sessionId: string): Promise<void> {
+    for (;;) {
+      const current = [...(this.lspTerminationTasks.get(sessionId) ?? [])];
+      if (current.length === 0) break;
+      await Promise.allSettled(current);
+    }
+    const failures = this.lspTerminationFailures.get(sessionId) ?? [];
+    this.lspTerminationFailures.delete(sessionId);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `Failed to terminate LSP processes for ${sessionId}`);
+    }
   }
 
   // ---------- 内部 ----------
@@ -1877,7 +2514,15 @@ export class SessionManager {
     return candidate;
   }
 
-  private assertSessionAvailable(sessionId: string): void {
+  private assertManagerActive(): void {
+    if (this.disposed) throw new Error("SessionManager is shutting down or disposed");
+  }
+
+  private assertSessionAvailable(sessionId: string, allowDisposed = false): void {
+    if (this.shutdownTimedOut) {
+      throw new Error("SessionManager shutdown deadline exceeded");
+    }
+    if (!allowDisposed) this.assertManagerActive();
     if (this.deletingSessions.has(sessionId)) {
       throw new Error(
         t(
@@ -1892,6 +2537,13 @@ export class SessionManager {
     if ((this.interruptEpochs.get(sessionId) ?? 0) !== expectedEpoch) {
       throw new Error(t("Session interrupted", "会话已中断"));
     }
+  }
+
+  private trackManagerOperation<T>(operation: Promise<T>): Promise<T> {
+    this.activeManagerOperations.add(operation);
+    const cleanup = () => this.activeManagerOperations.delete(operation);
+    void operation.then(cleanup, cleanup);
+    return operation;
   }
 
   private trackSessionOperation<T>(sessionId: string, operation: Promise<T>): Promise<T> {
@@ -1928,21 +2580,22 @@ export class SessionManager {
   }
 
   private runSessionOperation<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
-    return this.startSessionOperation(sessionId, run, true);
+    return this.startSessionOperation(sessionId, run, true, false);
   }
 
   /** Event projections are themselves tracked writes, so they must not drain the set containing self. */
   private runSessionProjection<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
-    return this.startSessionOperation(sessionId, run, false);
+    return this.startSessionOperation(sessionId, run, false, true);
   }
 
   private startSessionOperation<T>(
     sessionId: string,
     run: () => Promise<T>,
     drainRuntimeWrites: boolean,
+    allowDisposed: boolean,
   ): Promise<T> {
     const operation = (async () => {
-      this.assertSessionAvailable(sessionId);
+      this.assertSessionAvailable(sessionId, allowDisposed);
       // Metadata-only tenancy validation must precede provider construction and every durable,
       // artifact, runtime, recovery, or live-session side effect owned by the callback.
       let workspace = await this.preflightSessionWorkspace(sessionId);
@@ -1960,8 +2613,14 @@ export class SessionManager {
           };
         }
       }
-      this.assertSessionAvailable(sessionId);
-      return this.withSessionOperationLease(sessionId, workspace, run, drainRuntimeWrites);
+      this.assertSessionAvailable(sessionId, allowDisposed);
+      return this.withSessionOperationLease(
+        sessionId,
+        workspace,
+        run,
+        drainRuntimeWrites,
+        allowDisposed,
+      );
     })();
     return this.trackSessionOperation(sessionId, operation);
   }
@@ -1972,6 +2631,7 @@ export class SessionManager {
     workspace: ScopedWorkspaceIdentity,
     run: () => Promise<T>,
   ): Promise<T> {
+    this.assertManagerActive();
     const operation = this.withSessionOperationLease(sessionId, workspace, run);
     return this.trackSessionOperation(sessionId, operation);
   }
@@ -1981,6 +2641,7 @@ export class SessionManager {
     workspace: ScopedWorkspaceIdentity | undefined,
     run: () => Promise<T>,
     drainRuntimeWrites = true,
+    allowDisposed = false,
   ): Promise<T> {
     const lease = await this.lifecycle.acquireOperation({
       sessionId,
@@ -1991,7 +2652,7 @@ export class SessionManager {
         ? { workspaceIdentity: { device: workspace.device, inode: workspace.inode } }
         : {}),
     });
-    this.assertSessionAvailable(sessionId);
+    this.assertSessionAvailable(sessionId, allowDisposed);
     const heartbeat = this.startSessionOperationHeartbeat(lease);
     let result!: T;
     let failure: unknown;
@@ -2089,7 +2750,7 @@ export class SessionManager {
       const session = this.sessions.get(lease.sessionId);
       session?.stopBackgroundTasks();
       session?.close();
-      this.closeSessionLspPool(lease.sessionId);
+      void this.closeSessionLspPool(lease.sessionId);
     };
     const timer = setInterval(
       () => {
@@ -2357,7 +3018,7 @@ export class SessionManager {
     const live = this.sessions.get(sessionId);
     live?.stopBackgroundTasks();
     live?.close();
-    this.closeSessionLspPool(sessionId);
+    void this.closeSessionLspPool(sessionId);
   }
 
   private startSessionDeletionHeartbeat(claim: SessionDeletionClaim): {
@@ -2425,7 +3086,8 @@ export class SessionManager {
       live.stopBackgroundTasks();
       live.close();
     }
-    this.closeSessionLspPool(sessionId);
+    await this.closeSessionLspPool(sessionId).catch(() => undefined);
+    await this.waitForLspTermination(sessionId);
 
     // Both explicit sends and crash recovery can own a drive. close() aborts them; awaiting their
     // outer operations lets command finalization/outbox writes settle before the destructive pass.
@@ -2434,6 +3096,9 @@ export class SessionManager {
       this.waitForSessionOperations(sessionId),
       ...(recovery ? [recovery] : []),
       ...(live ? [live.whenIdle()] : []),
+      ...(live ? [live.whenBackgroundTasksIdle()] : []),
+      ...(live ? [live.whenPersistenceIdle()] : []),
+      ...(live ? [live.whenToolExecutionsIdle()] : []),
     ]);
     // A pre-fence recovery may have registered its drive while the first barrier was settling.
     await this.waitForSessionOperations(sessionId);
@@ -2441,6 +3106,9 @@ export class SessionManager {
       live.close();
       await live.whenIdle();
     }
+    if (live) await live.whenBackgroundTasksIdle();
+    if (live) await live.whenPersistenceIdle();
+    if (live) await live.closeToolResources();
 
     this.sessions.delete(sessionId);
     this.loading.delete(sessionId);
@@ -2449,7 +3117,7 @@ export class SessionManager {
 
     // recordSessionEvent is fenced while deleting; after all producers are drained, this flush is
     // a stable boundary. Everything below it is the final content purge.
-    await this.flushRuntimeWrites(sessionId);
+    await this.flushRuntimeWrites(sessionId, { discardFailures: true, dynamic: true });
     // Other processes may still own a producer lease. The atomic `deleting` transition has already
     // stopped new leases; wait for every prior lease to release or expire before crossing into any
     // separately persisted backend (including S3).
@@ -2552,6 +3220,11 @@ export class SessionManager {
 
   private async ensureLive(sessionId: string): Promise<ManagedSession> {
     this.assertSessionAvailable(sessionId);
+    const retiring = this.retiringSessions.get(sessionId);
+    if (retiring) {
+      await retiring;
+      this.assertSessionAvailable(sessionId);
+    }
     const pending = this.loading.get(sessionId);
     if (pending) {
       const session = await pending;
@@ -2598,7 +3271,8 @@ export class SessionManager {
     // Agent, drain its current drive, then reload persisted history into a newly constrained Agent.
     existing.stopBackgroundTasks();
     existing.close();
-    this.closeSessionLspPool(sessionId);
+    await this.closeSessionLspPool(sessionId).catch(() => undefined);
+    await this.waitForLspTermination(sessionId);
     await this.opts.onWorkspaceTrustChange?.({
       sessionId,
       cwd: existing.meta.cwd,
@@ -2606,6 +3280,9 @@ export class SessionManager {
       current: assessment!,
     });
     await existing.whenIdle();
+    await existing.whenBackgroundTasksIdle();
+    await existing.whenToolExecutionsIdle();
+    await existing.closeToolResources();
     this.assertSessionAvailable(sessionId);
     if (this.sessions.get(sessionId) === existing) this.sessions.delete(sessionId);
     const replacement = await this.loadSession(sessionId, assessment, existing.subscriberSet());
@@ -2718,14 +3395,20 @@ export class SessionManager {
     resolved: ResolvedProvider,
     workspaceTrust?: WorkspaceTrustAssessment,
     listeners?: Set<SessionListener>,
+    recovered: RecoveredSessionProjection = { checkpoints: [] },
   ): ManagedSession {
     const restricted = workspaceTrust?.trusted === false;
     const requestedDefault = (this.opts.permission?.mode ?? "default") === "default";
-    // Only an explicitly/default-resolved interactive mode gets the audited developer subset.
-    // Headless/high-privilege entry points (notably `anicode mcp`, whose requested mode is auto)
-    // retain the old read-only plan boundary so they neither auto-execute nor wait for a missing UI.
+    // Entry-point intent is independent of the requested trusted-workspace permission mode. A
+    // local interactive host can therefore start trusted sessions in auto/bypass while still
+    // degrading to the audited default+confirm surface after trust is revoked. Older embedders
+    // retain the mode===default inference until they opt into the explicit capability.
+    const restrictedDevelopmentRequested =
+      this.opts.allowRestrictedWorkspaceDevelopment ?? requestedDefault;
     const restrictedDevelopment =
-      restricted && workspaceTrust?.reason !== "inspection-failed" && requestedDefault;
+      restricted &&
+      workspaceTrust?.reason !== "inspection-failed" &&
+      restrictedDevelopmentRequested;
     const session = new ManagedSession(
       meta,
       (confirm) => {
@@ -2734,17 +3417,17 @@ export class SessionManager {
               ...(this.opts.permission?.denyRules?.length
                 ? { denyRules: this.opts.permission.denyRules }
                 : {}),
-              ...(requestedDefault && this.opts.permission?.allowRules?.length
+              ...(restrictedDevelopment && this.opts.permission?.allowRules?.length
                 ? { allowRules: this.opts.permission.allowRules }
                 : {}),
-              ...(requestedDefault && this.opts.permission?.askRules?.length
+              ...(restrictedDevelopment && this.opts.permission?.askRules?.length
                 ? { askRules: this.opts.permission.askRules }
                 : {}),
               // Never inherit readOnlyTools/editTools or a privileged mode into an untrusted Agent.
               mode: restrictedDevelopment ? "default" : "plan",
               // Headless/non-default entry points have no authorization UI. Omitting confirm is a
               // second fail-safe against future rule/tool metadata accidentally creating a wait.
-              ...(requestedDefault ? { confirm } : {}),
+              ...(restrictedDevelopment ? { confirm } : {}),
             }
           : {
               mode: "default",
@@ -2771,6 +3454,7 @@ export class SessionManager {
           resolveModel: this.opts.resolveProvider,
           ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
           ...(this.opts.fallbackModels?.length ? { fallbackModels: this.opts.fallbackModels } : {}),
+          ...(this.opts.runBudget ? { runBudget: this.opts.runBudget } : {}),
           ...(restrictedDevelopment
             ? { sandbox: "workspace-write" as const }
             : !restricted && this.opts.sandbox
@@ -2800,7 +3484,8 @@ export class SessionManager {
           ...(restricted
             ? {
                 tools: restrictedDevelopment
-                  ? restrictedWorkspaceDevelopmentTools()
+                  ? (this.opts.restrictedDevelopmentTools?.() ??
+                    restrictedWorkspaceDevelopmentTools())
                   : defaultTools().subset([...RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES]),
               }
             : this.opts.tools
@@ -2808,17 +3493,28 @@ export class SessionManager {
               : {}),
           ...(!restricted && this.opts.hooks ? { hooks: this.opts.hooks } : {}),
           ...(!restricted && this.opts.subagents !== undefined
-            ? { subagents: this.opts.subagents }
+            ? {
+                subagents: this.opts.subagents,
+                ...(recovered.tasks?.length ? { recoveredTasks: recovered.tasks } : {}),
+                onTaskState: (record: PersistedTaskRecord) => {
+                  this.persistSubagentState(meta.id, record);
+                },
+                onTaskUsageCredited: (credit: TaskUsageCredit) =>
+                  this.persistTaskUsageCredit(meta.id, credit),
+                onTaskEvicted: (taskId: string) => {
+                  this.evictSubagentState(meta.id, taskId);
+                },
+              }
             : {}),
           ...(!restricted && this.opts.skills !== undefined ? { skills: this.opts.skills } : {}),
           ...(restricted
-            ? { projectMemory: false }
+            ? { projectMemory: false, injectEnv: false }
             : this.opts.projectMemory !== undefined
               ? { projectMemory: this.opts.projectMemory }
               : {}),
           ...(this.opts.compaction !== undefined ? { compaction: this.opts.compaction } : {}),
           ...(this.opts.contextCompiler ? { contextCompiler: this.opts.contextCompiler } : {}),
-          ...(this.opts.verifier ? { verifier: this.opts.verifier } : {}),
+          ...(!restricted && this.opts.verifier ? { verifier: this.opts.verifier } : {}),
           ...(this.opts.verificationMaxAttempts !== undefined
             ? { verificationMaxAttempts: this.opts.verificationMaxAttempts }
             : {}),
@@ -2829,6 +3525,10 @@ export class SessionManager {
             store: this.opts.store,
             meta,
             ...(resumeMessages.length ? { resumeMessages } : {}),
+            ...(recovered.usage ? { resumeUsage: recovered.usage } : {}),
+            ...(recovered.lastInputTokens
+              ? { resumeLastInputTokens: recovered.lastInputTokens }
+              : {}),
           },
         });
         if (!restricted && this.opts.permissionProfile) {
@@ -2842,6 +3542,7 @@ export class SessionManager {
       },
       workspaceTrust,
       restrictedDevelopment,
+      recovered.checkpoints,
       listeners,
     );
     this.sessions.set(meta.id, session);
@@ -2853,6 +3554,7 @@ export class SessionManager {
    * 只覆盖订阅期间处于 live 的会话；冷会话被 resume/create 成 live 后自动纳入。
    */
   subscribeAll(listener: GlobalListener): () => void {
+    this.assertManagerActive();
     this.globalListeners.add(listener);
     return () => this.globalListeners.delete(listener);
   }
@@ -2871,9 +3573,10 @@ export class SessionManager {
   private recordSessionEvent(sessionId: string, event: SessionEvent): void {
     // Deletion is a lifecycle fence. Pre-fence writes are drained before purge; post-fence events
     // must never recreate a runtime stream or artifact after that purge.
-    if (this.deletingSessions.has(sessionId)) return;
+    if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) return;
     let type: string;
     let data: Record<string, unknown>;
+    let artifactInput: ArtifactInput | undefined;
     if (event.type === "state") {
       type = "session.state";
       data = { running: event.running };
@@ -2911,73 +3614,547 @@ export class SessionManager {
       } else if (agent.type === "verification") {
         type = "verification.completed";
         data = { id: agent.report.id, status: agent.report.status, summary: agent.report.summary };
-        void this.putArtifact({
+        artifactInput = {
           sessionId,
           kind: "verification",
           name: `${agent.report.id}.json`,
           mediaType: "application/json",
           data: JSON.stringify(agent.report, null, 2),
           metadata: { status: agent.report.status },
-        }).catch(() => undefined);
+        };
       } else if (agent.type === "done") {
         type = "agent.completed";
         data = { turns: agent.turns, usage: agent.usage, costUSD: agent.costUSD };
+      } else if (agent.type === "turn_end") {
+        type = "agent.turn_completed";
+        data = {
+          usage: agent.usage,
+          realInputTokens:
+            agent.usage.inputTokens + agent.usage.cacheReadTokens + agent.usage.cacheWriteTokens,
+        };
       } else if (agent.type === "error") {
         type = "agent.failed";
         data = { error: agent.message };
       } else if (agent.type === "checkpoint") {
         type = "checkpoint.created";
-        data = { id: agent.id, messageCount: agent.messageCount };
+        data = {
+          id: agent.id,
+          tree: agent.tree,
+          label: agent.label,
+          messageCount: agent.messageCount,
+        };
       } else {
         return;
       }
     }
-    this.trackRuntimeWrite(
-      sessionId,
-      this.runSessionProjection(sessionId, () =>
-        this.outbox.publish({ streamId: sessionId, type, data }),
-      ),
+    this.enqueueRuntimeProjection(sessionId, async () => {
+      if (artifactInput) await this.artifacts.put(artifactInput);
+      await this.outbox.publish({ streamId: sessionId, type, data });
+    });
+  }
+
+  /**
+   * Persist child transcripts as private Artifacts and publish only the content address in the
+   * runtime stream. This keeps prompts out of observability facts while making crash recovery
+   * deletion-fenced and independently auditable.
+   */
+  private enqueueRuntimeProjection(sessionId: string, run: () => Promise<void>): Promise<void> {
+    if (this.shutdownTimedOut) return Promise.resolve();
+    const previous = this.sessionProjectionTails.get(sessionId) ?? Promise.resolve();
+    const write = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) return;
+        await this.runSessionProjection(sessionId, run);
+      });
+    this.sessionProjectionTails.set(sessionId, write);
+    void write
+      .finally(() => {
+        if (this.sessionProjectionTails.get(sessionId) === write) {
+          this.sessionProjectionTails.delete(sessionId);
+        }
+      })
+      .catch(() => undefined);
+    this.trackRuntimeWrite(sessionId, write);
+    return write;
+  }
+
+  /**
+   * A detached child can finish after the parent emitted agent.completed. Persist its exact delta
+   * under a cumulative idempotency key so restart accounting neither loses nor duplicates billing.
+   */
+  private persistTaskUsageCredit(sessionId: string, credit: TaskUsageCredit): Promise<void> {
+    if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) {
+      return Promise.reject(new Error("Session is no longer accepting task usage credits"));
+    }
+    return this.enqueueRuntimeProjection(sessionId, () =>
+      this.outbox
+        .publish({
+          streamId: sessionId,
+          type: "subagent.usage_credited",
+          data: {
+            taskId: credit.taskId,
+            cumulative: credit.cumulative,
+            delta: credit.delta,
+            background: credit.background,
+          },
+          idempotencyKey: `subagent.usage:${credit.idempotencyKey}`,
+        })
+        .then(() => undefined),
     );
   }
 
-  private trackRuntimeWrite<T>(sessionId: string, promise: Promise<T>): void {
-    const writes = this.runtimeWrites.get(sessionId) ?? new Set<Promise<unknown>>();
-    writes.add(promise);
-    this.runtimeWrites.set(sessionId, writes);
-    void promise
+  /** Durable eviction tombstone plus private-artifact GC, serialized with task checkpoints. */
+  private evictSubagentState(sessionId: string, taskId: string): void {
+    if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) return;
+    const previous = this.subagentStateWrites.get(sessionId) ?? Promise.resolve();
+    const write = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) return;
+        await this.runSessionProjection(sessionId, async () => {
+          await this.outbox.publish({
+            streamId: sessionId,
+            type: "subagent.evicted",
+            data: { taskId },
+            idempotencyKey: `subagent.evicted:${taskId}`,
+          });
+          const artifacts = await this.artifacts.list(sessionId);
+          for (const artifact of artifacts) {
+            if (isInternalArtifact(artifact) && artifact.metadata?.["taskId"] === taskId) {
+              await this.artifacts.delete(sessionId, artifact.id);
+            }
+          }
+        });
+      });
+    this.subagentStateWrites.set(sessionId, write);
+    void write
       .finally(() => {
-        const current = this.runtimeWrites.get(sessionId);
-        current?.delete(promise);
-        if (current?.size === 0) this.runtimeWrites.delete(sessionId);
+        if (this.subagentStateWrites.get(sessionId) === write) {
+          this.subagentStateWrites.delete(sessionId);
+        }
       })
       .catch(() => undefined);
+    this.trackRuntimeWrite(sessionId, write);
   }
 
-  private async flushRuntimeWrites(sessionId: string): Promise<void> {
-    // 完成一个批次时，listener 可能又排入后续事件，因此循环到真正清空。
+  private persistSubagentState(sessionId: string, record: PersistedTaskRecord): void {
+    if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) return;
+    const payload = JSON.stringify({ version: 1, task: record });
+    const key = sessionId;
+    const previous = this.subagentStateWrites.get(key) ?? Promise.resolve();
+    const write = previous
+      .catch(() => undefined)
+      .then(async () => {
+        // Deletion intentionally discards queued checkpoints; the final purge is authoritative.
+        if (this.shutdownTimedOut || this.deletingSessions.has(sessionId)) return;
+        const sizeBytes = Buffer.byteLength(payload, "utf8");
+        if (sizeBytes > MAX_SUBAGENT_STATE_BYTES) {
+          throw new Error(
+            `Subagent ${record.id} state is ${sizeBytes} bytes; maximum is ${MAX_SUBAGENT_STATE_BYTES}`,
+          );
+        }
+        await this.runSessionProjection(sessionId, async () => {
+          let existing = (await this.artifacts.list(sessionId)).filter(isInternalArtifact);
+          const payloadSha256 = createHash("sha256").update(payload).digest("hex");
+          let identical = existing.find((artifact) => artifact.sha256 === payloadSha256);
+          let projectedBytes =
+            existing.reduce((total, artifact) => total + artifact.sizeBytes, 0) +
+            (identical ? 0 : sizeBytes);
+          if (projectedBytes > MAX_SUBAGENT_STATE_SESSION_BYTES) {
+            // Successful checkpoints leave two generations per task. Under quota pressure retain
+            // the latest known-good generation for this task, then retry the exact accounting.
+            const sameTask = existing
+              .filter((candidate) => candidate.metadata?.["taskId"] === record.id)
+              .sort(
+                (left, right) =>
+                  right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
+              );
+            const staleIds = new Set(sameTask.slice(1).map((candidate) => candidate.id));
+            for (const staleId of staleIds) await this.artifacts.delete(sessionId, staleId);
+            existing = existing.filter((candidate) => !staleIds.has(candidate.id));
+            identical = existing.find((artifact) => artifact.sha256 === payloadSha256);
+            projectedBytes =
+              existing.reduce((total, artifact) => total + artifact.sizeBytes, 0) +
+              (identical ? 0 : sizeBytes);
+          }
+          if (projectedBytes > MAX_SUBAGENT_STATE_SESSION_BYTES) {
+            throw new Error(
+              `Subagent state quota would reach ${projectedBytes} bytes; session maximum is ${MAX_SUBAGENT_STATE_SESSION_BYTES}`,
+            );
+          }
+          const artifact =
+            identical ??
+            (await this.artifacts.put({
+              sessionId,
+              kind: "other",
+              name: `subagent-${record.id}.json`,
+              mediaType: SUBAGENT_STATE_MEDIA_TYPE,
+              data: payload,
+              metadata: { taskId: record.id, status: record.status },
+            }));
+          const created = !identical;
+          try {
+            await this.outbox.publish({
+              streamId: sessionId,
+              type: "subagent.state",
+              data: { taskId: record.id, status: record.status, artifactId: artifact.id },
+              idempotencyKey: `subagent.state:${record.id}:${artifact.id}`,
+            });
+          } catch (error) {
+            if (created) {
+              try {
+                await this.artifacts.delete(sessionId, artifact.id);
+              } catch (cleanupError) {
+                throw new AggregateError(
+                  [error, cleanupError],
+                  `Failed to publish and roll back subagent state ${record.id}`,
+                  { cause: cleanupError },
+                );
+              }
+            }
+            throw error;
+          }
+          const sameTask = [
+            ...existing.filter((candidate) => candidate.id !== artifact.id),
+            artifact,
+          ]
+            .filter(
+              (candidate) =>
+                isInternalArtifact(candidate) && candidate.metadata?.["taskId"] === record.id,
+            )
+            .sort(
+              (left, right) =>
+                right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
+            );
+          const keep = new Set<string>([artifact.id]);
+          for (const candidate of sameTask) {
+            if (keep.size >= SUBAGENT_CHECKPOINTS_PER_TASK) break;
+            keep.add(candidate.id);
+          }
+          for (const stale of sameTask.filter((candidate) => !keep.has(candidate.id))) {
+            await this.artifacts.delete(sessionId, stale.id);
+          }
+        });
+      });
+    this.subagentStateWrites.set(key, write);
+    void write
+      .finally(() => {
+        if (this.subagentStateWrites.get(key) === write) this.subagentStateWrites.delete(key);
+      })
+      .catch(() => undefined);
+    this.trackRuntimeWrite(sessionId, write);
+  }
+
+  /** 从 append-only runtime facts 恢复不属于 transcript 的会话状态。 */
+  private async recoverSessionProjection(sessionId: string): Promise<RecoveredSessionProjection> {
+    const events = await this.runtime.events(sessionId);
+    const checkpoints: Checkpoint[] = [];
+    let usage: Usage | undefined;
+    let usageSequence = 0;
+    let lastInputTokens: number | undefined;
+    const taskArtifacts = new Map<string, string[]>();
+    const evictedTaskIds = new Set<string>();
+    for (const event of events) {
+      const data = event.data as Record<string, unknown>;
+      if (event.type === "checkpoint.created") {
+        const checkpoint = checkpointValue(data);
+        if (checkpoint) checkpoints.push(checkpoint);
+      } else if (event.type === "session.reverted") {
+        const id = typeof data["checkpointId"] === "string" ? data["checkpointId"] : "";
+        const index = checkpoints.findIndex((checkpoint) => checkpoint.id === id);
+        if (index >= 0) checkpoints.splice(index);
+      } else if (event.type === "agent.completed") {
+        const restored = usageValue(data["usage"]);
+        if (restored) {
+          usage = restored;
+          usageSequence = event.sequence;
+        }
+      } else if (event.type === "agent.turn_completed") {
+        const realInput = Number(data["realInputTokens"]);
+        if (Number.isFinite(realInput) && realInput > 0) lastInputTokens = Math.floor(realInput);
+        if (event.sequence > usageSequence) {
+          const delta = usageValue(data["usage"]);
+          if (delta) usage = addUsage(usage, delta);
+        }
+      } else if (event.type === "subagent.usage_credited") {
+        if (event.sequence > usageSequence) {
+          const delta = usageValue(data["delta"]);
+          if (delta) usage = addUsage(usage, delta);
+        }
+      } else if (event.type === "subagent.evicted") {
+        const taskId = typeof data["taskId"] === "string" ? data["taskId"] : "";
+        if (/^t[1-9]\d{0,5}$/.test(taskId)) {
+          evictedTaskIds.add(taskId);
+          taskArtifacts.delete(taskId);
+        }
+      } else if (event.type === "subagent.state") {
+        const taskId = typeof data["taskId"] === "string" ? data["taskId"] : "";
+        const artifactId = typeof data["artifactId"] === "string" ? data["artifactId"] : "";
+        if (/^t[1-9]\d{0,5}$/.test(taskId) && artifactId && !evictedTaskIds.has(taskId)) {
+          const candidates = taskArtifacts.get(taskId) ?? [];
+          candidates.unshift(artifactId);
+          if (candidates.length > 8) candidates.length = 8;
+          taskArtifacts.delete(taskId);
+          taskArtifacts.set(taskId, candidates);
+          while (taskArtifacts.size > 32) taskArtifacts.delete(taskArtifacts.keys().next().value!);
+        }
+      }
+    }
+    if (evictedTaskIds.size > 0) {
+      for (const artifact of await this.artifacts.list(sessionId)) {
+        const taskId = artifact.metadata?.["taskId"];
+        if (
+          isInternalArtifact(artifact) &&
+          typeof taskId === "string" &&
+          evictedTaskIds.has(taskId)
+        ) {
+          await this.artifacts.delete(sessionId, artifact.id);
+        }
+      }
+    }
+    const tasks: PersistedTaskRecord[] = [];
+    for (const [expectedTaskId, artifactIds] of taskArtifacts) {
+      for (const artifactId of artifactIds) {
+        try {
+          const artifact = await this.artifacts.get(sessionId, artifactId);
+          if (
+            !artifact ||
+            artifact.artifact.mediaType !== SUBAGENT_STATE_MEDIA_TYPE ||
+            artifact.artifact.metadata?.["taskId"] !== expectedTaskId ||
+            artifact.artifact.sizeBytes > MAX_SUBAGENT_STATE_BYTES
+          ) {
+            continue;
+          }
+          const document = JSON.parse(new TextDecoder().decode(artifact.data)) as unknown;
+          const envelope =
+            document && typeof document === "object" && !Array.isArray(document)
+              ? (document as Record<string, unknown>)
+              : undefined;
+          if (envelope?.["version"] !== 1) continue;
+          const task = parsePersistedTaskRecord(envelope["task"]);
+          if (task?.id === expectedTaskId) {
+            tasks.push(task);
+            break;
+          }
+        } catch {
+          // Try the previous last-known-good checkpoint before dropping this task entirely.
+        }
+      }
+    }
+    return {
+      checkpoints,
+      ...(usage ? { usage } : {}),
+      ...(lastInputTokens ? { lastInputTokens } : {}),
+      ...(tasks.length ? { tasks } : {}),
+    };
+  }
+
+  /** Final exact lease/fencing gate shared by this root drive and every detached descendant. */
+  private async assertCommandOwnership(command: DurableCommand): Promise<void> {
+    const sessionId = command.sessionId;
+    try {
+      if (this.activeCommands.get(sessionId)?.get(command.id) !== command) {
+        throw new Error(`Durable command ${command.id} no longer owns this execution tree`);
+      }
+      await this.commandInbox.heartbeat(
+        sessionId,
+        command.id,
+        this.workerId,
+        60_000,
+        command.fencingToken,
+      );
+      if (this.activeCommands.get(sessionId)?.get(command.id) !== command) {
+        throw new Error(`Durable command ${command.id} changed during the execution fence`);
+      }
+    } catch (error) {
+      if (this.interruptedCommands.get(sessionId)?.has(command.id)) {
+        throw new Error(t("Session interrupted", "会话已中断"), { cause: error });
+      }
+      // Abort the stale drive synchronously; ensureLive waits this common retirement fence before
+      // constructing a replacement Agent.
+      this.retireSessionAfterCommandLeaseLoss(sessionId);
+      throw error;
+    }
+  }
+
+  /** Persist every monotonic budget mutation before the provider/tool side effect it authorizes. */
+  private async persistRunBudgetCheckpoint(
+    command: DurableCommand,
+    input: RunBudgetSnapshot,
+  ): Promise<void> {
+    const sessionId = command.sessionId;
+    this.assertSessionAvailable(sessionId);
+    const snapshot = validateRunBudgetSnapshot(input);
+    await this.assertCommandOwnership(command);
+    await this.outbox.publish({
+      streamId: sessionId,
+      type: "command.budget_checkpoint",
+      data: { commandId: command.id, snapshot },
+      idempotencyKey: `command:${command.id}:budget:${snapshot.revision}`,
+    });
+    await this.assertCommandOwnership(command);
+  }
+
+  private initialRunBudgetSnapshot(command: DurableCommand): RunBudgetSnapshot {
+    const startedAt = Date.parse(command.createdAt);
+    if (!Number.isSafeInteger(startedAt) || startedAt < 0 || startedAt > Date.now() + 60_000) {
+      throw new Error(`Durable command ${command.id} has an invalid creation timestamp`);
+    }
+    return {
+      version: 1,
+      revision: 0,
+      startedAt,
+      chargedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      },
+      chargedCostUSD: 0,
+      reservedTokens: 0,
+      reservedCostUSD: 0,
+      toolCalls: 0,
+    };
+  }
+
+  /** Replay the highest valid checkpoint for one command; malformed/conflicting facts fail closed. */
+  private async recoverRunBudgetSnapshot(
+    sessionId: string,
+    command: DurableCommand,
+  ): Promise<RunBudgetSnapshot> {
+    let latest: RunBudgetSnapshot | undefined;
+    for (const event of await this.runtime.events(sessionId)) {
+      if (event.type !== "command.budget_checkpoint") continue;
+      const data = event.data as Record<string, unknown>;
+      if (data["commandId"] !== command.id) continue;
+      let candidate: RunBudgetSnapshot;
+      try {
+        candidate = validateRunBudgetSnapshot(data["snapshot"] as RunBudgetSnapshot);
+      } catch (error) {
+        throw new Error(`Invalid durable budget checkpoint for command ${command.id}`, {
+          cause: error,
+        });
+      }
+      if (candidate.startedAt !== Date.parse(command.createdAt)) {
+        throw new Error(`Durable budget checkpoint changed start time for command ${command.id}`);
+      }
+      if (latest && candidate.revision <= latest.revision) {
+        if (
+          candidate.revision !== latest.revision ||
+          JSON.stringify(candidate) !== JSON.stringify(latest)
+        ) {
+          throw new Error(`Non-monotonic durable budget checkpoint for command ${command.id}`);
+        }
+        continue;
+      }
+      latest = candidate;
+    }
+    return latest ?? this.initialRunBudgetSnapshot(command);
+  }
+
+  private trackRuntimeWrite<T>(sessionId: string, promise: Promise<T>): void {
+    const sequence = (this.runtimeWriteSequences.get(sessionId) ?? 0) + 1;
+    this.runtimeWriteSequences.set(sessionId, sequence);
+    const writes = this.runtimeWrites.get(sessionId) ?? new Map<number, Promise<unknown>>();
+    writes.set(sequence, promise);
+    this.runtimeWrites.set(sessionId, writes);
+    const cleanup = () => {
+      const current = this.runtimeWrites.get(sessionId);
+      current?.delete(sequence);
+      if (current?.size === 0) this.runtimeWrites.delete(sessionId);
+    };
+    void promise.then(cleanup, (error) => {
+      const failures = this.runtimeWriteFailures.get(sessionId) ?? new Map<number, unknown>();
+      if (failures.size < MAX_RUNTIME_FAILURES_PER_SESSION) failures.set(sequence, error);
+      else {
+        const overflow = this.runtimeWriteFailureOverflow.get(sessionId);
+        this.runtimeWriteFailureOverflow.set(sessionId, {
+          firstSequence: Math.min(overflow?.firstSequence ?? sequence, sequence),
+          count: (overflow?.count ?? 0) + 1,
+        });
+      }
+      this.runtimeWriteFailures.set(sessionId, failures);
+      this.durabilityFailureCount++;
+      if (this.durabilityFailures.length < MAX_DURABILITY_FAILURE_DETAILS) {
+        this.durabilityFailures.push(error);
+      }
+      cleanup();
+    });
+  }
+
+  private async flushRuntimeWrites(
+    sessionId: string,
+    options: { discardFailures?: boolean; dynamic?: boolean } = {},
+  ): Promise<void> {
+    // Ordinary operations wait only through the causal watermark observed at callback completion.
+    // Delete/shutdown use dynamic=true to drain detached producers until the set is truly empty.
+    const watermark = options.dynamic
+      ? Number.POSITIVE_INFINITY
+      : (this.runtimeWriteSequences.get(sessionId) ?? 0);
     for (;;) {
-      const writes = [...(this.runtimeWrites.get(sessionId) ?? [])];
-      if (writes.length === 0) return;
+      const writes = [...(this.runtimeWrites.get(sessionId)?.entries() ?? [])]
+        .filter(([sequence]) => sequence <= watermark)
+        .map(([, promise]) => promise);
+      if (writes.length === 0) break;
       await Promise.allSettled(writes);
+      if (!options.dynamic) break;
+    }
+    const failures = this.runtimeWriteFailures.get(sessionId);
+    const observed: unknown[] = [];
+    if (failures) {
+      for (const [sequence, error] of failures) {
+        if (sequence <= watermark) {
+          observed.push(error);
+          failures.delete(sequence);
+        }
+      }
+      if (failures.size === 0) this.runtimeWriteFailures.delete(sessionId);
+    }
+    const overflow = this.runtimeWriteFailureOverflow.get(sessionId);
+    if (overflow && overflow.firstSequence <= watermark) {
+      this.runtimeWriteFailureOverflow.delete(sessionId);
+      observed.push(
+        new Error(`${overflow.count} additional runtime projection failures were suppressed`),
+      );
+    }
+    if (!options.discardFailures && observed.length > 0) {
+      throw new AggregateError(observed, `Runtime projection failed for session ${sessionId}`);
     }
   }
 
   private async recoverSessionCommands(session: ManagedSession): Promise<number> {
     const sessionId = session.meta.id;
+    // A process can die after the inbox terminal update commits but before the separate outbox
+    // enqueue. Rebuild the canonical event first; outbox/runtime idempotency makes every startup
+    // and explicit retry safe, including a second crash during this reconciliation itself.
+    await this.reconcileCommandTerminalEvents(sessionId);
     await this.outbox.flush();
     await this.runtime.reconcileInterrupted(sessionId);
     const commands = await this.commandInbox.recoverable(sessionId);
     let recovered = 0;
     for (const command of commands) {
-      if (session.running || this.deletingSessions.has(sessionId)) break;
+      if (this.disposed || session.running || this.deletingSessions.has(sessionId)) break;
       let claimed: DurableCommand;
       try {
         claimed = await this.commandInbox.claim(sessionId, command.id, this.workerId);
       } catch {
         continue;
       }
+      if (this.disposed) {
+        await this.commandInbox.finish(sessionId, claimed.id, "cancelled", "host shutting down", {
+          owner: this.workerId,
+          fencingToken: claimed.fencingToken ?? 0,
+        });
+        await this.publishCommandTerminalEvent({
+          ...claimed,
+          status: "cancelled",
+          error: "host shutting down",
+        });
+        break;
+      }
       this.activateCommand(claimed);
-      const stopHeartbeat = this.startCommandHeartbeat(claimed);
+      const heartbeat = this.startCommandHeartbeat(claimed);
       const historyAdvanced = session.snapshot().messages.length > command.messageCountBefore;
       await this.outbox.publish({
         streamId: sessionId,
@@ -2986,7 +4163,9 @@ export class SessionManager {
         idempotencyKey: `command:${command.id}:recovered:${claimed.attempts}`,
       });
       try {
+        await heartbeat.assertOwned();
         const recoveredTraceParent = parseTraceparent(command.traceparent);
+        const runBudgetSnapshot = await this.recoverRunBudgetSnapshot(sessionId, claimed);
         const outcome = await session.send(
           historyAdvanced
             ? t(
@@ -2998,69 +4177,242 @@ export class SessionManager {
             ...(command.model ? { model: command.model } : {}),
             ...(historyAdvanced ? { resume: true } : {}),
             ...(recoveredTraceParent ? { traceParent: recoveredTraceParent } : {}),
+            runBudgetSnapshot,
+            beforeToolExecution: () => this.assertCommandOwnership(claimed),
+            onRunBudgetCheckpoint: (snapshot) => this.persistRunBudgetCheckpoint(claimed, snapshot),
           },
         );
         await this.flushRuntimeWrites(sessionId);
+        await heartbeat.assertOwned();
         if (outcome.error) {
           await this.commandInbox.finish(sessionId, command.id, "failed", outcome.error.message, {
             owner: this.workerId,
             fencingToken: claimed.fencingToken ?? 0,
           });
-          await this.outbox.publish({
-            streamId: sessionId,
-            type: "prompt.failed",
-            data: { commandId: command.id, recovered: true, error: outcome.error.message },
-            idempotencyKey: `command:${command.id}:failed`,
+          await this.publishCommandTerminalEvent({
+            ...command,
+            status: "failed",
+            error: outcome.error.message,
           });
         } else {
           await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
             owner: this.workerId,
             fencingToken: claimed.fencingToken ?? 0,
           });
-          await this.outbox.publish({
-            streamId: sessionId,
-            type: "prompt.completed",
-            data: { commandId: command.id, recovered: true },
-            idempotencyKey: `command:${command.id}:completed`,
-          });
+          await this.publishCommandTerminalEvent({ ...command, status: "completed" });
           recovered++;
         }
       } catch (error) {
-        await this.commandInbox.finish(
-          sessionId,
-          command.id,
-          "failed",
-          error instanceof Error ? error.message : String(error),
-          { owner: this.workerId, fencingToken: claimed.fencingToken ?? 0 },
-        );
-        await this.outbox.publish({
-          streamId: sessionId,
-          type: "prompt.failed",
-          data: {
-            commandId: command.id,
-            recovered: true,
-            error: error instanceof Error ? error.message : String(error),
-          },
-          idempotencyKey: `command:${command.id}:failed`,
+        const terminal = await this.commandInbox.get(sessionId, command.id);
+        if (
+          terminal &&
+          (terminal.status === "completed" ||
+            terminal.status === "failed" ||
+            terminal.status === "cancelled")
+        ) {
+          await this.publishCommandTerminalEvent(terminal);
+          continue;
+        }
+        const terminalError = error instanceof Error ? error.message : String(error);
+        await this.commandInbox.finish(sessionId, command.id, "failed", terminalError, {
+          owner: this.workerId,
+          fencingToken: claimed.fencingToken ?? 0,
+        });
+        await this.publishCommandTerminalEvent({
+          ...command,
+          status: "failed",
+          error: terminalError,
         });
       } finally {
-        stopHeartbeat();
+        await heartbeat.stop();
         this.deactivateCommand(sessionId, command.id);
       }
     }
     return recovered;
   }
 
-  private startCommandHeartbeat(command: DurableCommand): () => void {
-    const timer = setInterval(
-      () =>
-        void this.commandInbox
-          .heartbeat(command.sessionId, command.id, this.workerId, 60_000, command.fencingToken)
-          .catch(() => undefined),
-      20_000,
+  private async reconcileCommandTerminalEvents(sessionId: string): Promise<void> {
+    const events = await this.runtime.events(sessionId);
+    const terminalEvents = new Map(
+      events
+        .filter((event) => event.idempotencyKey?.startsWith("command:"))
+        .map((event) => [event.idempotencyKey!, event] as const),
     );
+    const commands = await this.commandInbox.store.read(sessionId);
+    for (const command of commands) {
+      if (
+        command.status === "completed" ||
+        command.status === "failed" ||
+        command.status === "cancelled"
+      ) {
+        const key = `command:${command.id}:${command.status}`;
+        const existing = terminalEvents.get(key);
+        if (existing) {
+          const data = existing.data as { commandId?: unknown };
+          if (existing.type !== `prompt.${command.status}` || data.commandId !== command.id) {
+            throw new Error(`Conflicting terminal event for durable command ${command.id}`);
+          }
+          continue;
+        }
+        await this.publishCommandTerminalEvent(command);
+      }
+    }
+  }
+
+  /** Publish one canonical terminal event whose key and payload depend only on inbox state. */
+  private async publishCommandTerminalEvent(command: DurableCommand): Promise<void> {
+    if (
+      command.status !== "completed" &&
+      command.status !== "failed" &&
+      command.status !== "cancelled"
+    ) {
+      throw new Error(`Cannot publish non-terminal durable command ${command.id}`);
+    }
+    const error =
+      command.status === "completed"
+        ? undefined
+        : (command.error ?? `Durable command ${command.id} ${command.status}`);
+    await this.outbox.publish({
+      streamId: command.sessionId,
+      type: `prompt.${command.status}`,
+      data: { commandId: command.id, ...(error ? { error } : {}) },
+      idempotencyKey: `command:${command.id}:${command.status}`,
+    });
+  }
+
+  private startCommandHeartbeat(command: DurableCommand): {
+    assertOwned(): Promise<void>;
+    stop(): Promise<void>;
+  } {
+    let stopped = false;
+    let lost: Error | undefined;
+    let tail: Promise<void> = Promise.resolve();
+    const lose = (error: unknown) => {
+      if (lost) return;
+      lost = this.interruptedCommands.get(command.sessionId)?.has(command.id)
+        ? new Error(t("Session interrupted", "会话已中断"), { cause: error })
+        : error instanceof Error
+          ? error
+          : new Error(String(error));
+      if (this.interruptedCommands.get(command.sessionId)?.has(command.id)) return;
+      this.retireSessionAfterCommandLeaseLoss(command.sessionId);
+    };
+    const renew = (): Promise<void> => {
+      if (stopped) return tail;
+      tail = tail
+        .catch(() => undefined)
+        .then(() =>
+          this.commandInbox.heartbeat(
+            command.sessionId,
+            command.id,
+            this.workerId,
+            60_000,
+            command.fencingToken,
+          ),
+        )
+        .catch((error) => {
+          lose(error);
+        });
+      return tail;
+    };
+    const timer = setInterval(() => void renew(), 20_000);
     timer.unref?.();
-    return () => clearInterval(timer);
+    return {
+      async assertOwned() {
+        if (lost) throw lost;
+        await renew();
+        if (lost) throw lost;
+      },
+      async stop() {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(timer);
+        await tail;
+      },
+    };
+  }
+
+  /** One authoritative retirement path for timer, checkpoint and final tool-dispatch lease loss. */
+  private retireSessionAfterCommandLeaseLoss(sessionId: string): void {
+    if (this.retiringSessions.has(sessionId)) return;
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.stopBackgroundTasks();
+    session.close();
+    const retirement = (async () => {
+      const drained = await Promise.allSettled([
+        session.whenIdle(),
+        session.whenBackgroundTasksIdle(),
+        session.whenPersistenceIdle(),
+      ]);
+      const failures = drained.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(failures, `Failed to retire session ${sessionId}`);
+      }
+      if (this.sessions.get(sessionId) === session && !this.deletingSessions.has(sessionId)) {
+        this.sessions.delete(sessionId);
+        await this.closeSessionLspPool(sessionId).catch(() => undefined);
+        await this.waitForLspTermination(sessionId);
+      }
+    })();
+    this.retiringSessions.set(sessionId, retirement);
+    void retirement
+      .finally(() => {
+        if (this.retiringSessions.get(sessionId) === retirement) {
+          this.retiringSessions.delete(sessionId);
+        }
+      })
+      .catch((error) => {
+        this.durabilityFailureCount++;
+        if (this.durabilityFailures.length < MAX_DURABILITY_FAILURE_DETAILS) {
+          this.durabilityFailures.push(error);
+        }
+      });
+  }
+
+  /** Join an already-running idempotent retry without ever taking over its live lease. */
+  private async waitForCommandTerminal(
+    command: DurableCommand,
+    interruptEpoch: number,
+  ): Promise<void> {
+    const configuredWallTime = this.opts.runBudget?.maxWallTimeMs ?? 30 * 60_000;
+    const createdAt = Date.parse(command.createdAt);
+    // One lease interval accounts for durable ACK/projection after the model wall-time budget.
+    const deadline = Math.max(
+      Date.now() + 1_000,
+      (Number.isFinite(createdAt) ? createdAt : Date.now()) + configuredWallTime + 60_000,
+    );
+    for (;;) {
+      this.assertSendGeneration(command.sessionId, interruptEpoch);
+      this.assertSessionAvailable(command.sessionId);
+      const current = await this.commandInbox.get(command.sessionId, command.id);
+      if (!current) throw new Error(`Durable command ${command.id} disappeared while joining`);
+      if (current.status === "completed") {
+        await this.publishCommandTerminalEvent(current);
+        return;
+      }
+      if (current.status === "failed" || current.status === "cancelled") {
+        await this.publishCommandTerminalEvent(current);
+        throw new Error(current.error ?? `Durable command ${command.id} ${current.status}`);
+      }
+      if (
+        current.status === "running" &&
+        current.leaseExpiresAt !== undefined &&
+        Date.parse(current.leaseExpiresAt) <= Date.now()
+      ) {
+        throw new Error(
+          `Durable command ${command.id} lease expired before completion; recovery is required`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for idempotent command ${command.id}`);
+      }
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, Math.min(100, this.sessionLifecyclePollMs)),
+      );
+    }
   }
 
   private activateCommand(command: DurableCommand): void {
@@ -3070,6 +4422,9 @@ export class SessionManager {
   }
 
   private deactivateCommand(sessionId: string, commandId: string): void {
+    const interrupted = this.interruptedCommands.get(sessionId);
+    interrupted?.delete(commandId);
+    if (interrupted?.size === 0) this.interruptedCommands.delete(sessionId);
     const active = this.activeCommands.get(sessionId);
     if (!active) return;
     active.delete(commandId);

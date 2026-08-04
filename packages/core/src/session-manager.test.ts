@@ -16,6 +16,7 @@ import { SessionManager, type SessionEvent } from "./session-manager.js";
 import { MigratingSessionStore, SessionStore } from "./session.js";
 import { MemoryArtifactStore, type ArtifactStore } from "./runtime/artifacts.js";
 import { DurableRuntime, MemoryRuntimeEventStore } from "./runtime/durable.js";
+import { CommandInbox, MemoryCommandInboxStore, type DurableCommand } from "./runtime/commands.js";
 import type { IsolatedRunRequest } from "./runtime/isolated-runtime.js";
 import { PatchSetService } from "./runtime/patchset.js";
 import type { Provider, StreamEvent, ChatMessage, StreamRequest } from "./types.js";
@@ -24,6 +25,7 @@ import {
   RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES,
   RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES,
 } from "./tools/index.js";
+import { ToolRegistry } from "./tools/tool.js";
 
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
@@ -103,6 +105,25 @@ test("SessionManager: 多订阅者都收到同一批事件", async () => {
   subA.close();
   subB.close();
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: snapshot 权限模式反映初始配置与运行时切换", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-permission-mode-"));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    permission: { mode: "acceptEdits" },
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    assert.equal((await manager.resumeSession(session.id)).permissionMode, "acceptEdits");
+
+    await manager.setPermissionMode(session.id, "plan");
+    assert.equal(manager.peek(session.id)?.permissionMode, "plan");
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("SessionManager: workspace scope 以 canonical cwd 隔离 list/create/load/fork", async () => {
@@ -733,6 +754,130 @@ test("SessionManager: 未信任 cwd 的非 default 启动模式退回只读 plan
   }
 });
 
+test("SessionManager: 显式关闭受限开发能力优先于 legacy default-mode 推断", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-no-dev-intent-"));
+  let captured: StreamRequest | undefined;
+  const provider: Provider = {
+    name: "capture-no-dev-intent",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      captured = request;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "restricted" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: async () => ({
+      trusted: false,
+      reason: "not-trusted",
+      executionSources: [],
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+    permission: { mode: "default" },
+    allowRestrictedWorkspaceDevelopment: false,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "capture" });
+    assert.equal(manager.peek(session.id)?.permissionMode, "plan");
+    await manager.send(session.id, "inspect only");
+    assert.deepEqual(
+      (captured?.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES].sort(),
+    );
+  } finally {
+    await manager.shutdown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 显式交互能力让高权限会话在 trust 撤销后降为 restricted default+confirm", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-interactive-intent-"));
+  const fingerprint = await workspaceExecutionFingerprint(dir);
+  let granted = true;
+  let turn = 0;
+  const requests: StreamRequest[] = [];
+  const provider: Provider = {
+    name: "capture-interactive-intent",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      requests.push(request);
+      const content: ChatMessage["content"] =
+        turn++ === 0
+          ? [
+              {
+                type: "tool_call",
+                id: "write-after-revoke",
+                name: "write",
+                args: { path: "must-not-exist.txt", content: "blocked" },
+              },
+            ]
+          : [{ type: "text", text: "permission handled" }];
+      yield {
+        type: "done",
+        stopReason: content.some((part) => part.type === "tool_call") ? "tool_use" : "end_turn",
+        message: { role: "assistant", content },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: async () => ({
+      trusted: granted,
+      reason: granted ? ("trusted" as const) : ("not-trusted" as const),
+      identity: fingerprint.identity,
+      executionHash: fingerprint.executionHash,
+      executionSources: fingerprint.executionSources,
+      storeFile: path.join(dir, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+    permission: { mode: "bypass" },
+    allowRestrictedWorkspaceDevelopment: true,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "capture" });
+    const events: SessionEvent[] = [];
+    const opened = await manager.open(session.id, (event) => {
+      events.push(event);
+      if (event.type === "permission_request") {
+        void manager.answerPermission(session.id, event.permId, "deny");
+      }
+    });
+    assert.equal(opened.snapshot.permissionMode, "bypass");
+
+    granted = false;
+    const restricted = await manager.resumeSession(session.id);
+    assert.equal(restricted.workspaceTrust?.trusted, false);
+    assert.equal(restricted.permissionMode, "default");
+
+    await manager.send(session.id, "attempt a write after trust was revoked");
+    assert.deepEqual(
+      (requests[0]?.tools ?? []).map((tool) => tool.name).sort(),
+      [...RESTRICTED_WORKSPACE_DEVELOPMENT_TOOL_NAMES].sort(),
+    );
+    assert.ok(
+      events.some(
+        (event) => event.type === "permission_request" && event.permId === "write-after-revoke",
+      ),
+      "restricted default must route side effects through the interactive confirmation callback",
+    );
+    assert.equal(
+      await fs.stat(path.join(dir, "must-not-exist.txt")).catch(() => undefined),
+      undefined,
+    );
+    opened.close();
+  } finally {
+    await manager.shutdown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager: 未信任 auto+ask 的只读调用不请求授权、不挂起，deny 仍优先", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-headless-ask-"));
   await fs.writeFile(path.join(dir, "safe.txt"), "safe");
@@ -962,7 +1107,7 @@ test("SessionManager: 未信任 default 下 write/bash 仍请求授权，bash �
   }
 });
 
-test("SessionManager: trust resolver 异常 fail closed 为最小只读；projectMemory=false 透传给 Agent", async () => {
+test("SessionManager: 交互能力也不能放宽 inspection-failed；projectMemory=false 透传给 Agent", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-trust-fail-"));
   await fs.writeFile(path.join(dir, "AGENTS.md"), "MEMORY_MUST_NOT_LOAD");
   let captured: StreamRequest | undefined;
@@ -984,11 +1129,14 @@ test("SessionManager: trust resolver 异常 fail closed 为最小只读；projec
     workspaceTrust: async () => {
       throw new Error("trust backend unavailable");
     },
+    permission: { mode: "bypass" },
+    allowRestrictedWorkspaceDevelopment: true,
     projectMemory: false,
   });
   try {
     const session = await manager.createSession({ cwd: dir, model: "capture" });
     assert.equal(manager.peek(session.id)?.workspaceTrust?.reason, "inspection-failed");
+    assert.equal(manager.peek(session.id)?.permissionMode, "plan");
     assert.match(manager.peek(session.id)?.workspaceTrust?.error ?? "", /backend unavailable/);
     await manager.send(session.id, "hello");
     assert.doesNotMatch(captured?.system ?? "", /MEMORY_MUST_NOT_LOAD/);
@@ -1603,6 +1751,185 @@ test("SessionManager: dispose 后即使 provider 忽略 AbortSignal 也不会执
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("SessionManager: shutdown 同步封死新工作并等待已开始的冷加载", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-shutdown-fence-"));
+  const store = new SessionStore(path.join(dir, "sessions"));
+  const creator = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  const created = await creator.createSession({ cwd: dir, model: "scripted" });
+  await creator.shutdown();
+
+  const loadStarted = deferred();
+  const releaseLoad = deferred();
+  const originalLoad = store.load.bind(store);
+  store.load = async (id) => {
+    loadStarted.resolve();
+    await releaseLoad.promise;
+    return originalLoad(id);
+  };
+  const manager = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  const resuming = manager.resumeSession(created.id);
+  await loadStarted.promise;
+  let shutdownSettled = false;
+  const shuttingDown = manager.shutdown().then(() => {
+    shutdownSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(shutdownSettled, false, "shutdown 必须等待 fence 前已经开始的 load");
+  await assert.rejects(
+    manager.createSession({ cwd: dir, model: "scripted" }),
+    /shutting down|disposed/,
+  );
+  await assert.rejects(manager.listSessions(), /shutting down|disposed/);
+  await assert.rejects(
+    manager.send(created.id, "late"),
+    /shutting down|disposed|shutdown deadline exceeded/,
+  );
+  assert.throws(() => manager.peek(created.id), /shutting down|disposed/);
+
+  releaseLoad.resolve();
+  await assert.rejects(resuming, /shutting down|disposed/);
+  await shuttingDown;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: shutdown 对不协作的持久后端执行全局硬截止并保持 fence", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-shutdown-deadline-"));
+  const store = new SessionStore(path.join(dir, "sessions"));
+  const creator = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+  });
+  const created = await creator.createSession({ cwd: dir, model: "scripted" });
+  await creator.shutdown();
+
+  const loadStarted = deferred();
+  store.load = async () => {
+    loadStarted.resolve();
+    return new Promise<never>(() => undefined);
+  };
+  const manager = new SessionManager({
+    store,
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    recoverCommands: false,
+    shutdownTimeoutMs: 25,
+  });
+  void manager.resumeSession(created.id).catch(() => undefined);
+  await loadStarted.promise;
+
+  const startedAt = Date.now();
+  await assert.rejects(manager.shutdown(), /shutdown exceeded the 25ms hard deadline/);
+  assert.ok(Date.now() - startedAt < 1_000, "shutdown 不能永久等待不协作的 store");
+  await assert.rejects(
+    manager.send(created.id, "late"),
+    /shutting down|disposed|shutdown deadline exceeded/,
+  );
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: steering 必须在 durable accept+claim 完成后才进入 Agent", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-steering-durable-"));
+  const acceptStarted = deferred();
+  const releaseAccept = deferred();
+  class SlowSecondAcceptStore extends MemoryCommandInboxStore {
+    override async write(sessionId: string, commands: DurableCommand[]): Promise<void> {
+      if (commands.some((command) => command.text === "second")) {
+        acceptStarted.resolve();
+        await releaseAccept.promise;
+      }
+      await super.write(sessionId, commands);
+    }
+  }
+  const firstStreamStarted = deferred();
+  const releaseFirstStream = deferred();
+  let providerCalls = 0;
+  const provider: Provider = {
+    name: "durable-steering",
+    async *stream(): AsyncIterable<StreamEvent> {
+      const turn = providerCalls++;
+      if (turn === 0) {
+        firstStreamStarted.resolve();
+        await releaseFirstStream.promise;
+      }
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: `turn-${turn}` }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    commandInbox: new CommandInbox(new SlowSecondAcceptStore()),
+    resolveProvider: () => ({ provider, model: "durable-steering" }),
+    recoverCommands: false,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "durable-steering" });
+    const first = manager.send(session.id, "first");
+    await firstStreamStarted.promise;
+    const second = manager.send(session.id, "second");
+    await acceptStarted.promise;
+    releaseFirstStream.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(providerCalls, 1, "未耐久的 steering 不能被当前 drive 消费");
+
+    releaseAccept.resolve();
+    await Promise.all([first, second]);
+    assert.equal(providerCalls, 2);
+  } finally {
+    releaseFirstStream.resolve();
+    releaseAccept.resolve();
+    await manager.shutdown().catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: command fencing heartbeat 失败时在 provider/tool 前 fail closed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-command-fence-"));
+  class LostLeaseStore extends MemoryCommandInboxStore {
+    async heartbeatCommand(): Promise<void> {
+      throw new Error("stale command fencing token");
+    }
+  }
+  let providerCalls = 0;
+  const provider: Provider = {
+    name: "must-not-run",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerCalls++;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "unsafe" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    commandInbox: new CommandInbox(new LostLeaseStore()),
+    resolveProvider: () => ({ provider, model: "must-not-run" }),
+    recoverCommands: false,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "must-not-run" });
+    await assert.rejects(manager.send(session.id, "do not execute"), /stale command fencing token/);
+    assert.equal(providerCalls, 0);
+  } finally {
+    await manager.shutdown().catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager: setTitle 更新标题并持久化，list/resume 都可见", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-"));
   const m = await mgr(
@@ -1936,7 +2263,7 @@ test("SessionManager: delete fence 等待并发冷载入，不让 load 迟到重
     recoverCommands: false,
   });
   const created = await creator.createSession({ cwd: dir, model: "scripted" });
-  creator.dispose();
+  await creator.shutdown();
 
   const loadStarted = deferred();
   const releaseLoad = deferred();
@@ -1972,7 +2299,7 @@ test("SessionManager: delete fence 等待并发冷载入，不让 load 迟到重
     await assert.rejects(() => originalLoad(created.id));
   } finally {
     releaseLoad.resolve();
-    manager.dispose();
+    await manager.shutdown();
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
@@ -2132,13 +2459,13 @@ test("SessionManager.compact: 手动压缩广播 compacted 事件并收缩历史
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("SessionManager.autoTitle: 首轮后用模型起标题、持久化并广播 title 事件", async () => {
+test("SessionManager.autoTitle: 首轮后本地起标题、持久化并广播 title 事件", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-title-"));
-  // 第 1 轮=正常回答；第 2 次调用即起名请求，返回带引号/句号的标题验证清洗
+  // 自动标题不再启动账外模型调用；三条脚本只对应三次正常用户回合。
   const provider = scriptedProvider([
     [{ role: "assistant", content: [{ type: "text", text: "好的，我来修" }] }],
-    [{ role: "assistant", content: [{ type: "text", text: "「修复登录超时。」" }] }],
     [{ role: "assistant", content: [{ type: "text", text: "第二轮回答" }] }],
+    [{ role: "assistant", content: [{ type: "text", text: "命名会话回答" }] }],
   ]);
   let tick = 1_700_000_200_000;
   const m = new SessionManager({
@@ -2153,10 +2480,15 @@ test("SessionManager.autoTitle: 首轮后用模型起标题、持久化并广播
   await m.open(s.id, (ev) => events.push(ev));
   await m.send(s.id, "登录接口超时了，帮我修一下");
 
+  const titleDeadline = Date.now() + 1_000;
+  while (!events.some((event) => event.type === "title") && Date.now() < titleDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
   const titled = events.find((e) => e.type === "title") as any;
   assert.ok(titled, "应广播 title 事件");
-  assert.equal(titled.title, "修复登录超时");
-  assert.equal((await m.resumeSession(s.id)).meta.title, "修复登录超时");
+  assert.equal(titled.title, "登录接口超时了");
+  assert.equal((await m.resumeSession(s.id)).meta.title, "登录接口超时了");
 
   // 已有标题后不再重复起名（第二轮消耗脚本第 3 条）
   await m.send(s.id, "继续");
@@ -2167,7 +2499,7 @@ test("SessionManager.autoTitle: 首轮后用模型起标题、持久化并广播
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({ provider, model: "scripted" }),
   });
-  assert.equal((await m2.resumeSession(s.id)).meta.title, "修复登录超时");
+  assert.equal((await m2.resumeSession(s.id)).meta.title, "登录接口超时了");
 
   // 显式命名的会话不会被覆盖
   const named = await m.createSession({ cwd: dir, model: "scripted", title: "手动标题" });
@@ -2175,6 +2507,8 @@ test("SessionManager.autoTitle: 首轮后用模型起标题、持久化并广播
   await m.send(named.id, "任务");
   assert.equal((await m.resumeSession(named.id)).meta.title, "手动标题");
 
+  await m.shutdown();
+  await m2.shutdown();
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -2184,6 +2518,7 @@ test("SessionManager: 后台任务空闲期完成 → 自动发起 drive 消化�
   let releaseChild!: () => void;
   const childGate = new Promise<void>((r) => (releaseChild = r));
   const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  let childEffect = false;
 
   // 子 agent 请求的辨识：它的用户消息文本就是 task prompt（"去干"）。
   const provider: Provider = {
@@ -2194,6 +2529,21 @@ test("SessionManager: 后台任务空闲期完成 → 自动发起 drive 消化�
       );
       if (isChild) {
         await childGate;
+        const hasToolResult = req.messages.some((message) =>
+          message.content.some((part) => part.type === "tool_result"),
+        );
+        if (!hasToolResult) {
+          yield {
+            type: "done",
+            stopReason: "tool_use",
+            message: {
+              role: "assistant",
+              content: [{ type: "tool_call", id: "child-write", name: "child_effect", args: {} }],
+            },
+            usage: zero,
+          };
+          return;
+        }
         yield {
           type: "done",
           stopReason: "end_turn",
@@ -2223,23 +2573,52 @@ test("SessionManager: 后台任务空闲期完成 → 自动发起 drive 消化�
     },
   };
 
+  const commandInbox = new CommandInbox(new MemoryCommandInboxStore());
+
   const m = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({ provider, model: "p" }),
     subagents: true,
     permission: { mode: "auto" },
+    commandInbox,
+    tools: () =>
+      new ToolRegistry().register({
+        def: { name: "child_effect", description: "child effect", parameters: { type: "object" } },
+        readOnly: false,
+        capabilities: ["filesystem-write"],
+        ruleKey: () => "child effect",
+        async run() {
+          childEffect = true;
+          return "effect committed";
+        },
+      }),
   });
   const s = await m.createSession({ cwd: dir, model: "p" });
   const events: SessionEvent[] = [];
   await m.open(s.id, (ev) => events.push(ev));
   await m.send(s.id, "开始");
   assert.equal(parentTurn, 2, "第一次 drive 结束（task 立即返回 + 收尾轮）");
+  assert.equal(childEffect, false, "root send 返回时后台副作用尚未发生");
+  const runningCommand = (await commandInbox.store.read(s.id))[0]!;
+  assert.equal(runningCommand.status, "running", "后台树运行期间 root command 必须保留 lease");
 
   // 会话空闲后子任务才完成 → onTaskNotice → 自动 send 通知 → 第二次 drive
   releaseChild();
   const deadline = Date.now() + 3000;
   while (parentTurn < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
   assert.equal(parentTurn, 3, "应自动发起第二次 drive");
+  assert.equal(childEffect, true, "后台子 agent 应在同一 command fence 内提交工具调用");
+  const terminalDeadline = Date.now() + 3_000;
+  let terminal = (await commandInbox.store.read(s.id)).find(
+    (command) => command.id === runningCommand.id,
+  );
+  while (terminal?.status !== "completed" && Date.now() < terminalDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    terminal = (await commandInbox.store.read(s.id)).find(
+      (command) => command.id === runningCommand.id,
+    );
+  }
+  assert.equal(terminal?.status, "completed");
   const notif = events.find(
     (e) =>
       e.type === "agent" &&

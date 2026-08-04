@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { CredentialBroker } from "../security/credentials.js";
 import { sanitizedShellEnv } from "../tools/shell-spawn.js";
@@ -11,6 +11,7 @@ import type {
   IsolatedRunRequest,
   IsolatedRunResult,
 } from "./isolated-runtime.js";
+import { assertBoundedStdin, terminateProcessTree } from "./isolated-runtime.js";
 import type { ScopedProxyCredentialIssuer, ScopedProxyCredentialLease } from "./network-proxy.js";
 
 export interface ContainerProcessResult {
@@ -26,6 +27,7 @@ export type ContainerProcessRunner = (
   timeoutMs: number,
   outputLimit: number,
   signal?: AbortSignal,
+  stdin?: string,
 ) => Promise<ContainerProcessResult>;
 
 export interface ContainerIsolatedRuntimeOptions {
@@ -45,6 +47,22 @@ export interface ContainerIsolatedRuntimeOptions {
   requirePinnedImage?: boolean;
   /** Test/embedding seam; production uses the local OCI CLI runner. */
   processRunner?: ContainerProcessRunner;
+  /** Trusted Docker/Podman CLI control-plane environment; never forwarded with container --env. */
+  controlEnvironment?: NodeJS.ProcessEnv;
+  /** Durable bounded journal used to reconcile containers after host/daemon crashes. */
+  orphanJournalPath?: string;
+  orphanJournalLimit?: number;
+  /** `false` disables periodic replay (tests); production defaults to one minute. */
+  orphanReconcileIntervalMs?: number | false;
+}
+
+interface ContainerOrphanRecord {
+  name: string;
+  engine: "docker" | "podman";
+  startedAt: string;
+  tenantId?: string;
+  actor?: string;
+  executionId?: string;
 }
 
 function safeName(value: string, label: string): string {
@@ -62,22 +80,89 @@ function canonical(value: string): string {
   }
 }
 
+const CONTAINER_ENGINE_CONTROL_ENV = [
+  "HOME",
+  "USERPROFILE",
+  "DOCKER_CONFIG",
+  "DOCKER_HOST",
+  "DOCKER_CONTEXT",
+  "DOCKER_CERT_PATH",
+  "DOCKER_TLS_VERIFY",
+  "CONTAINER_HOST",
+  "CONTAINER_CONNECTION",
+  "CONTAINERS_CONF",
+  "REGISTRY_AUTH_FILE",
+  "XDG_RUNTIME_DIR",
+  "SSH_AUTH_SOCK",
+] as const;
+
+/**
+ * Docker/Podman is trusted control-plane code and may need its context, registry auth and socket.
+ * Workload variables are merged only so `docker --env KEY` can source their values; control-plane
+ * keys are never added to that argv list by the caller.
+ */
+export function containerEngineEnvironment(
+  workload: NodeJS.ProcessEnv = {},
+  control: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env = { ...sanitizedShellEnv(control), ...workload };
+  for (const key of CONTAINER_ENGINE_CONTROL_ENV) {
+    const value = control[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
 export class ContainerIsolatedRuntime implements ExecutionRuntime {
   private readonly engine: "docker" | "podman";
   private readonly outputLimit: number;
   private readonly broker?: CredentialBroker;
   private readonly processRunner: ContainerProcessRunner;
+  private readonly controlEnvironment: NodeJS.ProcessEnv;
   private networkChecked = false;
+  private readonly orphanJournal?: ContainerOrphanJournal;
+  private readonly activeContainers = new Set<string>();
+  private reconciliationTail: Promise<void> = Promise.resolve();
+  private reconciliationTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly options: ContainerIsolatedRuntimeOptions) {
     this.engine = options.engine ?? "docker";
     this.outputLimit = Math.max(1_000, options.outputLimitChars ?? 60_000);
-    this.processRunner = options.processRunner ?? runProcess;
+    this.processRunner = options.processRunner ?? runContainerCliProcess;
+    this.controlEnvironment = options.controlEnvironment ?? process.env;
     if (options.broker) this.broker = options.broker;
     if (options.proxyUrl) assertCredentialFreeProxyUrl(options.proxyUrl);
     if ((options.requirePinnedImage ?? true) && !options.image.includes("@sha256:")) {
       throw new Error("Container runtime image must be pinned by sha256 digest");
     }
+    if (options.orphanJournalPath) {
+      this.orphanJournal = new ContainerOrphanJournal(
+        options.orphanJournalPath,
+        options.orphanJournalLimit,
+      );
+      void this.reconcileOrphans().catch(() => undefined);
+      if (options.orphanReconcileIntervalMs !== false) {
+        const intervalMs = Math.max(1_000, options.orphanReconcileIntervalMs ?? 60_000);
+        this.reconciliationTimer = setInterval(
+          () => void this.reconcileOrphans().catch(() => undefined),
+          intervalMs,
+        );
+        this.reconciliationTimer.unref?.();
+      }
+    }
+  }
+
+  /** Startup/periodic/operator replay. A failed proof keeps the record and rejects fail-closed. */
+  reconcileOrphans(): Promise<void> {
+    const task = this.reconciliationTail.then(() => this.reconcileOrphansNow());
+    this.reconciliationTail = task.catch(() => undefined);
+    return task;
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.reconciliationTimer) clearInterval(this.reconciliationTimer);
+    this.reconciliationTimer = undefined;
+    await this.reconciliationTail;
   }
 
   private async verifyInternalNetwork(): Promise<void> {
@@ -86,7 +171,7 @@ export class ContainerIsolatedRuntime implements ExecutionRuntime {
     const result = await this.processRunner(
       this.engine,
       ["network", "inspect", "--format", "{{.Internal}}", network],
-      sanitizedShellEnv(),
+      containerEngineEnvironment(undefined, this.controlEnvironment),
       10_000,
       4_000,
     );
@@ -99,6 +184,8 @@ export class ContainerIsolatedRuntime implements ExecutionRuntime {
   async run(request: IsolatedRunRequest): Promise<IsolatedRunResult> {
     const started = Date.now();
     request.signal?.throwIfAborted();
+    assertBoundedStdin(request.stdin);
+    if (this.orphanJournal) await this.reconcileOrphans();
     const cwd = canonical(request.cwd);
     const network = request.network ?? false;
     const timeoutMs = Math.max(1_000, request.timeoutMs ?? 120_000);
@@ -133,8 +220,22 @@ export class ContainerIsolatedRuntime implements ExecutionRuntime {
       value;
 
     const name = `anicode-${process.pid}-${randomUUID().slice(0, 12)}`;
+    let outcome: IsolatedRunResult | undefined;
+    let failure: Error | undefined;
+    this.activeContainers.add(name);
     try {
-      let containerEnv: NodeJS.ProcessEnv = { ...sanitizedShellEnv(), ...request.env };
+      await this.orphanJournal?.add({
+        name,
+        engine: this.engine,
+        startedAt: new Date().toISOString(),
+        ...(request.workload?.tenantId ? { tenantId: request.workload.tenantId } : {}),
+        ...(request.workload?.actor ? { actor: request.workload.actor } : {}),
+        ...(request.workload?.executionId ? { executionId: request.workload.executionId } : {}),
+      });
+      let containerEnv: NodeJS.ProcessEnv = sanitizedShellEnv({
+        ...this.controlEnvironment,
+        ...request.env,
+      });
       for (const lease of request.credentialLeases ?? []) {
         if (!this.broker) throw new Error("No credential broker configured");
         containerEnv = this.broker.injectEnv(lease, containerEnv);
@@ -151,12 +252,25 @@ export class ContainerIsolatedRuntime implements ExecutionRuntime {
         delete containerEnv.ALL_PROXY;
         delete containerEnv.NO_PROXY;
       }
+      // The container has no host HOME to discover. Omitting these keys preserves the image's
+      // internal HOME while keeping the Docker/Podman CLI's trusted config plane separate.
+      for (const key of [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+      ]) {
+        delete containerEnv[key];
+      }
+      const engineEnv = containerEngineEnvironment(containerEnv, this.controlEnvironment);
 
       const args = [
         "run",
         "--rm",
         "--name",
         name,
+        ...(request.stdin === undefined ? [] : ["--interactive"]),
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
@@ -190,12 +304,13 @@ export class ContainerIsolatedRuntime implements ExecutionRuntime {
       const result = await this.processRunner(
         this.engine,
         args,
-        containerEnv,
+        engineEnv,
         timeoutMs,
         this.outputLimit,
         request.signal,
+        request.stdin,
       );
-      return {
+      outcome = {
         exitCode: result.exitCode,
         output: redact(result.output),
         timedOut: result.timedOut,
@@ -206,21 +321,241 @@ export class ContainerIsolatedRuntime implements ExecutionRuntime {
       const message = redact(error instanceof Error ? error.message : String(error));
       // The original error can contain the injected capability in env/argv diagnostics. Keeping it
       // as `cause` would bypass the redaction boundary.
-      // eslint-disable-next-line preserve-caught-error
-      throw new Error(message);
+      failure = new Error(message);
     } finally {
       // `docker run --rm` normally removes the container itself. Timeout, abort, daemon errors and
-      // a killed Docker CLI can leave it running, so every exit path performs an awaited cleanup.
+      // a killed Docker CLI can leave it running, so every exit path performs an awaited stop/remove
+      // by its unique container identifier. Cleanup is intentionally detached from request.signal:
+      // an already-aborted caller must not cancel the operation that makes cancellation truthful.
       await this.processRunner(
         this.engine,
-        ["rm", "--force", name],
-        sanitizedShellEnv(),
+        ["stop", "--time", "1", name],
+        containerEngineEnvironment(undefined, this.controlEnvironment),
         10_000,
         2_000,
       ).catch(() => undefined);
+      let cleanupError: Error | undefined;
+      const removed = await this.processRunner(
+        this.engine,
+        ["rm", "--force", name],
+        containerEngineEnvironment(undefined, this.controlEnvironment),
+        10_000,
+        2_000,
+      ).catch((error) => {
+        cleanupError = error instanceof Error ? error : new Error(String(error));
+        return undefined;
+      });
+      if (!removed || removed.timedOut || removed.exitCode !== 0) {
+        const inspected = await this.processRunner(
+          this.engine,
+          ["container", "inspect", name],
+          containerEngineEnvironment(undefined, this.controlEnvironment),
+          10_000,
+          2_000,
+        ).catch((error) => {
+          cleanupError = new Error(
+            `Cannot prove container ${name} was removed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        });
+        if (inspected?.exitCode === 0) {
+          cleanupError = new Error(`Container ${name} still exists after stop/rm cleanup`);
+        } else if (inspected && containerInspectProvesMissing(inspected, name)) {
+          cleanupError = undefined;
+        } else if (inspected) {
+          cleanupError = new Error(
+            `Cannot prove container ${name} was removed (inspect exit=${inspected.exitCode}, timedOut=${inspected.timedOut})`,
+          );
+        }
+      }
       await proxyCredential?.revoke().catch(() => undefined);
+      this.activeContainers.delete(name);
+      if (!cleanupError) {
+        await this.orphanJournal?.remove(name);
+      }
+      if (cleanupError) {
+        const cleanupFailure = new Error(redact(cleanupError.message));
+        failure = failure
+          ? new AggregateError([failure, cleanupFailure], "Container execution and cleanup failed")
+          : cleanupFailure;
+      }
+    }
+    if (failure) throw failure;
+    if (!outcome) throw new Error("Container execution completed without a result");
+    return outcome;
+  }
+
+  private async reconcileOrphansNow(): Promise<void> {
+    if (!this.orphanJournal) return;
+    const records = await this.orphanJournal.list();
+    const failures: Error[] = [];
+    for (const record of records) {
+      if (this.activeContainers.has(record.name)) continue;
+      await this.processRunner(
+        record.engine,
+        ["stop", "--time", "1", record.name],
+        containerEngineEnvironment(undefined, this.controlEnvironment),
+        10_000,
+        2_000,
+      ).catch(() => undefined);
+      const removed = await this.processRunner(
+        record.engine,
+        ["rm", "--force", record.name],
+        containerEngineEnvironment(undefined, this.controlEnvironment),
+        10_000,
+        2_000,
+      ).catch(() => undefined);
+      if (removed?.exitCode === 0 && !removed.timedOut) {
+        await this.orphanJournal.remove(record.name);
+        continue;
+      }
+      const inspected = await this.processRunner(
+        record.engine,
+        ["container", "inspect", record.name],
+        containerEngineEnvironment(undefined, this.controlEnvironment),
+        10_000,
+        2_000,
+      ).catch(() => undefined);
+      if (inspected && containerInspectProvesMissing(inspected, record.name)) {
+        await this.orphanJournal.remove(record.name);
+        continue;
+      }
+      failures.push(new Error(`Cannot reconcile orphan container ${record.name}`));
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Container orphan reconciliation failed");
     }
   }
+}
+
+class ContainerOrphanJournal {
+  private tail: Promise<void> = Promise.resolve();
+  private readonly limit: number;
+
+  constructor(
+    private readonly file: string,
+    limit?: number,
+  ) {
+    this.limit = Math.max(1, Math.min(10_000, Math.floor(limit ?? 1_024)));
+  }
+
+  list(): Promise<ContainerOrphanRecord[]> {
+    return this.lock(() => this.read());
+  }
+
+  add(record: ContainerOrphanRecord): Promise<void> {
+    return this.lock(async () => {
+      const records = await this.read();
+      if (records.some((item) => item.name === record.name)) return;
+      if (records.length >= this.limit) {
+        throw new Error(`Container orphan journal reached its ${this.limit} record limit`);
+      }
+      records.push(record);
+      await this.write(records);
+    });
+  }
+
+  remove(name: string): Promise<void> {
+    return this.lock(async () => {
+      const records = await this.read();
+      const next = records.filter((record) => record.name !== name);
+      if (next.length !== records.length) await this.write(next);
+    });
+  }
+
+  private lock<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(operation);
+    this.tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async read(): Promise<ContainerOrphanRecord[]> {
+    let raw: string;
+    try {
+      const stat = await fs.lstat(this.file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024) {
+        throw new Error("Container orphan journal must be a regular bounded file");
+      }
+      raw = await fs.readFile(this.file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const parsed = JSON.parse(raw) as { version?: unknown; records?: unknown };
+    if (parsed.version !== 1 || !Array.isArray(parsed.records)) {
+      throw new Error("Invalid container orphan journal format");
+    }
+    return parsed.records.map(parseOrphanRecord);
+  }
+
+  private async write(records: ContainerOrphanRecord[]): Promise<void> {
+    const directory = path.dirname(this.file);
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
+    const handle = await fs.open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify({ version: 1, records })}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await fs.rename(temporary, this.file);
+      if (process.platform !== "win32") {
+        const directoryHandle = await fs.open(directory, "r");
+        try {
+          await directoryHandle.sync();
+        } finally {
+          await directoryHandle.close();
+        }
+      }
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+}
+
+function parseOrphanRecord(value: unknown): ContainerOrphanRecord {
+  const record = value as Partial<ContainerOrphanRecord> | null;
+  if (
+    !record ||
+    !safeContainerIdentifier(record.name) ||
+    (record.engine !== "docker" && record.engine !== "podman") ||
+    typeof record.startedAt !== "string" ||
+    !Number.isFinite(Date.parse(record.startedAt))
+  ) {
+    throw new Error("Invalid container orphan journal record");
+  }
+  for (const field of [record.tenantId, record.actor, record.executionId]) {
+    if (field !== undefined && (typeof field !== "string" || field.length > 512)) {
+      throw new Error("Invalid container orphan ownership metadata");
+    }
+  }
+  return {
+    name: record.name,
+    engine: record.engine,
+    startedAt: record.startedAt,
+    ...(record.tenantId ? { tenantId: record.tenantId } : {}),
+    ...(record.actor ? { actor: record.actor } : {}),
+    ...(record.executionId ? { executionId: record.executionId } : {}),
+  };
+}
+
+function safeContainerIdentifier(value: unknown): value is string {
+  return typeof value === "string" && /^anicode-[A-Za-z0-9_.-]{1,120}$/.test(value);
+}
+
+function containerInspectProvesMissing(result: ContainerProcessResult, name: string): boolean {
+  if (result.timedOut || result.exitCode === 0 || result.exitCode === null) return false;
+  const output = result.output.toLowerCase();
+  return (
+    output.includes(name.toLowerCase()) &&
+    /no such (?:object|container)|no container with name or id|does not exist/.test(output)
+  );
 }
 
 function assertCredentialFreeProxyUrl(value: string): void {
@@ -242,20 +577,26 @@ export function containerWorkspaceMount(cwd: string, policy: IsolatedRunRequest[
   return `type=bind,src=${cwd},dst=/workspace,${access}`;
 }
 
-async function runProcess(
+export async function runContainerCliProcess(
   file: string,
   args: string[],
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
   outputLimit: number,
   signal?: AbortSignal,
+  stdin?: string,
 ): Promise<ContainerProcessResult> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(signal.reason ?? new Error("Container execution aborted"));
       return;
     }
-    const child = spawn(file, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(file, args, {
+      env,
+      stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    });
     let output = "";
     let timedOut = false;
     const capture = (chunk: Buffer) => {
@@ -263,14 +604,28 @@ async function runProcess(
         output += chunk.toString().slice(0, outputLimit - output.length);
       }
     };
-    child.stdout.on("data", capture);
-    child.stderr.on("data", capture);
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
+    if (child.stdin) {
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(stdin);
+    }
+    let termination: Promise<void> | undefined;
+    const terminate = () => {
+      if (termination) return;
+      termination = terminateProcessTree(child);
+      // Reject after the bounded tree-kill proof fails; waiting only for `close` here could hang on
+      // an escaped descendant that still owns the Docker CLI's stdio pipes.
+      void termination.catch(reject);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      terminate();
     }, timeoutMs);
-    const onAbort = () => child.kill("SIGKILL");
+    const onAbort = () => terminate();
     signal?.addEventListener("abort", onAbort, { once: true });
+    // Cover an abort occurring between the pre-spawn check and listener installation.
+    if (signal?.aborted) onAbort();
     child.once("error", (error) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
@@ -279,7 +634,17 @@ async function runProcess(
     child.once("close", (exitCode) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      resolve({ exitCode, output, timedOut });
+      void (async () => {
+        try {
+          if (!termination && process.platform !== "win32") {
+            termination = terminateProcessTree(child);
+          }
+          await termination;
+          resolve({ exitCode, output, timedOut });
+        } catch (error) {
+          reject(error);
+        }
+      })();
     });
   });
 }

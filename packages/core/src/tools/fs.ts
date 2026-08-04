@@ -5,13 +5,23 @@
 
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
-import { ripgrepAvailable, runRipgrep } from "./ripgrep.js";
 import { t } from "../i18n.js";
 import { PatchSetService } from "../runtime/patchset.js";
 
 const MAX_RESULTS = 200;
+const MAX_READ_LINES = 5_000;
+const MAX_READ_SCAN_BYTES = 16 * 1024 * 1024;
+const MAX_EDIT_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_SEARCH_FILES = 100_000;
+const MAX_SEARCH_DIRECTORIES = 20_000;
+const MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_SEARCH_TOTAL_BYTES = 64 * 1024 * 1024;
+const MAX_SEARCH_MS = 10_000;
+const MAX_REGEX_CHARS = 512;
+const MAX_REGEX_LINE_CHARS = 4_096;
 
 /**
  * 把 model 给的路径解析为绝对路径，并确保**真实落点**在 cwd 内。
@@ -94,29 +104,96 @@ export const readTool: Tool = {
   async run(input, ctx: ToolContext) {
     ensureActive(ctx);
     const abs = await resolveInside(ctx.cwd, input["path"]);
-    let buf: Buffer;
+    let stat: Awaited<ReturnType<typeof fs.stat>>;
     try {
-      buf = await fs.readFile(abs);
+      stat = await fs.stat(abs);
     } catch (e: any) {
       throw new ToolError(`读取失败: ${e?.code ?? e?.message ?? e}`);
     }
+    if (!stat.isFile()) throw new ToolError(`读取失败: ${rel(ctx.cwd, abs)} 不是普通文件`);
     // 图片必须先于二进制判定：图片天然含 NUL，否则会被当成"二进制"拒读。
     const mediaType = imageMediaType(abs);
-    if (mediaType) return readImage(buf, mediaType, rel(ctx.cwd, abs), ctx);
-    // 二进制识别：NUL 字节几乎必是二进制；返回提示而非乱码撑爆上下文。
-    if (isBinary(buf)) {
-      return `(文件 ${rel(ctx.cwd, abs)} 看起来是二进制/非文本，${buf.length} 字节，未按文本读取)`;
+    if (mediaType) {
+      if (stat.size > MAX_IMAGE_BYTES) {
+        return imageTooLarge(mediaType, rel(ctx.cwd, abs), stat.size);
+      }
+      return readImage(await fs.readFile(abs), mediaType, rel(ctx.cwd, abs), ctx);
     }
-    const content = buf.toString("utf8");
-    const lines = content.split("\n");
-    const offset = Math.max(1, Number(input["offset"] ?? 1));
-    const limit = Math.max(1, Number(input["limit"] ?? 2000));
-    const slice = lines.slice(offset - 1, offset - 1 + limit);
-    if (slice.length === 0) return `(文件 ${rel(ctx.cwd, abs)} 在该范围内为空)`;
-    const width = String(offset + slice.length - 1).length;
-    return slice.map((l, i) => `${String(offset + i).padStart(width)}\t${clampLine(l)}`).join("\n");
+    const offset = boundedPositiveInteger(input["offset"], 1, Number.MAX_SAFE_INTEGER);
+    const limit = boundedPositiveInteger(input["limit"], 2_000, MAX_READ_LINES);
+    const result = await readTextRange(abs, offset, limit, ctx.signal);
+    if (result.binary) {
+      return `(文件 ${rel(ctx.cwd, abs)} 看起来是二进制/非文本，${stat.size} 字节，未按文本读取)`;
+    }
+    if (result.lines.length === 0) {
+      return result.truncated
+        ? `(读取 ${rel(ctx.cwd, abs)} 达到 ${MAX_READ_SCAN_BYTES} 字节扫描上限，尚未到第 ${offset} 行)`
+        : `(文件 ${rel(ctx.cwd, abs)} 在该范围内为空)`;
+    }
+    const width = String(offset + result.lines.length - 1).length;
+    const body = result.lines
+      .map((line, index) => `${String(offset + index).padStart(width)}\t${clampLine(line)}`)
+      .join("\n");
+    return result.truncated ? `${body}\n…（已达到本次读取的行数或字节上限）` : body;
   },
 };
+
+function boundedPositiveInteger(value: unknown, fallback: number, maximum: number): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(maximum, Math.floor(parsed)));
+}
+
+async function readTextRange(
+  file: string,
+  offset: number,
+  limit: number,
+  signal: AbortSignal,
+): Promise<{ lines: string[]; binary: boolean; truncated: boolean }> {
+  const handle = await fs.open(file, "r");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const decoder = new StringDecoder("utf8");
+  const lines: string[] = [];
+  let pending = "";
+  let position = 0;
+  let lineNumber = 1;
+  let eof = false;
+  try {
+    while (position < MAX_READ_SCAN_BYTES && lines.length < limit) {
+      if (signal.aborted) throw new ToolError("会话已中断，文件读取未完成");
+      const remaining = Math.min(buffer.length, MAX_READ_SCAN_BYTES - position);
+      const { bytesRead } = await handle.read(buffer, 0, remaining, position);
+      if (bytesRead === 0) {
+        eof = true;
+        break;
+      }
+      if (position === 0 && isBinary(buffer.subarray(0, Math.min(bytesRead, 8_192)))) {
+        return { lines: [], binary: true, truncated: false };
+      }
+      position += bytesRead;
+      pending += decoder.write(buffer.subarray(0, bytesRead));
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline).replace(/\r$/, "");
+        pending = pending.slice(newline + 1);
+        if (lineNumber >= offset) lines.push(line);
+        lineNumber++;
+        if (lines.length >= limit) break;
+      }
+    }
+    if (eof && lines.length < limit) {
+      pending += decoder.end();
+      if (pending.length > 0 && lineNumber >= offset) lines.push(pending.replace(/\r$/, ""));
+    }
+    return {
+      lines,
+      binary: false,
+      truncated: !eof || lines.length >= limit,
+    };
+  } finally {
+    await handle.close();
+  }
+}
 
 /** 各 provider 普遍支持的图片类型（Anthropic / OpenAI 交集）。 */
 const IMAGE_TYPES: Record<string, string> = {
@@ -195,6 +272,14 @@ function readImage(buf: Buffer, mediaType: string, relPath: string, ctx: ToolCon
   return t(
     `(Read image ${relPath} — ${mediaType}, ${kb} KB. The image itself is attached below.)`,
     `(已读取图片 ${relPath} —— ${mediaType}，${kb} KB。图片本体已附在下方。)`,
+  );
+}
+
+function imageTooLarge(mediaType: string, relPath: string, bytes: number): string {
+  const kb = Math.round(bytes / 1024);
+  return t(
+    `(${relPath} is an image (${mediaType}) but is too large at ${kb} KB (limit ${Math.round(MAX_IMAGE_BYTES / 1024)} KB); content not loaded. Shrink or crop it first.)`,
+    `(${relPath} 是图片（${mediaType}），但 ${kb} KB 超过 ${Math.round(MAX_IMAGE_BYTES / 1024)} KB 上限，未加载内容。可先压缩或裁剪。)`,
   );
 }
 
@@ -290,8 +375,16 @@ export const editTool: Tool = {
 
     let content: string;
     try {
+      const stat = await fs.stat(abs);
+      if (!stat.isFile()) throw new ToolError(`读取失败: ${rel(ctx.cwd, abs)} 不是普通文件`);
+      if (stat.size > MAX_EDIT_FILE_BYTES) {
+        throw new ToolError(
+          `文件过大，edit 单次最多处理 ${MAX_EDIT_FILE_BYTES} 字节: ${rel(ctx.cwd, abs)}`,
+        );
+      }
       content = await fs.readFile(abs, "utf8");
     } catch (e: any) {
+      if (e instanceof ToolError) throw e;
       throw new ToolError(`读取失败: ${e?.code ?? e}`);
     }
 
@@ -429,9 +522,9 @@ export const globTool: Tool = {
   def: {
     name: "glob",
     description: t(
-      "Find files by glob pattern (e.g. **/*.ts), returning a list of relative paths sorted by modification time, newest first (recently changed files are more likely relevant). Respects .gitignore when ripgrep is available; otherwise skips common directories like node_modules/.git/dist.",
+      "Find files by glob pattern (e.g. **/*.ts), returning a bounded list sorted by modification time, newest first. Skips common generated/vendor directories and never follows symlinks.",
       "按 glob 模式查找文件（如 **/*.ts），返回相对路径列表，按修改时间倒序（近期改动更可能相关）。" +
-        "有 ripgrep 时尊重 .gitignore；否则跳过 node_modules/.git/dist 等常见目录。",
+        "跳过 node_modules/.git/dist 等常见目录且不跟随符号链接；遍历有硬上限。",
     ),
     parameters: {
       type: "object",
@@ -451,33 +544,20 @@ export const globTool: Tool = {
     if (!pattern) throw new ToolError("pattern 不能为空");
     const root = path.resolve(ctx.cwd);
 
-    // 优先 ripgrep：--files 列全部（尊重 .gitignore），-g 过滤，--sortr modified 按 mtime 倒序。
-    if (await ripgrepAvailable()) {
-      const rg = await runRipgrep(
-        ["--files", "--sortr", "modified", "-g", pattern],
-        root,
-        ctx.signal,
-        MAX_RESULTS,
-      );
-      if (rg) {
-        if (rg.lines.length === 0) return `(无文件匹配 ${pattern})`;
-        const body = rg.lines.join("\n");
-        return rg.truncated
-          ? `${body}\n…（超过 ${MAX_RESULTS} 个匹配，仅显示最近修改的部分）`
-          : body;
-      }
-    }
-
-    // 回退：JS 递归遍历 + mtime 排序。
-    const matches: { path: string; mtime: number }[] = [];
-    await walk(root, root, globToRegExp(pattern), matches, ctx.signal);
+    const matches: WalkFile[] = [];
+    const budget = newWalkBudget();
+    await walk(root, root, globToRegExp(pattern), matches, ctx.signal, budget);
     matches.sort((a, b) => b.mtime - a.mtime);
-    if (matches.length === 0) return `(无文件匹配 ${pattern})`;
+    if (matches.length === 0) {
+      return budget.truncated
+        ? `(在有界扫描范围内无文件匹配 ${pattern}；仓库过大，结果可能不完整)`
+        : `(无文件匹配 ${pattern})`;
+    }
     const body = matches
       .slice(0, MAX_RESULTS)
       .map((m) => path.relative(root, m.path))
       .join("\n");
-    return matches.length > MAX_RESULTS
+    return matches.length > MAX_RESULTS || budget.truncated
       ? `${body}\n…（超过 ${MAX_RESULTS} 个匹配，仅显示最近修改的部分）`
       : body;
   },
@@ -485,14 +565,48 @@ export const globTool: Tool = {
 
 const IGNORE = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage"]);
 
+interface WalkFile {
+  path: string;
+  mtime: number;
+  size: number;
+}
+
+interface WalkBudget {
+  files: number;
+  directories: number;
+  deadline: number;
+  truncated: boolean;
+}
+
+function newWalkBudget(): WalkBudget {
+  return {
+    files: 0,
+    directories: 0,
+    deadline: Date.now() + MAX_SEARCH_MS,
+    truncated: false,
+  };
+}
+
+function walkBudgetExhausted(budget: WalkBudget): boolean {
+  const exhausted =
+    budget.files >= MAX_SEARCH_FILES ||
+    budget.directories >= MAX_SEARCH_DIRECTORIES ||
+    Date.now() >= budget.deadline;
+  if (exhausted) budget.truncated = true;
+  return exhausted;
+}
+
 async function walk(
   root: string,
   dir: string,
   re: RegExp,
-  out: { path: string; mtime: number }[],
+  out: WalkFile[],
   signal: AbortSignal,
+  budget: WalkBudget,
 ): Promise<void> {
-  if (signal.aborted) return;
+  if (signal.aborted) throw new ToolError("会话已中断，文件扫描未完成");
+  if (walkBudgetExhausted(budget)) return;
+  budget.directories++;
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -500,16 +614,19 @@ async function walk(
     return;
   }
   for (const e of entries) {
+    if (signal.aborted) throw new ToolError("会话已中断，文件扫描未完成");
+    if (walkBudgetExhausted(budget)) return;
     const abs = path.join(dir, e.name);
     if (e.isDirectory()) {
       if (IGNORE.has(e.name)) continue;
-      await walk(root, abs, re, out, signal);
+      await walk(root, abs, re, out, signal, budget);
     } else if (e.isFile()) {
+      budget.files++;
       const relPath = path.relative(root, abs);
       if (re.test(relPath)) {
         try {
           const st = await fs.stat(abs);
-          out.push({ path: abs, mtime: st.mtimeMs });
+          if (st.isFile()) out.push({ path: abs, mtime: st.mtimeMs, size: st.size });
         } catch {
           /* ignore */
         }
@@ -551,8 +668,8 @@ export const grepTool: Tool = {
   def: {
     name: "grep",
     description: t(
-      "Search file contents with a regex (uses ripgrep when available, respecting .gitignore and skipping binaries). output_mode: content=file:line:content (default), files_with_matches=list matching files only, count=matches per file. Optionally: glob to limit files, path to limit to a subdirectory, ignore_case to ignore case, context to include surrounding lines (content mode only).",
-      "在文件内容中用正则搜索（有 ripgrep 时走 ripgrep，尊重 .gitignore、跳过二进制）。" +
+      "Search file contents with a bounded regular expression scan that skips binaries, symlinks and common generated/vendor directories. output_mode: content=file:line:content (default), files_with_matches=list matching files only, count=matches per file. Optionally: glob to limit files, path to limit to a subdirectory, ignore_case to ignore case, context to include surrounding lines (content mode only).",
+      "在文件内容中用有硬资源上限的正则搜索（跳过二进制、符号链接和常见生成/依赖目录）。" +
         "output_mode: content=文件:行号:内容（默认）、files_with_matches=仅列命中文件、count=每文件命中数。" +
         "可选 glob 限定文件、path 限定子目录、ignore_case 忽略大小写、context 附带前后行（仅 content）。",
     ),
@@ -608,20 +725,7 @@ export const grepTool: Tool = {
     const root = path.resolve(ctx.cwd);
     // 子目录限定：约束在 cwd 内，防穿越。
     const searchDir = input["path"] ? await resolveInside(root, input["path"]) : root;
-    const searchArg = searchDir === root ? "." : path.relative(root, searchDir);
 
-    if (await ripgrepAvailable()) {
-      const out = await grepViaRipgrep(pattern, {
-        mode,
-        ignoreCase,
-        context,
-        ...(globFilter ? { glob: globFilter } : {}),
-        searchArg,
-        root,
-        signal: ctx.signal,
-      });
-      if (out !== null) return out;
-    }
     return grepViaJs(pattern, {
       mode,
       ignoreCase,
@@ -638,40 +742,6 @@ function normalizeMode(v: unknown): GrepMode {
   return v === "files_with_matches" || v === "count" ? v : "content";
 }
 
-async function grepViaRipgrep(
-  pattern: string,
-  o: {
-    mode: GrepMode;
-    ignoreCase: boolean;
-    context: number;
-    glob?: string;
-    searchArg: string;
-    root: string;
-    signal: AbortSignal;
-  },
-): Promise<string | null> {
-  const args: string[] = ["--color", "never"];
-  if (o.ignoreCase) args.push("-i");
-  if (o.glob) args.push("-g", o.glob);
-  if (o.mode === "files_with_matches") args.push("--files-with-matches");
-  else if (o.mode === "count") args.push("--count");
-  else {
-    args.push("--line-number", "--no-heading");
-    if (o.context > 0) args.push("-C", String(o.context));
-  }
-  args.push("-e", pattern);
-  // 搜索根目录时不传路径参数，让 rg 默认用 cwd —— 输出不带 "./" 前缀，与 JS 回退一致。
-  if (o.searchArg !== ".") args.push(o.searchArg);
-
-  const rg = await runRipgrep(args, o.root, o.signal, MAX_RESULTS);
-  if (!rg) return null;
-  // rg exit: 0=有匹配, 1=无匹配, 2=错误（如非法正则）。null=被中断，也当空结果。
-  if (rg.code === 2) throw new ToolError(`ripgrep 搜索失败（可能是非法正则）: /${pattern}/`);
-  if (rg.lines.length === 0) return emptyGrep(pattern, o.mode);
-  const body = rg.lines.join("\n");
-  return rg.truncated ? `${body}\n…（超过 ${MAX_RESULTS} 条，已截断）` : body;
-}
-
 async function grepViaJs(
   pattern: string,
   o: {
@@ -684,6 +754,7 @@ async function grepViaJs(
     signal: AbortSignal;
   },
 ): Promise<string> {
+  assertBoundedRegex(pattern);
   let re: RegExp;
   try {
     re = new RegExp(pattern, o.ignoreCase ? "i" : "");
@@ -691,24 +762,35 @@ async function grepViaJs(
     throw new ToolError(`无效正则: ${e?.message ?? e}`);
   }
   const fileRe = o.globFilter ? globToRegExp(o.globFilter) : /.*/;
-  const files: { path: string; mtime: number }[] = [];
-  await walk(o.searchDir, o.searchDir, fileRe, files, o.signal);
+  const files: WalkFile[] = [];
+  const budget = newWalkBudget();
+  await walk(o.searchDir, o.searchDir, fileRe, files, o.signal, budget);
 
   const results: string[] = [];
   const counts: string[] = [];
+  let scannedBytes = 0;
   outer: for (const f of files) {
-    if (o.signal.aborted) break;
-    let text: string;
+    if (o.signal.aborted) throw new ToolError("会话已中断，文件搜索未完成");
+    if (f.size > MAX_SEARCH_FILE_BYTES || scannedBytes + f.size > MAX_SEARCH_TOTAL_BYTES) {
+      budget.truncated = true;
+      if (scannedBytes + f.size > MAX_SEARCH_TOTAL_BYTES) break;
+      continue;
+    }
+    let contents: Buffer;
     try {
-      text = await fs.readFile(f.path, "utf8");
+      contents = await fs.readFile(f.path);
     } catch {
       continue; // 跳过二进制/不可读
     }
+    scannedBytes += contents.length;
+    if (isBinary(contents)) continue;
+    const text = contents.toString("utf8");
     const relPath = path.relative(o.root, f.path);
     const lines = text.split("\n");
     let fileHits = 0;
     for (let i = 0; i < lines.length; i++) {
-      if (!re.test(lines[i]!)) continue;
+      const searchable = lines[i]!.slice(0, MAX_REGEX_LINE_CHARS);
+      if (!re.test(searchable)) continue;
       fileHits++;
       if (o.mode === "files_with_matches") {
         results.push(relPath);
@@ -721,21 +803,55 @@ async function grepViaJs(
           for (let j = from; j <= to; j++) {
             results.push(`${relPath}:${j + 1}:${lines[j]!.slice(0, 200)}`);
           }
-          if (results.length >= MAX_RESULTS) break outer;
+          if (results.length >= MAX_RESULTS) {
+            budget.truncated = true;
+            break outer;
+          }
         } else {
           results.push(`${relPath}:${i + 1}:${lines[i]!.slice(0, 200)}`);
-          if (results.length >= MAX_RESULTS) break outer;
+          if (results.length >= MAX_RESULTS) {
+            budget.truncated = true;
+            break outer;
+          }
         }
       }
     }
     if (o.mode === "count" && fileHits > 0) {
       counts.push(`${relPath}:${fileHits}`);
-      if (counts.length >= MAX_RESULTS) break;
+      if (counts.length >= MAX_RESULTS) {
+        budget.truncated = true;
+        break;
+      }
     }
   }
 
-  if (o.mode === "count") return counts.length ? counts.join("\n") : emptyGrep(pattern, o.mode);
-  return results.length ? results.join("\n") : emptyGrep(pattern, o.mode);
+  const selected = o.mode === "count" ? counts : results;
+  if (!selected.length) {
+    return budget.truncated
+      ? `${emptyGrep(pattern, o.mode)}（扫描达到资源上限，结果可能不完整）`
+      : emptyGrep(pattern, o.mode);
+  }
+  const body = selected.join("\n");
+  return budget.truncated ? `${body}\n…（扫描达到资源上限，结果已截断）` : body;
+}
+
+function assertBoundedRegex(pattern: string): void {
+  if (pattern.length > MAX_REGEX_CHARS) {
+    throw new ToolError(`正则过长（最多 ${MAX_REGEX_CHARS} 字符）`);
+  }
+  // JavaScript RegExp has no deadline. Reject the common exponential-time constructs and
+  // backtracking features rather than letting a repository-controlled line block the host loop.
+  const nestedQuantifier =
+    /\((?:[^()\\]|\\.)*(?:[+*]|\{\d*,?\d*\})(?:[^()\\]|\\.)*\)\s*(?:[+*]|\{)/;
+  const quantifiedAlternation = /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*(?:[+*]|\{)/;
+  if (
+    nestedQuantifier.test(pattern) ||
+    quantifiedAlternation.test(pattern) ||
+    /\\[1-9]/.test(pattern) ||
+    /\(\?<([=!])/.test(pattern)
+  ) {
+    throw new ToolError("正则包含可能导致无界回溯的结构；请改用更简单的模式");
+  }
 }
 
 function emptyGrep(pattern: string, mode: GrepMode): string {

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
   DurableWorkerQueue,
   FileWorkerQueueStore,
+  MemoryWorkerQueueStore,
   PersistentWorker,
   WorktreeOwnership,
 } from "./worker.js";
@@ -126,4 +127,32 @@ test("WorktreeOwnership: 活跃租约独占，释放后可转移", async () => {
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("WorktreeOwnership: 过期 lease 不可复活，同 owner 的旧 fencing token 也失效", async () => {
+  const store = new MemoryWorkerQueueStore();
+  const ownership = new WorktreeOwnership(store);
+  const first = await ownership.acquire("/tmp/anicode-wt-fenced", "session:t1", 5_000);
+  await store.transact((rows) => {
+    const row = rows.find((candidate) => candidate.leaseOwner === "session:t1");
+    assert.ok(row);
+    row.leaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  });
+
+  await assert.rejects(
+    () => ownership.heartbeat(first.worktree, first.owner, 5_000, first.fencingToken),
+    /unowned/,
+  );
+  const second = await ownership.acquire(first.worktree, "session:t1", 5_000);
+  assert.ok(second.fencingToken > first.fencingToken);
+  await assert.rejects(
+    () => ownership.heartbeat(first.worktree, first.owner, 5_000, first.fencingToken),
+    /Stale fencing token/,
+  );
+  await assert.rejects(
+    () => ownership.release(first.worktree, first.owner, first.fencingToken),
+    /Stale fencing token/,
+  );
+  await ownership.heartbeat(second.worktree, second.owner, 5_000, second.fencingToken);
+  await ownership.release(second.worktree, second.owner, second.fencingToken);
 });

@@ -27,7 +27,7 @@ test("LSP: 握手 → didOpen → 收到 publishDiagnostics", async () => {
   assert.equal(diags[0]!.line, 3); // 0-based 2 → 1-based 3
   assert.equal(diags[0]!.column, 5);
   assert.match(diags[0]!.message, /类型不匹配/);
-  client.close();
+  await client.close();
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -41,7 +41,7 @@ test("LSP: diagnostics 工具格式化输出；未配置扩展名给出提示", 
   assert.match(out, /a\.ts:3:5 \[error\] 类型不匹配/);
   const none = await tool.run({ path: "readme.md" }, ctx);
   assert.match(none, /没有为 .md 配置语言服务器/);
-  pool.closeAll();
+  await pool.closeAll();
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -74,8 +74,8 @@ test("LSP: production runtime 以只读、断网策略 prepare 持久进程", as
   const pool = new LspPool(dir, [cfg], runtime);
   const diagnostics = await pool.clientFor(".ts")!.diagnose(file, 3000);
   assert.equal(diagnostics.length, 1);
-  assert.deepEqual(requests, [`read-only:false:${dir}`]);
-  pool.closeAll();
+  assert.deepEqual(requests, [`read-only:false:${await fs.realpath(dir)}`]);
+  await pool.closeAll();
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -90,6 +90,37 @@ test("LSP: 无响应 server 在请求超时后失败，不得挂住 agent", asyn
     timeoutMs: 100,
   });
   await assert.rejects(client.diagnose(file), /LSP request timed out: initialize/);
-  client.close();
+  await client.close();
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("LSP: 拒绝输入 symlink 逃逸，并过滤 server 返回的 workspace 外 URI", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-boundary-"));
+  const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-host-"));
+  const file = path.join(dir, "a.ts");
+  const outside = path.join(outsideDir, "secret.ts");
+  await fs.writeFile(file, "const x = 1\n");
+  await fs.writeFile(outside, "HOST_CANARY\n");
+  await fs.symlink(outside, path.join(dir, "escape.ts"));
+  const oversized = path.join(dir, "oversized.ts");
+  await fs.writeFile(oversized, "x");
+  await fs.truncate(oversized, 8 * 1024 * 1024 + 1);
+  const client = LspClient.start(dir, cfg);
+  await assert.rejects(() => client.diagnose(path.join(dir, "escape.ts")), /escapes the workspace/);
+  await assert.rejects(() => client.diagnose(oversized), /exceeds the 8 MiB limit/);
+  const definitions = await client.definition(file, { line: 0, character: 0 });
+  assert.deepEqual(definitions, [{ path: await fs.realpath(file), line: 1, column: 1 }]);
+  assert.deepEqual(await client.workspaceSymbols("outside"), []);
+  await client.close();
+  await fs.rm(dir, { recursive: true, force: true });
+  await fs.rm(outsideDir, { recursive: true, force: true });
+});
+
+test("LSP: 工具声明真实的持久进程与文件读取 capabilities", async () => {
+  const pool = new LspPool(process.cwd(), []);
+  assert.deepEqual(createDiagnosticsTool(pool).capabilities, [
+    "filesystem-read",
+    "process",
+    "persistent-process",
+  ]);
 });

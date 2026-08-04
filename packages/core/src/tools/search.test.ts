@@ -99,3 +99,38 @@ test("read 截断超长单行", async () => {
   assert.match(out, /已截断/);
   assert.ok(out.length < 5000, "超长行应被截断");
 });
+
+test("read 在读取前拒绝超大图片，并对超大文本使用扫描上限", async () => {
+  const dir = await scratch("anicode-read-bounds-");
+  const image = await fs.open(path.join(dir, "huge.png"), "w");
+  await image.truncate(128 * 1024 * 1024);
+  await image.close();
+  const imageOut = await readTool.run({ path: "huge.png" }, ctx(dir));
+  assert.match(imageOut, /超过.*上限|too large/);
+
+  await fs.writeFile(path.join(dir, "huge.txt"), "a".repeat(17 * 1024 * 1024));
+  const textOut = await readTool.run({ path: "huge.txt", limit: 50_000 }, ctx(dir));
+  assert.match(textOut, /读取.*上限|已达到/);
+  assert.ok(textOut.length < 10_000, "bounded read must not return the scanned body");
+});
+
+test("grep 跳过超大文件并拒绝可能指数回溯的正则", async () => {
+  const dir = await scratch("anicode-grep-bounds-");
+  await fs.writeFile(path.join(dir, "huge.txt"), "needle\n" + "a".repeat(2 * 1024 * 1024));
+  const bounded = await grepTool.run({ pattern: "needle" }, ctx(dir));
+  assert.match(bounded, /资源上限|可能不完整/);
+  assert.doesNotMatch(bounded, /huge\.txt:1/);
+  await assert.rejects(grepTool.run({ pattern: "(a+)+$" }, ctx(dir)), /无界回溯|simpler|更简单/);
+});
+
+test("glob 不跟随工作区内指向外部目录的 symlink", async () => {
+  const outer = await scratch("anicode-glob-symlink-");
+  const root = path.join(outer, "root");
+  const secret = path.join(outer, "secret");
+  await fs.mkdir(root);
+  await fs.mkdir(secret);
+  await fs.writeFile(path.join(secret, "outside.ts"), "secret");
+  await fs.symlink(secret, path.join(root, "linked"));
+  const out = await globTool.run({ pattern: "**/*.ts" }, ctx(root));
+  assert.doesNotMatch(out, /outside\.ts/);
+});

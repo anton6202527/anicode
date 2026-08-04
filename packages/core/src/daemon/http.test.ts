@@ -248,11 +248,27 @@ test("http host: oversized JSON responses are rejected before parsing", async ()
   }
 });
 
-test("http host: malformed SSE snapshots are rejected at the transport boundary", async () => {
-  const server = createHttpServer((_req, res) => {
+test("http host: snapshot permissionMode stays optional but rejects unknown values", async () => {
+  const server = createHttpServer((req, res) => {
+    const sessionId = req.url?.includes("s_legacy")
+      ? "s_legacy"
+      : req.url?.includes("s_malformed")
+        ? "s_malformed"
+        : "s_invalid";
+    const snapshot =
+      sessionId === "s_malformed"
+        ? {}
+        : {
+            meta: { id: sessionId },
+            messages: [],
+            usage: {},
+            running: false,
+            ...(sessionId === "s_invalid" ? { permissionMode: "unsafe" } : {}),
+            pendingPermissions: [],
+          };
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write(
-      `data: ${JSON.stringify({ type: "session.snapshot", properties: { snapshot: {} } })}\n\n`,
+      `data: ${JSON.stringify({ type: "session.snapshot", properties: { sessionId, snapshot } })}\n\n`,
     );
   });
   await new Promise<void>((resolve, reject) => {
@@ -263,6 +279,13 @@ test("http host: malformed SSE snapshots are rejected at the transport boundary"
   if (!address || typeof address === "string") assert.fail("expected TCP test server");
   const host = new HttpSessionHost({ baseUrl: `http://127.0.0.1:${address.port}` });
   try {
+    const legacy = await host.open("s_legacy", () => {});
+    assert.equal(legacy.snapshot.permissionMode, undefined);
+    legacy.close();
+    await assert.rejects(
+      host.open("s_malformed", () => {}),
+      /(?:Invalid|无效) SSE snapshot/,
+    );
     await assert.rejects(
       host.open("s_invalid", () => {}),
       /(?:Invalid|无效) SSE snapshot/,
@@ -292,6 +315,51 @@ test("http server: bounded request contract rejects negative indexes and oversiz
       body: JSON.stringify({ text: "hello" }),
     });
     assert.equal(send.status, 400);
+  } finally {
+    host.dispose();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("http send: exact idempotent retries coalesce and payload conflicts return 409", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-idempotency-"));
+  let providerCalls = 0;
+  const provider: Provider = {
+    name: "counted",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerCalls++;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const { server, baseUrl } = await startHttp(dir, provider);
+  const host = new HttpSessionHost({ baseUrl, token: TEST_HTTP_TOKEN });
+  try {
+    const meta = await host.createSession({ cwd: dir, model: "counted" });
+    const send = (text: string) =>
+      authenticatedFetch(`${baseUrl}/sessions/${meta.id}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": "same-request" },
+        body: JSON.stringify({ text }),
+      });
+    const [first, retry] = await Promise.all([send("build once"), send("build once")]);
+    assert.equal(first.status, 204);
+    assert.equal(retry.status, 204);
+    assert.equal(providerCalls, 1, "exact retries must join the authoritative command");
+
+    const conflict = await send("different payload");
+    assert.equal(conflict.status, 409);
+    assert.equal(
+      ((await conflict.json()) as { code?: string }).code,
+      "COMMAND_IDEMPOTENCY_CONFLICT",
+    );
+    assert.equal(providerCalls, 1);
   } finally {
     host.dispose();
     await server.close();

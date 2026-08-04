@@ -44,6 +44,8 @@ export interface NetworkProxyOptions {
   onAudit?: (event: NetworkAuditEvent) => void | Promise<void>;
   /** DNS-pinned Undici dispatchers retained across origins. Least-recently-used entries retire. */
   maxPinnedAgents?: number;
+  /** Maximum decoded bytes exposed by one in-process response body. */
+  maxResponseBytes?: number;
 }
 
 function domainMatches(pattern: string, hostname: string): boolean {
@@ -580,6 +582,7 @@ export class NetworkProxy {
   private readonly pinnedAgents = new Map<string, UndiciAgent>();
   private readonly retiringAgents = new Set<Promise<void>>();
   private readonly maxPinnedAgents: number;
+  private readonly maxResponseBytes: number;
   private readonly broker?: CredentialBroker;
   private readonly onAudit?: NetworkProxyOptions["onAudit"];
 
@@ -604,6 +607,9 @@ export class NetworkProxy {
     this.maxPinnedAgents = Number.isFinite(options.maxPinnedAgents)
       ? Math.max(1, Math.floor(options.maxPinnedAgents!))
       : 128;
+    this.maxResponseBytes = Number.isFinite(options.maxResponseBytes)
+      ? Math.max(1, Math.floor(options.maxResponseBytes!))
+      : 32 * 1024 * 1024;
     if (options.broker) this.broker = options.broker;
     if (options.onAudit) this.onAudit = options.onAudit;
   }
@@ -682,7 +688,9 @@ export class NetworkProxy {
             // 防止检查后再次 DNS 解析产生 rebinding/TOCTOU。
             dispatcher: this.dispatcher(current, authorization.addresses),
           } as RequestInit);
-      if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+      if (![301, 302, 303, 307, 308].includes(response.status)) {
+        return this.boundResponse(response);
+      }
       const location = response.headers.get("location");
       if (!location) return response;
       if (redirects >= this.policy.maxRedirects) {
@@ -712,6 +720,62 @@ export class NetworkProxy {
       const next = authorization.url;
       current = next;
     }
+  }
+
+  private async boundResponse(response: Response): Promise<Response> {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > this.maxResponseBytes) {
+      await response.body?.cancel("network response size limit exceeded");
+      throw new Error(`Network response exceeds ${this.maxResponseBytes} bytes`);
+    }
+    if (!response.body) return response;
+
+    const reader = response.body.getReader();
+    let received = 0;
+    let finished = false;
+    const maximum = this.maxResponseBytes;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            finished = true;
+            controller.close();
+            return;
+          }
+          received += chunk.value.byteLength;
+          if (received > maximum) {
+            finished = true;
+            await reader.cancel("network response size limit exceeded").catch(() => undefined);
+            controller.error(new Error(`Network response exceeds ${maximum} bytes`));
+            return;
+          }
+          controller.enqueue(chunk.value);
+        } catch (error) {
+          finished = true;
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        if (finished) return;
+        finished = true;
+        await reader.cancel(reason).catch(() => undefined);
+      },
+    });
+    const bounded = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+    // A reconstructed Response otherwise loses fetch metadata that some SDKs use for diagnostics.
+    for (const key of ["url", "redirected", "type"] as const) {
+      Object.defineProperty(bounded, key, {
+        configurable: true,
+        enumerable: false,
+        value: response[key],
+      });
+    }
+    return bounded;
   }
 
   async close(): Promise<void> {

@@ -19,6 +19,10 @@ export interface PersistenceConfig {
   meta: SessionMeta;
   /** resume：预填历史（跳过再次写 meta，只在此后 append） */
   resumeMessages?: ChatMessage[];
+  /** runtime event projection 恢复出的累计用量。 */
+  resumeUsage?: Usage;
+  /** runtime event projection 恢复出的最近一次真实输入 token。 */
+  resumeLastInputTokens?: number;
 }
 
 /**
@@ -66,14 +70,32 @@ export class Conversation {
   private cumulativeUsage: Usage = emptyUsage();
   private lastInput = 0; // 上一次 provider 调用的真实输入 token，驱动压缩触发
   private readonly persist: PersistenceConfig | null;
+  /** Serialize append/rewrite even when a caller deadline stops awaiting an old store Promise. */
+  private persistFence: Promise<void> = Promise.resolve();
+  /**
+   * Store failures remain observable by shutdown even when the initiating caller stopped waiting.
+   * Keep this bounded: the first failures carry the useful causes and the overflow counter proves
+   * that persistence is still unhealthy without retaining an unbounded error history.
+   */
+  private readonly persistFailures: Error[] = [];
+  private persistFailureOverflow = 0;
 
-  constructor(persistence?: PersistenceConfig | null) {
+  constructor(persistence?: PersistenceConfig | null, initialMessages: ChatMessage[] = []) {
     this.persist = persistence ?? null;
     if (this.persist?.resumeMessages) {
       const resumed = [...this.persist.resumeMessages];
       // 这些已在文件里，勿重复写；自愈补上的合成结果会在下次 flush 时落盘
       this.persistedCount = resumed.length;
       this.history = repairHistory(resumed);
+    } else if (initialMessages.length > 0) {
+      this.history = repairHistory([...initialMessages]);
+    }
+    if (this.persist?.resumeUsage) this.cumulativeUsage = normalizeUsage(this.persist.resumeUsage);
+    if (
+      Number.isFinite(this.persist?.resumeLastInputTokens) &&
+      Number(this.persist?.resumeLastInputTokens) > 0
+    ) {
+      this.lastInput = Math.floor(Number(this.persist?.resumeLastInputTokens));
     }
   }
 
@@ -125,9 +147,9 @@ export class Conversation {
   }
 
   /** 历史被改写（压缩等）后整体替换并重写持久化。 */
-  async replaceAll(messages: ChatMessage[]): Promise<void> {
+  async replaceAll(messages: ChatMessage[], signal?: AbortSignal): Promise<void> {
     this.history = messages;
-    await this.rewritePersist();
+    await this.rewritePersist(signal);
   }
 
   /**
@@ -146,30 +168,111 @@ export class Conversation {
   // ---------- 持久化 ----------
 
   /** 把尚未落盘的新消息按序 append 进会话文件。 */
-  async flush(): Promise<void> {
+  async flush(signal?: AbortSignal): Promise<void> {
     if (!this.persist) return;
-    for (let i = this.persistedCount; i < this.history.length; i++) {
-      await this.persist.store.append(this.persist.meta.id, this.history[i]!);
-    }
-    this.persistedCount = this.history.length;
+    const snapshot = [...this.history];
+    await this.enqueuePersist(async () => {
+      for (let i = this.persistedCount; i < snapshot.length; i++) {
+        await this.persist!.store.append(this.persist!.meta.id, snapshot[i]!);
+        this.persistedCount = i + 1;
+      }
+    }, signal);
   }
 
   /** 历史被改写（压缩/回滚）后整文件重写。 */
-  async rewritePersist(): Promise<void> {
+  async rewritePersist(signal?: AbortSignal): Promise<void> {
     if (!this.persist) return;
-    await this.persist.store.rewrite(this.persist.meta, this.history);
-    this.persistedCount = this.history.length;
+    const snapshot = [...this.history];
+    await this.enqueuePersist(async () => {
+      await this.persist!.store.rewrite(this.persist!.meta, snapshot);
+      this.persistedCount = snapshot.length;
+    }, signal);
+  }
+
+  /** Public host fence: rewrite the current meta/history through the same ordered queue as append. */
+  async rewritePersistence(signal?: AbortSignal): Promise<void> {
+    await this.rewritePersist(signal);
+  }
+
+  /**
+   * Atomically advance persistence metadata (for example a generated title) without racing an
+   * in-flight Agent append. The new metadata becomes active only after the rewrite really lands.
+   */
+  async updatePersistenceMeta(meta: SessionMeta, signal?: AbortSignal): Promise<void> {
+    if (!this.persist) return;
+    const nextMeta = { ...meta };
+    const snapshot = [...this.history];
+    await this.enqueuePersist(async () => {
+      await this.persist!.store.rewrite(nextMeta, snapshot);
+      this.persist!.meta = nextMeta;
+      this.persistedCount = snapshot.length;
+    }, signal);
+  }
+
+  private async enqueuePersist(
+    operation: () => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const scheduled = this.persistFence.then(operation);
+    // Cancellation only stops this caller waiting. Once a durable write is queued it continues in
+    // order; otherwise a wall-clock abort between enqueue and execution can silently lose history.
+    this.persistFence = scheduled.catch((error: unknown) => {
+      this.rememberPersistFailure(error);
+    });
+    if (!signal) return scheduled;
+    return raceWithSignal(scheduled, signal);
+  }
+
+  /** Dynamic fence used by shutdown/delete: wait for every already-started or newly-chained write. */
+  async whenPersisted(signal?: AbortSignal): Promise<void> {
+    while (true) {
+      const current = this.persistFence;
+      if (signal) await raceWithSignal(current, signal);
+      else await current;
+      if (current !== this.persistFence) continue;
+      if (this.persistFailures.length > 0 || this.persistFailureOverflow > 0) {
+        const failures = [...this.persistFailures];
+        if (this.persistFailureOverflow > 0) {
+          failures.push(
+            new Error(`${this.persistFailureOverflow} additional persistence failure(s) omitted`),
+          );
+        }
+        throw new AggregateError(failures, "Conversation persistence failed");
+      }
+      return;
+    }
+  }
+
+  private rememberPersistFailure(error: unknown): void {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    if (this.persistFailures.length < 32) this.persistFailures.push(normalized);
+    else this.persistFailureOverflow++;
   }
 
   // ---------- 记账 ----------
 
   accumulate(u: Usage): void {
-    this.cumulativeUsage = {
+    const next = {
       inputTokens: this.cumulativeUsage.inputTokens + u.inputTokens,
       outputTokens: this.cumulativeUsage.outputTokens + u.outputTokens,
       cacheReadTokens: this.cumulativeUsage.cacheReadTokens + u.cacheReadTokens,
       cacheWriteTokens: this.cumulativeUsage.cacheWriteTokens + u.cacheWriteTokens,
     };
+    if (
+      ![
+        u.inputTokens,
+        u.outputTokens,
+        u.cacheReadTokens,
+        u.cacheWriteTokens,
+        next.inputTokens,
+        next.outputTokens,
+        next.cacheReadTokens,
+        next.cacheWriteTokens,
+      ].every((value) => Number.isSafeInteger(value) && value >= 0)
+    ) {
+      throw new Error("usage 必须可累加为四个非负安全整数字段");
+    }
+    this.cumulativeUsage = next;
   }
 
   get cumulative(): Usage {
@@ -205,4 +308,28 @@ export class Conversation {
       this.cumulativeUsage.cacheWriteTokens * cacheWrite * per
     );
   }
+}
+
+function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    // Observe an already-started persistence operation so a later store rejection is never unhandled.
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason ?? new Error("aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+function normalizeUsage(usage: Usage): Usage {
+  const value = (candidate: number): number =>
+    Number.isSafeInteger(Math.floor(candidate)) && candidate > 0 ? Math.floor(candidate) : 0;
+  return {
+    inputTokens: value(usage.inputTokens),
+    outputTokens: value(usage.outputTokens),
+    cacheReadTokens: value(usage.cacheReadTokens),
+    cacheWriteTokens: value(usage.cacheWriteTokens),
+  };
 }

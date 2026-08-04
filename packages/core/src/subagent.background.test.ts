@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createTaskTools, TaskRegistry } from "./subagent.js";
+import { createTaskTools, parsePersistedTaskRecord, TaskRegistry } from "./subagent.js";
 import { ToolRegistry, type Tool, type ToolContext } from "./tools/tool.js";
 import type { AgentOptions } from "./agent.js";
 
@@ -164,6 +164,73 @@ test("task_send: 续话复用同一子 agent（上下文保留），前台返回
   const second = await p2;
   assert.match(second, /答二/);
   assert.deepEqual(child.prompts, ["第一问", "追问"], "同一子 agent 收到两轮输入");
+});
+
+test("durable recovery: 重启中断如实变 stopped，task_send 惰性重建完整上下文", async () => {
+  const prior = [
+    { role: "user" as const, content: [{ type: "text" as const, text: "第一问" }] },
+    { role: "assistant" as const, content: [{ type: "text" as const, text: "答一" }] },
+  ];
+  const changed: string[] = [];
+  const registry = new TaskRegistry(
+    [
+      {
+        id: "t4",
+        type: "general",
+        description: "恢复任务",
+        status: "running",
+        background: true,
+        messages: prior,
+        usage: { inputTokens: 11, outputTokens: 7, cacheReadTokens: 3, cacheWriteTokens: 2 },
+      },
+    ],
+    (record) => changed.push(record.status),
+  );
+  const child = stubChild();
+  let childOptions: AgentOptions | undefined;
+  const tools = createTaskTools({
+    makeAgent: (options) => {
+      childOptions = options;
+      return child.agent;
+    },
+    provider: { name: "p", async *stream() {} },
+    model: "m",
+    cwd: "/x",
+    tools: parentRegistry(),
+    registry,
+    notifyTaskDone: () => undefined,
+  });
+
+  assert.equal(registry.get("t4")!.status, "stopped");
+  assert.match(registry.get("t4")!.error!, /宿主重启/);
+  const resumed = tools.taskSend!.run({ id: "t4", message: "追问" }, ctx());
+  await tick();
+  assert.deepEqual(childOptions?.initialMessages, prior);
+  assert.deepEqual(childOptions?.initialUsage, {
+    inputTokens: 11,
+    outputTokens: 7,
+    cacheReadTokens: 3,
+    cacheWriteTokens: 2,
+  });
+  child.finish("答二");
+  assert.match(await resumed, /答二/);
+  assert.ok(changed.includes("running"));
+  assert.equal(changed.at(-1), "done");
+});
+
+test("durable recovery: 损坏或未知的消息 shape fail closed", () => {
+  assert.equal(
+    parsePersistedTaskRecord({
+      id: "t1",
+      type: "general",
+      description: "x",
+      status: "done",
+      background: false,
+      messages: [{ role: "assistant", content: [{ type: "future_unsafe" }] }],
+    }),
+    undefined,
+  );
+  assert.equal(new TaskRegistry([{ id: "../../bad" } as never]).list().length, 0);
 });
 
 test("task_send: 运行中的任务拒绝续话；未知 id 报在册清单", async () => {

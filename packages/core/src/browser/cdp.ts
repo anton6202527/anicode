@@ -7,9 +7,18 @@
  * 走 CDP flat-session（Target.attachToTarget flatten）多路复用页面会话。
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, promises as fs, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  promises as fs,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, normalize, sep } from "node:path";
+import { terminateProcessTree } from "../runtime/isolated-runtime.js";
+import { sanitizedShellEnv } from "../tools/shell-spawn.js";
 import { WsClient } from "./ws.js";
 
 /** 平台候选二进制路径（按优先级）。可被显式路径 / 环境变量覆盖。 */
@@ -42,7 +51,10 @@ function chromeCandidates(): string[] {
 }
 
 /** 解析要用的 Chrome 二进制：显式 > 环境变量 ANICODE_BROWSER_PATH > 平台候选。找不到抛错。 */
-export function resolveChromePath(explicit?: string): string {
+export function resolveChromePath(
+  explicit?: string,
+  options: { requireTrustedExecutable?: boolean } = {},
+): string {
   const tried: string[] = [];
   const push = (p: string | undefined): string | undefined => {
     if (!p) return undefined;
@@ -61,7 +73,42 @@ export function resolveChromePath(explicit?: string): string {
       ].join(", ")}`,
     );
   }
-  return found;
+  return options.requireTrustedExecutable ? trustedBrowserExecutable(found) : found;
+}
+
+function trustedBrowserExecutable(candidate: string): string {
+  if (!isAbsolute(candidate)) {
+    throw new Error("Production browser executable must use an absolute path");
+  }
+  let canonical: string;
+  let stat: ReturnType<typeof statSync>;
+  try {
+    canonical = realpathSync(candidate);
+    stat = statSync(canonical);
+  } catch (error) {
+    throw new Error(`Cannot verify browser executable ${candidate}`, { cause: error });
+  }
+  if (!stat.isFile()) throw new Error(`Browser executable is not a regular file: ${candidate}`);
+
+  if (process.platform === "win32") {
+    const roots = [process.env["PROGRAMFILES"], process.env["PROGRAMFILES(X86)"]]
+      .filter((value): value is string => Boolean(value))
+      .map((value) => normalize(value).toLowerCase());
+    const target = normalize(canonical).toLowerCase();
+    if (!roots.some((root) => target === root || target.startsWith(root + sep))) {
+      throw new Error("Production browser executable must be installed under Program Files");
+    }
+    return canonical;
+  }
+
+  // Project-controlled binaries and writable system shims are code execution, not configuration.
+  // Production only accepts an administrator-owned executable whose group/other write bits are off.
+  if (stat.uid !== 0 || (stat.mode & 0o022) !== 0) {
+    throw new Error(
+      "Production browser executable must be root-owned and not group/world writable",
+    );
+  }
+  return canonical;
 }
 
 export interface ConsoleEntry {
@@ -92,6 +139,61 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 const LIVE = new Set<Browser>();
 let exitHooked = false;
 
+export interface BrowserResource {
+  close(): Promise<void>;
+}
+
+/** An ownership scope lets one host/session-manager dispose only the browsers it launched. */
+export class BrowserRegistry {
+  private readonly browsers = new Set<BrowserResource>();
+  private readonly launches = new Set<Promise<unknown>>();
+  private closed = false;
+  private closePromise: Promise<void> | undefined;
+
+  async add<T extends BrowserResource>(browser: T): Promise<T> {
+    if (this.closed) {
+      await browser.close();
+      throw new Error("Browser registry is closed");
+    }
+    this.browsers.add(browser);
+    return browser;
+  }
+
+  delete(browser: BrowserResource): void {
+    this.browsers.delete(browser);
+  }
+
+  launch(opts: Omit<Parameters<typeof Browser.launch>[0], "registry">): Promise<Browser> {
+    if (this.closed) return Promise.reject(new Error("Browser registry is closed"));
+    const launch = Browser.launch({ ...opts, registry: this });
+    this.launches.add(launch);
+    void launch.finally(() => this.launches.delete(launch)).catch(() => undefined);
+    return launch;
+  }
+
+  closeAll(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    this.closePromise = (async () => {
+      const launchResults = await Promise.allSettled([...this.launches]);
+      const closeResults = await Promise.allSettled(
+        [...this.browsers].map((browser) => browser.close()),
+      );
+      const failures = [...launchResults, ...closeResults].flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      const unexpected = failures.filter(
+        (failure) =>
+          !(failure instanceof Error && failure.message === "Browser registry is closed"),
+      );
+      if (unexpected.length > 0) {
+        throw new AggregateError(unexpected, "Failed to close browsers");
+      }
+    })();
+    return this.closePromise;
+  }
+}
+
 /** 关闭所有存活的浏览器（供宿主优雅退出、测试收尾调用）。 */
 export async function closeAllBrowsers(): Promise<void> {
   const results = await Promise.allSettled([...LIVE].map((browser) => browser.close()));
@@ -115,16 +217,22 @@ export class Browser {
     private readonly proc: ChildProcess,
     private readonly userDataDir: string,
     private readonly commandTimeoutMs: number,
+    private readonly registry?: BrowserRegistry,
   ) {}
 
   static async launch(opts: {
     executablePath?: string;
+    requireTrustedExecutable?: boolean;
     headless?: boolean;
     launchTimeoutMs?: number;
     commandTimeoutMs?: number;
     args?: string[];
+    registry?: BrowserRegistry;
   }): Promise<Browser> {
-    const bin = resolveChromePath(opts.executablePath);
+    const bin = resolveChromePath(
+      opts.executablePath,
+      opts.requireTrustedExecutable ? { requireTrustedExecutable: true } : {},
+    );
     const userDataDir = mkdtempSync(join(tmpdir(), "anicode-browser-"));
     const headless = opts.headless !== false;
     const args = [
@@ -141,7 +249,12 @@ export class Browser {
       ...(opts.args ?? []),
       "about:blank",
     ];
-    const proc = spawn(bin, args, { stdio: "ignore" });
+    const proc = spawn(bin, args, {
+      stdio: "ignore",
+      env: sanitizedShellEnv(),
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    });
     // unref：Chrome 子进程不拖住 Node 事件循环退出（退出钩子仍会 kill 它）。
     proc.unref();
     proc.on("error", () => {
@@ -161,17 +274,28 @@ export class Browser {
       Number.isSafeInteger(requestedCommandTimeout) && requestedCommandTimeout > 0
         ? Math.min(requestedCommandTimeout, 5 * 60_000)
         : 30_000;
-    const self = new Browser(proc, userDataDir, commandTimeoutMs);
-    self.ws = await WsClient.connect(
-      wsUrl,
-      {
-        onMessage: (text) => self.dispatch(text),
-        onClose: () => self.failPending(new Error("Chrome DevTools connection closed")),
-        onError: (error) => self.failPending(error),
-      },
-      timeoutMs,
-    );
+    const self = new Browser(proc, userDataDir, commandTimeoutMs, opts.registry);
+    try {
+      self.ws = await WsClient.connect(
+        wsUrl,
+        {
+          onMessage: (text) => self.dispatch(text),
+          onClose: () => self.failPending(new Error("Chrome DevTools connection closed")),
+          onError: (error) => self.failPending(error),
+        },
+        timeoutMs,
+      );
+    } catch (error) {
+      await terminateChild(proc);
+      await removeUserDataDir(userDataDir);
+      throw error;
+    }
+    proc.once("exit", () => {
+      self.failPending(new Error("Chrome process exited"));
+      void self.close().catch(() => undefined);
+    });
     LIVE.add(self);
+    if (opts.registry) await opts.registry.add(self);
     if (!exitHooked) {
       exitHooked = true;
       // exit 事件不能等待 Promise，但 close() 在首次 await 前会同步关闭 WS 并 kill Chrome。
@@ -230,6 +354,7 @@ export class Browser {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     LIVE.delete(this);
+    this.registry?.delete(this);
     this.closePromise = (async () => {
       try {
         this.ws.close();
@@ -293,41 +418,8 @@ export class Browser {
  * SIGTERM 超时才升级 SIGKILL，两个等待都有硬上限，避免宿主退出被卡死。
  */
 async function terminateChild(proc: ChildProcess): Promise<void> {
-  if (proc.pid === undefined || proc.exitCode !== null || proc.signalCode !== null) return;
-  try {
-    proc.kill("SIGTERM");
-  } catch {
-    return;
-  }
-  if (await waitForChild(proc, 2_000)) return;
-  try {
-    proc.kill("SIGKILL");
-  } catch {
-    return;
-  }
-  await waitForChild(proc, 1_000);
-}
-
-function waitForChild(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (exited: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      proc.off("exit", onExit);
-      proc.off("close", onExit);
-      proc.off("error", onError);
-      resolve(exited);
-    };
-    const onExit = () => finish(true);
-    const onError = () => finish(proc.exitCode !== null || proc.signalCode !== null);
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    proc.once("exit", onExit);
-    proc.once("close", onExit);
-    proc.once("error", onError);
-  });
+  if (proc.pid === undefined) return;
+  await terminateProcessTree(proc, { graceMs: 2_000, killWaitMs: 1_000 });
 }
 
 async function removeUserDataDir(userDataDir: string): Promise<void> {

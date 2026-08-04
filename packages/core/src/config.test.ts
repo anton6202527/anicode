@@ -82,8 +82,12 @@ test("config: 非法 JSON 只记 warning 不抛，未知键提示", async () => 
 });
 
 test("config: 转换 mcp / agents 为运行期结构", () => {
-  const mcp = toMcpServerConfigs({ mcp: { fs: { command: "srv", args: ["--root", "."] } } });
-  assert.deepEqual(mcp, [{ name: "fs", command: "srv", args: ["--root", "."] }]);
+  const mcp = toMcpServerConfigs({
+    mcp: { fs: { command: "srv", args: ["--root", "."], discoveryTimeoutMs: 750 } },
+  });
+  assert.deepEqual(mcp, [
+    { name: "fs", command: "srv", args: ["--root", "."], discoveryTimeoutMs: 750 },
+  ]);
   const agents = toSubagentDefinitions({
     agents: { reviewer: { description: "评审", prompt: "你是评审", tools: ["read", "grep"] } },
   });

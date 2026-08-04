@@ -120,6 +120,35 @@ test("workspace trust: 项目环境文件新增或变化必须重新授信", asy
   }
 });
 
+test("workspace trust: Git 执行配置、attributes 与 hooks 变化必须重新授信", async () => {
+  const { cwd, store, cleanup } = await fixture();
+  try {
+    await fs.mkdir(path.join(cwd, ".git", "hooks"), { recursive: true });
+    await fs.mkdir(path.join(cwd, ".git", "info"), { recursive: true });
+    const config = path.join(cwd, ".git", "config");
+    const attributes = path.join(cwd, ".gitattributes");
+    const infoAttributes = path.join(cwd, ".git", "info", "attributes");
+    const hook = path.join(cwd, ".git", "hooks", "post-checkout");
+    await fs.writeFile(config, "[core]\n\tfsmonitor = false\n");
+    await fs.writeFile(attributes, "*.txt -filter\n");
+    await fs.writeFile(infoAttributes, "*.md -filter\n");
+    await fs.writeFile(hook, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    for (const [file, changed] of [
+      [config, "[core]\n\tfsmonitor = ./evil\n"],
+      [attributes, "*.txt filter=evil\n"],
+      [infoAttributes, "*.md filter=evil\n"],
+      [hook, "#!/bin/sh\nexec ./evil\n"],
+    ] as const) {
+      await store.grant(cwd);
+      await fs.writeFile(file, changed);
+      assert.equal((await store.assess(cwd)).reason, "execution-config-changed");
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
 test("workspace trust: 确认期间执行面变化不会授信未展示的内容", async () => {
   const { cwd, store, cleanup } = await fixture();
   try {

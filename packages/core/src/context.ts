@@ -20,46 +20,75 @@ import type { ChatMessage, ContentPart } from "./types.js";
 // ---------- 项目记忆 ----------
 
 const MEMORY_FILES = ["AGENTS.md", "CLAUDE.md"];
+const MAX_MEMORY_FILE_BYTES = 256 * 1024;
+const MAX_PROJECT_MEMORY_BYTES = 1024 * 1024;
+const MAX_PROJECT_ANCESTORS = 64;
 
 export interface ProjectMemoryOptions {
   /** Defaults to true. Set false until Workspace Trust has been granted. */
   includeProject?: boolean;
 }
 
-/** 从 cwd 向上（到文件系统根或 .git 边界）收集所有记忆文件，就近优先拼接 */
+/** 从 cwd 向上（到最近 .git 边界）收集记忆；没有仓库边界时绝不越过 cwd。 */
 export async function loadProjectMemory(
   cwd: string,
   options: ProjectMemoryOptions = {},
 ): Promise<string> {
   if (options.includeProject === false) return "";
   const chunks: string[] = [];
-  let dir = path.resolve(cwd);
-  const seenGitRoot = { hit: false };
+  const requestedRoot = path.resolve(cwd);
+  const canonicalCwd = await fs.realpath(requestedRoot);
+  const projectRoot = await nearestProjectBoundary(canonicalCwd);
+  let dir = canonicalCwd;
+  let totalBytes = 0;
 
   while (true) {
     for (const name of MEMORY_FILES) {
       const file = path.join(dir, name);
       try {
+        const stat = await fs.lstat(file);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_MEMORY_FILE_BYTES) continue;
+        const canonicalFile = await fs.realpath(file);
+        if (!isInside(projectRoot, canonicalFile)) continue;
         const text = await fs.readFile(file, "utf8");
+        const bytes = Buffer.byteLength(text, "utf8");
+        if (totalBytes + bytes > MAX_PROJECT_MEMORY_BYTES) continue;
+        totalBytes += bytes;
         chunks.push(
-          `${t("# Project memory", "# 项目记忆")}（${path.relative(cwd, file) || name}）\n${text.trim()}`,
+          `${t("# Project memory", "# 项目记忆")}（${path.relative(canonicalCwd, file) || name}）\n${text.trim()}`,
         );
       } catch {
         /* 文件不存在，跳过 */
       }
     }
-    // 到 .git 所在目录就停（项目边界）
-    try {
-      await fs.access(path.join(dir, ".git"));
-      seenGitRoot.hit = true;
-    } catch {
-      /* no .git here */
-    }
+    if (dir === projectRoot) break;
     const parent = path.dirname(dir);
-    if (parent === dir || seenGitRoot.hit) break;
+    if (parent === dir || !isInside(projectRoot, parent)) break;
     dir = parent;
   }
   return chunks.join("\n\n");
+}
+
+async function nearestProjectBoundary(cwd: string): Promise<string> {
+  let dir = cwd;
+  for (let depth = 0; depth < MAX_PROJECT_ANCESTORS; depth++) {
+    try {
+      // Any entry named .git is a conservative boundary. A malformed/symlink marker must stop
+      // ancestor discovery too; ignoring it could import instructions from an unrelated parent.
+      await fs.lstat(path.join(dir, ".git"));
+      return dir;
+    } catch {
+      /* keep looking for the nearest explicit repository boundary */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return cwd;
+}
+
+function isInside(root: string, target: string): boolean {
+  return target === root || target.startsWith(root + path.sep);
 }
 
 /** 把项目记忆拼到基础 system 提示后面 */
@@ -94,7 +123,7 @@ function partChars(part: ContentPart): number {
 
 // ---------- Compaction ----------
 
-export type Summarizer = (messages: ChatMessage[]) => Promise<string>;
+export type Summarizer = (messages: ChatMessage[], signal?: AbortSignal) => Promise<string>;
 
 export interface CompactionConfig {
   /** 触发阈值（token 估算）。默认 120k（给 1M 窗口留足余量 + 控成本） */
@@ -225,7 +254,7 @@ export async function maybeCompact(
    */
   actualInputTokens?: number,
   /** force：跳过触发线判定，立即压缩（手动 /compact）。 */
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; signal?: AbortSignal },
 ): Promise<CompactionResult> {
   const original = history;
   const trigger = cfg.triggerTokens ?? 120_000;
@@ -281,7 +310,7 @@ export async function maybeCompact(
   const older = original.slice(0, cutoff);
   const recent = history.slice(cutoff);
 
-  const summary = await cfg.summarizer(older);
+  const summary = await cfg.summarizer(older, opts?.signal);
   const compactedPair: ChatMessage[] = [
     {
       role: "user",
@@ -308,9 +337,10 @@ export function providerSummarizer(
   stream: (
     messages: ChatMessage[],
     system: string,
+    signal?: AbortSignal,
   ) => AsyncIterable<{ type: string; text?: string }>,
 ): Summarizer {
-  return async (messages) => {
+  return async (messages, signal) => {
     const system = t(
       "You are a context compactor. Compress the conversation history below into a concise but " +
         "information-complete summary: keep the key decisions made, files changed, unfinished tasks, " +
@@ -323,7 +353,7 @@ export function providerSummarizer(
       content: [{ type: "text", text: renderHistory(messages) }],
     };
     let out = "";
-    for await (const ev of stream([flattened], system)) {
+    for await (const ev of stream([flattened], system, signal)) {
       if (ev.type === "text" && ev.text) out += ev.text;
     }
     return out.trim() || t("(empty summary)", "（摘要为空）");

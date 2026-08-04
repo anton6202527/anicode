@@ -6,12 +6,15 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  createLocalRuntimeStack,
   registerOpenAICompatibleProvider,
   WorkspaceTrustStore,
   type SessionHost,
 } from "@anicode/core";
 import {
+  assertProviderConfigured,
   colorlessTerminalOutput,
+  disposeCliRuntimeResources,
   enterTerminalScreen,
   fullscreenViewportOutput,
   helpText,
@@ -20,10 +23,13 @@ import {
   parseExecArgs,
   resolveConfiguredProvider,
   resolveDefaultModel,
+  resolveInteractivePermissionMode,
   runMcpCatalogCommand,
+  runMcpCommand,
   runTrustCommand,
   runExecCommand,
   selectSessionId,
+  selectStartupModel,
   startRawModeWatchdog,
   terminalSafe,
   validateArgs,
@@ -182,6 +188,27 @@ test("CLI: 默认关闭鼠标跟踪以保留原生框选，--mouse 可显式开�
   assert.throws(() => parseArgs(["--plain", "--mouse"]), /不能与|cannot be used with/);
 });
 
+test("CLI: 已信任本地交互默认最高权限，受限、显式、exec 与远端保持各自策略", () => {
+  const local = parseArgs([]);
+  assert.equal(local.permissionMode, "default", "共享解析器必须继续 fail closed");
+  assert.equal(local.permissionModeExplicit, false);
+  assert.equal(resolveInteractivePermissionMode(local, true), "bypass");
+  assert.equal(resolveInteractivePermissionMode(local, false), "default");
+
+  const daemon = parseArgs(["--daemon"]);
+  assert.equal(resolveInteractivePermissionMode(daemon, true), "default");
+  const http = parseArgs(["--http", "http://127.0.0.1:8327"]);
+  assert.equal(resolveInteractivePermissionMode(http, true), "default");
+
+  assert.equal(resolveInteractivePermissionMode(parseArgs(["--auto"]), true), "auto");
+  assert.equal(parseArgs(["--auto"]).permissionModeExplicit, true);
+  assert.equal(
+    resolveInteractivePermissionMode(parseArgs(["--accept-edits"]), true),
+    "acceptEdits",
+  );
+  assert.equal(parseExecArgs(["--demo", "--prompt", "hello"]).args.permissionMode, "default");
+});
+
 test("CLI: MCP 开发目录可列出，并按项目或全局原子安装/移除", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-catalog-"));
   const cwd = path.join(root, "project");
@@ -327,13 +354,20 @@ test("CLI: 非 resume 路径只创建一次会话", async () => {
   assert.equal(createCalls, 1);
 });
 
-test("CLI: daemon 客户端拒绝静默忽略权限模式", () => {
-  for (const flag of ["--auto", "--accept-edits"]) {
-    const args = parseArgs(["--daemon", flag]);
-    assert.throws(() => validateArgs(args), new RegExp(`${flag}.*daemon 进程.*不会被当前连接修改`));
+test("CLI: daemon/HTTP 客户端拒绝静默忽略本地权限与会话目录参数", () => {
+  for (const transport of [["--daemon"], ["--http", "http://127.0.0.1:8327"]]) {
+    for (const flag of ["--auto", "--accept-edits"]) {
+      const args = parseArgs([...transport, flag]);
+      assert.throws(() => validateArgs(args), new RegExp(`${flag}.*宿主.*不会修改`));
+    }
+    assert.throws(
+      () => validateArgs(parseArgs([...transport, "--sessions", "/tmp/sessions"])),
+      /--sessions.*宿主管理/,
+    );
   }
 
   assert.doesNotThrow(() => validateArgs(parseArgs(["--daemon"])));
+  assert.doesNotThrow(() => validateArgs(parseArgs(["--http", "http://127.0.0.1:8327"])));
   assert.doesNotThrow(() => validateArgs(parseArgs(["--auto"])));
 });
 
@@ -371,7 +405,7 @@ test("CLI: demo 与隔离会话目录适合零配置本地调试", () => {
 test("CLI: daemon 拒绝本地专属会话目录，trace 必须配日志", () => {
   assert.throws(
     () => validateArgs(parseArgs(["--daemon", "--sessions", "/tmp/sessions"])),
-    /会话目录由 daemon 管理/,
+    /会话目录由宿主管理/,
   );
   assert.throws(() => validateArgs(parseArgs(["--trace-content"])), /必须与 --debug-log 一起使用/);
 });
@@ -407,6 +441,141 @@ test("CLI: 无 --model 时不硬耦合 ANTHROPIC_API_KEY，无凭证回退 debug
       else process.env[k] = v;
     }
   }
+});
+
+test("CLI: 隐式配置模型缺凭证时安全回退，显式模型与无效 provider 保持 fail-fast", () => {
+  const missingCredentials = {
+    diagnoseProvider(model: string) {
+      if (model === "unknown/model") throw new Error("Unknown provider: unknown");
+      return {
+        requiresApiKey: model !== "debug/demo",
+        hasCredentials: model === "debug/demo",
+        warnings: model === "debug/demo" ? [] : ["missing DEEPSEEK_API_KEY"],
+      };
+    },
+    resolveDefaultModel: () => "debug/demo",
+  };
+
+  assert.deepEqual(
+    selectStartupModel(
+      {
+        model: "deepseek/deepseek-v4-flash",
+        modelExplicit: false,
+        demo: false,
+      },
+      "deepseek/deepseek-v4-flash",
+      missingCredentials,
+    ),
+    {
+      model: "debug/demo",
+      fallbackFrom: "deepseek/deepseek-v4-flash",
+      fallbackReason: "missing DEEPSEEK_API_KEY",
+    },
+  );
+
+  const explicit = selectStartupModel(
+    { model: "deepseek/deepseek-v4-flash", modelExplicit: true, demo: false },
+    "debug/demo",
+    missingCredentials,
+  );
+  assert.deepEqual(explicit, { model: "deepseek/deepseek-v4-flash" });
+  assert.throws(
+    () => assertProviderConfigured(explicit.model, missingCredentials.diagnoseProvider),
+    /DEEPSEEK_API_KEY.*--demo/,
+  );
+  assert.deepEqual(
+    selectStartupModel(
+      { model: "debug/demo", modelExplicit: false, demo: true },
+      "deepseek/deepseek-v4-flash",
+      missingCredentials,
+    ),
+    { model: "debug/demo" },
+  );
+  assert.throws(
+    () =>
+      selectStartupModel(
+        { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+        "unknown/model",
+        missingCredentials,
+      ),
+    /Unknown provider/,
+  );
+});
+
+test("CLI: 模型选择读取当前 runtime Broker，而不是密钥清理后的 process.env", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-provider-broker-"));
+  const env: NodeJS.ProcessEnv = {
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    DEEPSEEK_API_KEY: "test-only-secret",
+  };
+  const stack = createLocalRuntimeStack(root, env);
+  try {
+    assert.equal(env.DEEPSEEK_API_KEY, undefined, "credential must leave the mutable environment");
+    assert.deepEqual(
+      selectStartupModel(
+        {
+          model: "deepseek/deepseek-v4-flash",
+          modelExplicit: false,
+          demo: false,
+        },
+        "deepseek/deepseek-v4-flash",
+        stack.providers,
+      ),
+      { model: "deepseek/deepseek-v4-flash" },
+    );
+    assert.doesNotThrow(() =>
+      assertProviderConfigured("deepseek/deepseek-v4-flash", stack.providers.diagnoseProvider),
+    );
+  } finally {
+    await Promise.resolve(stack.artifacts.close?.()).catch(() => undefined);
+    await stack.networkProxy.close().catch(() => undefined);
+    await stack.database.close().catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI: runtime 清理即使中途失败也会关闭 telemetry、sandbox、artifact、proxy 与 database", async () => {
+  const closed: string[] = [];
+  const runtime = {
+    isolatedRuntime: {
+      async shutdown() {
+        closed.push("isolatedRuntime");
+      },
+    },
+    artifacts: {
+      async close() {
+        closed.push("artifacts");
+        throw new Error("artifact close failed");
+      },
+    },
+    networkProxy: {
+      async close() {
+        closed.push("networkProxy");
+      },
+    },
+    database: {
+      async close() {
+        closed.push("database");
+      },
+    },
+  } as unknown as Parameters<typeof disposeCliRuntimeResources>[0];
+  const telemetry = {
+    startSpan: () => {
+      throw new Error("unused");
+    },
+    async shutdown() {
+      closed.push("telemetry");
+    },
+  };
+
+  await assert.rejects(disposeCliRuntimeResources(runtime, telemetry), AggregateError);
+  assert.deepEqual(closed, [
+    "telemetry",
+    "isolatedRuntime",
+    "artifacts",
+    "networkProxy",
+    "database",
+  ]);
 });
 
 test("CLI: 本地 resolver 在建会话时给出缺凭证诊断，debug 始终可用", () => {
@@ -455,6 +624,7 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
       http: baseUrl,
       httpTokenFile: tokenFile,
       permissionMode: "default",
+      permissionModeExplicit: false,
       socket: "",
       sessionsDir: path.join(dir, "unused"),
       sessionsExplicit: false,
@@ -560,7 +730,52 @@ test("CLI exec: demo 模型无 TTY 完成一次 JSONL 会话", async () => {
   }
 });
 
-test("CLI exec: inspection-failed 明确退回只读 plan，不承诺 write/bash", async (t) => {
+test("CLI headless: 配置模型缺凭证时 exec 与 MCP fail-fast，不伪装成 demo 成功", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-headless-model-"));
+  const cwd = path.join(root, "workspace");
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousDeepSeek = process.env.DEEPSEEK_API_KEY;
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.XDG_CONFIG_HOME = path.join(root, "config");
+  delete process.env.DEEPSEEK_API_KEY;
+  try {
+    await fs.mkdir(cwd);
+    await fs.writeFile(
+      path.join(cwd, "anicode.json"),
+      JSON.stringify({ model: "deepseek/deepseek-v4-flash" }),
+    );
+    const output = { write: () => true } as unknown as NodeJS.WritableStream;
+    await assert.rejects(
+      runExecCommand(
+        [
+          "--cwd",
+          cwd,
+          "--sessions",
+          path.join(root, "exec-sessions"),
+          "--prompt",
+          "must use the configured model",
+        ],
+        { output, error: output },
+      ),
+      /DEEPSEEK_API_KEY.*--demo/,
+    );
+    await assert.rejects(
+      runMcpCommand(["--cwd", cwd, "--sessions", path.join(root, "mcp-sessions")], { output }),
+      /DEEPSEEK_API_KEY.*--demo/,
+    );
+  } finally {
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    if (previousDeepSeek === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previousDeepSeek;
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI exec: inspection-failed 明确退回严格只读安全策略，不承诺 write/bash", async (t) => {
   if (process.platform === "win32") {
     t.skip("Windows symlink privileges vary by host policy");
     return;
@@ -603,7 +818,8 @@ test("CLI exec: inspection-failed 明确退回只读 plan，不承诺 write/bash
       .join("\n");
     assert.match(warnings, /Workspace inspection failed|工作区检查失败/);
     assert.match(warnings, /read\/glob\/grep/);
-    assert.match(warnings, /plan mode|plan 模式/);
+    assert.match(warnings, /strict read-only safety policy|严格只读安全策略/);
+    assert.doesNotMatch(warnings, /plan mode|plan 模式|计划模式/);
     assert.doesNotMatch(warnings, /approve built-in development tools|内置开发工具逐项授权/);
   } finally {
     if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;

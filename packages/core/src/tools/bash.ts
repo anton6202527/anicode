@@ -12,6 +12,7 @@
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import { buildShellSpawn, sanitizedShellEnv } from "./shell-spawn.js";
+import { terminateProcessTree } from "../runtime/isolated-runtime.js";
 import { startBackgroundShell } from "./shells.js";
 import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
@@ -393,6 +394,8 @@ export const bashTool: Tool = {
       const child = spawn(spawnFile, spawnArgs, {
         cwd: ctx.cwd,
         env: sanitizedShellEnv(),
+        detached: process.platform !== "win32",
+        windowsHide: true,
       });
       const capture = new OutputCapture();
       const onData = (buf: Buffer) => capture.push(buf.toString());
@@ -401,25 +404,26 @@ export const bashTool: Tool = {
 
       // 超时不是「无结果」：命令挂住前往往已经打印了关键线索（哪个测试卡住、
       // 连到哪个地址）。把已捕获的输出如实回给模型，比只丢一句「超时」有用得多。
+      let terminal: "timeout" | "abort" | undefined;
+      let termination: Promise<void> | undefined;
+      const stop = () => {
+        termination ??= terminateProcessTree(child);
+        void termination.catch(() => undefined);
+        return termination;
+      };
       const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-        resolve(
-          `[timeout ${timeout}ms]\n${capture.render(
-            t(
-              `\n…（command exceeded ${timeout}ms and was killed; output above is what it printed before that）`,
-              `\n…（命令超过 ${timeout}ms 被终止；以上是终止前的输出）`,
-            ),
-          )}`,
-        );
+        terminal = "timeout";
+        void stop();
       }, timeout);
 
       // 用户中断与超时不同：这是显式打断，应作为错误上抛，让 loop 结束本轮。
       const onAbort = () => {
-        child.kill("SIGKILL");
+        terminal = "abort";
         clearTimeout(timer);
-        reject(new ToolError("命令被中断"));
+        void stop();
       };
       ctx.signal.addEventListener("abort", onAbort, { once: true });
+      if (ctx.signal.aborted) onAbort();
 
       child.on("error", (err) => {
         clearTimeout(timer);
@@ -427,9 +431,36 @@ export const bashTool: Tool = {
         reject(new ToolError(`无法启动命令: ${err.message}`));
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
-        ctx.signal.removeEventListener("abort", onAbort);
-        resolve(`[exit ${code ?? "?"}]\n${capture.render()}`);
+        void (async () => {
+          clearTimeout(timer);
+          ctx.signal.removeEventListener("abort", onAbort);
+          if (!termination && process.platform !== "win32") {
+            termination = terminateProcessTree(child);
+          }
+          await termination;
+          if (terminal === "abort") {
+            reject(new ToolError("命令被中断"));
+            return;
+          }
+          if (terminal === "timeout") {
+            resolve(
+              `[timeout ${timeout}ms]\n${capture.render(
+                t(
+                  `\n…（command exceeded ${timeout}ms and was killed; output above is what it printed before that）`,
+                  `\n…（命令超过 ${timeout}ms 被终止；以上是终止前的输出）`,
+                ),
+              )}`,
+            );
+            return;
+          }
+          resolve(`[exit ${code ?? "?"}]\n${capture.render()}`);
+        })().catch((error) =>
+          reject(
+            new ToolError(
+              `命令进程树清理失败: ${error instanceof Error ? error.message : String(error)}`,
+            ),
+          ),
+        );
       });
     });
   },

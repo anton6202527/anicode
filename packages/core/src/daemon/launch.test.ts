@@ -5,12 +5,17 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  createDaemonManagerComposition,
   daemonHelpText,
   parseDaemonArgs,
   prepareSocketDirectory,
   removeStaleSocket,
 } from "./launch.js";
 import { defaultDaemonSocketPath, isWindowsNamedPipePath } from "./socket-path.js";
+import { createLocalRuntimeStack } from "../runtime/local-stack.js";
+import { DisabledExecutionRuntime } from "../runtime/isolated-runtime.js";
+import { noTelemetry } from "../runtime/telemetry.js";
+import type { Provider, StreamEvent, StreamRequest } from "../types.js";
 
 test("daemon socket: default endpoint is isolated per user and portable", () => {
   assert.equal(
@@ -112,6 +117,59 @@ test("daemon CLI: 严格解析路径、权限与帮助参数", () => {
     parseDaemonArgs(["--socket", "\\\\.\\pipe\\anicode-test"]).socketPath,
     "\\\\.\\pipe\\anicode-test",
   );
+});
+
+test("daemon composition: Windows restricted runtime does not expose process tools", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-composition-"));
+  const workspace = path.join(root, "workspace");
+  await fs.mkdir(workspace);
+  const stack = createLocalRuntimeStack(root, { ANICODE_CREDENTIAL_BACKEND: "memory" });
+  const requests: StreamRequest[] = [];
+  const provider: Provider = {
+    name: "capture-daemon-windows",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      requests.push(request);
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const composition = createDaemonManagerComposition({
+    cwd: workspace,
+    sessionsDir: path.join(root, "sessions"),
+    permissionMode: "default",
+    runtimeStack: {
+      ...stack,
+      executionMode: "restricted",
+      isolatedRuntime: new DisabledExecutionRuntime("Windows native execution disabled"),
+    },
+    telemetry: noTelemetry,
+    resolveProvider: () => ({ provider, model: "capture" }),
+    workspaceTrust: async () => ({
+      trusted: false,
+      reason: "not-trusted",
+      executionSources: [],
+      storeFile: path.join(root, "trust.json"),
+      assessedAt: new Date().toISOString(),
+    }),
+  });
+  try {
+    const session = await composition.manager.createSession({ cwd: workspace, model: "capture" });
+    await composition.manager.send(session.id, "safe inspection");
+    const schema = (requests[0]?.tools ?? []).map((tool) => tool.name);
+    assert.equal(schema.includes("bash"), false);
+    assert.equal(schema.includes("bash_output"), false);
+    assert.equal(schema.includes("kill_shell"), false);
+  } finally {
+    await composition.dispose();
+    await stack.artifacts.close?.();
+    await stack.networkProxy.close();
+    await stack.database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("daemon CLI: 不会把正在监听的 socket 当作陈旧文件删除", async () => {

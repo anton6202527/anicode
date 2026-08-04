@@ -83,6 +83,20 @@ test("沙箱: 正常读写/新建子目录文件不受影响", async () => {
   await fs.rm(base, { recursive: true, force: true });
 });
 
+test("edit: 超大文件在整文件读入内存前被拒绝", async () => {
+  const { base, root } = await setup();
+  const target = path.join(root, "large.txt");
+  const handle = await fs.open(target, "w");
+  await handle.truncate(16 * 1024 * 1024 + 1);
+  await handle.close();
+
+  await assert.rejects(
+    () => editTool.run({ path: "large.txt", old_string: "a", new_string: "b" }, ctx(root)),
+    /文件过大.*16777216/,
+  );
+  await fs.rm(base, { recursive: true, force: true });
+});
+
 test("applyEdit: 精确唯一匹配", () => {
   const r = applyEdit("a\nfoo\nb", "foo", "bar", false);
   assert.equal(r.mode, "exact");

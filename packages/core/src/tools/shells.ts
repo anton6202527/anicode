@@ -26,6 +26,7 @@ import type { Tool, ToolContext } from "./tool.js";
 import { ToolError } from "./tool.js";
 import { buildShellSpawn, sanitizedShellEnv } from "./shell-spawn.js";
 import { t } from "../i18n.js";
+import { terminateProcessTree } from "../runtime/isolated-runtime.js";
 
 /** 每个 shell 的待读缓冲上限（字符）。超出丢最旧的。 */
 const MAX_PENDING_CHARS = 60_000;
@@ -48,6 +49,7 @@ export interface ShellInfo {
 
 interface ShellEntry extends ShellInfo {
   child: ChildProcess;
+  termination?: Promise<void>;
   /** 尚未被 bash_output 读走的输出 */
   pending: string;
   /** 因缓冲上限被丢弃的字符数（读取时如实告知） */
@@ -107,6 +109,8 @@ export class ShellRegistry {
         env: opts.env ?? sanitizedShellEnv(),
         // stdin 开管道：交互式进程（REPL/向导/等待确认的安装脚本）可经 write_stdin 喂输入。
         stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+        windowsHide: true,
       });
     } catch (err) {
       throw new ToolError(`无法启动后台命令: ${(err as Error)?.message ?? err}`);
@@ -216,12 +220,18 @@ export class ShellRegistry {
     if (entry.status === "running") {
       entry.status = "killed";
       entry.endedAt = Date.now();
-      try {
-        entry.child.kill("SIGKILL");
-      } catch {
-        /* 已经死了 */
-      }
+      entry.termination ??= terminateProcessTree(entry.child);
+      void entry.termination.catch(() => undefined);
     }
+    return true;
+  }
+
+  /** kill_shell 的强完成语义：只有整棵进程树关闭后才向模型报告成功。 */
+  async killAndWait(id: string): Promise<boolean> {
+    const entry = this.shells.get(id);
+    if (!entry) return false;
+    this.kill(id);
+    await entry.termination;
     return true;
   }
 
@@ -283,15 +293,20 @@ export class ShellRegistry {
   }
 
   /** 杀掉全部（宿主退出 / 会话结束时调用）。 */
-  killAll(): void {
+  async killAll(): Promise<void> {
+    const terminations: Promise<void>[] = [];
     for (const e of this.shells.values()) {
-      try {
-        e.child.kill("SIGKILL");
-      } catch {
-        /* ignore */
-      }
+      if (e.status === "running") this.kill(e.id);
+      if (e.termination) terminations.push(e.termination);
     }
     this.shells.clear();
+    const results = await Promise.allSettled(terminations);
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Failed to close background shell process trees");
+    }
   }
 }
 
@@ -304,7 +319,7 @@ function installExitHook(): void {
   if (exitHookInstalled) return;
   exitHookInstalled = true;
   try {
-    process.on("exit", () => shells.killAll());
+    process.on("exit", () => void shells.killAll().catch(() => undefined));
   } catch {
     /* 无 process 环境 */
   }
@@ -511,7 +526,7 @@ export const killShellTool: Tool = {
   async run(input) {
     const id = String(input["shell_id"] ?? "");
     if (!id) throw new ToolError("shell_id 不能为空");
-    if (!shells.kill(id)) {
+    if (!(await shells.killAndWait(id))) {
       throw new ToolError(t(`Unknown shell id: ${id}`, `未知的 shell id: ${id}`));
     }
     return t(`Killed background shell ${id}.`, `已终止后台 shell ${id}。`);

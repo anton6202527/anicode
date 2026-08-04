@@ -18,13 +18,27 @@ import {
   traceparent,
 } from "./telemetry.js";
 import { canonicalizeIpAddress, NetworkProxy, isPrivateAddress } from "./network-proxy.js";
-import { IsolatedRuntime } from "./isolated-runtime.js";
+import { IsolatedRuntime, type ExecutionRuntime } from "./isolated-runtime.js";
 import { CapabilityAuthority, SecurityPolicyEngine } from "../security/policy.js";
 import { CredentialBroker } from "../security/credentials.js";
 import { Agent } from "../agent.js";
 import { ToolRegistry, type Tool } from "../tools/tool.js";
 import { sanitizedShellEnv } from "../tools/shell-spawn.js";
 import type { ChatMessage, Provider, StreamEvent } from "../types.js";
+
+const deterministicVerifierRuntime: ExecutionRuntime = {
+  async run(request) {
+    const requestedExit = /process\.exit\((\d+)\)/.exec(request.command)?.[1];
+    const exitCode = requestedExit === undefined ? 0 : Number(requestedExit);
+    return {
+      exitCode,
+      output: "",
+      timedOut: false,
+      sandboxed: true,
+      durationMs: 1,
+    };
+  },
+};
 
 test("runtime: artifact 内容寻址、持久化与 session 隔离", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-artifacts-"));
@@ -285,8 +299,11 @@ test("runtime: scheduler 尊重依赖与写资源互斥", async () => {
   assert.equal(order.at(-1), "c");
 });
 
-test("runtime: verifier 并行执行并以 required check 作为完成门槛", async () => {
+test("runtime: verifier 并行执行并以 required check 作为完成门槛", async (t) => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-verifier-architecture-"));
+  t.after(() => fs.rm(cwd, { recursive: true, force: true }));
   const verifier = new Verifier({
+    executionRuntime: deterministicVerifierRuntime,
     policy: {
       checks: [
         { id: "pass", command: process.execPath, args: ["-e", "process.exit(0)"] },
@@ -294,7 +311,7 @@ test("runtime: verifier 并行执行并以 required check 作为完成门槛", a
       ],
     },
   });
-  const report = await verifier.verify({ cwd: process.cwd() });
+  const report = await verifier.verify({ cwd });
   assert.equal(report.status, "failed");
   assert.equal(report.checks.find((check) => check.id === "fail")?.exitCode, 3);
 });
@@ -524,7 +541,9 @@ test("telemetry: 静态敏感 header fail-close，Broker 引用按域注入且�
   assert.equal(sentBody.includes("collector-secret"), false);
 });
 
-test("agent 主路径: Security Policy → tool → Verifier → OpenTelemetry", async () => {
+test("agent 主路径: Security Policy → tool → Verifier → OpenTelemetry", async (t) => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-verifier-agent-"));
+  t.after(() => fs.rm(cwd, { recursive: true, force: true }));
   let turn = 0;
   const scripts: ChatMessage[] = [
     {
@@ -562,7 +581,7 @@ test("agent 主路径: Security Policy → tool → Verifier → OpenTelemetry",
   const agent = new Agent({
     provider,
     model: "scripted",
-    cwd: process.cwd(),
+    cwd,
     tools: new ToolRegistry().register(change),
     permission: { mode: "bypass" },
     projectMemory: false,
@@ -570,6 +589,7 @@ test("agent 主路径: Security Policy → tool → Verifier → OpenTelemetry",
     telemetry,
     securityPolicy: new SecurityPolicyEngine(),
     verifier: new Verifier({
+      executionRuntime: deterministicVerifierRuntime,
       policy: {
         checks: [{ id: "pass", command: process.execPath, args: ["-e", "process.exit(0)"] }],
       },
@@ -585,4 +605,59 @@ test("agent 主路径: Security Policy → tool → Verifier → OpenTelemetry",
   assert.ok(telemetry.spans.some((span) => span.name === "anicode.model.stream"));
   assert.ok(telemetry.spans.some((span) => span.name === "anicode.tool.execute"));
   assert.ok(telemetry.spans.every((span) => span.ended));
+});
+
+test("agent: dirty workspace cannot finish when the verifier has no applicable evidence", async () => {
+  let turn = 0;
+  const scripts: ChatMessage[] = [
+    {
+      role: "assistant",
+      content: [{ type: "tool_call", id: "edit_1", name: "change", args: { path: "a.ts" } }],
+    },
+    { role: "assistant", content: [{ type: "text", text: "done" }] },
+  ];
+  const provider: Provider = {
+    name: "scripted",
+    async *stream(): AsyncIterable<StreamEvent> {
+      const message = scripts[turn++]!;
+      yield {
+        type: "done",
+        stopReason: message.content.some((part) => part.type === "tool_call")
+          ? "tool_use"
+          : "end_turn",
+        message,
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const change: Tool = {
+    readOnly: false,
+    mutatesFiles: true,
+    def: { name: "change", description: "change", parameters: { type: "object" } },
+    ruleKey: () => "a.ts",
+    async run() {
+      return "changed";
+    },
+  };
+  const agent = new Agent({
+    provider,
+    model: "scripted",
+    cwd: process.cwd(),
+    tools: new ToolRegistry().register(change),
+    permission: { mode: "bypass" },
+    projectMemory: false,
+    injectEnv: false,
+    verificationMaxAttempts: 1,
+    verifier: new Verifier({ executionRuntime: deterministicVerifierRuntime }),
+  });
+  const events = [];
+  for await (const event of agent.send("change it")) events.push(event);
+  assert.ok(
+    events.some((event) => event.type === "verification" && event.report.status === "failed"),
+  );
+  assert.ok(events.some((event) => event.type === "error"));
+  assert.equal(
+    events.some((event) => event.type === "done"),
+    false,
+  );
 });

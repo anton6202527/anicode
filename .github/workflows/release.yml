@@ -14,8 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # 合并到 main 时：有待发布的 changeset 就开「Version Packages」PR；
-  # 该 PR 合并后再次触发，此时直接 publish 到 npm。
+  # Unprivileged validation and packing. Repository code never runs in the OIDC publish job.
   npm:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -37,31 +36,138 @@ jobs:
     env:
       ANICODE_TEST_DATABASE_URL: postgresql://anicode:anicode-test-only@127.0.0.1:5432/anicode_test
     permissions:
-      contents: write
-      pull-requests: write
-      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Audit registry signatures and activate reviewed native dependencies
+        run: npm run rebuild:trusted
+
+      - name: Run complete release gate
+        run: npm run verify:release
+
+      - name: Pack the already-gated npm artifact without lifecycle scripts
+        run: |
+          mkdir -p release-npm
+          npm pack --workspace anicode --ignore-scripts --pack-destination release-npm
+          node scripts/write-sha256s.mjs release-npm/SHA256SUMS.txt release-npm .tgz
+
+      - name: Stage the gated npm artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-npm
+          path: release-npm
+          if-no-files-found: error
+          retention-days: 1
+
+  # Changesets may update a version PR with a write-scoped GitHub token, but this job has no OIDC.
+  version-pr:
+    if: github.event_name == 'push'
+    needs: npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      hasChangesets: ${{ steps.changesets.outputs.hasChangesets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install Changesets without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Create or update the version PR
+        id: changesets
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
+        with:
+          version: npm run version
+          commitMode: github-api
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # The only OIDC-capable npm job has no checkout and executes no repository-provided code.
+  publish-npm:
+    if: needs.version-pr.outputs.hasChangesets == 'false'
+    needs: [npm, version-pr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - run: npm ci
-
-      - name: Run complete release gate
-        run: npm run verify:release
-
-      - name: Create Release PR or publish
-        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
+      - name: Download the gated npm artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          version: npm run version
-          publish: npm run release
-        env:
-          # GitHub supplies this per job; npm publish uses trusted publishing (OIDC), not a stored token.
-          GITHUB_TOKEN: ${{ github.token }}
-          NPM_CONFIG_PROVENANCE: "true"
+          name: release-npm
+          path: release-npm
+
+      - name: Verify and publish the tarball with trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-npm
+          sha256sum --check SHA256SUMS.txt
+          shopt -s nullglob
+          tarballs=( *.tgz )
+          test "${#tarballs[@]}" -eq 1 || { echo "Expected exactly one npm tarball" >&2; exit 1; }
+          tarball="${tarballs[0]}"
+          mapfile -t package_files < <(tar -tzf "$tarball" | LC_ALL=C sort)
+          expected_files=( package/LICENSE package/README.md package/dist/cli.js package/package.json )
+          test "${#package_files[@]}" -eq "${#expected_files[@]}" || {
+            printf 'Unexpected npm tarball contents:\n%s\n' "${package_files[@]}" >&2
+            exit 1
+          }
+          for index in "${!expected_files[@]}"; do
+            test "${package_files[$index]}" = "${expected_files[$index]}" || {
+              printf 'Unexpected npm tarball contents:\n%s\n' "${package_files[@]}" >&2
+              exit 1
+            }
+          done
+          package_json="$(tar -xOf "$tarball" package/package.json)"
+          package_name="$(jq -er '.name | select(. == "anicode")' <<<"$package_json")"
+          package_version="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"))' <<<"$package_json")"
+          jq -e '
+            .repository.url == "git+https://github.com/anton6202527/anicode.git" and
+            .repository.directory == "packages/cli"
+          ' <<<"$package_json" >/dev/null
+          local_integrity="sha512-$(openssl dgst -sha512 -binary "$tarball" | openssl base64 -A)"
+          if registry_integrity_json="$(npm view "$package_name@$package_version" dist.integrity --json 2>npm-view.err)"; then
+            registry_integrity="$(jq -er 'select(type == "string" and startswith("sha512-"))' <<<"$registry_integrity_json")"
+            test "$registry_integrity" = "$local_integrity" || {
+              echo "$package_name@$package_version already exists with different bytes" >&2
+              exit 1
+            }
+            echo "$package_name@$package_version is already published with the identical integrity; nothing to do"
+          elif grep -Eq 'E404|404 Not Found' npm-view.err; then
+            npm publish "$tarball" --access public --provenance --ignore-scripts
+          else
+            cat npm-view.err >&2
+            exit 1
+          fi
 
   # Release assets are built only after the tagged commit passes the same gate as npm publishing.
   validate-release:
@@ -86,13 +192,23 @@ jobs:
       ANICODE_TEST_DATABASE_URL: postgresql://anicode:anicode-test-only@127.0.0.1:5432/anicode_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
 
-      - run: npm ci
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Audit registry signatures and activate reviewed native dependencies
+        run: npm run rebuild:trusted
+
+      - name: Set release version before the release gate
+        run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
 
       - name: Validate tagged release candidate
         run: npm run verify:release
@@ -114,19 +230,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
 
-      - run: npm ci
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Audit registry signatures and activate reviewed native dependencies
+        run: npm run rebuild:trusted
 
       - name: Set release version
         run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
@@ -144,17 +264,49 @@ jobs:
           "packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt"
           packages/vscode .vsix
 
+      - name: Stage VSIX assets for the publication job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-vsix-${{ matrix.target }}
+          path: |
+            packages/vscode/anicode-${{ matrix.target }}.vsix
+            packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-vsix:
+    if: github.event_name == 'release'
+    needs: vsix
+    name: publish vsix (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x64, linux-arm64, darwin-arm64, darwin-x64, win32-x64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download gated VSIX assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-vsix-${{ matrix.target }}
+          path: release-assets
+
       - name: Attest VSIX build provenance
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
-          subject-checksums: packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt
+          subject-checksums: release-assets/anicode-${{ matrix.target }}-SHA256SUMS.txt
 
       - name: Upload .vsix to release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: |
-            packages/vscode/anicode-${{ matrix.target }}.vsix
-            packages/vscode/anicode-${{ matrix.target }}-SHA256SUMS.txt
+            release-assets/anicode-${{ matrix.target }}.vsix
+            release-assets/anicode-${{ matrix.target }}-SHA256SUMS.txt
 
   desktop:
     if: github.event_name == 'release'
@@ -181,30 +333,39 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
-    env:
-      CSC_LINK: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_LINK || secrets.WINDOWS_CSC_LINK }}
-      CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_KEY_PASSWORD || secrets.WINDOWS_CSC_KEY_PASSWORD }}
-      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      GH_TOKEN: ${{ github.token }}
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
 
-      - run: npm ci
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
 
-      - name: Require release signing credentials
+      - name: Audit registry signatures and activate reviewed native dependencies
+        run: npm run rebuild:trusted
+
+      - name: Set release version
+        run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
+
+      - name: Build desktop application without signing credentials
+        run: npm run build --workspace @anicode/app
+
+      - name: Build and sign desktop installers
         if: matrix.signed == 'true'
         shell: bash
+        env:
+          CSC_LINK: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_LINK || secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_KEY_PASSWORD || secrets.WINDOWS_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_BASE64: ${{ matrix.platform == 'mac' && secrets.APPLE_API_KEY_BASE64 || '' }}
+          APPLE_API_KEY_ID: ${{ matrix.platform == 'mac' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ matrix.platform == 'mac' && secrets.APPLE_API_ISSUER || '' }}
         run: |
           test -n "$CSC_LINK" || { echo "Missing code-signing certificate" >&2; exit 1; }
           test -n "$CSC_KEY_PASSWORD" || { echo "Missing certificate password" >&2; exit 1; }
@@ -212,20 +373,16 @@ jobs:
             test -n "$APPLE_API_KEY_BASE64" || { echo "Missing Apple notarization API key" >&2; exit 1; }
             test -n "$APPLE_API_KEY_ID" || { echo "Missing Apple API key ID" >&2; exit 1; }
             test -n "$APPLE_API_ISSUER" || { echo "Missing Apple API issuer" >&2; exit 1; }
+            export APPLE_API_KEY="$RUNNER_TEMP/AuthKey.p8"
+            trap 'rm -f "$APPLE_API_KEY"' EXIT
+            printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$APPLE_API_KEY"
+            chmod 600 "$APPLE_API_KEY"
           fi
+          npm exec --workspace @anicode/app -- electron-builder ${{ matrix.args }} --publish never
 
-      - name: Prepare Apple notarization key
-        if: matrix.platform == 'mac'
-        shell: bash
-        run: |
-          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-          echo "APPLE_API_KEY=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
-
-      - name: Set release version
-        run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
-
-      - name: Build signed desktop installers
-        run: npm run dist --workspace @anicode/app -- ${{ matrix.args }} --publish never
+      - name: Build unsigned Linux installers
+        if: matrix.signed != 'true'
+        run: npm exec --workspace @anicode/app -- electron-builder ${{ matrix.args }} --publish never
 
       - name: Generate desktop checksums
         run: >-
@@ -233,15 +390,46 @@ jobs:
           "packages/app/release/anicode-${{ matrix.platform }}-SHA256SUMS.txt"
           packages/app/release .dmg .zip .exe .AppImage .yml .blockmap
 
+      - name: Stage desktop assets for the publication job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-desktop-${{ matrix.platform }}
+          path: |
+            packages/app/release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-desktop:
+    if: github.event_name == 'release'
+    needs: desktop
+    name: publish desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [mac, windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download signed desktop assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-desktop-${{ matrix.platform }}
+          path: release-assets
+
       - name: Attest desktop build provenance
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
-          subject-checksums: packages/app/release/anicode-${{ matrix.platform }}-SHA256SUMS.txt
+          subject-checksums: release-assets/anicode-${{ matrix.platform }}-SHA256SUMS.txt
 
       - name: Upload desktop release assets
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           fail_on_unmatched_files: true
           files: |
-            packages/app/release/*.{dmg,zip,exe,AppImage,yml,blockmap}
-            packages/app/release/anicode-${{ matrix.platform }}-SHA256SUMS.txt
+            release-assets/*.{dmg,zip,exe,AppImage,yml,blockmap}
+            release-assets/anicode-${{ matrix.platform }}-SHA256SUMS.txt

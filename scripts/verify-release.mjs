@@ -3,7 +3,7 @@
 import { spawn, spawnSync } from "node:child_process";
 
 function parseVersion(value, label) {
-  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value.trim());
   if (!match) throw new Error(`Cannot determine ${label} version from ${JSON.stringify(value)}`);
   return match.slice(1).map(Number);
 }
@@ -17,11 +17,10 @@ function versionAtLeast(version, minimum) {
 
 function assertReleaseToolchain() {
   const node = parseVersion(process.versions.node, "Node.js");
-  const supportedNode =
-    (node[0] === 22 && versionAtLeast(node, [22, 15, 0])) || node[0] === 23 || node[0] === 24;
+  const supportedNode = (node[0] === 22 && versionAtLeast(node, [22, 15, 0])) || node[0] === 24;
   if (!supportedNode) {
     throw new Error(
-      `Release gate requires Node.js >=22.15.0 <25; current version is ${process.versions.node}`,
+      `Release gate requires Node.js 22.15+ or 24.x; current version is ${process.versions.node}`,
     );
   }
 
@@ -42,7 +41,9 @@ function assertReleaseToolchain() {
   const npmVersion = userAgentVersion ?? npmProbe.stdout;
   const npm = parseVersion(npmVersion, "npm");
   if (npm[0] !== 11 || !versionAtLeast(npm, [11, 5, 1])) {
-    throw new Error(`Release gate requires npm >=11.5.1 <12; current version is ${npmVersion.trim()}`);
+    throw new Error(
+      `Release gate requires npm >=11.5.1 <12; current version is ${npmVersion.trim()}`,
+    );
   }
 }
 
@@ -53,9 +54,11 @@ const steps = [
   "lint",
   "typecheck",
   "codegen:check",
+  "test:release-contract",
   "test",
   "audit:production",
   "audit:build",
+  "audit:install-scripts",
   "audit:signatures",
   "smoke:cli",
   "build:app",

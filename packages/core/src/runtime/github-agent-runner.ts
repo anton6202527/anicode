@@ -10,6 +10,13 @@ import { createProvider } from "../provider/registry.js";
 import { SecurityPolicyEngine } from "../security/policy.js";
 import { createConfiguredLocalRuntimeStack, telemetryForLocalStack } from "./local-stack.js";
 import { Verifier, type VerificationReport } from "./verifier.js";
+import {
+  createIsolatedGitPlumbing,
+  hardenedGitArguments,
+  hardenedGitEnvironment,
+  trustedGitExecutable,
+  validateGitRepository,
+} from "./git-control.js";
 
 const runFile = promisify(execFile);
 
@@ -37,14 +44,32 @@ function safeJobType(value: string): JobType {
 }
 
 async function changedFiles(cwd: string): Promise<string[]> {
-  const { stdout } = await runFile(
-    "git",
-    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    {
-      cwd,
-      maxBuffer: 8 * 1024 * 1024,
-    },
-  );
+  const repository = await validateGitRepository(cwd);
+  const executable = await trustedGitExecutable();
+  const head = await runFile(executable, hardenedGitArguments(["rev-parse", "HEAD"], cwd), {
+    cwd,
+    env: hardenedGitEnvironment(),
+    maxBuffer: 1024 * 1024,
+  });
+  const plumbing = await createIsolatedGitPlumbing(cwd, path.join(repository.gitDir, "index"));
+  let stdout: string;
+  try {
+    await fs.writeFile(path.join(plumbing.gitDir, "HEAD"), `${head.stdout.trim()}\n`, {
+      mode: 0o600,
+    });
+    const result = await runFile(
+      executable,
+      hardenedGitArguments(["status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd),
+      {
+        cwd,
+        env: hardenedGitEnvironment(plumbing.environment),
+        maxBuffer: 8 * 1024 * 1024,
+      },
+    );
+    stdout = result.stdout;
+  } finally {
+    await plumbing.cleanup();
+  }
   return stdout
     .split("\0")
     .filter(Boolean)
@@ -94,7 +119,10 @@ async function main(): Promise<void> {
     ) {
       throw new Error(`Production GitHub agent model is not credentialed: ${modelSpec}`);
     }
-    const verifier = new Verifier({ autoDiscover: true });
+    const verifier = new Verifier({
+      autoDiscover: true,
+      executionRuntime: stack.isolatedRuntime,
+    });
     const agent = new Agent({
       provider: model.provider,
       model: model.model,

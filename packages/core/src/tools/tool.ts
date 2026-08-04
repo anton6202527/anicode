@@ -50,8 +50,17 @@ export interface ToolContext {
   addUsage?: (usage: Usage) => void;
 }
 
+export type ToolCapability =
+  "memory" | "filesystem-read" | "filesystem-write" | "network" | "process" | "persistent-process";
+
 export interface Tool {
   readonly def: ToolDefinition;
+  /**
+   * Host capabilities required by this implementation. Production restricted/container hosts
+   * fail closed when this declaration is absent; plugin code is still part of the trusted host
+   * boundary and must not under-declare what it executes.
+   */
+  readonly capabilities?: readonly ToolCapability[];
   /** 是否只读（无副作用）—— 权限引擎据此自动放行；也是并行执行的默认资格线 */
   readonly readOnly: boolean;
   /** 是否属于"文件编辑类"（write/edit）—— acceptEdits 权限模式据此自动放行 */
@@ -78,9 +87,16 @@ export interface Tool {
    * 为另一个 Agent 创建独立工具实例。有闭包状态的工具必须实现；无状态工具可省略。
    */
   fork?(): Tool;
+  /** Release instance-bound resources (browser/process/client pools). Idempotent when implemented. */
+  close?(): Promise<void>;
   /**
    * 执行，返回给模型的文本结果。抛异常 = 工具错误（上层包成 is_error 回传）。
    * 需要附带图片时用 ctx.attachImage，不改变本返回值契约。
+   *
+   * Deadline note: callbacks/results are ignored after ctx.signal aborts, but JavaScript cannot
+   * forcibly terminate an arbitrary non-cooperative in-process Promise. Side-effecting production
+   * tools therefore must execute through ctx.isolatedRuntime (or another killable worker/process)
+   * and honour ctx.signal; merely racing a third-party JS Promise cannot undo late side effects.
    */
   run(input: Record<string, unknown>, ctx: ToolContext): Promise<string>;
 }
@@ -139,12 +155,44 @@ export class ToolRegistry {
     return [...this.tools.values()].filter((t) => t.readOnly).map((t) => t.def.name);
   }
 
+  /**
+   * Read-only tools which are safe to auto-approve without crossing a host/external boundary.
+   * `readOnly` only means the tool does not mutate AniCode's workspace; a browser, HTTP lookup or
+   * process-control tool can still disclose data or affect an external system. Those tools must
+   * therefore remain visible to the normal permission rules/confirmation path.
+   */
+  permissionReadOnlyNames(): string[] {
+    const approvalSensitive = new Set<ToolCapability>([
+      "filesystem-write",
+      "network",
+      "process",
+      "persistent-process",
+    ]);
+    return [...this.tools.values()]
+      .filter(
+        (tool) =>
+          tool.readOnly &&
+          !tool.capabilities?.some((capability) => approvalSensitive.has(capability)),
+      )
+      .map((tool) => tool.def.name);
+  }
+
   editNames(): string[] {
     return [...this.tools.values()].filter((t) => t.mutatesFiles).map((t) => t.def.name);
   }
 
   names(): string[] {
     return [...this.tools.keys()];
+  }
+
+  /** Close only resources owned by tool instances in this registry. */
+  async closeAll(): Promise<void> {
+    const closers = [...new Set([...this.tools.values()].filter((tool) => tool.close))];
+    const results = await Promise.allSettled(closers.map((tool) => tool.close!()));
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0) throw new AggregateError(failures, "Failed to close tool resources");
   }
 
   /** 为一个新 Agent 创建独立 registry；有状态工具通过 fork() 隔离闭包状态。 */

@@ -16,7 +16,10 @@ assuming a separate CI workflow finished first.
 
 The GitHub `release` workflow expects `MACOS_CSC_LINK`, `MACOS_CSC_KEY_PASSWORD`,
 `WINDOWS_CSC_LINK`, `WINDOWS_CSC_KEY_PASSWORD`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, and
-`APPLE_API_ISSUER` as protected environment secrets. Missing signing material fails the release.
+`APPLE_API_ISSUER` as protected environment secrets. They are referenced only by the single
+platform signing step: checkout, toolchain setup, dependency installation, registry audits,
+version mutation, checksumming, attestation and upload do not receive them. The temporary Apple
+API key file is mode `0600` and removed by a shell trap. Missing signing material fails the release.
 Linux AppImage artifacts are unsigned and must be distributed with GitHub provenance/checksums.
 VSIX and desktop release assets are attested from their generated SHA-256 manifests. After download,
 verify both layers (replace the repository placeholder):
@@ -25,6 +28,28 @@ verify both layers (replace the repository placeholder):
 shasum -a 256 -c anicode-<platform>-SHA256SUMS.txt
 gh attestation verify <downloaded-asset> -R <owner>/<repository>
 ```
+
+Every release job that installs dependencies uses `npm ci --ignore-scripts`. This still verifies the lockfile's
+registry URLs and integrity hashes without executing package lifecycle code. The next step checks
+`npm audit signatures` and compares every `hasInstallScript` lockfile node against the exact
+package/version `allowScripts` list; only then does `npm rebuild` run those reviewed lifecycle
+scripts. Any new lifecycle package, stale allowlist entry, non-npm tarball, or missing SHA-512
+integrity fails closed.
+
+For a GitHub Release, `set-release-version.mjs` runs before the complete release gate. Validation
+and every platform build check out the event's exact `github.sha` and apply the same deterministic
+version mutation, so signed assets are not produced from a post-gate manifest. Build jobs have
+read-only repository permissions. Separate publication jobs download already-built assets and hold
+the OIDC, attestation and release-upload permissions; they do not check out or execute repository
+code.
+
+The main-branch npm path is split into three jobs. A read-only job runs the complete gate and packs
+the CLI tarball with lifecycle scripts disabled. A contents-write job, with no OIDC permission and
+no persisted checkout credential, may update the Changesets version PR. Only when Changesets reports
+that no version changes remain does a third job receive `id-token: write`; that job has no checkout,
+downloads the gated tarball, verifies its SHA-256 and embedded name/version, and publishes the
+tarball with `--ignore-scripts --provenance`. An already-published version is a no-op only when the
+registry's SHA-512 integrity is byte-identical; a version collision or registry error fails closed.
 
 The optional socket daemon uses a per-user endpoint rather than a shared `/tmp` socket. On POSIX the
 default is `$XDG_RUNTIME_DIR/anicode/anicode.sock`, falling back to
@@ -44,16 +69,25 @@ remove bearer authentication, rate limits, body limits, or SSE backpressure.
 ## Workspace and execution boundary
 
 Every production launcher that accepts a cwd must configure both `WorkspaceTrustStore` and an exact
-canonical `workspaceScope`. An untrusted or uninspectable workspace runs in restricted mode: Core
-forces `plan`, replaces the tool set with `read`/`glob`/`grep`, and disables project env/config,
-writes, permission persistence, PatchSet, MCP, LSP, hooks, browser, network, skills, subagents, and
-project extensions. Trust is granted only in a real interactive terminal:
+canonical `workspaceScope`. An untrusted workspace runs in restricted mode. In an interactive
+`default` session, Core retains its built-in read/search tools plus individually approved
+write/edit/apply-patch and offline sandboxed shell tools; it disables project env/config,
+permission persistence, session PatchSets, MCP, LSP, hooks, browser, network, skills, subagents,
+project memory and project extensions. Explicit automatic modes become read-only. If inspection
+itself fails, Core enters a strict read-only safety boundary and exposes only `read`/`glob`/`grep`. Trust is granted only in a
+real interactive terminal:
 
 ```bash
 anicode trust status --cwd "$PWD" --json
 anicode trust grant --cwd "$PWD"
 anicode trust revoke --cwd "$PWD"
 ```
+
+Workspace Trust enables reviewed project capabilities but is not itself a shell sandbox or tool
+approval. The trusted local interactive TUI has a separate, explicit host default: it starts at the
+highest permission level and auto-approves, while still enforcing explicit deny/ask rules, the
+sandbox, network policy, credential boundary, runtime, and exact workspace scope. Untrusted,
+remote, daemon/HTTP, and headless entry points retain conservative defaults.
 
 The grant confirmation binds to the inspected canonical identity and execution-surface hash. A
 change while the prompt is open invalidates the operation. Scoped managers hide foreign sessions
@@ -105,6 +139,13 @@ opening the picker does not spend inference tokens or consume completion quota. 
 listing is an availability hint, not a guarantee that the next generation will survive concurrent
 quota or a provider outage. Transient failures never persistently delete the offline catalog;
 `--list-models` remains a static inventory, not a liveness result.
+
+Ollama readiness probes accept only credential-free loopback URLs. AniCode does not resolve or run
+`ollama` from `PATH` by default. Optional auto-start requires both
+`ANICODE_OLLAMA_AUTO_START=1` and `ANICODE_OLLAMA_EXECUTABLE` set to an absolute regular executable
+owned by the current user or root and not group/world-writable; a failed startup is process-tree
+terminated. Remote Ollama deployments must be registered as a controlled network provider instead
+of using this loopback exception.
 
 ## SLO and alerting
 

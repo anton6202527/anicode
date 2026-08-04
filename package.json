@@ -5,17 +5,17 @@
   "type": "module",
   "packageManager": "npm@11.17.0",
   "engines": {
-    "node": ">=22.15.0 <25"
+    "node": ">=22.15.0 <23 || >=24.0.0 <25"
   },
   "devEngines": {
     "runtime": {
       "name": "node",
-      "version": ">=22.15.0 <25",
+      "version": ">=22.15.0 <23 || >=24.0.0 <25",
       "onFail": "warn"
     },
     "packageManager": {
       "name": "npm",
-      "version": ">=11.5.1 <12",
+      "version": ">=10.9.2 <12",
       "onFail": "error"
     }
   },
@@ -25,6 +25,8 @@
   "scripts": {
     "dev:tui": "tsx packages/tui/src/cli.tsx --cwd . --sessions .anicode-dev/sessions --debug-log .anicode-dev/tui.jsonl",
     "dev:tui:demo": "tsx packages/tui/src/cli.tsx --demo --cwd . --sessions .anicode-dev/sessions --debug-log .anicode-dev/tui.jsonl",
+    "dev:trust": "tsx packages/tui/src/cli.tsx trust grant --cwd .",
+    "dev:trust:status": "tsx packages/tui/src/cli.tsx trust status --cwd .",
     "build:cli": "npm run build --workspace anicode",
     "dev:app": "npm run dev --workspace @anicode/app",
     "build:app": "npm run build --workspace @anicode/app",
@@ -38,6 +40,9 @@
     "audit:production": "npm audit --omit=dev --audit-level=high",
     "audit:build": "node scripts/audit-build-dependencies.mjs",
     "audit:signatures": "npm audit signatures",
+    "audit:install-scripts": "node scripts/audit-install-scripts.mjs",
+    "rebuild:trusted": "node scripts/rebuild-trusted-dependencies.mjs",
+    "test:release-contract": "node --test scripts/audit-install-scripts.test.mjs scripts/release-workflow.test.mjs",
     "smoke:cli": "npm run build:cli && node scripts/smoke-cli-package.mjs",
     "verify:release": "node scripts/verify-release.mjs",
     "lint": "eslint \"packages/*/src/**/*.{ts,tsx}\" --max-warnings 0",
@@ -70,7 +75,11 @@
     "@ast-grep/lang-java@0.0.7": true,
     "@ast-grep/lang-python@0.0.6": true,
     "@ast-grep/lang-rust@0.0.7": true,
+    "@vscode/vsce-sign@2.0.9": true,
     "electron-winstaller@5.4.0": true,
-    "esbuild": true
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true,
+    "keytar@7.9.0": true
   }
 }

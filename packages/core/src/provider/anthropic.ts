@@ -34,6 +34,11 @@ import {
 } from "../auth/oauth.js";
 import type { TokenSource } from "../auth/token-source.js";
 
+const MAX_STREAM_EVENTS = 100_000;
+const MAX_STREAM_TEXT_BYTES = 16 * 1024 * 1024;
+const MAX_STREAM_TOOL_ARGUMENT_BYTES = 2 * 1024 * 1024;
+const MAX_STREAM_TOOL_CALLS = 256;
+
 export interface AnthropicProviderOptions {
   apiKey?: string;
   baseURL?: string;
@@ -105,12 +110,18 @@ export class AnthropicProvider implements Provider {
 
     // 按块索引跟踪进行中的 tool_use，便于在 block stop 时按序发出 tool_call_end
     const pendingTools = new Map<number, { id: string; name: string; json: string }>();
+    let eventCount = 0;
+    let textBytes = 0;
 
     for await (const event of stream) {
+      if (++eventCount > MAX_STREAM_EVENTS) throw new Error("Provider stream event limit exceeded");
       switch (event.type) {
         case "content_block_start": {
           const block = event.content_block;
           if (block.type === "tool_use") {
+            if (pendingTools.size >= MAX_STREAM_TOOL_CALLS) {
+              throw new Error("Provider tool-call count limit exceeded");
+            }
             pendingTools.set(event.index, { id: block.id, name: block.name, json: "" });
             yield { type: "tool_call_start", id: block.id, name: block.name };
           }
@@ -119,13 +130,24 @@ export class AnthropicProvider implements Provider {
         case "content_block_delta": {
           const d = event.delta;
           if (d.type === "text_delta") {
+            textBytes += Buffer.byteLength(d.text, "utf8");
+            if (textBytes > MAX_STREAM_TEXT_BYTES) {
+              throw new Error("Provider text stream size limit exceeded");
+            }
             yield { type: "text_delta", text: d.text };
           } else if (d.type === "thinking_delta") {
+            textBytes += Buffer.byteLength(d.thinking, "utf8");
+            if (textBytes > MAX_STREAM_TEXT_BYTES) {
+              throw new Error("Provider thinking stream size limit exceeded");
+            }
             yield { type: "thinking_delta", text: d.thinking };
           } else if (d.type === "input_json_delta") {
             const t = pendingTools.get(event.index);
             if (t) {
               t.json += d.partial_json;
+              if (Buffer.byteLength(t.json, "utf8") > MAX_STREAM_TOOL_ARGUMENT_BYTES) {
+                throw new Error("Provider tool-call arguments limit exceeded");
+              }
               yield { type: "tool_call_delta", id: t.id, argsText: d.partial_json };
             }
           }

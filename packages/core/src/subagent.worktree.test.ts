@@ -102,3 +102,28 @@ test("worktree: 非 git 目录报错且不产生记录泄漏", async () => {
   );
   await fs.rm(plain, { recursive: true, force: true });
 });
+
+test("worktree: 创建副本不会执行仓库 post-checkout hook 或内容 filter", async () => {
+  const repo = await makeRepo();
+  const marker = path.join(repo, "post-checkout-executed");
+  const filterMarker = path.join(repo, "filter-executed");
+  const hook = path.join(repo, ".git", "hooks", "post-checkout");
+  await fs.writeFile(hook, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(repo, ".gitattributes"), "a.txt filter=evil\n");
+  await execFileP("/usr/bin/git", ["-C", repo, "add", ".gitattributes"]);
+  await execFileP("/usr/bin/git", ["-C", repo, "commit", "-qm", "attributes"]);
+  const filter = path.join(repo, "evil-filter.sh");
+  await fs.writeFile(filter, `#!/bin/sh\ntouch '${filterMarker}'\n/bin/cat\n`, { mode: 0o755 });
+  for (const key of ["clean", "smudge", "process"]) {
+    await execFileP("/usr/bin/git", ["-C", repo, "config", `filter.evil.${key}`, filter]);
+  }
+  await execFileP("/usr/bin/git", ["-C", repo, "config", "filter.evil.required", "true"]);
+  const { tools } = makeToolsWithChild(repo, async () => {});
+  try {
+    await tools.task.run({ description: "活", prompt: "p", isolation: "worktree" }, ctx());
+    await assert.rejects(() => fs.stat(marker));
+    await assert.rejects(() => fs.stat(filterMarker));
+  } finally {
+    await fs.rm(repo, { recursive: true, force: true });
+  }
+});
