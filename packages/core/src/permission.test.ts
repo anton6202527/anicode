@@ -94,6 +94,101 @@ test("权限: 显式 ask 规则在 bypass 模式下仍强制 confirm", async () 
   assert.equal(decision.behavior, "deny");
 });
 
+test("权限: bash network=true 在 auto/bypass/预授权/hook 下仍逐次强制确认", async () => {
+  for (const setup of [
+    { mode: "auto" as const },
+    { mode: "bypass" as const },
+    { allowRules: ["Bash"] },
+  ]) {
+    let confirmations = 0;
+    const engine = new PermissionEngine({
+      ...setup,
+      confirm: async () => {
+        confirmations++;
+        return { behavior: "allow", remember: "always" };
+      },
+    });
+    const request = req({
+      input: { command: "curl https://example.com", network: true },
+      ruleKey: "curl https://example.com",
+      network: true,
+    });
+    assert.equal((await engine.check(request)).behavior, "allow");
+    assert.equal((await engine.check(request)).behavior, "allow");
+    assert.equal(confirmations, 2, "shell 联网授权不得被记住或自动放行");
+  }
+
+  let hookConfirmations = 0;
+  const hookEngine = new PermissionEngine({
+    confirm: async () => {
+      hookConfirmations++;
+      return { behavior: "allow" };
+    },
+  });
+  const hookDecision = await hookEngine.check(
+    req({ ruleKey: "wget https://example.com", network: true, hookAllowed: true }),
+  );
+  assert.equal(hookDecision.behavior, "allow");
+  assert.equal(hookConfirmations, 1);
+});
+
+test("权限: bash 联网在非交互环境 fail closed，非联网命令保持既有 auto 语义", async () => {
+  const headless = new PermissionEngine({ mode: "bypass" });
+  const denied = await headless.check(req({ ruleKey: "curl https://example.com", network: true }));
+  assert.equal(denied.behavior, "deny");
+  assert.match(denied.message!, /需要授权/);
+
+  const automatic = new PermissionEngine({ mode: "auto" });
+  const allowed = await automatic.check(req({ ruleKey: "npm test", network: false }));
+  assert.equal(allowed.behavior, "allow");
+});
+
+test("权限: 后台联网 shell 无条件拒绝且不弹确认", async () => {
+  let confirmations = 0;
+  const engine = new PermissionEngine({
+    mode: "bypass",
+    confirm: async () => {
+      confirmations++;
+      return { behavior: "allow" };
+    },
+  });
+  const denied = await engine.check(
+    req({
+      input: { command: "sh", network: true, run_in_background: true },
+      ruleKey: "sh",
+      network: true,
+    }),
+  );
+  assert.equal(denied.behavior, "deny");
+  assert.match(denied.message!, /后台 shell 联网|Background shell network/);
+  assert.equal(confirmations, 0);
+
+  for (const invalidBackground of ["yes", 1, null]) {
+    const invalid = await engine.check(
+      req({
+        input: { command: "sh", network: true, run_in_background: invalidBackground },
+        ruleKey: "sh",
+        network: true,
+      }),
+    );
+    assert.equal(invalid.behavior, "deny", String(invalidBackground));
+  }
+  assert.equal(confirmations, 0);
+});
+
+test("权限: confirm 不可通过 updatedInput 偷渡 bash 联网", () => {
+  const engine = new PermissionEngine({ mode: "auto" });
+  const decision = engine.validateUpdatedInput(
+    req({
+      input: { command: "curl https://example.com", network: true },
+      ruleKey: "curl https://example.com",
+      network: true,
+    }),
+  );
+  assert.equal(decision.behavior, "deny");
+  assert.match(decision.message!, /显式授权/);
+});
+
 test("权限: acceptEdits 自动放行文件编辑类，bash 仍要问", async () => {
   const engine = new PermissionEngine({ mode: "acceptEdits", editTools: ["write", "edit"] });
   const w = await engine.check(req({ toolName: "write", ruleKey: "src/a.ts" }));

@@ -3,14 +3,15 @@
  *
  * 决策链（第一个命中即返回，deny 永远最先——即使 bypass 也压不过显式 deny）：
  *   1. denyRules 命中        → deny（用户明令禁止，最高优先级）
- *   2. askRules 命中         → 强制走 confirm（即使 bypass/只读/allowRules 也要问）
- *   3. mode=bypass           → allow（危险，仅限沙箱/CI 明确授权）
- *   4. 只读工具              → allow（Read/Grep/Glob 等无副作用）
- *   5. 已记住的决定          → allow
- *   6. allowRules 命中       → allow（用户/项目预授权规则）
- *   7. mode=acceptEdits 且工具是文件编辑类 → allow（bash 等仍要问）
- *   8. mode=auto             → allow（写/执行也自动放行）
- *   9. 交给 confirm 回调     → 由前端（TUI/App/CI）决定
+ *   2. bash 后台联网         → deny（不允许一次授权后经 stdin 复用联网进程）
+ *   3. bash 显式申请联网或 askRules 命中 → 强制走 confirm（即使 bypass/只读/allowRules 也要问）
+ *   4. mode=bypass           → allow（危险，仅限沙箱/CI 明确授权）
+ *   5. 只读工具              → allow（Read/Grep/Glob 等无副作用）
+ *   6. 已记住的决定          → allow
+ *   7. allowRules 命中       → allow（用户/项目预授权规则）
+ *   8. mode=acceptEdits 且工具是文件编辑类 → allow（bash 等仍要问）
+ *   9. mode=auto             → allow（写/执行也自动放行）
+ *  10. 交给 confirm 回调     → 由前端（TUI/App/CI）决定
  *
  * confirm 回调是 core 与前端的唯一耦合点：core 不知道谁在确认，
  * 前端返回 allow / deny / allow-and-remember。
@@ -181,6 +182,15 @@ export class PermissionEngine {
     if (this.matchesDeny(req)) {
       return { behavior: "deny", message: `操作被 deny 规则禁止: ${req.toolName}(${req.ruleKey})` };
     }
+    if (isPersistentNetworkShell(req)) {
+      return {
+        behavior: "deny",
+        message: t(
+          "Background shell network access is not supported. Use a foreground bash network request so each action receives explicit approval.",
+          "不支持后台 shell 联网。请改用前台 bash 联网请求，确保每次操作都经过显式授权。",
+        ),
+      };
+    }
     // 计划模式：只读工具放行，任何有副作用的操作一律拒绝——让模型先给出方案，
     // 用户确认（退出计划模式）后再执行。拒绝理由是反射式的，引导模型转为规划。
     if (this.mode === "plan" && !this.readOnly.has(req.toolName.toLowerCase())) {
@@ -192,10 +202,13 @@ export class PermissionEngine {
         ),
       };
     }
-    // ask：任一单元命中则强制走 confirm（压过 bypass / hook allow / 只读 / allowRules）
+    // ask：任一单元命中则强制走 confirm（压过 bypass / hook allow / 只读 / allowRules）。
+    // Shell 联网是专门的人工决策边界：模型把 network 设为 true 只代表“申请”，
+    // 不能把 auto/bypass/已记住规则解释成用户同意以 curl/wget 等方式绕过专用联网工具。
     const parts = req.ruleParts?.length ? req.ruleParts : [req.ruleKey];
     const complete = req.rulePartsComplete !== false;
-    const forceAsk = this.matchesAsk(req);
+    const explicitNetworkApproval = requiresExplicitNetworkApproval(req);
+    const forceAsk = explicitNetworkApproval || this.matchesAsk(req);
     if (!forceAsk) {
       if (this.mode === "bypass") return { behavior: "allow" };
       if (req.hookAllowed) return { behavior: "allow" };
@@ -229,7 +242,12 @@ export class PermissionEngine {
       ? await raceWithSignal(confirmation, req.signal)
       : await confirmation;
     if (req.signal?.aborted) return { behavior: "deny", message: "授权请求已取消" };
-    if (decision.behavior === "allow" && decision.remember && !decision.updatedInput) {
+    if (
+      decision.behavior === "allow" &&
+      decision.remember &&
+      !decision.updatedInput &&
+      !explicitNetworkApproval
+    ) {
       this.remembered.add(`${req.toolName}::${req.ruleKey}`);
       if (decision.remember === "always") {
         // 持久化为 allow 规则：写进 baseAllow（切档位重建叠加层时不丢），
@@ -249,7 +267,9 @@ export class PermissionEngine {
     }
     // 不能把「原始输入 → 经 UI 改写后才允许」记成原始输入的永久放行。
     // 否则下一次命中 remembered 时不会重放改写，会直接执行原始危险动作。
-    return decision.updatedInput && decision.remember ? { ...decision, remember: false } : decision;
+    return (decision.updatedInput || explicitNetworkApproval) && decision.remember
+      ? { ...decision, remember: false }
+      : decision;
   }
 
   /**
@@ -264,10 +284,10 @@ export class PermissionEngine {
         message: `修改后的操作被 deny 规则禁止: ${req.toolName}(${req.ruleKey})`,
       };
     }
-    if (this.matchesAsk(req)) {
+    if (requiresExplicitNetworkApproval(req) || this.matchesAsk(req)) {
       return {
         behavior: "deny",
-        message: `修改后的操作命中 ask 规则，请以新参数重新发起授权: ${req.toolName}(${req.ruleKey})`,
+        message: `修改后的操作需要显式授权，请以新参数重新发起授权: ${req.toolName}(${req.ruleKey})`,
       };
     }
     return { behavior: "allow" };
@@ -290,6 +310,19 @@ export class PermissionEngine {
       parts.some((p) => matchesAnyRule(this.askRules, req.toolName, p))
     );
   }
+}
+
+export function requiresExplicitNetworkApproval(
+  req: Pick<PermissionRequest, "toolName" | "network">,
+): boolean {
+  return req.toolName.toLowerCase() === "bash" && req.network === true;
+}
+
+function isPersistentNetworkShell(req: PermissionRequest): boolean {
+  const background = req.input["run_in_background"];
+  // Invalid schema values fail closed too. The bash implementation only accepts an actual boolean,
+  // but the permission boundary must not rely on a downstream validator for this invariant.
+  return requiresExplicitNetworkApproval(req) && background !== undefined && background !== false;
 }
 
 function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
