@@ -40,6 +40,17 @@ test("bash: 空输出命令回报 (无输出) 与退出码", async () => {
   assert.match(out, /无输出/);
 });
 
+test("bash: defense in depth rejects persistent background network shells before spawn", () => {
+  assert.throws(
+    () => bashTool.run({ command: "sh", network: true, run_in_background: true }, ctx()),
+    /后台 shell 联网|Background shell network/,
+  );
+  assert.throws(
+    () => bashTool.run({ command: "sh", network: true, run_in_background: "yes" }, ctx()),
+    /run_in_background 必须是 boolean/,
+  );
+});
+
 test("bash: host network mutations are blocked even through common command wrappers", async () => {
   const mutations = [
     "networksetup -setwebproxy Wi-Fi 127.0.0.1 8080",

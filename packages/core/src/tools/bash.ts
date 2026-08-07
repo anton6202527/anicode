@@ -3,8 +3,8 @@
  *
  * 安全说明：
  * - 命令在 cwd 下执行，默认经 OS 级沙箱（macOS Seatbelt / Linux bubblewrap，见 sandbox.ts）：
- *   写入限工作区+临时目录，.git/.anicode 保持只读；网络默认放行，可用
- *   AGENTX_SANDBOX_NETWORK=off 收紧。缺沙箱二进制时回退裸跑并告警一次。
+ *   写入限工作区+临时目录，.git/.anicode 保持只读；网络默认拒绝，只有单次前台调用
+ *   显式申请并获批后才通过受控代理放行。缺可信沙箱二进制时 fail closed。
  * - 有超时；abort signal 会 kill 子进程
  * - ruleKey 直接返回命令原文，便于 "Bash(git *)" 这类规则匹配
  */
@@ -693,15 +693,15 @@ export const bashTool: Tool = {
         run_in_background: {
           type: "boolean",
           description: t(
-            "Run in the background and return a shell id immediately instead of blocking. Use for dev servers, watch builds, log tailing, and anything long-running or that never exits on its own. Read its output later with bash_output, stop it with kill_shell.",
-            "在后台运行并立即返回 shell id，不阻塞。适合 dev server、watch 构建、日志跟随，以及任何长时间运行或不会自己结束的命令。之后用 bash_output 读输出、kill_shell 停止。",
+            "Run in the background and return a shell id immediately instead of blocking. Use for offline dev servers, watch builds, log tailing, and anything long-running or that never exits on its own. Cannot be combined with network=true. Read its output later with bash_output, stop it with kill_shell.",
+            "在后台运行并立即返回 shell id，不阻塞。适合离线 dev server、watch 构建、日志跟随，以及任何长时间运行或不会自己结束的命令。不能与 network=true 组合。之后用 bash_output 读输出、kill_shell 停止。",
           ),
         },
         network: {
           type: "boolean",
           description: t(
-            "Request network access through the configured AniCode proxy (default false).",
-            "申请通过 AniCode 代理访问网络（默认 false）。",
+            "Request one-shot foreground network access through the configured AniCode proxy (default false). This always requires explicit user approval, cannot run in the background, and must not be used as a silent fallback for web_search or webfetch.",
+            "申请通过 AniCode 代理进行一次性前台联网（默认 false）。此操作始终需要用户显式确认、不能在后台运行，也不得作为 web_search 或 webfetch 的静默替代。",
           ),
         },
       },
@@ -718,6 +718,15 @@ export const bashTool: Tool = {
   run(input, ctx: ToolContext): Promise<string> {
     const command = String(input["command"] ?? "");
     if (!command) throw new ToolError("command 不能为空");
+    if (input["network"] !== undefined && typeof input["network"] !== "boolean") {
+      throw new ToolError("network 必须是 boolean");
+    }
+    if (
+      input["run_in_background"] !== undefined &&
+      typeof input["run_in_background"] !== "boolean"
+    ) {
+      throw new ToolError("run_in_background 必须是 boolean");
+    }
     if (ctx.signal.aborted) throw new ToolError("命令被中断");
     const credentialStoreAccess = systemCredentialStoreAccessReason(command);
     if (credentialStoreAccess) {
@@ -737,10 +746,18 @@ export const bashTool: Tool = {
         ),
       );
     }
+    if (input["network"] === true && input["run_in_background"] === true) {
+      throw new ToolError(
+        t(
+          "Background shell network access is not supported; use a foreground request so each network action receives explicit approval.",
+          "不支持后台 shell 联网；请改用前台请求，确保每次联网操作都经过显式授权。",
+        ),
+      );
+    }
 
     // 后台模式：立即返回 shell id，不阻塞、不受 timeout 约束（这正是它存在的意义）。
     // 沙箱与前台完全一致（共用 buildShellSpawn），权限门也已在此之前走过。
-    if (input["run_in_background"]) {
+    if (input["run_in_background"] === true) {
       return Promise.resolve(
         startBackgroundShell(command, ctx, { network: input["network"] === true }),
       );

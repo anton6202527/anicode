@@ -36,6 +36,8 @@ export {
   parseBraveResponse,
   webSearchBackendFromEnv,
   webSearchBackendFromBroker,
+  selectBrokerWebSearch,
+  type BrokerWebSearchSelection,
   type BrokerWebSearchOptions,
   type WebSearchBackend,
   type WebSearchResult,
@@ -149,8 +151,18 @@ function withoutBackgroundParameter(parameters: Record<string, unknown>): Record
   return { ...parameters, properties: foregroundProperties };
 }
 
-/** Foreground-only shell facade for ephemeral OCI runtimes (which intentionally lack prepare()). */
-export function foregroundOnlyBash(tool: Tool = bashTool): Tool {
+export interface ForegroundOnlyBashOptions {
+  /** Enable one-shot shell networking only when the runtime proves whole-workload teardown. */
+  allowNetwork?: boolean;
+}
+
+/** Foreground-only shell facade for runtimes which intentionally lack persistent prepare(). */
+export function foregroundOnlyBash(
+  tool: Tool = bashTool,
+  options: ForegroundOnlyBashOptions = {},
+): Tool {
+  const allowNetwork = options.allowNetwork === true;
+  const foregroundParameters = withoutBackgroundParameter(tool.def.parameters);
   const facade: Tool = {
     ...tool,
     // OCI execution is foreground-only, not read-only: redirects, generators and formatters can
@@ -159,14 +171,21 @@ export function foregroundOnlyBash(tool: Tool = bashTool): Tool {
     def: {
       ...tool.def,
       description: t(
-        "Run a foreground shell command inside the pinned OCI runtime. Background processes are unavailable because each execution is ephemeral.",
-        "在固定摘要的 OCI 运行时中执行前台 shell 命令。每次执行都是临时容器，因此不支持后台进程。",
+        allowNetwork
+          ? "Run a foreground shell command inside a whole-workload isolated runtime. Background processes are unavailable because each execution is ephemeral."
+          : "Run an offline foreground shell command inside the native sandbox. Background processes and shell networking are unavailable because native process groups cannot prove containment of detached sessions.",
+        allowNetwork
+          ? "在整工作负载隔离的运行时中执行前台 shell 命令。每次执行都是临时环境，因此不支持后台进程。"
+          : "在原生沙箱中执行离线前台 shell 命令。原生进程组无法证明包含自行脱离的会话，因此不支持后台进程或 shell 联网。",
       ),
-      parameters: withoutBackgroundParameter(tool.def.parameters),
+      parameters: allowNetwork
+        ? foregroundParameters
+        : withoutNetworkParameter(foregroundParameters),
     },
     run(input, ctx) {
       const foregroundInput = { ...input };
       delete foregroundInput["run_in_background"];
+      if (!allowNetwork) foregroundInput["network"] = false;
       return tool.run(foregroundInput, ctx);
     },
   };
