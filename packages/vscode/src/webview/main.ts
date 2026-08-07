@@ -111,7 +111,12 @@ function applyEvent(se: SessionEvent): void {
   }
   if (se.type === "permission_request") {
     if (!state.pendings.some((p) => p.permId === se.permId))
-      state.pendings.push({ permId: se.permId, toolName: se.toolName, ruleKey: se.ruleKey });
+      state.pendings.push({
+        permId: se.permId,
+        toolName: se.toolName,
+        ruleKey: se.ruleKey,
+        ...(se.network !== undefined ? { network: se.network } : {}),
+      });
     render();
     return;
   }
@@ -368,23 +373,35 @@ function renderTodos(todos: TodoItem[]): HTMLElement {
 function renderPermission(p: PendingPerm, extra: number): HTMLElement {
   const card = div("perm-card");
   const title = div("perm-title");
+  const networkApproval = p.toolName.toLowerCase() === "bash" && p.network === true;
   title.textContent =
-    t(`⚠ Permission request: ${p.toolName}`, `⚠ 授权请求：${p.toolName}`) +
-    (extra > 0 ? t(`(${extra} more pending)`, `（还有 ${extra} 个待裁决）`) : "");
+    t(
+      `⚠ Permission request: ${p.toolName}${networkApproval ? " · NETWORK" : ""}`,
+      `⚠ 授权请求：${p.toolName}${networkApproval ? " · 联网" : ""}`,
+    ) + (extra > 0 ? t(`(${extra} more pending)`, `（还有 ${extra} 个待裁决）`) : "");
   const key = div("perm-key");
   key.textContent = p.ruleKey;
   const actions = div("perm-actions");
   actions.append(
-    permButton(t("Allow", "允许"), "allow", p.permId, "allow"),
-    permButton(t("Allow and remember", "允许并记住"), "remember", p.permId, "allow_remember"),
     permButton(
-      t("Always allow (persist)", "永久允许（写入项目）"),
-      "remember",
+      networkApproval ? t("Allow network once", "本次允许联网") : t("Allow", "允许"),
+      "allow",
       p.permId,
-      "allow_always",
+      "allow",
     ),
-    permButton(t("Deny", "拒绝"), "deny", p.permId, "deny"),
   );
+  if (!networkApproval) {
+    actions.append(
+      permButton(t("Allow and remember", "允许并记住"), "remember", p.permId, "allow_remember"),
+      permButton(
+        t("Always allow (persist)", "永久允许（写入项目）"),
+        "remember",
+        p.permId,
+        "allow_always",
+      ),
+    );
+  }
+  actions.append(permButton(t("Deny", "拒绝"), "deny", p.permId, "deny"));
   card.append(title, key, actions);
   return card;
 }

@@ -10,6 +10,12 @@ import { fileChangeFor } from "./filechange.js";
 
 export type Poster = (msg: HostToWebview) => void;
 
+function isPermissionDecision(value: unknown): value is PermissionDecision {
+  return (
+    value === "allow" || value === "allow_remember" || value === "allow_always" || value === "deny"
+  );
+}
+
 export class ChatBridge {
   private currentId: string | null = null;
   private currentModel: string;
@@ -55,12 +61,9 @@ export class ChatBridge {
         if (this.currentId) await this.manager.interrupt(this.currentId);
         return;
       case "answer":
-        if (this.currentId)
-          await this.manager.answerPermission(
-            this.currentId,
-            msg.permId,
-            msg.decision as PermissionDecision,
-          );
+        if (this.currentId && isPermissionDecision(msg.decision)) {
+          await this.manager.answerPermission(this.currentId, msg.permId, msg.decision);
+        }
         return;
       case "newSession":
         await this.newSession(this.currentModel);

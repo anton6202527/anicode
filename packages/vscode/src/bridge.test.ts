@@ -8,10 +8,35 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionManager, SessionStore } from "@anicode/core";
+import { SessionManager, SessionStore, type SessionEvent } from "@anicode/core";
 import { buildManager, packagedKeyringModulePath, resolveConfiguredProvider } from "./host.js";
 import { ChatBridge } from "./bridge.js";
-import type { HostToWebview } from "./protocol.js";
+import type { HostToWebview, WebviewToHost } from "./protocol.js";
+
+function permissionRequest(messages: readonly HostToWebview[]) {
+  for (const message of messages) {
+    if (message.type === "event" && message.event.type === "permission_request") {
+      return message.event;
+    }
+  }
+  return undefined;
+}
+
+function permissionResolution(
+  messages: readonly HostToWebview[],
+  permId: string,
+): Extract<SessionEvent, { type: "permission_resolved" }> | undefined {
+  for (const message of messages) {
+    if (
+      message.type === "event" &&
+      message.event.type === "permission_resolved" &&
+      message.event.permId === permId
+    ) {
+      return message.event;
+    }
+  }
+  return undefined;
+}
 
 test("VSIX host binds the isolated helper to its packaged loader", () => {
   assert.equal(
@@ -74,6 +99,34 @@ test("ChatBridge: send 驱动回合，事件回流并按首句自动命名", asy
     // 首条消息 → 自动标题。
     const listed = await manager.listSessions();
     assert.equal(listed[0]?.title, "帮我看看这个 bug");
+  } finally {
+    bridge.dispose();
+    manager.dispose();
+  }
+});
+
+test("ChatBridge: 伪造的权限 decision 不会穿透 webview 边界", async () => {
+  const { manager, posted, bridge } = await setup();
+  try {
+    await bridge.handle({ type: "ready" });
+    posted.length = 0;
+    const sending = bridge.handle({ type: "send", text: "!write" });
+    for (let i = 0; i < 100 && !permissionRequest(posted); i++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    const pending = permissionRequest(posted);
+    assert.ok(pending, "应收到权限请求");
+
+    await bridge.handle({
+      type: "answer",
+      permId: pending.permId,
+      decision: "bogus",
+    } as unknown as WebviewToHost);
+    assert.equal(permissionResolution(posted, pending.permId), undefined);
+
+    await bridge.handle({ type: "answer", permId: pending.permId, decision: "deny" });
+    await sending;
+    assert.equal(permissionResolution(posted, pending.permId)?.decision, "deny");
   } finally {
     bridge.dispose();
     manager.dispose();

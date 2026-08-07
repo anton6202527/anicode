@@ -29,6 +29,7 @@ export interface PendingPerm {
   permId: string;
   toolName: string;
   ruleKey: string;
+  network?: boolean;
 }
 
 export type PermissionDecision = "allow" | "allow_remember" | "allow_always" | "deny";
