@@ -12,6 +12,7 @@ export interface PendingPerm {
   permId: string;
   toolName: string;
   ruleKey: string;
+  network?: boolean;
 }
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
@@ -139,7 +140,12 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
   if (se.type === "permission_request") {
     dispatch({
       t: "permAdd",
-      perm: { permId: se.permId, toolName: se.toolName, ruleKey: se.ruleKey },
+      perm: {
+        permId: se.permId,
+        toolName: se.toolName,
+        ruleKey: se.ruleKey,
+        ...(se.network !== undefined ? { network: se.network } : {}),
+      },
     });
     return;
   }

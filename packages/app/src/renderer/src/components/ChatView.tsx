@@ -143,11 +143,14 @@ function PermissionCard({
   ) => void;
   extra: number;
 }) {
+  const requiresOneTimeNetworkApproval =
+    pending.toolName.toLowerCase() === "bash" && pending.network;
   return (
     <div className="perm-card">
       <div className="perm-title">
         ⚠ {t("Permission request:", "授权请求：")}
         <strong>{pending.toolName}</strong>
+        {requiresOneTimeNetworkApproval ? <strong>{t(" · NETWORK", " · 联网")}</strong> : null}
         {extra > 0 ? (
           <span className="perm-more">
             {t(`(${extra} more pending)`, `（还有 ${extra} 个待裁决）`)}
@@ -157,14 +160,26 @@ function PermissionCard({
       <div className="perm-key">{pending.ruleKey}</div>
       <div className="perm-actions">
         <button className="btn allow" onClick={() => onAnswer(pending.permId, "allow")}>
-          {t("Allow", "允许")}
+          {requiresOneTimeNetworkApproval
+            ? t("Allow network once", "本次允许联网")
+            : t("Allow", "允许")}
         </button>
-        <button className="btn remember" onClick={() => onAnswer(pending.permId, "allow_remember")}>
-          {t("Allow and remember", "允许并记住")}
-        </button>
-        <button className="btn remember" onClick={() => onAnswer(pending.permId, "allow_always")}>
-          {t("Always allow (persist)", "永久允许（写入项目）")}
-        </button>
+        {requiresOneTimeNetworkApproval ? null : (
+          <>
+            <button
+              className="btn remember"
+              onClick={() => onAnswer(pending.permId, "allow_remember")}
+            >
+              {t("Allow and remember", "允许并记住")}
+            </button>
+            <button
+              className="btn remember"
+              onClick={() => onAnswer(pending.permId, "allow_always")}
+            >
+              {t("Always allow (persist)", "永久允许（写入项目）")}
+            </button>
+          </>
+        )}
         <button className="btn deny" onClick={() => onAnswer(pending.permId, "deny")}>
           {t("Deny", "拒绝")}
         </button>
