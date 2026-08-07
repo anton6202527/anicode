@@ -8,6 +8,7 @@ import {
   formatSearchResults,
   parseTavilyResponse,
   parseBraveResponse,
+  selectBrokerWebSearch,
   tavilyBackend,
   webSearchBackendFromEnv,
   webSearchBackendFromBroker,
@@ -113,6 +114,51 @@ test("webSearchBackendFromEnv: 默认拒绝进程密钥，仅显式 legacy 模�
   assert.equal(webSearchBackendFromEnv({} as any), undefined);
 });
 
+test("selectBrokerWebSearch: 只读元数据且 Tavily 优先、Brave fallback", () => {
+  let backendReads = 0;
+  const lazyBackend = {
+    kind: "fake-search-secrets",
+    async get() {
+      backendReads++;
+      return "must-not-read-during-selection";
+    },
+    async put() {},
+    async delete() {
+      return true;
+    },
+  };
+  const broker = new CredentialBroker();
+
+  assert.equal(selectBrokerWebSearch(broker), undefined);
+  broker.register({
+    id: "env:BRAVE_SEARCH_API_KEY",
+    value: "brave-secret",
+    scopes: credentialScopesForEnvironment("BRAVE_SEARCH_API_KEY"),
+  });
+  assert.deepEqual(selectBrokerWebSearch(broker), {
+    provider: "brave",
+    credentialId: "env:BRAVE_SEARCH_API_KEY",
+    credentialAvailability: "available",
+  });
+
+  broker.registerAsyncReference({
+    id: "env:TAVILY_API_KEY",
+    backend: lazyBackend,
+    backendKey: "env:TAVILY_API_KEY",
+    scopes: credentialScopesForEnvironment("TAVILY_API_KEY"),
+  });
+  assert.deepEqual(selectBrokerWebSearch(broker), {
+    provider: "tavily",
+    credentialId: "env:TAVILY_API_KEY",
+    credentialAvailability: "configured",
+  });
+  assert.equal(backendReads, 0, "metadata selection must never hydrate the lazy credential");
+
+  broker.revoke("env:TAVILY_API_KEY");
+  assert.equal(selectBrokerWebSearch(broker)?.provider, "brave");
+  assert.equal(backendReads, 0);
+});
+
 test("webSearchBackendFromBroker: secret 由 NetworkProxy 限域注入且不进 body", async () => {
   const broker = new CredentialBroker();
   broker.register({
@@ -137,6 +183,87 @@ test("webSearchBackendFromBroker: secret 由 NetworkProxy 限域注入且不进 
     assert.equal((await backend("query", { signal: new AbortController().signal })).length, 1);
     assert.equal(headers.get("authorization"), "Bearer tavily-secret");
     assert.ok(!body.includes("tavily-secret"));
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("webSearchBackendFromBroker: lazy reference is read once on first real search", async () => {
+  let backendReads = 0;
+  const broker = new CredentialBroker();
+  broker.registerAsyncReference({
+    id: "env:TAVILY_API_KEY",
+    backend: {
+      kind: "fake-lazy-search",
+      async get() {
+        backendReads++;
+        return "lazy-tavily-secret";
+      },
+      async put() {},
+      async delete() {
+        return true;
+      },
+    },
+    backendKey: "env:TAVILY_API_KEY",
+    scopes: credentialScopesForEnvironment("TAVILY_API_KEY"),
+  });
+  const proxy = new NetworkProxy({
+    broker,
+    policy: { allowDomains: ["api.tavily.com"] },
+    resolver: async () => ["93.184.216.34"],
+    fetch: (async (_url, init) => {
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer lazy-tavily-secret");
+      return Response.json({ results: [] });
+    }) as typeof fetch,
+  });
+  try {
+    assert.equal(selectBrokerWebSearch(broker)?.credentialAvailability, "configured");
+    assert.equal(backendReads, 0);
+    const backend = webSearchBackendFromBroker({ provider: "tavily", broker, proxy });
+    await backend("first", { signal: new AbortController().signal });
+    await backend("second", { signal: new AbortController().signal });
+    assert.equal(backendReads, 1, "the broker cache must avoid reopening the lazy backend");
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("webSearchBackendFromBroker: network policy denial happens before lazy credential read", async () => {
+  let backendReads = 0;
+  const broker = new CredentialBroker();
+  broker.registerAsyncReference({
+    id: "env:TAVILY_API_KEY",
+    backend: {
+      kind: "fake-denied-search",
+      async get() {
+        backendReads++;
+        return "must-not-be-read";
+      },
+      async put() {},
+      async delete() {
+        return true;
+      },
+    },
+    backendKey: "env:TAVILY_API_KEY",
+    scopes: credentialScopesForEnvironment("TAVILY_API_KEY"),
+  });
+  const proxy = new NetworkProxy({
+    broker,
+    policy: { allowDomains: ["example.com"] },
+    resolver: async () => {
+      throw new Error("resolver must not run for a denied host");
+    },
+    fetch: (async () => {
+      throw new Error("fetch must not run for a denied host");
+    }) as typeof fetch,
+  });
+  try {
+    const backend = webSearchBackendFromBroker({ provider: "tavily", broker, proxy });
+    await assert.rejects(
+      () => backend("denied", { signal: new AbortController().signal }),
+      /domain is not allowlisted/,
+    );
+    assert.equal(backendReads, 0);
   } finally {
     await proxy.close();
   }

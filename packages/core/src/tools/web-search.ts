@@ -8,7 +8,7 @@
  */
 import { type Tool, type ToolContext, ToolError } from "./tool.js";
 import { t } from "../i18n.js";
-import type { CredentialBroker } from "../security/credentials.js";
+import type { CredentialAvailability, CredentialBroker } from "../security/credentials.js";
 import type { NetworkProxy } from "../runtime/network-proxy.js";
 
 export interface WebSearchResult {
@@ -193,6 +193,37 @@ export interface BrokerWebSearchOptions {
   proxy: NetworkProxy;
   credentialId?: string;
   endpoint?: string;
+}
+
+export interface BrokerWebSearchSelection {
+  provider: BrokerWebSearchOptions["provider"];
+  credentialId: string;
+  credentialAvailability: Exclude<CredentialAvailability, "unavailable">;
+}
+
+const BROKER_WEB_SEARCH_CANDIDATES: readonly Omit<
+  BrokerWebSearchSelection,
+  "credentialAvailability"
+>[] = [
+  { provider: "tavily", credentialId: "env:TAVILY_API_KEY" },
+  { provider: "brave", credentialId: "env:BRAVE_SEARCH_API_KEY" },
+];
+
+/**
+ * Select an explicitly registered search credential using metadata only. `availability()` never
+ * opens Keychain/Vault/KMS, so production composition can advertise the tool without resolving a
+ * secret. Tavily remains the deterministic first choice; Brave is considered only when Tavily has
+ * no usable value or exact backend reference.
+ */
+export function selectBrokerWebSearch(
+  broker: Pick<CredentialBroker, "availability">,
+): BrokerWebSearchSelection | undefined {
+  for (const candidate of BROKER_WEB_SEARCH_CANDIDATES) {
+    const credentialAvailability = broker.availability(candidate.credentialId);
+    if (credentialAvailability === "unavailable") continue;
+    return { ...candidate, credentialAvailability };
+  }
+  return undefined;
 }
 
 /** 搜索密钥只由代理按 host/audience 注入；不会进入工具输入、请求 body 或进程 env。 */
