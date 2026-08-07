@@ -58,6 +58,21 @@ test("传入 webSearch 后端 → 注册 web_search 工具", async () => {
   assert.ok(names.includes("web_search"), `实际工具: ${names.join(",")}`);
 });
 
+test("hasTool: reports the Agent's actual registry without exposing definitions", () => {
+  const agent = new Agent({
+    provider: capturingProvider({ toolNames: [] }),
+    model: "m",
+    cwd: process.cwd(),
+    retry: false,
+    projectMemory: false,
+    injectEnv: false,
+    webSearch: async () => [],
+  });
+  assert.equal(agent.hasTool("web_search"), true);
+  assert.equal(agent.hasTool("webfetch"), true);
+  assert.equal(agent.hasTool("missing"), false);
+});
+
 test("传入 lsp 池 → 注册 diagnostics + 导航工具套件", async () => {
   const pool = new LspPool(process.cwd(), []); // 空 servers：不 spawn 任何进程
   const names = await toolsOffered({ lsp: pool });

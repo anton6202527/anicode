@@ -19,6 +19,7 @@ import { toolCallsOf } from "./types.js";
 import {
   BUILTIN_PROFILES,
   PermissionEngine,
+  requiresExplicitNetworkApproval,
   type PermissionConfig,
   type PermissionDecision,
   type PermissionRequest,
@@ -319,7 +320,7 @@ export function defaultSystem(): string {
 - Identify the user's actual outcome before choosing a workflow. Match their language, requested depth, format, and constraints.
 - Start with substantive help. Do not introduce answers with an identity label, a capability disclaimer, or an "as a ..." preamble unless the user explicitly asks about identity or limitations.
 - Treat non-code work as first-class. Do not inspect or modify a repository merely because a working directory exists; use workspace tools only when they materially help the requested task.
-- For research or time-sensitive factual work, use web_search/webfetch when available, cross-check important claims, distinguish evidence from inference, and include useful source links.
+- For research or time-sensitive factual work, use web_search first and webfetch for known URLs when available; cross-check important claims, distinguish evidence from inference, and include useful source links. If either tool is unavailable, explain that limitation. Never silently fall back to curl, wget, or another shell HTTP client; only request bash network access after the user explicitly approves that fallback.
 - For writing, planning, summarization, and analysis, optimize for the requested audience and deliverable instead of forcing an engineering workflow.
 - When a task involves several uncertain steps, use todo_write to lay out a checklist and update it as you go, so the user sees the plan.
 - For broad search across many files, cross-file investigation, or several independent subtasks, delegate them with the task tool instead of doing it all yourself — the subagent's intermediate steps don't consume your context; you get back only its conclusion.
@@ -329,7 +330,7 @@ export function defaultSystem(): string {
 # Using tools
 - Choose tools from the task, not from a fixed coding routine. Prefer purpose-built search, document, browser, data, or workspace tools when available.
 - For workspace search, prefer grep / glob / read. Edit files with edit / write; don't rewrite source via shell redirection (echo >> / sed -i).
-- Reserve bash for commands that genuinely need a shell, such as builds, tests, git, package management, and system inspection.
+- Reserve bash for commands that genuinely need a shell, such as builds, tests, git, package management, and system inspection. If its schema exposes network, setting bash network=true is only a request for explicit user approval; it is never pre-approved by an automatic permission mode and cannot be combined with run_in_background. Native sandboxes deliberately do not expose shell networking.
 - For anything long-running or that never exits on its own (dev servers, watch builds, tailing logs), use bash with run_in_background instead of blocking until timeout; then read its output with bash_output and stop it with kill_shell when done.
 - Send multiple independent read-only calls (reading a few files, running a few searches) together in one turn so they run in parallel, rather than one at a time.
 
@@ -352,7 +353,7 @@ export function defaultSystem(): string {
 - 先确认用户真正要的结果，再选择工作流；跟随用户的语言、深度、格式和约束。
 - 直接进入实质内容。除非用户明确询问身份或限制，不要用身份标签、能力声明或“作为……”式前言开场。
 - 把非代码任务当作一等任务。不要仅因存在工作目录就检查或修改仓库；只在对当前目标有实质帮助或用户明确要求时使用工作区工具。
-- 处理调研或时效性事实时，若 web_search/webfetch 可用就用它们查证；交叉核对重要结论，区分证据与推断，并给出有用的来源链接。
+- 处理调研或时效性事实时，若可用则先用 web_search 搜索、再用 webfetch 抓取已知 URL；交叉核对重要结论，区分证据与推断，并给出有用的来源链接。若工具不可用，应明确说明原因。不得静默改用 curl、wget 或其他 shell HTTP 客户端；只有用户显式同意这种回退后，才能申请 bash 联网。
 - 处理写作、规划、摘要和分析时，围绕受众和交付物组织结果，不要强行套用工程流程。
 - 一次任务涉及多个不确定步骤时，用 todo_write 列清单并随进度更新，让用户看到规划。
 - 遇到大范围检索、跨多文件调研、或多个互相独立的子任务时，用 task 工具委派给子 agent，别全都自己串着做 —— 子 agent 的中间步骤不占你的上下文，只回传结论。
@@ -362,7 +363,7 @@ export function defaultSystem(): string {
 # 工具使用
 - 从任务出发选工具，不要固定套用代码流程；有专用的搜索、文档、浏览器、数据或工作区工具时优先使用。
 - 搜索工作区时优先用 grep / glob / read；修改文件用 edit / write，避免用 shell 重定向改源码。
-- bash 留给真正需要 shell 的命令，如构建、测试、git、包管理和系统检查。
+- bash 留给真正需要 shell 的命令，如构建、测试、git、包管理和系统检查。若 schema 暴露 network，bash 的 network=true 也只代表申请用户显式授权，任何自动权限模式都不预先放行，且不能与 run_in_background 组合；原生沙箱刻意不开放 shell 联网。
 - 长时间运行或不会自己结束的命令（dev server、watch 构建、日志跟随）用 bash 的 run_in_background，别阻塞到超时；之后用 bash_output 读输出，用完 kill_shell 停掉。
 - 多个相互独立的只读调用（读几个文件、跑几处搜索）请在同一轮里一起发出，让它们并行执行，别一个个串着来。
 
@@ -627,7 +628,9 @@ export class Agent {
           if (h.blocked) {
             return { behavior: "deny", message: h.reason ?? "被 PermissionRequest hook 拒绝" };
           }
-          if (h.allowed) return { behavior: "allow" };
+          // A hook may still block shell networking, but cannot manufacture the user's one-shot
+          // consent. Continue to the interactive confirmation for this exact boundary.
+          if (h.allowed && !requiresExplicitNetworkApproval(req)) return { behavior: "allow" };
         }
         // Notification（观察性）：即将弹授权确认，用户可能不在屏幕前 —— 外接提醒的时机。
         if (this.hooks.has("Notification")) {
@@ -834,6 +837,10 @@ export class Agent {
     if (!this.conv.lastInputTokens) return null;
     const window = this.modelInfoOpt?.limits.contextWindow;
     return { tokens: this.conv.lastInputTokens, ...(window ? { window } : {}) };
+  }
+  /** Authoritative runtime view used by host snapshots; never exposes tool schemas or closures. */
+  hasTool(name: string): boolean {
+    return this.tools.get(name) !== undefined;
   }
   snapshot(): AgentSnapshot {
     return { messages: [...this.conv.messages], usage: this.conv.cumulative };

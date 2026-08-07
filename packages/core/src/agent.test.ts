@@ -48,6 +48,8 @@ test("默认 system 定位为通用 Agent，不注入单一职业身份", () => 
   assert.doesNotMatch(system, forbiddenEnglish);
   assert.doesNotMatch(system, forbiddenChinese);
   assert.match(system, /identity label|身份标签/);
+  assert.match(system, /Never silently fall back to curl|不得静默改用 curl/);
+  assert.match(system, /explicit user approval|用户显式同意/);
 });
 
 test("Agent.closeToolResources attempts every cleanup and aggregates failures", async () => {

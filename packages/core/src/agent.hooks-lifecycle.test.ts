@@ -114,6 +114,73 @@ test("PermissionRequest hook: allow 自动批准（不弹确认）", async () =>
   assert.match(result.content, /副作用已执行/);
 });
 
+test("PermissionRequest hook: allow 不能替代 bash 联网的用户显式确认", async () => {
+  let confirmCalls = 0;
+  const networkBash = {
+    readOnly: false,
+    def: {
+      name: "bash",
+      description: "test network bash",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          command: { type: "string" as const },
+          network: { type: "boolean" as const },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+    },
+    ruleKey: (input: Record<string, unknown>) => String(input["command"] ?? ""),
+    run: async () => "network action executed",
+  };
+  const agent = new Agent({
+    provider: scriptedProvider([
+      [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_call",
+              id: "network-bash",
+              name: "bash",
+              args: { command: "curl https://example.com", network: true },
+            },
+          ],
+        },
+      ],
+      [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    ]),
+    model: "m",
+    cwd: process.cwd(),
+    retry: false,
+    projectMemory: false,
+    injectEnv: false,
+    tools: new ToolRegistry().register(networkBash),
+    permission: {
+      mode: "bypass",
+      confirm: async () => {
+        confirmCalls++;
+        return { behavior: "allow" };
+      },
+    },
+    hooks: [
+      {
+        event: "PermissionRequest",
+        handler: () => ({ decision: "allow" }),
+      },
+    ],
+  });
+
+  const events: AgentEvent[] = [];
+  for await (const event of agent.send("use shell networking")) events.push(event);
+  assert.equal(confirmCalls, 1);
+  assert.match(
+    (events.find((event) => event.type === "tool_result") as { content: string }).content,
+    /network action executed/,
+  );
+});
+
 test("PermissionRequest hook: block 自动拒绝", async () => {
   const { confirmCalls, result } = await runPermissionScenario({
     withHook: true,
