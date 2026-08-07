@@ -12,4 +12,4 @@
 - 重构凭据边界：环境密钥进入进程内 Broker 后即清理，Keychain/Vault/KMS 按精确引用惰性读取；测试、构建和 metadata-only 浏览强制禁止访问 OS Keychain。
 - 修正实时模型发现的三态诊断、DeepSeek V4 选择及并发竞态；端点不可查询不再误报为模型不存在，未信任项目会明确提示 `.env` 未加载。
 - 将 CLI 运行时基线提升到 Node.js 22.15，并覆盖 Node 22 LTS、Node 24 LTS 与最新稳定主版本；校验所有外置运行时依赖均已在发布包中声明。
-- 加固 npm 发布链：完整 release gate、四文件最小 tarball、OIDC trusted publishing、provenance、完整性比对及隔离的发布权限。
+- 加固 npm 发布链：完整 release gate、四文件最小 tarball、OIDC trusted publishing、provenance、完整性比对及隔离的发布权限；本地直发入口默认拒绝，并修复发布审计发现的 `js-yaml` 高危漏洞。

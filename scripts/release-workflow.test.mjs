@@ -42,6 +42,10 @@ const smokeCliPackage = await readFile(
   new URL("../scripts/smoke-cli-package.mjs", import.meta.url),
   "utf8",
 );
+const refuseLocalPublish = await readFile(
+  new URL("../scripts/refuse-local-publish.mjs", import.meta.url),
+  "utf8",
+);
 const workflowSources = await Promise.all(
   (await readdir(new URL("../.github/workflows/", import.meta.url), { withFileTypes: true }))
     .filter(
@@ -351,6 +355,14 @@ test("npm validation, version PR, and OIDC publication are separate trust domain
   assert.match(publish, /expected_files=.*package\/dist\/cli\.js/);
   assert.match(publish, /npm view .*dist\.integrity/);
   assert.match(publish, /already exists with different bytes/);
+});
+
+test("local npm publish entrypoints fail closed in favor of the OIDC artifact path", () => {
+  assert.equal(rootPackage.scripts.release, "node scripts/refuse-local-publish.mjs");
+  assert.equal(cliPackage.scripts.prepublishOnly, "node ../../scripts/refuse-local-publish.mjs");
+  assert.doesNotMatch(rootPackage.scripts.release, /changeset publish|npm publish/);
+  assert.match(refuseLocalPublish, /Direct local npm publishing is disabled/);
+  assert.match(refuseLocalPublish, /process\.exitCode = 1/);
 });
 
 test("every release checkout disables persisted GitHub credentials", () => {

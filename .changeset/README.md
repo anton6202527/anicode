@@ -19,6 +19,7 @@ npm run changeset
 Packages」PR（累计变更 + 更新 CHANGELOG + 升版本号）；合并该 PR 即触发
 隔离的 npm Trusted Publishing job。该 job 使用 GitHub OIDC 短期身份和 provenance，
 不 checkout 或执行仓库代码；需先在 npm 包设置中绑定本仓库的 release workflow。
+本地 `npm run release` 与 `npm publish` 默认 fail closed，不能代替上述不可变产物链路。
 
 VSCode 扩展（`.vsix`）与 Electron 安装包不走 npm：
 
