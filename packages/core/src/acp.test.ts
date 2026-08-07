@@ -28,6 +28,8 @@ class FakeHost implements SessionHost {
     running: false,
   };
 
+  constructor(private readonly networkPermission = false) {}
+
   listSessions(): Promise<SessionSummary[]> {
     return Promise.resolve([this.summary]);
   }
@@ -60,13 +62,19 @@ class FakeHost implements SessionHost {
     listener({ type: "agent", event: { type: "text", text: "ACP answer" } });
     listener({
       type: "agent",
-      event: { type: "tool_start", id: "call_1", name: "read", ruleKey: "a.ts" },
+      event: {
+        type: "tool_start",
+        id: "call_1",
+        name: this.networkPermission ? "bash" : "read",
+        ruleKey: this.networkPermission ? "curl https://example.com" : "a.ts",
+      },
     });
     listener({
       type: "permission_request",
       permId: "call_1",
-      toolName: "read",
-      ruleKey: "a.ts",
+      toolName: this.networkPermission ? "bash" : "read",
+      ruleKey: this.networkPermission ? "curl https://example.com" : "a.ts",
+      ...(this.networkPermission ? { network: true, risk: "high" as const } : {}),
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     listener({
@@ -158,6 +166,53 @@ test("ACP v1: initialize/new/prompt/update/permission 映射到 SessionHost", as
 
   const listed = await adapter.handle({ jsonrpc: "2.0", id: 3, method: "session/list" });
   assert.equal((listed?.result as { sessions: unknown[] }).sessions.length, 1);
+  adapter.close();
+});
+
+test("ACP v1: shell 联网授权只提供一次性选项并拒绝伪造的 allow_always", async () => {
+  const host = new FakeHost(true);
+  let permissionRequest: Record<string, unknown> | undefined;
+  const adapter = new AcpAgentAdapter({
+    host,
+    defaultModel: "debug/demo",
+    peer: {
+      notify: () => {},
+      request: async (_method, params) => {
+        permissionRequest = params;
+        return { outcome: { optionId: "allow_always" } };
+      },
+    },
+  });
+  await adapter.handle({
+    jsonrpc: "2.0",
+    id: 0,
+    method: "initialize",
+    params: { protocolVersion: 1 },
+  });
+  await adapter.handle({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "session/new",
+    params: { cwd: "/tmp/project", mcpServers: [] },
+  });
+  await adapter.handle({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "session/prompt",
+    params: { sessionId: "s_acp", prompt: [{ type: "text", text: "network" }] },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const options = permissionRequest?.["options"] as Array<{ optionId: string }>;
+  assert.deepEqual(
+    options.map((option) => option.optionId),
+    ["allow_once", "reject_once"],
+  );
+  assert.match(
+    String((permissionRequest?.["toolCall"] as Record<string, unknown>)?.["title"]),
+    /Network access/,
+  );
+  assert.equal(host.permissions[0]?.decision, "deny");
   adapter.close();
 });
 

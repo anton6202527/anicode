@@ -425,12 +425,23 @@ export class AcpAgentAdapter {
 
   private async forward(sessionId: string, event: SessionEvent): Promise<void> {
     if (event.type === "permission_request") {
+      const networkApproval = event.toolName.toLowerCase() === "bash" && event.network === true;
       const result = (await this.peer.request("session/request_permission", {
         sessionId,
-        toolCall: { toolCallId: event.permId, title: event.ruleKey, kind: "other" },
+        toolCall: {
+          toolCallId: event.permId,
+          title: networkApproval ? `Network access: ${event.ruleKey}` : event.ruleKey,
+          kind: "other",
+        },
         options: [
-          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-          { optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+          {
+            optionId: "allow_once",
+            name: networkApproval ? "Allow network once" : "Allow once",
+            kind: "allow_once",
+          },
+          ...(!networkApproval
+            ? [{ optionId: "allow_always", name: "Always allow", kind: "allow_always" as const }]
+            : []),
           { optionId: "reject_once", name: "Reject", kind: "reject_once" },
         ],
       })) as { outcome?: { optionId?: string } };
@@ -438,7 +449,11 @@ export class AcpAgentAdapter {
       await this.host.answerPermission(
         sessionId,
         event.permId,
-        option === "allow_always" ? "allow_always" : option === "allow_once" ? "allow" : "deny",
+        option === "allow_once"
+          ? "allow"
+          : !networkApproval && option === "allow_always"
+            ? "allow_always"
+            : "deny",
       );
       return;
     }
