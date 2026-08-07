@@ -99,6 +99,23 @@ declared order using pure availability metadata. Once resolution starts reading 
 reference, denial, lock, timeout or a missing value ends that attempt; it does not open additional
 fallback Keychain items after the failure.
 
+Trusted production sessions apply the same rule to search: they select the first metadata-available
+`TAVILY_API_KEY`, then `BRAVE_SEARCH_API_KEY`, without resolving either value. The selected reference
+is opened only by the first `web_search` call and is injected exclusively by `NetworkProxy` with its
+declared audience, host, tool and header scope. Session status reports only ready/disabled state and
+provider name; it never includes a credential id, backend error or secret. `webfetch` remains the
+tool for known URLs. Untrusted workspaces expose neither network tool.
+
+A model cannot silently replace an unavailable search/fetch tool with a shell HTTP client. Native
+sandboxes do not advertise shell networking and force it off again at execution, because a child can
+create a new POSIX session outside the original process group. Only OCI/container runtimes that can
+prove whole-workload teardown expose it. There, every foreground `bash` request with `network=true`
+requires a fresh interactive approval even in auto/bypass mode and even when hooks, remembered
+decisions or allow rules would otherwise approve the command. Headless hosts fail closed, clients do
+not offer persistent approval for this case, and background network shells are rejected so later
+`write_stdin` calls cannot reuse a one-time grant. Network-enabled shell execution remains
+process-scoped behind the AniCode proxy; it never changes host proxy, DNS or route configuration.
+
 OS Keychain writes and deletes are user actions, not startup side effects:
 
 ```bash

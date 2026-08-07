@@ -126,6 +126,18 @@ HOST=127.0.0.1 PORT=8787 ANICODE_NETWORK_ALLOW_DOMAINS=api.github.com,github.com
 ANICODE_NETWORK_PROXY_URL=http://127.0.0.1:8787 npm run dev:tui
 ```
 
+受信任工作区配置 `TAVILY_API_KEY` 或 `BRAVE_SEARCH_API_KEY` 后，生产会话会按 Tavily、Brave
+的顺序选择首个已配置引用并注册 `web_search`；搜索后端选择、会话 create/open/resume、`/status`
+和 `/tools` 都只检查 Broker 内存元数据，不会解析懒加载引用或打开 Keychain，首次真实搜索才通过受控 `NetworkProxy` 解析精确引用。
+`webfetch` 用于读取已知 HTTP(S) URL，无需搜索服务密钥。两者在 restricted workspace 中均禁用。
+
+若专用联网工具不可用，Agent 必须说明原因，不会静默改用 `curl`、`wget` 或其他 shell HTTP
+客户端。只有能证明整项工作负载随调用销毁的 OCI/container 运行时才暴露 shell 联网；原生沙箱的 `bash`
+从 schema 到执行层均强制断网，避免 `setsid`/double-fork 逃离原进程组。容器内所有前台 `bash network:true`
+请求即使在 auto/bypass 模式、hook 放行或已有 allow 规则下也必须逐次由用户明确确认；无交互入口直接拒绝，
+联网批准不能记住或持久化。后台联网 shell 被拒绝，避免一次批准后经 stdin 复用长期联网进程。该链路只设置受隔离子进程的
+进程级代理，不修改系统代理、DNS 或路由。
+
 ### Windows 的安全执行模式
 
 AniCode 目前只为 macOS 和 Linux 提供原生 OS sandbox。原生 Windows 不会静默回退到裸 PowerShell/
@@ -401,7 +413,7 @@ registerOpenAICompatibleProvider({
 - **环境接地**：会话开始时快照 `<env>`（cwd/平台/系统/日期/是否 git 仓库/当前分支）+ `<git-status>`（工作区改动与最近提交）注入 system，缓存友好，让模型不再盲飞。见 `env.ts`。
 - 模型能力驱动请求：按 profile 控制 tools、reasoning、输出上限和 compaction 阈值；未知兼容模型不会被强塞 16k 输出参数。
 - 子 agent 的 `provider/model` override 会重新解析 provider，不再错误复用父 provider。
-- 默认工具：`read / write / edit / apply_patch / glob / grep / bash / bash_output / write_stdin / list_shells / kill_shell / webfetch / todo_write / task / skill`；配置 LSP 后追加 `diagnostics`。
+- 默认工具：`read / write / edit / apply_patch / glob / grep / bash / bash_output / write_stdin / list_shells / kill_shell / webfetch / todo_write / task / skill`；Broker 中配置 Tavily/Brave 搜索引用后追加 `web_search`，配置 LSP 后追加 `diagnostics`。
 - **多 agent 编排**（对齐 Claude Code 的 Agent/SendMessage/TaskOutput/TaskStop 收敛形态）：
   - `task` 委派子任务（内置 `general`/`explore` + 文件/配置自定义类型）；只读型可并行 fan-out；`orchestrator` 型可嵌套下派（深度硬顶）。
   - `task(background=true)` 后台运行：立即返回任务 id，父 agent 继续干活；完成时 `<task-notification>` 在 turn 边界注入（运行中）或由 SessionManager 自动发起一次 drive（空闲时）——主 agent 不用轮询。
@@ -424,7 +436,7 @@ registerOpenAICompatibleProvider({
 - MCP：保留 stdio（规范的换行分隔 JSON-RPC）与 Streamable HTTP 客户端；生产工具注册只开放受控出口的 HTTP，敏感 header/env 只能由 Credential Broker 短租约注入。stdio 仅供非生产兼容/测试，直到它由可证明清理的 cgroup、OCI sidecar 或 Windows Job Object 托管。`anicode mcp serve` 可把自身暴露为 MCP server。
 - Notification hook（turn_done / permission_request）+ TUI 授权响铃：配合 anicode.json 命令 hook 可外接桌面通知（对齐 Codex notify）。
 - 插件目录：`~/.anicode/plugins/<name>/` 与项目 `.anicode/plugins/<name>/` 下的 agents/skills/commands 子目录自动并入发现器（Claude Code plugins 的精简形态）。
-- TUI：`/diff`（工作区改动）、`/review`（uncommitted/branch/commit/自定义 四模式审查）、`/tasks`（后台任务一览）、`/status` 显示上下文占用（tokens/窗口/百分比）。
+- TUI：`/diff`（工作区改动）、`/review`（uncommitted/branch/commit/自定义 四模式审查）、`/tasks`（后台任务一览）、`/status` 显示上下文占用与联网工具摘要、`/tools` 显示 `web_search` / `webfetch` 的实际装配状态及安全的禁用原因。
 
 ## TUI 参数
 
