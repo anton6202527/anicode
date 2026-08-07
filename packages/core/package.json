@@ -41,6 +41,6 @@
     "undici": "^7.24.4"
   },
   "devDependencies": {
-    "@types/pg": "^8.20.0"
+    "@types/pg": "^8.20.3"
   }
 }
