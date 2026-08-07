@@ -7,8 +7,12 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { commandHook, commandHooksFromConfig, isHookEventName } from "./hooks-exec.js";
-import { HookRunner } from "./hooks.js";
-import type { ExecutionRuntime, IsolatedRunRequest } from "./runtime/isolated-runtime.js";
+import { HookExecutionBoundaryError, HookRunner } from "./hooks.js";
+import {
+  RuntimeTerminationError,
+  type ExecutionRuntime,
+  type IsolatedRunRequest,
+} from "./runtime/isolated-runtime.js";
 import { TransactionalExecutionRuntime } from "./runtime/transactional-runtime.js";
 
 const payload = { event: "PreToolUse" as const, cwd: process.cwd(), toolName: "bash" };
@@ -157,6 +161,55 @@ test("命令 hook: runtime without prepare still executes through run, never hos
   assert.equal(outcome.blocked, true);
   assert.equal(outcome.reason, "runtime block");
   assert.equal(executed, true);
+});
+
+test("命令 hook: abort 不能吞 runtime termination proof failure，runner 持久熔断", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  let started!: () => void;
+  const didStart = new Promise<void>((resolve) => (started = resolve));
+  let releaseCleanup!: () => void;
+  const cleanupGate = new Promise<void>((resolve) => (releaseCleanup = resolve));
+  const runtime: ExecutionRuntime = {
+    async run(request) {
+      calls++;
+      started();
+      await new Promise<void>((resolve) => {
+        if (request.signal?.aborted) resolve();
+        else request.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await cleanupGate;
+      throw new RuntimeTerminationError();
+    },
+  };
+  const runner = new HookRunner([
+    commandHook({ event: "Stop", command: "project-hook" }, { executionRuntime: runtime }),
+  ]);
+
+  const running = runner.run({ event: "Stop", cwd: process.cwd(), signal: controller.signal });
+  await didStart;
+  controller.abort(new Error("cancel hook"));
+  releaseCleanup();
+
+  await assert.rejects(
+    running,
+    (error: unknown) =>
+      error instanceof HookExecutionBoundaryError && error.cause instanceof RuntimeTerminationError,
+  );
+  await assert.rejects(
+    runner.awaitIdle(),
+    (error: unknown) =>
+      error instanceof HookExecutionBoundaryError && error.cause instanceof RuntimeTerminationError,
+  );
+  await assert.rejects(
+    runner.run({
+      event: "Stop",
+      cwd: process.cwd(),
+      signal: AbortSignal.abort(new Error("already cancelled")),
+    }),
+    (error: unknown) => error instanceof HookExecutionBoundaryError,
+  );
+  assert.equal(calls, 1, "poisoned runner must not start another external command hook");
 });
 
 test("命令 hook: Transactional foreground commits writes without leaking PatchSet summary", async () => {

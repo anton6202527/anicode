@@ -37,6 +37,29 @@ export interface DaemonServerOptions {
   unsafeAllowUnauthenticatedForTests?: boolean;
   /** Test/embedding override; production defaults to the core provider registry. */
   discoverModels?: (providerId: string) => Promise<string[] | undefined>;
+  /** Deadline for the first authenticated request frame. Default: 10 seconds. */
+  initialRequestTimeoutMs?: number;
+  /** Maximum simultaneous local IPC clients. Default: 128. */
+  maxConnections?: number;
+  /** Maximum dispatched requests per connection. Default: 256. */
+  maxInFlightRequestsPerConnection?: number;
+}
+
+const DEFAULT_INITIAL_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_CONNECTIONS = 128;
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS = 256;
+
+function boundedPositiveInteger(
+  value: number | undefined,
+  fallback: number,
+  name: string,
+  maximum: number,
+): number {
+  const candidate = value ?? fallback;
+  if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > maximum) {
+    throw new TypeError(`${name} must be an integer between 1 and ${maximum}`);
+  }
+  return candidate;
 }
 
 export class DaemonServer {
@@ -44,7 +67,10 @@ export class DaemonServer {
   private manager: SessionManager;
   private readonly providerModelDiscovery: (providerId: string) => Promise<string[] | undefined>;
   private readonly authTokenDigest: Buffer | undefined;
+  private readonly initialRequestTimeoutMs: number;
+  private readonly maxInFlightRequestsPerConnection: number;
   private conns = new Set<net.Socket>();
+  private closing: Promise<void> | undefined;
 
   constructor(opts: DaemonServerOptions) {
     if (opts.authToken === undefined && opts.unsafeAllowUnauthenticatedForTests !== true) {
@@ -59,7 +85,25 @@ export class DaemonServer {
       opts.authToken !== undefined
         ? createHash("sha256").update(validateDaemonAuthToken(opts.authToken)).digest()
         : undefined;
+    this.initialRequestTimeoutMs = boundedPositiveInteger(
+      opts.initialRequestTimeoutMs,
+      DEFAULT_INITIAL_REQUEST_TIMEOUT_MS,
+      "initialRequestTimeoutMs",
+      5 * 60_000,
+    );
+    this.maxInFlightRequestsPerConnection = boundedPositiveInteger(
+      opts.maxInFlightRequestsPerConnection,
+      DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+      "maxInFlightRequestsPerConnection",
+      4_096,
+    );
     this.server = net.createServer((sock) => this.onConnection(sock));
+    this.server.maxConnections = boundedPositiveInteger(
+      opts.maxConnections,
+      DEFAULT_MAX_CONNECTIONS,
+      "maxConnections",
+      4_096,
+    );
   }
 
   async listen(socketPath: string): Promise<void> {
@@ -82,10 +126,14 @@ export class DaemonServer {
 
   /** 关闭：先断开所有连接（否则 server.close 会等待它们自然结束），再停监听 */
   close(): Promise<void> {
-    this.manager.dispose();
-    for (const sock of this.conns) sock.destroy();
-    this.conns.clear();
-    return new Promise((res) => this.server.close(() => res()));
+    if (this.closing) return this.closing;
+    this.closing = (async () => {
+      this.manager.dispose();
+      for (const sock of this.conns) sock.destroy();
+      this.conns.clear();
+      await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    })();
+    return this.closing;
   }
 
   private onConnection(sock: net.Socket): void {
@@ -94,6 +142,12 @@ export class DaemonServer {
     sock.setEncoding("utf8");
     let buffer = "";
     let connectionClosed = false;
+    let acceptedFirstRequest = false;
+    let inFlightRequests = 0;
+    const initialRequestTimer = setTimeout(() => {
+      if (!acceptedFirstRequest) sock.destroy();
+    }, this.initialRequestTimeoutMs);
+    initialRequestTimer.unref();
     // 该连接的订阅：sessionId → unsubscribe
     const subs = new Map<string, () => void>();
     // 仅把同一 session 的 open/close 串行化；send/permission 仍可并行，避免
@@ -145,7 +199,31 @@ export class DaemonServer {
             sock.destroy();
             return;
           }
-          void this.handle(req, write, waitForDrain, subs, subscriptionOps, () => connectionClosed);
+          if (!acceptedFirstRequest) {
+            acceptedFirstRequest = true;
+            clearTimeout(initialRequestTimer);
+          }
+          if (inFlightRequests >= this.maxInFlightRequestsPerConnection) {
+            write({
+              type: "result",
+              id: req.id,
+              ok: false,
+              error: t(
+                `too many in-flight daemon requests (max ${this.maxInFlightRequestsPerConnection})`,
+                `daemon 并发请求过多（上限 ${this.maxInFlightRequestsPerConnection}）`,
+              ),
+            });
+            continue;
+          }
+          inFlightRequests++;
+          void this.handle(
+            req,
+            write,
+            waitForDrain,
+            subs,
+            subscriptionOps,
+            () => connectionClosed,
+          ).finally(() => inFlightRequests--);
         }
       } catch {
         // 协议错误只关闭当前连接，不能让未捕获的 JSON.parse 异常击穿 daemon。
@@ -154,6 +232,7 @@ export class DaemonServer {
     });
     const cleanup = () => {
       connectionClosed = true;
+      clearTimeout(initialRequestTimer);
       for (const unsub of subs.values()) unsub();
       subs.clear();
       this.conns.delete(sock);

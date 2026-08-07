@@ -9,12 +9,12 @@ import * as vscode from "vscode";
 import {
   loadConfig,
   loadProjectEnv,
-  resolveDefaultModel,
   t,
+  type BoundProviderRegistry,
   WorkspaceTrustStore,
 } from "@anicode/core";
 import { ChatBridge } from "./bridge.js";
-import { buildManagerCompositionAsync, modelChoices } from "./host.js";
+import { buildManagerCompositionAsync, modelChoices, packagedKeyringModulePath } from "./host.js";
 import type { HostToWebview, WebviewToHost } from "./protocol.js";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -23,14 +23,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const workspaceTrust = await workspaceTrustStore.assess(cwd);
   await loadProjectEnv({ cwd, workspaceTrust });
   const { config } = await loadConfig({ cwd, workspaceTrust });
-  const defaultModel = config.model ?? resolveDefaultModel();
   const sessionsDir = path.join(context.globalStorageUri.fsPath, "sessions");
   const managerComposition = await buildManagerCompositionAsync(
     sessionsDir,
     workspaceTrustStore,
     cwd,
     config,
+    packagedKeyringModulePath(context.extensionPath),
   );
+  const defaultModel =
+    config.model ?? managerComposition.runtimeStack.providers.resolveDefaultModel();
   const manager = managerComposition.manager;
 
   if (!workspaceTrust.trusted) {
@@ -56,6 +58,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     manager,
     cwd,
     defaultModel,
+    managerComposition.runtimeStack.providers,
     () => {
       status.text = `$(sparkle) ${provider.model}`;
       status.tooltip = t(
@@ -93,6 +96,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly manager: import("@anicode/core").SessionManager,
     private readonly cwd: string,
     defaultModel: string,
+    private readonly providers: Pick<BoundProviderRegistry, "diagnoseProvider">,
     private readonly onModelChange: () => void,
     private readonly disposeManager: () => Promise<void>,
   ) {
@@ -130,7 +134,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   async pickModel(): Promise<void> {
-    const choices = await modelChoices();
+    const choices = await modelChoices(this.providers);
     const pick = await vscode.window.showQuickPick(
       choices.map((c) => ({ label: c.label, detail: c.detail, spec: c.spec })),
       {

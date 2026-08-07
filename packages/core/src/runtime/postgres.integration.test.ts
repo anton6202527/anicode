@@ -28,6 +28,129 @@ test("PostgreSQL: production timeouts cannot be disabled or made unbounded", asy
   );
 });
 
+test("PostgreSQL session store: load uses one transaction snapshot", async () => {
+  const sessionId = "session_snapshot";
+  const first = {
+    meta: {
+      id: sessionId,
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      cwd: "/workspace",
+      workspace_device: null,
+      workspace_inode: null,
+      model: "model-a",
+      title: "snapshot-a",
+    },
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "text", text: "snapshot-a" }],
+      },
+    ],
+  };
+  const replacement = {
+    meta: {
+      ...first.meta,
+      updated_at: "2026-01-02T00:00:00.000Z",
+      model: "model-b",
+      title: "snapshot-b",
+    },
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "snapshot-b" }],
+      },
+    ],
+  };
+  let live = structuredClone(first);
+  let transactionCalls = 0;
+  let poolCalls = 0;
+  const database = {
+    pool: {
+      async query(sql: string) {
+        poolCalls++;
+        if (sql.startsWith("SELECT * FROM anicode_sessions")) {
+          const meta = structuredClone(live.meta);
+          live = structuredClone(replacement);
+          return { rows: [meta] };
+        }
+        return { rows: live.messages.map((data) => ({ data: structuredClone(data) })) };
+      },
+    },
+    async transaction<T>(
+      work: (client: {
+        query(sql: string): Promise<{ rows: Record<string, unknown>[] }>;
+      }) => Promise<T> | T,
+    ): Promise<T> {
+      transactionCalls++;
+      const snapshot = structuredClone(live);
+      return work({
+        async query(sql: string) {
+          if (sql.startsWith("SELECT * FROM anicode_sessions")) {
+            const meta = structuredClone(snapshot.meta);
+            // Model a rewrite committing between the two SELECT statements. Transaction-local
+            // reads must continue to observe the original metadata and transcript together.
+            live = structuredClone(replacement);
+            return { rows: [meta] };
+          }
+          return {
+            rows: snapshot.messages.map((data) => ({ data: structuredClone(data) })),
+          };
+        },
+      });
+    },
+  } as unknown as PostgresRuntimeDatabase;
+
+  const store = new PostgresSessionStore(database);
+  assert.equal(store.storageSemantics, "transactional-primary");
+  const loaded = await store.load(sessionId);
+  assert.equal(loaded.title, "snapshot-a");
+  assert.equal(loaded.model, "model-a");
+  assert.equal((loaded.messages[0]!.content[0] as { text: string }).text, "snapshot-a");
+  assert.equal(transactionCalls, 1);
+  assert.equal(poolCalls, 0, "load must not split a logical session across pool connections");
+});
+
+test("PostgreSQL session store: load never escapes a failed commit", async () => {
+  const database = {
+    pool: {
+      async query() {
+        return { rows: [] };
+      },
+    },
+    async transaction<T>(
+      work: (client: {
+        query(sql: string): Promise<{ rows: Record<string, unknown>[] }>;
+      }) => Promise<T> | T,
+    ): Promise<T> {
+      await work({
+        async query(sql: string) {
+          if (sql.startsWith("SELECT * FROM anicode_sessions")) {
+            return {
+              rows: [
+                {
+                  id: "session_commit_failure",
+                  created_at: "2026-01-01T00:00:00.000Z",
+                  updated_at: "2026-01-01T00:00:00.000Z",
+                  cwd: "/workspace",
+                  model: "model-a",
+                },
+              ],
+            };
+          }
+          return { rows: [] };
+        },
+      });
+      throw new Error("simulated commit failure");
+    },
+  } as unknown as PostgresRuntimeDatabase;
+
+  await assert.rejects(
+    () => new PostgresSessionStore(database).load("session_commit_failure"),
+    /simulated commit failure/,
+  );
+});
+
 test(
   "PostgreSQL: normalized inbox/outbox/queue、SKIP LOCKED 与 fencing token",
   { skip: databaseUrl ? false : "ANICODE_TEST_DATABASE_URL is not configured" },

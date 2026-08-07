@@ -14,6 +14,7 @@ function run(command, args, options = {}) {
     env: {
       ...process.env,
       ANICODE_CREDENTIAL_BACKEND: "memory",
+      ANICODE_DISABLE_OS_KEYCHAIN: "1",
       ANICODE_LANG: "en",
       NO_COLOR: "1",
     },
@@ -55,6 +56,7 @@ async function runInteractivePty(entry, project, options = {}) {
     env: {
       ...process.env,
       ANICODE_CREDENTIAL_BACKEND: "memory",
+      ANICODE_DISABLE_OS_KEYCHAIN: "1",
       ANICODE_LANG: "en",
       CI: "1",
       ...(options.screenReader ? { INK_SCREEN_READER: "true" } : {}),

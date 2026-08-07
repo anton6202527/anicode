@@ -7,5 +7,13 @@
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["@anicode/core", "@anicode/shared", "@anicode/tui", "@anicode/app", "anicode-vscode"]
+  "ignore": [
+    "@anicode/app",
+    "@anicode/core",
+    "@anicode/eval",
+    "@anicode/sdk",
+    "@anicode/shared",
+    "@anicode/tui",
+    "anicode-vscode"
+  ]
 }

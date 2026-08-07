@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CredentialBroker } from "../security/credentials.js";
 import { GitHubDelivery } from "./github-delivery.js";
+import { RuntimeTerminationError } from "./isolated-runtime.js";
 import { NetworkProxy } from "./network-proxy.js";
 import { RemoteRuntime } from "./remote.js";
 import { InMemoryTelemetry, parseTraceparent } from "./telemetry.js";
@@ -85,6 +86,208 @@ test("RemoteRuntime: 经受控代理鉴权、幂等提交并轮询完成", async
       (request) => parseTraceparent(request.traceparent ?? undefined)?.spanId === clientSpan.spanId,
     ),
   );
+});
+
+test("RemoteRuntime: transient submission failures retry with the same idempotency identity", async () => {
+  let attempts = 0;
+  const requestIds: string[] = [];
+  const idempotencyKeys: string[] = [];
+  const proxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async (_target, init) => {
+      attempts++;
+      requestIds.push(new Headers(init?.headers).get("x-request-id") ?? "");
+      idempotencyKeys.push(
+        String((JSON.parse(String(init?.body)) as Record<string, unknown>)["idempotencyKey"]),
+      );
+      if (attempts < 3) {
+        return new Response("temporarily unavailable", {
+          status: 503,
+          headers: { "retry-after": "0" },
+        });
+      }
+      return Response.json({
+        id: "run-retried",
+        status: "succeeded",
+        result: {
+          exitCode: 0,
+          output: "ok after retry",
+          timedOut: false,
+          sandboxed: true,
+          durationMs: 1,
+        },
+      });
+    },
+  });
+  try {
+    const runtime = new RemoteRuntime({
+      endpoint: "https://runtime.example",
+      proxy,
+      maxRequestRetries: 2,
+    });
+    const result = await runtime.run({ command: "true", cwd: "/workspace" });
+    assert.equal(result.output, "ok after retry");
+    assert.equal(attempts, 3);
+    assert.equal(new Set(requestIds).size, 1);
+    assert.equal(new Set(idempotencyKeys).size, 1);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("RemoteRuntime: an ambiguous submission deadline is a termination-proof failure", async () => {
+  const proxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async () => new Promise<Response>(() => undefined),
+  });
+  try {
+    const runtime = new RemoteRuntime({
+      endpoint: "https://runtime.example",
+      proxy,
+      requestTimeoutMs: 250,
+      maxRequestRetries: 0,
+    });
+    await assert.rejects(
+      () => runtime.run({ command: "true", cwd: "/workspace" }),
+      (error: unknown) => error instanceof RuntimeTerminationError,
+    );
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("RemoteRuntime: an unparseable submission response remains indeterminate", async () => {
+  const proxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async () =>
+      new Response("x".repeat(2_048), {
+        headers: { "content-length": "2048", "content-type": "application/json" },
+      }),
+  });
+  try {
+    const runtime = new RemoteRuntime({
+      endpoint: "https://runtime.example",
+      proxy,
+      maxResponseBytes: 1_024,
+      maxRequestRetries: 0,
+    });
+    await assert.rejects(
+      () => runtime.run({ command: "true", cwd: "/workspace" }),
+      (error: unknown) => error instanceof RuntimeTerminationError,
+    );
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("RemoteRuntime: indeterminate server outcomes remain typed termination-proof failures", async () => {
+  let polls = 0;
+  const proxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async (_target, init) => {
+      if (init?.method === "POST") {
+        return Response.json({ id: "run-indeterminate", status: "running", outcome: "known" });
+      }
+      polls++;
+      return Response.json({
+        id: "run-indeterminate",
+        status: "failed",
+        outcome: "indeterminate",
+        error: "untrusted and potentially sensitive remote diagnostics",
+      });
+    },
+  });
+  try {
+    const runtime = new RemoteRuntime({
+      endpoint: "https://runtime.example",
+      proxy,
+      pollMs: 1,
+      maxRequestRetries: 0,
+    });
+    await assert.rejects(
+      () => runtime.run({ command: "true", cwd: "/workspace" }),
+      (error: unknown) =>
+        error instanceof RuntimeTerminationError &&
+        error.message === "Execution runtime could not prove workload termination",
+    );
+    assert.equal(polls, 1);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("RemoteRuntime: caller abort waits for an independently polled terminal cancellation", async () => {
+  const controller = new AbortController();
+  let deleted = 0;
+  let cancellationPolls = 0;
+  const proxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async (_target, init) => {
+      if (init?.method === "POST") {
+        queueMicrotask(() => controller.abort(new Error("caller stopped")));
+        return Response.json({ id: "run-cancel", status: "running", outcome: "known" });
+      }
+      if (init?.method === "DELETE") {
+        deleted++;
+        return Response.json({ status: "cancellation_requested" }, { status: 202 });
+      }
+      cancellationPolls++;
+      return Response.json(
+        cancellationPolls === 1
+          ? { id: "run-cancel", status: "cancellation_requested", outcome: "known" }
+          : { id: "run-cancel", status: "cancelled", outcome: "known" },
+      );
+    },
+  });
+  try {
+    const runtime = new RemoteRuntime({
+      endpoint: "https://runtime.example",
+      proxy,
+      pollMs: 1,
+      maxRequestRetries: 0,
+      terminationTimeoutMs: 1_000,
+    });
+    await assert.rejects(
+      () => runtime.run({ command: "true", cwd: "/workspace", signal: controller.signal }),
+      /caller stopped/,
+    );
+    assert.equal(deleted, 1);
+    assert.equal(cancellationPolls, 2);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("RemoteRuntime: abort cleanup propagates an indeterminate cancellation outcome", async () => {
+  const controller = new AbortController();
+  const proxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async (_target, init) => {
+      if (init?.method === "POST") {
+        queueMicrotask(() => controller.abort());
+        return Response.json({ id: "run-unknown", status: "running", outcome: "known" });
+      }
+      if (init?.method === "DELETE") {
+        return Response.json({ status: "cancellation_requested" }, { status: 202 });
+      }
+      return Response.json({ id: "run-unknown", status: "failed", outcome: "indeterminate" });
+    },
+  });
+  try {
+    const runtime = new RemoteRuntime({
+      endpoint: "https://runtime.example",
+      proxy,
+      pollMs: 1,
+      maxRequestRetries: 0,
+      terminationTimeoutMs: 1_000,
+    });
+    await assert.rejects(
+      () => runtime.run({ command: "true", cwd: "/workspace", signal: controller.signal }),
+      (error: unknown) => error instanceof RuntimeTerminationError,
+    );
+  } finally {
+    await proxy.close();
+  }
 });
 
 test("GitHubDelivery: branch/files/draft PR/workflow 构成闭环", async () => {

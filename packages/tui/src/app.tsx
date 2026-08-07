@@ -446,6 +446,13 @@ export function terminalDisplayText(text: string, max = MAX_RENDERED_ITEM_CHARS)
   return `… ${t("older display content omitted", "较早的显示内容已省略")} …\n${safe.slice(start)}`;
 }
 
+/** Render a copy-safe POSIX shell argument without allowing host-owned cwd metadata to add syntax. */
+function shellQuote(value: string): string {
+  const safe = sanitizeTerminalText(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(safe)) return safe;
+  return `'${safe.replaceAll("'", `'\\''`)}'`;
+}
+
 /** Metadata belongs on one terminal row; control sequences/newlines are never markup. */
 function terminalInlineText(text: string, max = 4 * 1024): string {
   return terminalDisplayText(text, max)
@@ -867,7 +874,10 @@ export interface AppProps {
   catalog?: readonly ModelCatalogEntry[];
   /** 测试可覆盖宿主侧模型探测；缺省委托 SessionHost，能力缺失时 fail closed。 */
   discoverModels?: (providerId: string) => Promise<readonly string[] | undefined>;
-  /** 仅本地 host 可安全读取当前进程 env；daemon 的凭证属于服务端进程。 */
+  /**
+   * 仅供未使用生产 CredentialBroker 的嵌入/测试宿主检查当前进程环境。
+   * 正式宿主会迁走环境密钥，必须以宿主的模型探测结果为准。
+   */
   inspectProviderCredentials?: boolean;
   /** 自定义斜杠命令（.anicode/command/*.md）。 */
   commands?: readonly CustomCommand[];
@@ -1059,8 +1069,6 @@ export function App({
   }, [activePermissionId, stdout, terminalControl]);
   // /model 选择器：非空即打开，index 为高亮项，filter 为搜索词。
   const [picker, setPicker] = useState<ModelPickerState | null>(null);
-  /** Only the newest asynchronous /model refresh may publish picker state. */
-  const modelProbeGenerationRef = useRef(0);
   /** Invalidates selection verification when a picker closes/reopens or another choice starts. */
   const modelPickerGenerationRef = useRef(0);
   const modelSelectionGenerationRef = useRef(0);
@@ -1117,10 +1125,9 @@ export function App({
   const switchSession = useCallback(
     (id: string): void => {
       // Invalidate old async picker work synchronously, before React commits the
-      // session state change. This closes the event-loop race with a resolved probe.
+      // session state change. This closes the event-loop race with a resolved verification.
       modelPickerGenerationRef.current++;
       modelSelectionGenerationRef.current++;
-      modelProbeGenerationRef.current++;
       activeSessionRef.current = { id, generation: state.generation };
       setPicker(null);
       setNextModel(null);
@@ -1278,6 +1285,19 @@ export function App({
     };
   }, []);
 
+  const beginExplicitModelSelection = useCallback((): (() => boolean) => {
+    const selectionGeneration = ++modelSelectionGenerationRef.current;
+    const selectedSession = { ...activeSessionRef.current };
+    return () => {
+      const active = activeSessionRef.current;
+      return (
+        modelSelectionGenerationRef.current === selectionGeneration &&
+        active.id === selectedSession.id &&
+        active.generation === selectedSession.generation
+      );
+    };
+  }, []);
+
   const selectModel = useCallback(
     async (spec: string, isCurrent: () => boolean = () => true): Promise<void> => {
       if (!isCurrent()) return;
@@ -1408,7 +1428,6 @@ export function App({
     closeRef.current = null;
     setPendings([]);
     setExpandedToolIds(new Set());
-    modelProbeGenerationRef.current++;
     closeModelPicker();
     updatePermMode("default"); // snapshot 到达后会替换为宿主的权威模式
     if (requireWorkspaceTrust) {
@@ -1617,31 +1636,71 @@ export function App({
       const slash = spec.indexOf("/");
       const providerId = slash > 0 ? spec.slice(0, slash) : "";
       const modelId = slash > 0 ? spec.slice(slash + 1) : "";
+      if (!providerId || !modelId) {
+        if (!isCurrent()) return false;
+        dispatch({
+          t: "push",
+          item: {
+            kind: "error",
+            text: t(
+              `Invalid model spec ${spec}; expected <provider/model>`,
+              `模型标识 ${spec} 无效；应使用 <provider/model> 格式`,
+            ),
+          },
+        });
+        return false;
+      }
+
       let advertised: readonly string[] | undefined;
-      if (providerId && modelId) {
-        try {
-          advertised = await discoverModels(providerId);
-        } catch {
-          advertised = undefined;
-        }
+      try {
+        advertised = await discoverModels(providerId);
+      } catch {
+        advertised = undefined;
       }
       // The picker/session may have changed while discovery was in flight. A
       // stale response must be completely silent, including its error notice.
       if (!isCurrent()) return false;
       if (advertised?.includes(modelId)) return true;
+
+      if (advertised === undefined) {
+        const provider = providers.find(
+          (candidate) => candidate.id === providerId || candidate.aliases.includes(providerId),
+        );
+        const credentialHint = provider?.apiKeyEnv.join(" / ");
+        const projectEnvUnavailable =
+          requireWorkspaceTrust && canInspectWorkspace && !workspaceTrustedRef.current;
+        const trustCommand = `anicode trust grant --cwd ${shellQuote(state.meta.cwd)}`;
+        dispatch({
+          t: "push",
+          item: {
+            kind: "error",
+            text: projectEnvUnavailable
+              ? t(
+                  `Cannot verify ${spec}: the model endpoint could not be queried, and restricted workspaces do not load project .env credentials. If this project is trusted, run ${trustCommand} in an interactive terminal, restart AniCode, and retry.`,
+                  `${spec} 无法从模型端点校验，且受限工作区不会加载项目 .env 凭据。确认项目内容可信后，请在交互式终端运行 ${trustCommand}，重启 AniCode 后重试。`,
+                )
+              : t(
+                  `Cannot verify ${spec}: the model endpoint could not be queried. Check ${credentialHint || "provider credentials"}, endpoint configuration, and network connectivity, then retry.`,
+                  `${spec} 无法从模型端点校验。请检查${credentialHint ? ` ${credentialHint}` : " Provider 凭据"}、端点配置和网络连接后重试。`,
+                ),
+          },
+        });
+        return false;
+      }
+
       dispatch({
         t: "push",
         item: {
           kind: "error",
           text: t(
-            `${spec} is not currently advertised by its model endpoint; refresh /model and choose an available model`,
-            `${spec} 当前未被模型端点列为可用；请刷新 /model 后选择可用模型`,
+            `${spec} is not currently advertised by its model endpoint; the endpoint returned a model list successfully, so choose another endpoint-supported model`,
+            `${spec} 当前未被模型端点列为可用；端点已成功返回模型列表，请选择该端点支持的其他模型`,
           ),
         },
       });
       return false;
     },
-    [discoverModels],
+    [canInspectWorkspace, discoverModels, providers, requireWorkspaceTrust, state.meta.cwd],
   );
 
   const runSlash = useCallback(
@@ -1864,20 +1923,18 @@ export function App({
       if (cmd === "model") {
         const spec = rest[0];
         if (!spec) {
-          // 不带参数：并发读取每个 provider 的鉴权 `/models`。只有端点实际响应且
-          // 返回了该模型，才允许进入选择器；仅有静态目录或 API Key 不算可用。
-          const generation = ++modelProbeGenerationRef.current;
-          const live = await probeLive(providers, discoverModels);
-          if (generation !== modelProbeGenerationRef.current) return true;
-          const rows = buildPickerRows(catalog, providers, inspectProviderCredentials, live);
+          // 浏览阶段只使用非敏感 provider/catalog 元数据，绝不调用鉴权 `/models`。
+          // 用户按 Enter/Tab 最终选定后，verifyAdvertisedModel 才只读取该
+          // provider 的凭据并做一次在线校验。
+          const rows = buildPickerRows(catalog, providers, inspectProviderCredentials);
           if (rows.length === 0) {
             dispatch({
               t: "push",
               item: {
                 kind: "error",
                 text: t(
-                  "No model endpoint responded successfully; check provider credentials, network, and local services",
-                  "没有模型端点探测成功；请检查 provider 凭证、网络和本地服务",
+                  "No models are present in the local catalog; use /model <provider/model> for an explicit host-validated selection",
+                  "本地模型目录为空；可用 /model <provider/model> 显式选择并交由宿主校验",
                 ),
               },
             });
@@ -1897,9 +1954,11 @@ export function App({
           });
           return true;
         }
-        if (!(await verifyAdvertisedModel(spec))) return true;
+        const isCurrent = beginExplicitModelSelection();
+        if (!(await verifyAdvertisedModel(spec, isCurrent)) || !isCurrent()) return true;
         // `/model <spec> once`：仅下一条消息用该模型（per-prompt 覆盖），不新建会话。
         if ((rest[1] ?? "").toLowerCase() === "once") {
+          if (!isCurrent()) return true;
           setNextModel(spec);
           dispatch({
             t: "push",
@@ -1913,7 +1972,7 @@ export function App({
           });
           return true;
         }
-        await selectModel(spec);
+        await selectModel(spec, isCurrent);
         return true;
       }
       if (cmd === "sessions") {
@@ -2335,7 +2394,6 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       host,
       providers,
       catalog,
-      discoverModels,
       inspectProviderCredentials,
       selectModel,
       openSessionPicker,
@@ -2354,6 +2412,7 @@ Requirements: read the actual diff and surrounding code before judging; verify e
       toggleToolDetail,
       suspendTerminalWithCaret,
       mouseTracking,
+      beginExplicitModelSelection,
       verifyAdvertisedModel,
       switchSession,
     ],
@@ -3905,22 +3964,14 @@ export function buildPickerRows(
     let ready: boolean | undefined;
     let readyHint: string;
     if (liveProbe?.probed.has(entry.providerId)) {
-      // 只有鉴权 `/models` 返回成功才会进入 currentCatalog；凭证状态仅用于提示，
-      // 不会让“有 Key 但请求失败”的模型重新出现。
+      // 只有宿主使用自身 CredentialBroker 成功完成鉴权 `/models` 后，provider 才会进入
+      // currentCatalog。此结果就是权威的凭证/端点就绪状态；不能再从 TUI 进程的
+      // process.env 复查，因为生产安全栈会在启动时把 key 迁入 Broker 并清空环境变量。
       const endpointReady = liveProbe.live.has(entry.providerId);
-      const credentialState =
-        entry.requiresApiKey && inspectCredentials && descriptor
-          ? inspectProviderCredential(descriptor, entry.spec)
-          : undefined;
-      ready = endpointReady && (credentialState?.ready ?? !entry.requiresApiKey);
+      ready = endpointReady;
       readyHint = !endpointReady
         ? t(`Start ${entry.providerName} first`, `需先启动 ${entry.providerName}`)
-        : credentialState && !credentialState.ready
-          ? t(
-              `Missing ${apiKeyEnv.join("/") || "API key"}`,
-              `缺 ${apiKeyEnv.join("/") || "API key"}`,
-            )
-          : t(`${entry.providerName} ready`, `${entry.providerName} 已就绪`);
+        : t(`${entry.providerName} ready`, `${entry.providerName} 已就绪`);
     } else if (!entry.requiresApiKey) {
       ready = true;
       readyHint = entry.local ? t("local/no key", "本地/免 key") : t("no key", "免 key");
@@ -4033,47 +4084,6 @@ export function filterPickerRows(rows: readonly PickerRow[], filter: string): Pi
       r.label.toLowerCase().includes(q) ||
       r.providerName.toLowerCase().includes(q),
   );
-}
-
-/** 有界并发探测 provider；只有鉴权 `/models` 成功的模型才进入 `/model`。 */
-export async function probeLive(
-  providers: readonly ProviderDescriptor[],
-  discover: (providerId: string) => Promise<readonly string[] | undefined>,
-  options: { concurrency?: number; timeoutMs?: number } = {},
-): Promise<ProviderProbe> {
-  const probed = new Set(providers.map((provider) => provider.id));
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? 4, providers.length || 1));
-  const timeoutMs = Math.max(100, options.timeoutMs ?? 8_000);
-  const discovered = new Map<string, readonly string[] | undefined>();
-  let next = 0;
-  let accepting = true;
-  const workers = Array.from({ length: concurrency }, async () => {
-    while (accepting) {
-      const index = next++;
-      const provider = providers[index];
-      if (!provider) return;
-      const models = await discover(provider.id).catch(() => undefined);
-      if (accepting) discovered.set(provider.id, models);
-    }
-  });
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    Promise.all(workers),
-    new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
-      timer.unref?.();
-    }),
-  ]);
-  accepting = false;
-  if (timer) clearTimeout(timer);
-  const live = new Set<string>();
-  const models = new Map<string, readonly string[]>();
-  for (const [providerId, ids] of [...discovered]) {
-    if (ids === undefined) continue;
-    live.add(providerId);
-    models.set(providerId, ids);
-  }
-  return { probed, live, models };
 }
 
 // opencode 同款选择器高亮色（暖橙）。

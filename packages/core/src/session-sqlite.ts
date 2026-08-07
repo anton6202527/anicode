@@ -38,6 +38,8 @@ interface SqliteDatabase {
   close(): void;
 }
 
+const SQLITE_PRIVATE_MODE = 0o600;
+
 function defaultDbPath(): string {
   return path.join(os.homedir(), ".anicode", "sessions.db");
 }
@@ -53,6 +55,11 @@ export async function sqliteAvailable(): Promise<boolean> {
 }
 
 export class SqliteSessionStore implements ISessionStore {
+  readonly storageSemantics = "transactional-primary" as const;
+  private operationTail: Promise<void> = Promise.resolve();
+  private closed = false;
+  private closeTask?: Promise<void>;
+
   private constructor(
     private db: SqliteDatabase,
     private dbPath: string,
@@ -77,55 +84,109 @@ export class SqliteSessionStore implements ISessionStore {
         ),
       );
     }
-    const file = dbPath ?? defaultDbPath();
-    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    const requestedFile = dbPath ?? defaultDbPath();
+    const inMemory = requestedFile === ":memory:";
+    // DatabaseSync resolves relative paths only when it opens the handle. Persisting that relative
+    // spelling would make later permission checks follow a changed process.cwd() to another file.
+    const file = inMemory ? requestedFile : path.resolve(requestedFile);
+    if (!inMemory) {
+      const directory = path.dirname(file);
+      await ensureDatabaseParent(directory, dbPath === undefined);
+      await preparePrivateDatabaseFile(file);
+    }
+
     const db = new DatabaseSync(file);
-    // WAL 提升并发读写；外键级联让删除会话自动清消息。
-    db.exec("PRAGMA journal_mode = WAL");
-    db.exec("PRAGMA foreign_keys = ON");
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        id         TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        cwd        TEXT NOT NULL,
-        workspace_device TEXT,
-        workspace_inode  TEXT,
-        model      TEXT NOT NULL,
-        title      TEXT
-      );
-      CREATE TABLE IF NOT EXISTS messages (
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        idx        INTEGER NOT NULL,
-        data       TEXT NOT NULL,
-        PRIMARY KEY (session_id, idx)
-      );
-      CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
-    `);
-    const sessionColumns = new Set(
-      db
-        .prepare("PRAGMA table_info(sessions)")
-        .all()
-        .map((row) => String(row.name)),
-    );
-    if (!sessionColumns.has("workspace_device")) {
-      db.exec("ALTER TABLE sessions ADD COLUMN workspace_device TEXT");
+    try {
+      // Bound lock contention rather than failing immediately under a second local process. FULL
+      // synchronous WAL commits trade a little latency for crash-safe acknowledged transcripts.
+      db.exec("PRAGMA busy_timeout = 5000");
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA synchronous = FULL");
+      db.exec("PRAGMA foreign_keys = ON");
+      // Serialize schema discovery + ALTER across processes. Without one write transaction, two
+      // old-database openers can both observe a missing column and the loser fails with duplicate.
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS sessions (
+            id         TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            cwd        TEXT NOT NULL,
+            workspace_device TEXT,
+            workspace_inode  TEXT,
+            model      TEXT NOT NULL,
+            title      TEXT
+          );
+          CREATE TABLE IF NOT EXISTS messages (
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            idx        INTEGER NOT NULL,
+            data       TEXT NOT NULL,
+            PRIMARY KEY (session_id, idx)
+          );
+          CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+        `);
+        const sessionColumns = new Set(
+          db
+            .prepare("PRAGMA table_info(sessions)")
+            .all()
+            .map((row) => String(row.name)),
+        );
+        if (!sessionColumns.has("workspace_device")) {
+          db.exec("ALTER TABLE sessions ADD COLUMN workspace_device TEXT");
+        }
+        if (!sessionColumns.has("workspace_inode")) {
+          db.exec("ALTER TABLE sessions ADD COLUMN workspace_inode TEXT");
+        }
+        db.exec("COMMIT");
+      } catch (error) {
+        rollback(db);
+        throw error;
+      }
+      const integrity = db.prepare("PRAGMA quick_check(1)").get();
+      if (integrity && String(integrity.quick_check) !== "ok") {
+        throw new Error(
+          `SQLite session database integrity check failed: ${String(integrity.quick_check)}`,
+        );
+      }
+      if (!inMemory) await secureDatabaseFiles(file);
+      return new SqliteSessionStore(db, file);
+    } catch (error) {
+      try {
+        db.close();
+      } catch {
+        // Preserve the initialization error; SQLite may already have invalidated the handle.
+      }
+      throw error;
     }
-    if (!sessionColumns.has("workspace_inode")) {
-      db.exec("ALTER TABLE sessions ADD COLUMN workspace_inode TEXT");
-    }
-    await fs.chmod(file, 0o600).catch(() => {});
-    return new SqliteSessionStore(db, file);
   }
 
-  async create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
-    assertSessionId(meta.id);
-    const now = new Date().toISOString();
-    const full: SessionMeta = { ...meta, createdAt: now, updatedAt: now };
-    try {
-      this.db
+  private enqueue<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(
+        new Error(t("SQLite session store is closed", "SQLite 会话存储已关闭")),
+      );
+    }
+    const result = this.operationTail.then(operation);
+    this.operationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async secureFiles(): Promise<void> {
+    if (this.dbPath !== ":memory:") await secureDatabaseFiles(this.dbPath);
+  }
+
+  create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
+    return this.enqueue(async () => {
+      assertSessionId(meta.id);
+      const now = new Date().toISOString();
+      const full: SessionMeta = { ...meta, createdAt: now, updatedAt: now };
+      const result = this.db
         .prepare(
-          "INSERT INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           full.id,
@@ -137,117 +198,285 @@ export class SqliteSessionStore implements ISessionStore {
           full.model,
           full.title ?? null,
         );
-    } catch (err) {
-      throw new Error(
-        t(`Session ${meta.id} already exists`, `会话 ${meta.id} 已存在`) +
-          `: ${(err as Error).message}`,
-        { cause: err },
-      );
-    }
-    return full;
+      if (Number(result.changes) !== 1) {
+        throw new Error(t(`Session ${meta.id} already exists`, `会话 ${meta.id} 已存在`));
+      }
+      await this.secureFiles();
+      return full;
+    });
   }
 
-  async append(id: string, message: ChatMessage): Promise<void> {
-    assertSessionId(id);
-    const row = this.db.prepare("SELECT MAX(idx) AS n FROM messages WHERE session_id = ?").get(id);
-    const next = typeof row?.n === "number" ? row.n + 1 : 0;
-    this.db
-      .prepare("INSERT INTO messages (session_id, idx, data) VALUES (?, ?, ?)")
-      .run(id, next, JSON.stringify(message));
-    this.db
-      .prepare("UPDATE sessions SET updated_at = ? WHERE id = ?")
-      .run(new Date().toISOString(), id);
+  append(id: string, message: ChatMessage): Promise<void> {
+    return this.enqueue(async () => {
+      assertSessionId(id);
+      const serialized = JSON.stringify(message);
+      if (serialized === undefined)
+        throw new Error(t("Cannot serialize session message", "无法序列化会话消息"));
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        // Computing the index inside the INSERT keeps it atomic across multiple processes.
+        this.db
+          .prepare(
+            "INSERT INTO messages (session_id, idx, data) " +
+              "SELECT ?, COALESCE(MAX(idx) + 1, 0), ? FROM messages WHERE session_id = ?",
+          )
+          .run(id, serialized, id);
+        this.db
+          .prepare("UPDATE sessions SET updated_at = ? WHERE id = ?")
+          .run(new Date().toISOString(), id);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        rollback(this.db);
+        throw error;
+      }
+      await this.secureFiles();
+    });
   }
 
-  async rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
-    assertSessionId(meta.id);
-    const updated: SessionMeta = { ...meta, updatedAt: new Date().toISOString() };
-    this.db.exec("BEGIN");
-    try {
-      this.db
-        .prepare(
-          "INSERT INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, cwd = excluded.cwd, workspace_device = excluded.workspace_device, workspace_inode = excluded.workspace_inode, model = excluded.model, title = excluded.title",
-        )
-        .run(
-          updated.id,
-          updated.createdAt,
-          updated.updatedAt,
-          updated.cwd,
-          updated.workspaceIdentity?.device ?? null,
-          updated.workspaceIdentity?.inode ?? null,
-          updated.model,
-          updated.title ?? null,
+  rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
+    return this.enqueue(async () => {
+      assertSessionId(meta.id);
+      const updated: SessionMeta = { ...meta, updatedAt: new Date().toISOString() };
+      const serialized = messages.map((message) => {
+        const value = JSON.stringify(message);
+        if (value === undefined)
+          throw new Error(t("Cannot serialize session message", "无法序列化会话消息"));
+        return value;
+      });
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db
+          .prepare(
+            "INSERT INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+              "ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, cwd = excluded.cwd, workspace_device = excluded.workspace_device, workspace_inode = excluded.workspace_inode, model = excluded.model, title = excluded.title",
+          )
+          .run(
+            updated.id,
+            updated.createdAt,
+            updated.updatedAt,
+            updated.cwd,
+            updated.workspaceIdentity?.device ?? null,
+            updated.workspaceIdentity?.inode ?? null,
+            updated.model,
+            updated.title ?? null,
+          );
+        this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(meta.id);
+        const insert = this.db.prepare(
+          "INSERT INTO messages (session_id, idx, data) VALUES (?, ?, ?)",
         );
-      this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(meta.id);
-      const insert = this.db.prepare(
-        "INSERT INTO messages (session_id, idx, data) VALUES (?, ?, ?)",
-      );
-      messages.forEach((m, i) => insert.run(meta.id, i, JSON.stringify(m)));
-      this.db.exec("COMMIT");
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    }
-    // 与 live meta 共享对象：成功后同步更新时间。
-    meta.updatedAt = updated.updatedAt;
+        serialized.forEach((data, index) => insert.run(meta.id, index, data));
+        this.db.exec("COMMIT");
+      } catch (err) {
+        rollback(this.db);
+        throw err;
+      }
+      await this.secureFiles();
+      // 与 live meta 共享对象：成功后同步更新时间。
+      meta.updatedAt = updated.updatedAt;
+    });
   }
 
-  async load(id: string): Promise<SessionData> {
-    assertSessionId(id);
-    const meta = this.db
-      .prepare(
-        "SELECT id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title FROM sessions WHERE id = ?",
-      )
-      .get(id);
-    if (!meta) throw new Error(t(`Session ${id} not found`, `会话 ${id} 不存在`));
-    const rows = this.db
-      .prepare("SELECT data FROM messages WHERE session_id = ? ORDER BY idx ASC")
-      .all(id);
-    return {
-      ...rowToMeta(meta),
-      messages: rows.map((r) => JSON.parse(String(r.data)) as ChatMessage),
-    };
+  load(id: string): Promise<SessionData> {
+    return this.enqueue(() => {
+      assertSessionId(id);
+      // The metadata and message rows are one logical value. A read transaction pins one WAL
+      // snapshot so a concurrent rewrite/delete cannot produce a mixed old/new SessionData.
+      this.db.exec("BEGIN");
+      try {
+        const meta = this.db
+          .prepare(
+            "SELECT id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title FROM sessions WHERE id = ?",
+          )
+          .get(id);
+        if (!meta) throw new Error(t(`Session ${id} not found`, `会话 ${id} 不存在`));
+        const rows = this.db
+          .prepare("SELECT data FROM messages WHERE session_id = ? ORDER BY idx ASC")
+          .all(id);
+        const data = {
+          ...rowToMeta(meta),
+          messages: rows.map((row) => JSON.parse(String(row.data)) as ChatMessage),
+        };
+        this.db.exec("COMMIT");
+        return data;
+      } catch (error) {
+        rollback(this.db);
+        throw error;
+      }
+    });
   }
 
-  async list(): Promise<SessionMeta[]> {
-    const rows = this.db
-      .prepare(
-        "SELECT id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title FROM sessions ORDER BY updated_at DESC",
-      )
-      .all();
-    return rows.map(rowToMeta);
+  list(): Promise<SessionMeta[]> {
+    return this.enqueue(() => {
+      const rows = this.db
+        .prepare(
+          "SELECT id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title FROM sessions ORDER BY updated_at DESC",
+        )
+        .all();
+      return rows.map(rowToMeta);
+    });
   }
 
-  async delete(id: string): Promise<void> {
-    assertSessionId(id);
-    // 外键 ON DELETE CASCADE 会连带删除 messages。
-    this.db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+  delete(id: string): Promise<void> {
+    return this.enqueue(async () => {
+      assertSessionId(id);
+      // 外键 ON DELETE CASCADE 会连带删除 messages。
+      this.db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+      await this.secureFiles();
+    });
   }
 
-  /** 关闭底层数据库句柄（进程退出前调用）。 */
-  close(): void {
-    this.db.close();
+  /**
+   * Fence new work synchronously, drain every operation accepted before close, then close once.
+   * Returning the same promise makes concurrent shutdown paths deterministic.
+   */
+  close(): Promise<void> {
+    if (this.closeTask) return this.closeTask;
+    this.closed = true;
+    const acceptedTail = this.operationTail;
+    this.closeTask = acceptedTail.then(async () => {
+      let error: unknown;
+      try {
+        await this.secureFiles();
+      } catch (cause) {
+        error = cause;
+      }
+      try {
+        this.db.close();
+      } catch (cause) {
+        error ??= cause;
+      }
+      try {
+        await this.secureFiles();
+      } catch (cause) {
+        error ??= cause;
+      }
+      if (error) throw error;
+    });
+    return this.closeTask;
   }
 
-  /** 从一个 ISessionStore 全量迁移会话进本库（幂等：已存在的会话跳过）。 */
+  /** 从一个 ISessionStore 全量迁移会话进本库（逐会话事务化且幂等）。 */
   async importFrom(source: ISessionStore): Promise<number> {
-    const existing = new Set((await this.list()).map((m) => m.id));
+    const existing = new Set((await this.list()).map((meta) => meta.id));
     let imported = 0;
     for (const meta of await source.list()) {
       if (existing.has(meta.id)) continue;
       const data = await source.load(meta.id);
-      await this.create({
-        id: meta.id,
-        cwd: meta.cwd,
-        ...(meta.workspaceIdentity ? { workspaceIdentity: meta.workspaceIdentity } : {}),
-        model: meta.model,
-        ...(meta.title ? { title: meta.title } : {}),
+      if (
+        data.id !== meta.id ||
+        data.cwd !== meta.cwd ||
+        data.model !== meta.model ||
+        data.workspaceIdentity?.device !== meta.workspaceIdentity?.device ||
+        data.workspaceIdentity?.inode !== meta.workspaceIdentity?.inode
+      ) {
+        throw new Error(`Session ${meta.id} metadata changed while import was running`);
+      }
+      const inserted = await this.enqueue(async () => {
+        const serialized = data.messages.map((message) => {
+          const value = JSON.stringify(message);
+          if (value === undefined)
+            throw new Error(t("Cannot serialize session message", "无法序列化会话消息"));
+          return value;
+        });
+        this.db.exec("BEGIN IMMEDIATE");
+        let created: boolean;
+        try {
+          const result = this.db
+            .prepare(
+              "INSERT OR IGNORE INTO sessions (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+              data.id,
+              data.createdAt,
+              data.updatedAt,
+              data.cwd,
+              data.workspaceIdentity?.device ?? null,
+              data.workspaceIdentity?.inode ?? null,
+              data.model,
+              data.title ?? null,
+            );
+          created = Number(result.changes) === 1;
+          if (created) {
+            const insert = this.db.prepare(
+              "INSERT INTO messages (session_id, idx, data) VALUES (?, ?, ?)",
+            );
+            serialized.forEach((message, index) => insert.run(data.id, index, message));
+          }
+          this.db.exec("COMMIT");
+        } catch (error) {
+          rollback(this.db);
+          throw error;
+        }
+        await this.secureFiles();
+        return created;
       });
-      await this.rewrite({ ...meta }, data.messages);
-      imported++;
+      existing.add(meta.id);
+      if (inserted) imported++;
     }
     return imported;
+  }
+}
+
+function rollback(db: SqliteDatabase): void {
+  try {
+    db.exec("ROLLBACK");
+  } catch {
+    // Preserve the operation error if SQLite already rolled the transaction back.
+  }
+}
+
+async function ensureDatabaseParent(directory: string, applicationOwned: boolean): Promise<void> {
+  let created = false;
+  try {
+    const stat = await fs.lstat(directory);
+    if (!stat.isDirectory())
+      throw new Error(`SQLite session path is not a directory: ${directory}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    created = true;
+  }
+  // Never chmod an arbitrary existing custom parent (for example /tmp). The default application
+  // directory and a leaf we created are owned by this store and can safely be tightened.
+  if (applicationOwned || created) await fs.chmod(directory, 0o700);
+}
+
+async function preparePrivateDatabaseFile(file: string): Promise<void> {
+  try {
+    const stat = await fs.lstat(file);
+    if (!stat.isFile()) throw new Error(`SQLite session path is not a regular file: ${file}`);
+    await fs.chmod(file, SQLITE_PRIVATE_MODE);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  try {
+    const handle = await fs.open(file, "wx", SQLITE_PRIVATE_MODE);
+    await handle.close();
+  } catch (error) {
+    // Another process may have won the create race. Re-validate instead of following an attacker
+    // controlled non-regular replacement.
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const stat = await fs.lstat(file);
+    if (!stat.isFile())
+      throw new Error(`SQLite session path is not a regular file: ${file}`, { cause: error });
+  }
+  await fs.chmod(file, SQLITE_PRIVATE_MODE);
+}
+
+async function secureDatabaseFiles(file: string): Promise<void> {
+  for (const candidate of [file, `${file}-wal`, `${file}-shm`, `${file}-journal`]) {
+    try {
+      const stat = await fs.lstat(candidate);
+      if (!stat.isFile()) {
+        throw new Error(`SQLite session path is not a regular file: ${candidate}`);
+      }
+      await fs.chmod(candidate, SQLITE_PRIVATE_MODE);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && candidate !== file) continue;
+      throw error;
+    }
   }
 }
 

@@ -46,7 +46,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["22", "24"]
+        # Guard the minimum, the pinned release LTS, and the newest stable Node release.
+        # `current` is resolved from the official Node distribution on every CI run.
+        node: ["22.15.0", "24", "current"]
     services:
       postgres:
         image: postgres:16-alpine
@@ -100,6 +102,10 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Published CLI compatibility smoke test
+        if: matrix.node == 'current'
+        run: npm run smoke:cli
 
   # Native terminal, keychain and packaging behavior must not be inferred from Linux-only CI.
   # PostgreSQL integration remains in the Ubuntu job above; these jobs exercise the portable path.

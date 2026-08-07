@@ -7,6 +7,7 @@ import { createTodoTool } from "./todo.js";
 import { webFetchTool } from "./webfetch.js";
 import { applyPatchTool } from "./apply-patch.js";
 import { bashOutputTool, killShellTool, writeStdinTool, listShellsTool } from "./shells.js";
+import { coreOwnedTool, isCoreOwnedTool } from "./core-owned.js";
 
 export * from "./tool.js";
 export { readTool, writeTool, editTool, globTool, grepTool } from "./fs.js";
@@ -112,11 +113,11 @@ export const PERSISTENT_PROCESS_TOOL_NAMES = [
 ] as const;
 
 function withCapabilities(tool: Tool, capabilities: readonly ToolCapability[]): Tool {
-  return {
+  return coreOwnedTool({
     ...tool,
     capabilities,
     ...(tool.fork ? { fork: () => withCapabilities(tool.fork!(), capabilities) } : {}),
-  };
+  });
 }
 
 function withoutNetworkParameter(parameters: Record<string, unknown>): Record<string, unknown> {
@@ -150,7 +151,7 @@ function withoutBackgroundParameter(parameters: Record<string, unknown>): Record
 
 /** Foreground-only shell facade for ephemeral OCI runtimes (which intentionally lack prepare()). */
 export function foregroundOnlyBash(tool: Tool = bashTool): Tool {
-  return {
+  const facade: Tool = {
     ...tool,
     // OCI execution is foreground-only, not read-only: redirects, generators and formatters can
     // still mutate the mounted workspace and therefore must trigger dirty verification.
@@ -169,9 +170,10 @@ export function foregroundOnlyBash(tool: Tool = bashTool): Tool {
       return tool.run(foregroundInput, ctx);
     },
   };
+  return isCoreOwnedTool(tool) ? coreOwnedTool(facade) : facade;
 }
 
-export const foregroundOnlyBashTool: Tool = foregroundOnlyBash();
+export const foregroundOnlyBashTool: Tool = coreOwnedTool(foregroundOnlyBash());
 
 // Local fallback is deliberately fail-closed: if the host cannot enforce its OS sandbox,
 // restricted bash fails instead of silently spawning an unrestricted process.
@@ -181,7 +183,7 @@ const restrictedLocalRuntime = new IsolatedRuntime({ failClosed: true, requirePr
  * Restricted bash never exposes or honors a model-supplied network request. The runtime adapter
  * enforces the invariant again at the execution boundary, including background shells.
  */
-export const restrictedWorkspaceBashTool: Tool = {
+export const restrictedWorkspaceBashTool: Tool = coreOwnedTool({
   ...bashTool,
   capabilities: ["process", "filesystem-write"],
   def: {
@@ -195,7 +197,7 @@ export const restrictedWorkspaceBashTool: Tool = {
       { ...ctx, sandbox: "workspace-write", isolatedRuntime: runtime },
     );
   },
-};
+});
 
 /**
  * 默认工具集：Read/Write/Edit/ApplyPatch/Glob/Grep/Bash/BashOutput/KillShell/WebFetch/TodoWrite

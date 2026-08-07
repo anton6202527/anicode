@@ -94,6 +94,109 @@ test("daemon socket: bearer auth is required and client discovers the private to
   }
 });
 
+test("daemon socket: idle clients must send an initial request before the deadline", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-idle-client-"));
+  const sockPath = path.join(dir, "d.sock");
+  const token = generateDaemonAuthToken();
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  const server = new DaemonServer({ manager, authToken: token, initialRequestTimeoutMs: 25 });
+  await server.listen(sockPath);
+  const idle = await new Promise<net.Socket>((resolve, reject) => {
+    const socket = net.createConnection(sockPath, () => resolve(socket));
+    socket.once("error", reject);
+  });
+  idle.on("error", () => {});
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("idle daemon socket did not close")),
+        1_000,
+      );
+      idle.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    assert.equal(idle.destroyed, true);
+
+    const healthy = await DaemonClient.connect(sockPath, { authToken: token });
+    assert.deepEqual(await healthy.listSessions(), []);
+    healthy.dispose();
+  } finally {
+    idle.destroy();
+    await Promise.all([server.close(), server.close()]);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("daemon socket: one client cannot dispatch unbounded concurrent requests", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-in-flight-"));
+  const sockPath = path.join(dir, "d.sock");
+  let releaseDiscovery!: () => void;
+  const discoveryGate = new Promise<void>((resolve) => (releaseDiscovery = resolve));
+  let enteredDiscovery!: () => void;
+  const discoveryEntered = new Promise<void>((resolve) => (enteredDiscovery = resolve));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  const server = new DaemonServer({
+    manager,
+    unsafeAllowUnauthenticatedForTests: true,
+    maxInFlightRequestsPerConnection: 1,
+    discoverModels: async () => {
+      enteredDiscovery();
+      await discoveryGate;
+      return ["ready"];
+    },
+  });
+  await server.listen(sockPath);
+  const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const connection = net.createConnection(sockPath, () => resolve(connection));
+    connection.once("error", reject);
+  });
+  socket.setEncoding("utf8");
+  let buffer = "";
+  const frames: Array<{ id: number; ok: boolean; data?: unknown; error?: string }> = [];
+  const waiters: Array<() => void> = [];
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      frames.push(JSON.parse(buffer.slice(0, newline)) as (typeof frames)[number]);
+      buffer = buffer.slice(newline + 1);
+      waiters.shift()?.();
+    }
+  });
+  const nextFrame = async (): Promise<(typeof frames)[number]> => {
+    if (frames.length === 0) await new Promise<void>((resolve) => waiters.push(resolve));
+    return frames.shift()!;
+  };
+  try {
+    socket.write(JSON.stringify({ id: 1, method: "discoverModels", providerId: "first" }) + "\n");
+    await discoveryEntered;
+    socket.write(JSON.stringify({ id: 2, method: "discoverModels", providerId: "second" }) + "\n");
+
+    const rejected = await nextFrame();
+    assert.equal(rejected.id, 2);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error ?? "", /in-flight|并发请求过多/);
+
+    releaseDiscovery();
+    const completed = await nextFrame();
+    assert.deepEqual(completed, { type: "result", id: 1, ok: true, data: ["ready"] });
+  } finally {
+    releaseDiscovery();
+    socket.destroy();
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("daemon host: model discovery executes in the authoritative server and fails closed", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-models-"));
   const calls: string[] = [];

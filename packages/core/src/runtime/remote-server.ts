@@ -13,7 +13,11 @@ import { lstatSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import type { Telemetry } from "./telemetry.js";
 import { noTelemetry, parseTraceparent } from "./telemetry.js";
-import type { ExecutionRuntime, IsolatedRunResult } from "./isolated-runtime.js";
+import {
+  RuntimeTerminationError,
+  type ExecutionRuntime,
+  type IsolatedRunResult,
+} from "./isolated-runtime.js";
 import { DurableWorkerQueue, WorkerQueueQuotaError, type WorkerJob } from "./worker.js";
 
 export interface RemoteIdentity {
@@ -653,10 +657,12 @@ export class RemoteExecutionService {
     const linked = linkedExecutionAbort(signal);
     this.activeExecutions.set(job.id, linked.controller);
     const heartbeat = setInterval(
-      () =>
+      () => {
+        if (linked.controller.signal.aborted) return;
         void this.options.queue
           .heartbeat(job.id, this.workerId, this.leaseMs, job.fencingToken)
-          .catch((error) => linked.controller.abort(error)),
+          .catch((error) => linked.controller.abort(error));
+      },
       Math.max(1_000, Math.floor(this.leaseMs / 3)),
     );
     let checkingControlState = false;
@@ -690,6 +696,12 @@ export class RemoteExecutionService {
       },
       Math.max(100, Math.min(5_000, this.options.authorizationPollMs ?? 500)),
     );
+    const stopLeaseMaintenance = () => {
+      clearInterval(heartbeat);
+      clearInterval(controlStatePoll);
+    };
+    linked.controller.signal.addEventListener("abort", stopLeaseMaintenance, { once: true });
+    if (linked.controller.signal.aborted) stopLeaseMaintenance();
     try {
       await this.revalidateExecutionGrant(job);
       const result = await this.options.executionRuntime.run({
@@ -720,29 +732,45 @@ export class RemoteExecutionService {
       if (
         current?.status === "cancellation_requested" &&
         current.leaseOwner === this.workerId &&
-        current.fencingToken === job.fencingToken
+        current.fencingToken === job.fencingToken &&
+        !(error instanceof RuntimeTerminationError)
       ) {
         // Only the worker which held the execution lease can acknowledge that it observed the
         // durable request and stopped. Until this transition, clients see cancellation_requested.
         await this.options.queue
           .acknowledgeCancellation(job.id, this.workerId, job.fencingToken)
           .catch(() => undefined);
+      } else if (
+        error instanceof RuntimeTerminationError &&
+        current?.status === "cancellation_requested" &&
+        current.leaseOwner === this.workerId &&
+        current.fencingToken === job.fencingToken
+      ) {
+        // Never turn an indeterminate termination into a durable `cancelled` acknowledgement.
+        // Keeping cancellation_requested preserves tenant capacity and makes the stranded workload
+        // visible to health/operator reconciliation instead of claiming that it stopped.
+        span.setAttribute("anicode.remote.termination_proven", false);
       } else if (remoteJobOwned(current, this.workerId, job.fencingToken)) {
         await this.options.queue
           .fail(
             job.id,
             this.workerId,
-            error instanceof Error ? error.message : String(error),
+            error instanceof RuntimeTerminationError
+              ? "Execution termination indeterminate; cleanup proof required"
+              : error instanceof Error
+                ? error.message
+                : String(error),
             job.payload.retryPolicy === "safe" &&
-              !(error instanceof RemoteWorkerAuthorizationError),
+              !(error instanceof RemoteWorkerAuthorizationError) &&
+              !(error instanceof RuntimeTerminationError),
             job.fencingToken,
           )
           .catch(() => undefined);
       }
       span.recordException(error).setStatus({ code: "error" });
     } finally {
-      clearInterval(heartbeat);
-      clearInterval(controlStatePoll);
+      stopLeaseMaintenance();
+      linked.controller.signal.removeEventListener("abort", stopLeaseMaintenance);
       linked.dispose();
       if (this.activeExecutions.get(job.id) === linked.controller) {
         this.activeExecutions.delete(job.id);

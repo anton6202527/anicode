@@ -11,12 +11,11 @@ import { randomUUID } from "node:crypto";
 import type { IpcMain, IpcMainInvokeEvent, WebContents } from "electron";
 import {
   SessionManager,
+  createConfiguredLocalRuntimeStack,
   createProductionSessionManager,
-  diagnoseProvider,
   listModelCatalog,
   listProviderDetails,
   probeLocalProviders,
-  resolveDefaultModel,
   createLocalRuntimeStack,
   closeAllBrowsers,
   telemetryForLocalStack,
@@ -24,6 +23,7 @@ import {
   type LocalRuntimeStack,
   type OpenHandle,
   type PermissionDecisionKind,
+  type SecretBackend,
   type Telemetry,
   type AnicodeConfig,
   type WorkspaceTrustSource,
@@ -47,6 +47,11 @@ export interface BridgeOptions {
   /** 可注入的 MCP 连接器与环境（测试用）；默认走 core 的真实实现与 process.env。 */
   mcpConnector?: McpConnector;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Async host-owned credential backend. When supplied, Bridge.create lazily registers its
+   * references through the configured runtime and owns closing this backend.
+   */
+  credentialBackend?: SecretBackend & { close?(): void | Promise<void> };
   /** Enforces restricted sessions until this cwd has an explicit Workspace Trust grant. */
   workspaceTrust?: WorkspaceTrustSource;
   /** Initial assessment used to avoid starting plugin processes before the first session. */
@@ -123,10 +128,29 @@ export class Bridge {
   private readonly subscriptions = new Map<string, { handle: OpenHandle; sender: WebContents }>();
 
   static async create(options: BridgeOptions): Promise<Bridge> {
+    let preparedRuntimeStack: LocalRuntimeStack | undefined;
     try {
-      return new Bridge(options);
+      if (options.credentialBackend) {
+        preparedRuntimeStack = await createConfiguredLocalRuntimeStack(
+          path.dirname(options.sessionsDir),
+          options.env ?? process.env,
+          { backend: options.credentialBackend },
+        );
+      }
+      return new Bridge(options, preparedRuntimeStack);
     } catch (error) {
-      if (!(error instanceof BridgeConstructionError)) throw error;
+      if (!(error instanceof BridgeConstructionError)) {
+        if (preparedRuntimeStack) {
+          await Promise.allSettled([
+            preparedRuntimeStack.isolatedRuntime.shutdown?.() ?? Promise.resolve(),
+            preparedRuntimeStack.artifacts.close?.() ?? Promise.resolve(),
+            preparedRuntimeStack.networkProxy.close(),
+            preparedRuntimeStack.database.close(),
+          ]);
+        }
+        await options.credentialBackend?.close?.();
+        throw error;
+      }
       try {
         await error.cleanup;
       } catch (cleanupError) {
@@ -140,15 +164,20 @@ export class Bridge {
     }
   }
 
-  constructor(private readonly options: BridgeOptions) {
+  constructor(
+    private readonly options: BridgeOptions,
+    preparedRuntimeStack?: LocalRuntimeStack,
+  ) {
     let runtimeStack: LocalRuntimeStack | undefined;
     let telemetry: Telemetry | undefined;
     let plugins: PluginRuntime | undefined;
     try {
-      runtimeStack = createLocalRuntimeStack(
-        path.dirname(options.sessionsDir),
-        options.env ?? process.env,
-      );
+      if (options.credentialBackend && !preparedRuntimeStack) {
+        throw new Error("Async credential backends require Bridge.create()");
+      }
+      runtimeStack =
+        preparedRuntimeStack ??
+        createLocalRuntimeStack(path.dirname(options.sessionsDir), options.env ?? process.env);
       telemetry = telemetryForLocalStack(runtimeStack, options.env ?? process.env);
       plugins = new PluginRuntime(options.mcpConnector, options.env, runtimeStack.broker, {
         telemetry,
@@ -201,6 +230,7 @@ export class Bridge {
           await attempt(() => runtimeStack!.networkProxy.close());
           await attempt(() => runtimeStack!.database.close());
         }
+        await attempt(async () => options.credentialBackend?.close?.());
         if (failures.length > 0) throw new AggregateError(failures, "Bridge rollback failed");
       })();
       void cleanup.catch(() => undefined);
@@ -341,7 +371,7 @@ export class Bridge {
     source: "builtin" | "user",
     status: { probed: Set<string>; live: Set<string> },
   ): ModelRow {
-    const d = diagnoseProvider(entry.spec);
+    const d = this.runtimeStack.providers.diagnoseProvider(entry.spec);
     let ready: boolean | undefined;
     let readyHint: string;
     if (status.probed.has(entry.providerId)) {
@@ -356,10 +386,15 @@ export class Bridge {
     } else {
       ready = d.hasCredentials;
       readyHint = d.hasCredentials
-        ? t(
-            `${d.credentialEnv ?? t("credential", "凭证")} configured`,
-            `${d.credentialEnv ?? t("credential", "凭证")} 已配置`,
-          )
+        ? d.credentialAvailability === "configured"
+          ? t(
+              `${d.credentialEnv ?? t("credential", "凭证")} configured (not verified)`,
+              `${d.credentialEnv ?? t("credential", "凭证")} 已配置（未验证）`,
+            )
+          : t(
+              `${d.credentialEnv ?? t("credential", "凭证")} available`,
+              `${d.credentialEnv ?? t("credential", "凭证")} 可用`,
+            )
         : t(
             `Missing ${d.apiKeyEnv.join(" / ") || "API key"}`,
             `缺 ${d.apiKeyEnv.join(" / ") || "API key"}`,
@@ -452,7 +487,7 @@ export class Bridge {
       version: this.options.appVersion,
       cwd: this.options.cwd,
       sessionsDir: this.options.sessionsDir,
-      defaultModel: this.options.defaultModel ?? resolveDefaultModel(),
+      defaultModel: this.options.defaultModel ?? this.runtimeStack.providers.resolveDefaultModel(),
       inspectProviderCredentials: true,
     };
   }
@@ -553,6 +588,7 @@ export class Bridge {
       await attempt(async () => this.runtimeStack.isolatedRuntime.shutdown?.());
       await attempt(() => this.runtimeStack.networkProxy.close());
       await attempt(() => this.runtimeStack.database.close());
+      await attempt(async () => this.options.credentialBackend?.close?.());
 
       if (failures.length > 0) {
         throw new AggregateError(failures, "Failed to dispose one or more Bridge resources");

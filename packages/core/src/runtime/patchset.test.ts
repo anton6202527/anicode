@@ -405,6 +405,14 @@ test("PatchSet: 拒绝 symlink 与运行时状态路径，且保留可执行权�
       () => service.prepare([{ path: ".anicode/patchsets/forged.json", content: "no" }]),
       /protected runtime state/,
     );
+    await assert.rejects(
+      () => service.prepare([{ path: "packages/child/.git/config", content: "no" }]),
+      /protected runtime state/,
+    );
+    await assert.rejects(
+      () => service.prepare([{ path: "packages/child/.anicode/state.json", content: "no" }]),
+      /protected runtime state/,
+    );
     const patchset = await service.prepare([
       { path: "run.sh", content: "#!/bin/sh\necho new\n" },
       { path: "private.sh", content: "#!/bin/sh\ntrue\n", mode: 0o700 },

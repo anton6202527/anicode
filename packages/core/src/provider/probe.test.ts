@@ -108,9 +108,13 @@ test("discoverProviderModels: 本地兼容端点返回实时模型 ID 并清理�
     local: true,
     requiresApiKey: false,
   });
+  let calls = 0;
   const fetchImpl = (async (input: URL | string, init?: RequestInit) => {
-    assert.equal(String(input), "http://127.0.0.1:18317/v1/models");
+    calls++;
     assert.equal(init?.redirect, "error");
+    assert.equal(String(input), "http://127.0.0.1:18317/v1/models");
+    assert.equal(init?.method, undefined);
+    assert.equal(init?.body, undefined);
     return Response.json({
       data: [
         { id: "model-new" },
@@ -132,7 +136,50 @@ test("discoverProviderModels: 本地兼容端点返回实时模型 ID 并清理�
     "model-new",
     "model-old",
   ]);
+  assert.equal(calls, 1, "模型发现只能读取一次 /models，不能产生推理计费副作用");
   assert.equal(await discoverProviderModels("deepseek", 600, fetchImpl), undefined);
+});
+
+test("discoverProviderModels: 只读取 /models，并合并并发请求与缓存结果", async () => {
+  registerOpenAICompatibleProvider({
+    id: "discover-cache-fixture",
+    baseURL: "http://127.0.0.1:18320/v1",
+    local: true,
+    requiresApiKey: false,
+  });
+  const advertised = Array.from({ length: 30 }, (_, index) => `model-${index}`);
+  let directoryCalls = 0;
+  const fetchImpl = (async (input: URL | string, init?: RequestInit) => {
+    directoryCalls++;
+    assert.equal(String(input), "http://127.0.0.1:18320/v1/models");
+    assert.equal(init?.method, undefined);
+    assert.equal(init?.body, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return Response.json({ data: advertised.map((id) => ({ id })) });
+  }) as unknown as typeof fetch;
+
+  const [first, concurrent] = await Promise.all([
+    discoverProviderModels("discover-cache-fixture", 600, fetchImpl),
+    discoverProviderModels("discover-cache-fixture", 600, fetchImpl),
+  ]);
+  const second = await discoverProviderModels("discover-cache-fixture", 600, fetchImpl);
+  assert.deepEqual(first, advertised);
+  assert.deepEqual(concurrent, advertised);
+  assert.deepEqual(second, first);
+  assert.equal(directoryCalls, 1);
+});
+
+test("discoverProviderModels: 不合作的模型目录请求也受硬超时约束", async () => {
+  registerOpenAICompatibleProvider({
+    id: "discover-timeout-fixture",
+    baseURL: "http://127.0.0.1:18321/v1",
+    local: true,
+    requiresApiKey: false,
+  });
+  const fetchImpl = (async () => new Promise<Response>(() => {})) as unknown as typeof fetch;
+  const started = Date.now();
+  assert.equal(await discoverProviderModels("discover-timeout-fixture", 100, fetchImpl), undefined);
+  assert.ok(Date.now() - started < 500);
 });
 
 test("discoverProviderModels: 拒绝超大模型目录响应", async () => {

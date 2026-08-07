@@ -1,6 +1,6 @@
 /** Kubernetes/容器专用受控出口代理 launcher。 */
 
-import { CredentialBroker, isCredentialEnvironmentName } from "../security/credentials.js";
+import { CredentialBroker, isSensitiveEnvironmentName } from "../security/credentials.js";
 import { configuredSecretBackendFromEnv } from "../security/secret-backends.js";
 import {
   NetworkProxy,
@@ -52,7 +52,7 @@ async function proxyControlTokenProvider(): Promise<() => Promise<string>> {
     return read;
   } finally {
     for (const name of Object.keys(process.env)) {
-      if (isCredentialEnvironmentName(name)) delete process.env[name];
+      if (isSensitiveEnvironmentName(name)) delete process.env[name];
     }
   }
 }

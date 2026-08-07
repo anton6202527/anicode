@@ -20,11 +20,12 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { CredentialBroker } from "./security/credentials.js";
 import { sanitizedShellEnv } from "./tools/shell-spawn.js";
 import { t } from "./i18n.js";
 import type { Tool, ToolContext } from "./tools/tool.js";
-import { ToolError } from "./tools/tool.js";
+import { managedExternalTool, ToolError } from "./tools/tool.js";
 import { terminateProcessTree, type ExecutionRuntime } from "./runtime/isolated-runtime.js";
 import type { NetworkProxy } from "./runtime/network-proxy.js";
 import { noTelemetry, traceparent, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
@@ -56,6 +57,7 @@ const MAX_MCP_STDIO_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_MCP_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_MCP_SSE_EVENTS = 10_000;
 const MAX_MCP_PENDING_REQUESTS = 256;
+const MAX_MCP_CLOSE_TIMEOUT_MS = 2_000;
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION = "2025-11-25";
 const PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion";
@@ -63,6 +65,11 @@ const CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo";
 const CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities";
 const MCP_HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const MAX_MCP_SCHEMA_NODES = 4_096;
+const MAX_MCP_RULE_KEY_DEPTH = 32;
+const MAX_MCP_RULE_KEY_NODES = 4_096;
+const MAX_MCP_RULE_KEY_ENTRIES = 4_096;
+const MAX_MCP_RULE_KEY_HASH_BYTES = 1024 * 1024;
+const MCP_RULE_KEY_DIGEST_HEX_CHARS = 32;
 
 class McpRpcError extends Error {
   constructor(
@@ -84,6 +91,192 @@ class McpHttpError extends Error {
     super(`MCP HTTP ${status}: ${body.slice(0, 200)}`);
     this.name = "McpHttpError";
   }
+}
+
+class McpOutcomeIndeterminateError extends Error {
+  constructor() {
+    super("MCP HTTP transport closed while a tool call was in flight");
+    this.name = "McpOutcomeIndeterminateError";
+  }
+}
+
+/**
+ * Clone JSON/error-shaped values while redacting strings. Keeping the original prototype and
+ * property descriptors preserves McpRpcError/McpHttpError classification without retaining the
+ * unredacted message in stack, cause, or RPC data.
+ */
+function redactMcpValue<T>(
+  value: T,
+  broker: CredentialBroker | undefined,
+  seen = new WeakMap<object, unknown>(),
+): T {
+  if (!broker) return value;
+  if (typeof value === "string") return broker.redact(value) as T;
+  if (value === null || typeof value !== "object") return value;
+
+  const object = value as object;
+  const previous = seen.get(object);
+  if (previous !== undefined) return previous as T;
+  const prototype = Object.getPrototypeOf(object);
+  if (
+    !Array.isArray(object) &&
+    !(object instanceof Error) &&
+    prototype !== Object.prototype &&
+    prototype !== null
+  ) {
+    return value;
+  }
+
+  const clone: object = Array.isArray(object) ? [] : Object.create(prototype);
+  seen.set(object, clone);
+  for (const key of Reflect.ownKeys(object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor) continue;
+    if ("value" in descriptor) {
+      descriptor.value = redactMcpValue(descriptor.value, broker, seen);
+    }
+    Object.defineProperty(clone, key, descriptor);
+  }
+  return clone as T;
+}
+
+function redactMcpError(error: unknown, broker: CredentialBroker | undefined): unknown {
+  return redactMcpValue(error, broker);
+}
+
+async function closeMcpTransportAfterFailure(
+  transport: McpTransport,
+  failure: unknown,
+  broker: CredentialBroker | undefined,
+): Promise<never> {
+  const redactedFailure = redactMcpError(failure, broker);
+  try {
+    await transport.close();
+  } catch (cleanupFailure) {
+    const redactedCleanupFailure = redactMcpError(cleanupFailure, broker);
+    throw new AggregateError(
+      [redactedFailure, redactedCleanupFailure],
+      "MCP startup failed and transport cleanup failed",
+      // The raw caught error may contain broker-managed credentials; only the redacted clone may
+      // cross this boundary, including through `cause`.
+      // eslint-disable-next-line preserve-caught-error
+      { cause: redactedCleanupFailure },
+    );
+  }
+  throw redactedFailure;
+}
+
+interface McpRuleKeyHashState {
+  hash: ReturnType<typeof createHash>;
+  bytes: number;
+  nodes: number;
+  ancestors: WeakSet<object>;
+}
+
+function updateMcpRuleKeyHash(state: McpRuleKeyHashState, token: string): void {
+  if (token.length > MAX_MCP_RULE_KEY_HASH_BYTES) {
+    throw new ToolError("MCP tool input exceeds the rule-key hashing size limit");
+  }
+  const bytes = Buffer.byteLength(token, "utf8");
+  if (state.bytes + bytes > MAX_MCP_RULE_KEY_HASH_BYTES) {
+    throw new ToolError("MCP tool input exceeds the rule-key hashing size limit");
+  }
+  state.hash.update(token);
+  state.bytes += bytes;
+}
+
+function hashMcpRuleKeyValue(value: unknown, state: McpRuleKeyHashState, depth: number): void {
+  if (depth > MAX_MCP_RULE_KEY_DEPTH || ++state.nodes > MAX_MCP_RULE_KEY_NODES) {
+    throw new ToolError("MCP tool input exceeds the rule-key hashing complexity limit");
+  }
+  if (value === null) {
+    updateMcpRuleKeyHash(state, "null;");
+    return;
+  }
+  switch (typeof value) {
+    case "string":
+      updateMcpRuleKeyHash(state, `string:${value.length}:`);
+      updateMcpRuleKeyHash(state, value);
+      updateMcpRuleKeyHash(state, ";");
+      return;
+    case "number":
+      updateMcpRuleKeyHash(
+        state,
+        `number:${Object.is(value, -0) ? "-0" : Number.isNaN(value) ? "NaN" : String(value)};`,
+      );
+      return;
+    case "boolean":
+      updateMcpRuleKeyHash(state, value ? "boolean:true;" : "boolean:false;");
+      return;
+    case "undefined":
+    case "bigint":
+    case "symbol":
+    case "function":
+      throw new ToolError("MCP tool input for rule-key hashing must be JSON-compatible");
+  }
+
+  const object = value as object;
+  if (state.ancestors.has(object)) {
+    throw new ToolError("MCP tool input for rule-key hashing must not contain cycles");
+  }
+  const prototype = Object.getPrototypeOf(object);
+  if (!Array.isArray(object) && prototype !== Object.prototype && prototype !== null) {
+    throw new ToolError("MCP tool input for rule-key hashing must be a plain JSON object");
+  }
+  state.ancestors.add(object);
+  try {
+    if (Array.isArray(object)) {
+      if (object.length > MAX_MCP_RULE_KEY_ENTRIES) {
+        throw new ToolError("MCP tool input exceeds the rule-key hashing entry limit");
+      }
+      updateMcpRuleKeyHash(state, `array:${object.length}:[`);
+      for (let index = 0; index < object.length; index++) {
+        updateMcpRuleKeyHash(state, `${index}:`);
+        if (Object.hasOwn(object, index)) hashMcpRuleKeyValue(object[index], state, depth + 1);
+        else updateMcpRuleKeyHash(state, "<hole>;");
+      }
+      updateMcpRuleKeyHash(state, "];");
+      return;
+    }
+
+    const keys: string[] = [];
+    for (const key in object) {
+      if (!Object.hasOwn(object, key)) continue;
+      keys.push(key);
+      if (keys.length > MAX_MCP_RULE_KEY_ENTRIES) {
+        throw new ToolError("MCP tool input exceeds the rule-key hashing entry limit");
+      }
+    }
+    keys.sort();
+    updateMcpRuleKeyHash(state, `object:${keys.length}:{`);
+    for (const key of keys) {
+      updateMcpRuleKeyHash(state, `key:${key.length}:`);
+      updateMcpRuleKeyHash(state, key);
+      updateMcpRuleKeyHash(state, "=");
+      const descriptor = Object.getOwnPropertyDescriptor(object, key);
+      if (descriptor && "value" in descriptor) {
+        hashMcpRuleKeyValue(descriptor.value, state, depth + 1);
+      } else {
+        throw new ToolError("MCP tool input for rule-key hashing must not use accessors");
+      }
+    }
+    updateMcpRuleKeyHash(state, "};");
+  } finally {
+    state.ancestors.delete(object);
+  }
+}
+
+function mcpRuleKey(name: string, input: Record<string, unknown>): string {
+  const state: McpRuleKeyHashState = {
+    hash: createHash("sha256"),
+    bytes: 0,
+    nodes: 0,
+    ancestors: new WeakSet(),
+  };
+  hashMcpRuleKeyValue(input, state, 0);
+  state.hash.update(`|nodes:${state.nodes}|bytes:${state.bytes}`);
+  const digest = state.hash.digest("hex").slice(0, MCP_RULE_KEY_DIGEST_HEX_CHARS);
+  return `${name} sha256:${digest}`;
 }
 
 /** server 声明的资源元数据（resources/list）。 */
@@ -164,6 +357,18 @@ export type McpServerConfig = McpStdioConfig | McpHttpConfig;
 
 function isHttp(cfg: McpServerConfig): cfg is McpHttpConfig {
   return typeof (cfg as McpHttpConfig).url === "string";
+}
+
+/** Production local hosts permit only managed HTTP MCP; reject the whole set before any spawn. */
+export function assertProductionHttpMcpConfigs(
+  configs: McpServerConfig[],
+): asserts configs is McpHttpConfig[] {
+  const unsupported = configs.find((config) => !isHttp(config));
+  if (unsupported) {
+    throw new TypeError(
+      `Production stdio MCP server ${unsupported.name} is disabled without a close-confirmed process boundary`,
+    );
+  }
 }
 
 const SENSITIVE_MCP_HEADER =
@@ -357,7 +562,7 @@ interface McpTransport {
     parameterHeaders?: Record<string, string>,
     signal?: AbortSignal,
   ): Promise<any>;
-  notify(method: string, params: unknown): void | Promise<void>;
+  notify(method: string, params: unknown, timeoutMs?: number): void | Promise<void>;
   close(): void | Promise<void>;
   /** 旧 Streamable HTTP 后续请求需要复用 initialize 协商出的版本 header。 */
   setLegacyProtocolVersion?(version: string): void;
@@ -370,6 +575,7 @@ async function initializeLegacy(
   cfg: McpServerConfig,
   telemetry: Telemetry,
   http: boolean,
+  broker?: CredentialBroker,
 ): Promise<{ capabilities: Record<string, unknown>; protocolVersion: string }> {
   const span = telemetry.startSpan("anicode.mcp.request", {
     "rpc.system": "jsonrpc",
@@ -396,9 +602,9 @@ async function initializeLegacy(
     transport.setLegacyProtocolVersion?.(protocolVersion);
     return { capabilities: asRecord(result?.capabilities), protocolVersion };
   } catch (error) {
-    span.recordException(error).setStatus({ code: "error" });
-    await transport.close();
-    throw error;
+    const redacted = redactMcpError(error, broker);
+    span.recordException(redacted).setStatus({ code: "error" });
+    return closeMcpTransportAfterFailure(transport, redacted, broker);
   } finally {
     span.end();
   }
@@ -406,11 +612,26 @@ async function initializeLegacy(
 
 // ---------- 客户端 ----------
 
+/** Hydrate only explicitly configured MCP credentials before synchronous lease injection. */
+async function prepareMcpCredentials(
+  config: McpServerConfig,
+  broker: CredentialBroker | undefined,
+): Promise<void> {
+  if (!broker || isHttp(config)) return;
+  for (const credentialId of new Set(Object.values(config.credentialEnv ?? {}))) {
+    await broker.trustedValueAsync(credentialId, {
+      audience: `mcp:${config.name}`,
+      tool: "stdio",
+    });
+  }
+}
+
 export class McpClient {
   /** server/discover 或 initialize 取回的 server 能力面。 */
   readonly capabilities: McpServerCapabilities;
   /** 实际选择的协议版本。 */
   readonly protocolVersion: string;
+  private closeTask?: Promise<void>;
 
   /** 配置里的 server 名（工具/prompt 的前缀）。 */
   get name(): string {
@@ -425,6 +646,7 @@ export class McpClient {
     private readonly modern: boolean,
     private readonly http: boolean,
     private readonly telemetry: Telemetry,
+    private readonly credentialBroker?: CredentialBroker,
   ) {
     this.capabilities = capabilities;
     this.protocolVersion = protocolVersion;
@@ -433,6 +655,7 @@ export class McpClient {
   /** 启动 server，优先协商 2026-07-28；旧 server 回退 initialize 握手。 */
   static async start(cfg: McpServerConfig, handlers?: McpClientHandlers): Promise<McpClient> {
     const timeoutMs = positiveTimeout(cfg.timeoutMs, DEFAULT_TIMEOUT_MS);
+    await prepareMcpCredentials(cfg, handlers?.credentialBroker);
     const transport: McpTransport = isHttp(cfg)
       ? new HttpTransport(cfg, timeoutMs, handlers?.networkProxy, handlers?.credentialBroker)
       : new StdioTransport(cfg, timeoutMs, handlers?.credentialBroker, handlers?.executionRuntime);
@@ -455,9 +678,9 @@ export class McpClient {
       discoverSpan.setStatus({ code: "ok" });
     } catch (error) {
       if (!shouldFallbackToLegacy(error, isHttp(cfg))) {
-        discoverSpan.recordException(error).setStatus({ code: "error" });
-        await transport.close();
-        throw error;
+        const redacted = redactMcpError(error, handlers?.credentialBroker);
+        discoverSpan.recordException(redacted).setStatus({ code: "error" });
+        return closeMcpTransportAfterFailure(transport, redacted, handlers?.credentialBroker);
       }
       legacyFallback = true;
       discoverSpan.addEvent("anicode.mcp.legacy_fallback", {
@@ -471,7 +694,13 @@ export class McpClient {
     let capabilities: Record<string, unknown>;
     let protocolVersion: string;
     if (legacyFallback) {
-      const initialized = await initializeLegacy(transport, cfg, telemetry, isHttp(cfg));
+      const initialized = await initializeLegacy(
+        transport,
+        cfg,
+        telemetry,
+        isHttp(cfg),
+        handlers?.credentialBroker,
+      );
       capabilities = initialized.capabilities;
       protocolVersion = initialized.protocolVersion;
     } else {
@@ -490,8 +719,7 @@ export class McpClient {
         capabilities = asRecord(discover?.capabilities);
         protocolVersion = MODERN_PROTOCOL_VERSION;
       } catch (error) {
-        await transport.close();
-        throw error;
+        return closeMcpTransportAfterFailure(transport, error, handlers?.credentialBroker);
       }
     }
 
@@ -508,6 +736,7 @@ export class McpClient {
       !legacyFallback,
       isHttp(cfg),
       telemetry,
+      handlers?.credentialBroker,
     );
     transport.onNotification = (method) => {
       if (method === "notifications/tools/list_changed") handlers?.onToolsChanged?.();
@@ -516,10 +745,9 @@ export class McpClient {
       try {
         // 旧协议要求 initialized 先于任何普通请求；HTTP 必须等待 2xx，避免 tools/list
         // 在并行负载下抢跑并被严格 server 以 400 拒绝。
-        await transport.notify("notifications/initialized", {});
+        await transport.notify("notifications/initialized", {}, timeoutMs);
       } catch (error) {
-        await transport.close();
-        throw error;
+        return closeMcpTransportAfterFailure(transport, error, handlers?.credentialBroker);
       }
     }
     return client;
@@ -535,17 +763,30 @@ export class McpClient {
       if (this.modern && this.http) {
         const compiled = compileMcpHeaderBindings(spec.inputSchema);
         if (!compiled.ok) {
+          const reason = this.redactText(compiled.reason);
           const span = this.telemetry.startSpan("anicode.mcp.tool_schema_rejected", {
             "anicode.mcp.server": this.serverName,
-            "anicode.mcp.tool": String(spec.name).slice(0, 256),
-            "anicode.mcp.reason": compiled.reason,
+            "anicode.mcp.tool": this.redactText(String(spec.name)).slice(0, 256),
+            "anicode.mcp.reason": reason,
           });
-          span.setStatus({ code: "error", message: compiled.reason }).end();
+          span.setStatus({ code: "error", message: reason }).end();
           continue;
         }
         bindings = compiled.bindings;
       }
-      tools.push(this.wrap(spec, bindings));
+      try {
+        tools.push(this.wrap(spec, bindings));
+      } catch (error) {
+        const reason = this.redactText(
+          error instanceof Error ? error.message : "Invalid MCP tool definition",
+        );
+        const span = this.telemetry.startSpan("anicode.mcp.tool_schema_rejected", {
+          "anicode.mcp.server": this.serverName,
+          "anicode.mcp.tool": this.redactText(String(spec?.name)).slice(0, 256),
+          "anicode.mcp.reason": reason,
+        });
+        span.setStatus({ code: "error", message: reason }).end();
+      }
     }
     return tools;
   }
@@ -554,30 +795,32 @@ export class McpClient {
   async listResources(): Promise<McpResource[]> {
     if (!this.capabilities.resources) return [];
     const res = await this.request("resources/list", {});
-    return (res?.resources ?? []) as McpResource[];
+    return redactMcpValue((res?.resources ?? []) as McpResource[], this.credentialBroker);
   }
 
   /** 读取一个资源的文本内容（blob 内容以占位说明代替，不注入二进制）。 */
   async readResource(uri: string): Promise<string> {
     const res = await this.request("resources/read", { uri });
     const contents: any[] = res?.contents ?? [];
-    return contents
-      .map((c) =>
-        typeof c?.text === "string"
-          ? c.text
-          : t(
-              `[binary content: ${c?.mimeType ?? "unknown"}]`,
-              `[二进制内容: ${c?.mimeType ?? "未知类型"}]`,
-            ),
-      )
-      .join("\n");
+    return this.redactText(
+      contents
+        .map((c) =>
+          typeof c?.text === "string"
+            ? c.text
+            : t(
+                `[binary content: ${c?.mimeType ?? "unknown"}]`,
+                `[二进制内容: ${c?.mimeType ?? "未知类型"}]`,
+              ),
+        )
+        .join("\n"),
+    );
   }
 
   /** 列出 server 的 prompt 模板；未声明 prompts 能力时返回空数组。 */
   async listPrompts(): Promise<McpPrompt[]> {
     if (!this.capabilities.prompts) return [];
     const res = await this.request("prompts/list", {});
-    return (res?.prompts ?? []) as McpPrompt[];
+    return redactMcpValue((res?.prompts ?? []) as McpPrompt[], this.credentialBroker);
   }
 
   /** 取一个 prompt 模板渲染后的消息文本（拼接为可直接作为用户输入的文本）。 */
@@ -587,23 +830,37 @@ export class McpClient {
       ...(args ? { arguments: args } : {}),
     });
     const messages: any[] = res?.messages ?? [];
-    return messages
-      .map((m) => {
-        const content = m?.content;
-        if (typeof content?.text === "string") return content.text;
-        if (Array.isArray(content))
-          return content
-            .filter((c: any) => typeof c?.text === "string")
-            .map((c: any) => c.text)
-            .join("\n");
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
+    return this.redactText(
+      messages
+        .map((m) => {
+          const content = m?.content;
+          if (typeof content?.text === "string") return content.text;
+          if (Array.isArray(content))
+            return content
+              .filter((c: any) => typeof c?.text === "string")
+              .map((c: any) => c.text)
+              .join("\n");
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n"),
+    );
   }
 
-  async close(): Promise<void> {
-    await this.transport.close();
+  close(): Promise<void> {
+    if (this.closeTask) return this.closeTask;
+    try {
+      this.closeTask = Promise.resolve(this.transport.close()).catch((error) => {
+        throw redactMcpError(error, this.credentialBroker);
+      });
+    } catch (error) {
+      this.closeTask = Promise.reject(redactMcpError(error, this.credentialBroker));
+    }
+    return this.closeTask;
+  }
+
+  private redactText(value: string): string {
+    return this.credentialBroker?.redact(value) ?? value;
   }
 
   private async request(
@@ -636,16 +893,21 @@ export class McpClient {
       span.setStatus({ code: "ok" });
       return result;
     } catch (error) {
-      span.recordException(error).setStatus({ code: "error" });
-      throw error;
+      const redacted = redactMcpError(error, this.credentialBroker);
+      span.recordException(redacted).setStatus({ code: "error" });
+      throw redacted;
     } finally {
       span.end();
     }
   }
 
   private wrap(spec: McpToolSpec, headerBindings: readonly McpHeaderBinding[]): Tool {
-    const fqName = `${this.serverName}__${spec.name}`;
+    const publicToolName = this.redactText(String(spec.name));
+    const fqName = `${this.serverName}__${publicToolName}`;
     const serverName = this.serverName;
+    const http = this.http;
+    const credentialBroker = this.credentialBroker;
+    const redactText = (value: string) => this.redactText(value);
     const callTool = (
       input: Record<string, unknown>,
       parent?: SpanContext,
@@ -661,24 +923,61 @@ export class McpClient {
         signal,
       );
     };
-    return {
+    const adapter: Tool = {
       readOnly: false, // 外部工具默认不可信，走权限门
-      capabilities: this.http ? ["network"] : ["process", "persistent-process"],
+      capabilities: http ? ["network"] : ["process", "persistent-process"],
       def: {
         name: fqName,
-        description: spec.description ?? `MCP 工具 ${spec.name}（来自 ${serverName}）`,
-        parameters: (spec.inputSchema as Record<string, unknown>) ?? {
-          type: "object",
-          properties: {},
-        },
+        description: spec.description
+          ? this.redactText(spec.description)
+          : `MCP 工具 ${publicToolName}（来自 ${serverName}）`,
+        parameters: redactMcpValue(
+          (spec.inputSchema as Record<string, unknown>) ?? {
+            type: "object",
+            properties: {},
+          },
+          this.credentialBroker,
+        ),
       },
-      ruleKey: (input) => `${spec.name} ${JSON.stringify(input).slice(0, 80)}`,
+      ruleKey: (input) => mcpRuleKey(publicToolName, input),
       async run(input: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-        const res = await callTool(input, ctx.traceContext, ctx.signal);
-        return renderToolResult(res);
+        try {
+          const res = await callTool(input, ctx.traceContext, ctx.signal);
+          return renderToolResult(res, redactText);
+        } catch (error) {
+          const redacted = redactMcpError(error, credentialBroker);
+          if (
+            http &&
+            (ctx.signal.aborted ||
+              mcpRequestTimedOut(redacted) ||
+              redacted instanceof McpOutcomeIndeterminateError)
+          ) {
+            // Aborting a client-side HTTP request cannot prove whether the remote server committed
+            // its side effect. Keep this fixed and credential-free rather than echoing abort causes.
+            throw new ToolError(
+              "MCP HTTP tool call timed out or was cancelled; remote operation outcome is unknown",
+            );
+          }
+          throw redacted;
+        }
       },
     };
+    return managedExternalTool(adapter, {
+      kind: "managed-external",
+      protocol: http ? "mcp-http" : "mcp-stdio",
+      namespace: serverName,
+      // A stdio request owns and kills its server process tree before rejecting. HTTP can stop
+      // local transport work but cannot prove whether a remote side effect committed.
+      // A native stdio child can create a detached/session process outside killpg. Until MCP
+      // sidecars run inside a cgroup/container/job object, both transports are outcome-indeterminate.
+      cancellation: "outcome-indeterminate",
+    });
   }
+}
+
+function mcpRequestTimedOut(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : "";
+  return /\btimed out\b|超时/i.test(message);
 }
 
 // ---------- stdio 传输（MCP 规范：换行分隔 JSON，消息内不得含裸换行）----------
@@ -727,6 +1026,11 @@ class StdioTransport implements McpTransport {
     let args = config.args ?? [];
     let cwd: string | undefined;
     if (executionRuntime) {
+      if (executionRuntime.managedProcessBoundary !== "close-confirmed") {
+        throw new Error(
+          "Persistent stdio MCP requires a cgroup/container/job-object process boundary",
+        );
+      }
       if (!executionRuntime.prepare) {
         throw new Error(
           "Persistent stdio MCP requires an execution runtime with prepare() support",
@@ -772,7 +1076,7 @@ class StdioTransport implements McpTransport {
     _parameterHeaders?: Record<string, string>,
     signal?: AbortSignal,
   ): Promise<any> {
-    if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.terminalError) return this.rejectAfterTermination(this.terminalError);
     if (signal?.aborted) {
       return Promise.reject(signal.reason ?? new Error(`MCP request cancelled (${method})`));
     }
@@ -801,7 +1105,7 @@ class StdioTransport implements McpTransport {
         signal?.removeEventListener("abort", onAbort);
       };
       const cancel = (error: Error) => {
-        if (cancelling || !this.pending.delete(id)) return;
+        if (cancelling || !this.pending.has(id)) return;
         cancelling = true;
         cleanup();
         try {
@@ -814,14 +1118,6 @@ class StdioTransport implements McpTransport {
           /* the hard process-tree stop below is authoritative */
         }
         this.failTransport(error);
-        // A stdio server is a child we own: do not acknowledge cancellation until its entire
-        // process tree is gone. This also prevents a server which ignores the notification from
-        // committing a later host-side effect.
-        void this.stopProcess().then(
-          () => reject(error),
-          (terminationError) =>
-            reject(new AggregateError([error, terminationError], "Failed to terminate MCP server")),
-        );
       };
       // 超时：挂死的 server 不该无限期占住一次工具调用；如实告知方法与时限。
       const timer = setTimeout(
@@ -867,7 +1163,7 @@ class StdioTransport implements McpTransport {
   }
 
   async close(): Promise<void> {
-    this.failTransport(new Error(t("MCP client has closed", "MCP 客户端已关闭")), false);
+    this.failTransport(new Error(t("MCP client has closed", "MCP 客户端已关闭")));
     await this.stopProcess();
   }
 
@@ -918,18 +1214,42 @@ class StdioTransport implements McpTransport {
     }
   }
 
-  private failTransport(error: Error, terminate = true): void {
+  private failTransport(error: Error): void {
     if (this.terminalError) return;
     this.terminalError = error;
     this.buffer = Buffer.alloc(0);
-    for (const pending of this.pending.values()) pending.reject(error);
+    const pending = [...this.pending.values()];
     this.pending.clear();
-    if (terminate) void this.stopProcess().catch(() => undefined);
+    // Every request that was already on the wire shares one authoritative process-tree close
+    // proof. No sibling request may reject early while the server can still commit a late effect.
+    void this.stopProcess().then(
+      () => {
+        for (const request of pending) request.reject(error);
+      },
+      (terminationError) => {
+        const failure = new AggregateError(
+          [error, terminationError],
+          "Failed to terminate MCP server",
+        );
+        for (const request of pending) request.reject(failure);
+      },
+    );
   }
 
   private stopProcess(): Promise<void> {
     this.termination ??= terminateProcessTree(this.proc);
     return this.termination;
+  }
+
+  private async rejectAfterTermination(error: Error): Promise<never> {
+    try {
+      await this.stopProcess();
+    } catch (terminationError) {
+      throw new AggregateError([error, terminationError], "Failed to terminate MCP server", {
+        cause: terminationError,
+      });
+    }
+    throw error;
   }
 
   private handleMessage(body: string): void {
@@ -988,6 +1308,10 @@ class HttpTransport implements McpTransport {
   private nextId = 1;
   private sessionId: string | null = null;
   private legacyProtocolVersion: string | undefined;
+  private closed = false;
+  private closeTask?: Promise<void>;
+  private inFlight = 0;
+  private readonly activeCancellations = new Set<(reason: Error) => void>();
   onNotification?: (method: string, params: unknown) => void;
 
   constructor(
@@ -1000,7 +1324,7 @@ class HttpTransport implements McpTransport {
     rejectSensitiveHeaders(config.headers);
   }
 
-  async request(
+  request(
     method: string,
     params: unknown,
     context?: SpanContext,
@@ -1008,34 +1332,28 @@ class HttpTransport implements McpTransport {
     parameterHeaders?: Record<string, string>,
     signal?: AbortSignal,
   ): Promise<any> {
-    if (signal?.aborted) throw signal.reason ?? new Error(`MCP request cancelled (${method})`);
     const id = this.nextId++;
-    const requestTimeoutMs = positiveTimeout(timeoutOverrideMs, this.timeoutMs);
     const modern = requestProtocolVersion(params) === MODERN_PROTOCOL_VERSION;
-    // 超时覆盖整个请求（含 SSE 流式响应体的读取），abort 统一收束。
-    const ac = new AbortController();
-    let timedOut = false;
-    const onAbort = () =>
-      ac.abort(signal?.reason ?? new Error(t("MCP request cancelled", "MCP 请求已取消")));
-    signal?.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      ac.abort(new Error(`MCP request timed out (${method})`));
-    }, requestTimeoutMs);
-    timer.unref?.();
-    try {
+    return this.withDeadline(method, timeoutOverrideMs, signal, async (requestSignal) => {
       const res = await this.post(
         { jsonrpc: "2.0", id, method, params },
-        ac.signal,
+        requestSignal,
         context,
         parameterHeaders,
       );
+      if (requestSignal.aborted) {
+        await res.body?.cancel().catch(() => undefined);
+        throw requestSignal.reason ?? new Error(`MCP request cancelled (${method})`);
+      }
       // 只有旧 initialize 协议允许传输层 session；现代响应即便误带也不得吸收。
       if (!modern) {
         const sid = res.headers.get("mcp-session-id");
         if (sid) this.sessionId = sid;
       }
-      const message = await this.readResponse(res, id);
+      const message = await this.readResponse(res, id, requestSignal);
+      if (requestSignal.aborted) {
+        throw requestSignal.reason ?? new Error(`MCP request cancelled (${method})`);
+      }
       if (message.error)
         throw new McpRpcError(
           message.error.code,
@@ -1044,51 +1362,174 @@ class HttpTransport implements McpTransport {
           res.status,
         );
       return message.result;
-    } catch (err) {
-      if (timedOut) {
-        throw new Error(
-          t(
-            `MCP request timed out (${method}, ${requestTimeoutMs}ms)`,
-            `MCP 请求超时（${method}，${requestTimeoutMs}ms）`,
-          ),
-          { cause: err },
-        );
-      }
-      if (signal?.aborted) throw signal.reason ?? err;
-      throw err;
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-    }
+    });
   }
 
-  async notify(method: string, params: unknown): Promise<void> {
-    const res = await this.post({ jsonrpc: "2.0", method, params });
-    if (!res.ok) {
-      throw new McpHttpError(res.status, await readBoundedResponseText(res).catch(() => ""));
-    }
-    // 规范响应通常为 202 空 body；若 server 附带 body，主动释放连接资源。
-    await res.body?.cancel().catch(() => {});
+  notify(method: string, params: unknown, timeoutOverrideMs?: number): Promise<void> {
+    return this.withDeadline(method, timeoutOverrideMs, undefined, async (requestSignal) => {
+      const res = await this.post({ jsonrpc: "2.0", method, params }, requestSignal);
+      if (requestSignal.aborted) {
+        await res.body?.cancel().catch(() => undefined);
+        throw requestSignal.reason ?? new Error(`MCP request cancelled (${method})`);
+      }
+      if (!res.ok) {
+        throw new McpHttpError(
+          res.status,
+          await readBoundedResponseText(res, undefined, requestSignal).catch(() => ""),
+        );
+      }
+      // 规范响应通常为 202 空 body；若 server 附带 body，主动释放连接资源。
+      await res.body?.cancel().catch(() => undefined);
+    });
   }
 
   setLegacyProtocolVersion(version: string): void {
     this.legacyProtocolVersion = version;
   }
 
-  close(): void {
-    if (!this.sessionId) return;
-    // 尽力释放服务端会话；失败无妨。
-    void this.fetch({
-      method: "DELETE",
-      headers: {
-        ...this.config.headers,
-        "mcp-session-id": this.sessionId,
-        ...(this.legacyProtocolVersion === "2025-06-18" ||
-        this.legacyProtocolVersion === "2025-11-25"
-          ? { "mcp-protocol-version": this.legacyProtocolVersion }
-          : {}),
-      },
-    }).catch(() => {});
+  close(): Promise<void> {
+    if (this.closeTask) return this.closeTask;
+    this.closed = true;
+    const closeError = new McpOutcomeIndeterminateError();
+    for (const cancel of [...this.activeCancellations]) cancel(closeError);
+    const sessionId = this.sessionId;
+    this.sessionId = null;
+    this.closeTask = this.closeSession(sessionId);
+    return this.closeTask;
+  }
+
+  private withDeadline<T>(
+    method: string,
+    timeoutOverrideMs: number | undefined,
+    signal: AbortSignal | undefined,
+    run: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new Error(t("MCP client has closed", "MCP 客户端已关闭")));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason ?? new Error(`MCP request cancelled (${method})`));
+    }
+    if (this.inFlight >= MAX_MCP_PENDING_REQUESTS) {
+      return Promise.reject(
+        new Error(
+          t(
+            `MCP client has ${MAX_MCP_PENDING_REQUESTS} requests in flight`,
+            `MCP 客户端已有 ${MAX_MCP_PENDING_REQUESTS} 个请求在处理中`,
+          ),
+        ),
+      );
+    }
+
+    const requestTimeoutMs = positiveTimeout(timeoutOverrideMs, this.timeoutMs);
+    const controller = new AbortController();
+    let timedOut = false;
+    let boundarySettled = false;
+    let rejectBoundary!: (reason: Error) => void;
+    const boundary = new Promise<never>((_resolve, reject) => {
+      rejectBoundary = reject;
+    });
+    const cancel = (reason: Error) => {
+      if (boundarySettled) return;
+      boundarySettled = true;
+      controller.abort(reason);
+      rejectBoundary(reason);
+    };
+    const onAbort = () =>
+      cancel(
+        signal?.reason instanceof Error
+          ? signal.reason
+          : new Error(t(`MCP request cancelled (${method})`, `MCP 请求已取消（${method}）`)),
+      );
+    const timer = setTimeout(() => {
+      timedOut = true;
+      cancel(new Error(`MCP request timed out (${method})`));
+    }, requestTimeoutMs);
+    timer.unref?.();
+    // `inFlight` counts the physical operation, not only the caller-visible boundary. A custom
+    // NetworkProxy/fetch implementation may ignore AbortSignal forever; releasing the slot when
+    // the deadline wins would let repeated timeouts create unbounded live requests underneath.
+    this.inFlight++;
+    this.activeCancellations.add(cancel);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+
+    const operation = Promise.resolve()
+      .then(() => {
+        // withDeadline returns before this microtask starts. close()/external abort may run in
+        // that gap; never begin a physical request after the synchronous fence has been raised.
+        if (controller.signal.aborted) {
+          throw controller.signal.reason ?? new Error(`MCP request cancelled (${method})`);
+        }
+        return run(controller.signal);
+      })
+      .finally(() => {
+        this.activeCancellations.delete(cancel);
+        this.inFlight--;
+      });
+
+    return (async () => {
+      try {
+        return await Promise.race([operation, boundary]);
+      } catch (error) {
+        if (timedOut) {
+          throw new Error(
+            t(
+              `MCP request timed out (${method}, ${requestTimeoutMs}ms)`,
+              `MCP 请求超时（${method}，${requestTimeoutMs}ms）`,
+            ),
+            { cause: error },
+          );
+        }
+        if (signal?.aborted) throw signal.reason ?? error;
+        throw error;
+      } finally {
+        boundarySettled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      }
+    })();
+  }
+
+  private async closeSession(sessionId: string | null): Promise<void> {
+    if (!sessionId) return;
+    const controller = new AbortController();
+    const closeTimeoutMs = Math.min(this.timeoutMs, MAX_MCP_CLOSE_TIMEOUT_MS);
+    let response: Response | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort(new Error(`MCP session close timed out (${closeTimeoutMs}ms)`));
+        void response?.body?.cancel().catch(() => undefined);
+        resolve();
+      }, closeTimeoutMs);
+      timer.unref?.();
+    });
+    const cleanup = Promise.resolve()
+      .then(() =>
+        this.fetch({
+          method: "DELETE",
+          signal: controller.signal,
+          headers: {
+            ...this.config.headers,
+            "mcp-session-id": sessionId,
+            ...(this.legacyProtocolVersion === "2025-06-18" ||
+            this.legacyProtocolVersion === "2025-11-25"
+              ? { "mcp-protocol-version": this.legacyProtocolVersion }
+              : {}),
+          },
+        }),
+      )
+      .then(async (res) => {
+        response = res;
+        await res.body?.cancel().catch(() => undefined);
+      })
+      .catch(() => undefined);
+    try {
+      await Promise.race([cleanup, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private post(
@@ -1164,9 +1605,13 @@ class HttpTransport implements McpTransport {
   }
 
   /** 读取一个 JSON-RPC 响应：application/json 直接解析；text/event-stream 读到匹配 id 的消息。 */
-  private async readResponse(res: Response, id: number): Promise<JsonRpcResponse> {
+  private async readResponse(
+    res: Response,
+    id: number,
+    signal?: AbortSignal,
+  ): Promise<JsonRpcResponse> {
     if (!res.ok) {
-      const text = await readBoundedResponseText(res).catch(() => "");
+      const text = await readBoundedResponseText(res, undefined, signal).catch(() => "");
       try {
         const parsed = JSON.parse(text) as JsonRpcResponse;
         if (parsed?.id === id && parsed.error) return parsed;
@@ -1177,10 +1622,13 @@ class HttpTransport implements McpTransport {
     }
     const ctype = res.headers.get("content-type") ?? "";
     if (ctype.includes("application/json")) {
-      return JSON.parse(await readBoundedResponseText(res)) as JsonRpcResponse;
+      return checkedJsonRpcResponse(
+        JSON.parse(await readBoundedResponseText(res, undefined, signal)),
+        id,
+      );
     }
     if (ctype.includes("text/event-stream")) {
-      const msg = await readSseForId(res, id, this.onNotification);
+      const msg = await readSseForId(res, id, this.onNotification, signal);
       if (!msg)
         throw new Error(
           t("MCP SSE stream returned no matching response", "MCP SSE 流未返回匹配的响应"),
@@ -1188,9 +1636,9 @@ class HttpTransport implements McpTransport {
       return msg;
     }
     // 少数 server 不带 content-type；尝试当 JSON 解析。
-    const text = await readBoundedResponseText(res);
+    const text = await readBoundedResponseText(res, undefined, signal);
     try {
-      return JSON.parse(text) as JsonRpcResponse;
+      return checkedJsonRpcResponse(JSON.parse(text), id);
     } catch {
       throw new Error(
         t(
@@ -1202,15 +1650,33 @@ class HttpTransport implements McpTransport {
   }
 }
 
+function checkedJsonRpcResponse(value: unknown, expectedId: number): JsonRpcResponse {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (value as { id?: unknown }).id !== expectedId
+  ) {
+    throw new Error(`MCP JSON-RPC response id mismatch (expected ${expectedId})`);
+  }
+  return value as JsonRpcResponse;
+}
+
 /** 从 SSE 流里读出 id 匹配的 JSON-RPC 响应（读到即返回）；流内通知转交回调。 */
 async function readSseForId(
   res: Response,
   id: number,
   onNotification?: (method: string, params: unknown) => void,
+  signal?: AbortSignal,
 ): Promise<JsonRpcResponse | null> {
   const body = res.body;
   if (!body) return null;
   const reader = body.getReader();
+  const onAbort = () => {
+    void reader.cancel(signal?.reason).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   const decoder = new TextDecoder();
   let buf = "";
   let totalBytes = 0;
@@ -1241,14 +1707,20 @@ async function readSseForId(
         try {
           const msg = JSON.parse(data) as JsonRpcResponse & { method?: string; params?: unknown };
           if (msg.id === id) return msg;
-          if (msg.id === undefined && typeof msg.method === "string")
-            onNotification?.(msg.method, msg.params);
+          if (msg.id === undefined && typeof msg.method === "string") {
+            try {
+              onNotification?.(msg.method, msg.params);
+            } catch {
+              // Consumer callbacks are isolation boundaries; stream processing must continue.
+            }
+          }
         } catch {
           /* 非 JSON 或部分事件，跳过 */
         }
       }
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     if (!complete) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
@@ -1258,6 +1730,7 @@ async function readSseForId(
 async function readBoundedResponseText(
   response: Response,
   maximum = MAX_MCP_HTTP_RESPONSE_BYTES,
+  signal?: AbortSignal,
 ): Promise<string> {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maximum) {
@@ -1266,6 +1739,11 @@ async function readBoundedResponseText(
   }
   if (!response.body) return "";
   const reader = response.body.getReader();
+  const onAbort = () => {
+    void reader.cancel(signal?.reason).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   const decoder = new TextDecoder();
   let total = 0;
   let text = "";
@@ -1284,6 +1762,7 @@ async function readBoundedResponseText(
       text += decoder.decode(value, { stream: true });
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     if (!complete) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
@@ -1310,11 +1789,12 @@ function sseData(rawEvent: string): string {
 // ---------- 结果渲染 ----------
 
 /** MCP tools/call 结果 → 文本（content 数组里取 text 块拼接） */
-function renderToolResult(res: any): string {
+function renderToolResult(res: any, redact: (value: string) => string = (value) => value): string {
+  const text = redact(extractText(res));
   if (res?.isError) {
-    throw new ToolError(extractText(res) || "MCP 工具返回错误");
+    throw new ToolError(text || "MCP 工具返回错误");
   }
-  return extractText(res) || "(无输出)";
+  return text || "(无输出)";
 }
 
 function extractText(res: any): string {
@@ -1344,18 +1824,35 @@ export async function connectMcpServers(
 }> {
   const clients: McpClient[] = [];
   const tools: Tool[] = [];
-  for (const cfg of configs) {
-    let client: McpClient;
-    const perServer: McpClientHandlers = {
-      onToolsChanged: () => handlers?.onToolsChanged?.(cfg.name, client),
-      ...(handlers?.telemetry ? { telemetry: handlers.telemetry } : {}),
-      ...(handlers?.networkProxy ? { networkProxy: handlers.networkProxy } : {}),
-      ...(handlers?.credentialBroker ? { credentialBroker: handlers.credentialBroker } : {}),
-      ...(handlers?.executionRuntime ? { executionRuntime: handlers.executionRuntime } : {}),
-    };
-    client = await McpClient.start(cfg, perServer);
-    clients.push(client);
-    tools.push(...(await client.listTools()));
+  try {
+    for (const cfg of configs) {
+      let client: McpClient | undefined;
+      const perServer: McpClientHandlers = {
+        onToolsChanged: () => {
+          if (client) handlers?.onToolsChanged?.(cfg.name, client);
+        },
+        ...(handlers?.telemetry ? { telemetry: handlers.telemetry } : {}),
+        ...(handlers?.networkProxy ? { networkProxy: handlers.networkProxy } : {}),
+        ...(handlers?.credentialBroker ? { credentialBroker: handlers.credentialBroker } : {}),
+        ...(handlers?.executionRuntime ? { executionRuntime: handlers.executionRuntime } : {}),
+      };
+      client = await McpClient.start(cfg, perServer);
+      clients.push(client);
+      tools.push(...(await client.listTools()));
+    }
+  } catch (error) {
+    const cleanup = await Promise.allSettled(
+      [...clients].reverse().map((client) => client.close()),
+    );
+    const failures = cleanup
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      throw new AggregateError([error, ...failures], "Failed to connect and clean up MCP servers", {
+        cause: error,
+      });
+    }
+    throw error;
   }
   return { tools, clients };
 }

@@ -21,6 +21,7 @@ export {
 export { DebugProvider, type DebugProviderOptions } from "./provider/debug.js";
 export {
   createProvider,
+  inspectProvider,
   bindProviderRegistry,
   configureProviderCredentialBroker,
   configureProviderNetworkProxy,
@@ -49,6 +50,7 @@ export {
   type ProviderDiagnostics,
   type ResolvedModel,
   type CreatedModel,
+  type InspectedModel,
   type OpenAICompatibleProviderRegistration,
   type ProviderRuntimeBindings,
   type BoundProviderRegistry,
@@ -125,6 +127,7 @@ export {
 export {
   SessionManager,
   type SessionManagerOptions,
+  type SessionModelInspection,
   type WorkspaceTrustResolver,
   type WorkspaceTrustSource,
   type SessionEvent,
@@ -157,11 +160,20 @@ export {
   challengeFromVerifier,
   type OAuthTokens,
   type AuthorizationRequest,
+  type OAuthRequestDeps,
   ANTHROPIC_CLIENT_ID,
   ANTHROPIC_OAUTH_BETA,
   ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
 } from "./auth/oauth.js";
-export { AuthStore, type Credential, type OAuthCredential } from "./auth/store.js";
+export {
+  AuthStore,
+  AuthStorePersistenceError,
+  type AuthStoreBackendKind,
+  type AuthStoreCommitOutcome,
+  type AuthStoreOptions,
+  type Credential,
+  type OAuthCredential,
+} from "./auth/store.js";
 export { AnthropicOAuthTokenSource, type TokenSource } from "./auth/token-source.js";
 export {
   type SessionHost,
@@ -175,6 +187,7 @@ export {
   newSessionId,
   assertSessionId,
   type ISessionStore,
+  type SessionStoreSemantics,
   type SessionMeta,
   type SessionData,
 } from "./session.js";
@@ -197,6 +210,7 @@ export {
 export {
   McpClient,
   connectMcpServers,
+  assertProductionHttpMcpConfigs,
   type McpServerConfig,
   type McpResource,
   type McpPrompt,
@@ -291,7 +305,15 @@ export {
   type RepoMapOptions,
   type SourceFile,
 } from "./repomap.js";
-export { ToolRegistry, ToolError, type Tool, type ToolContext } from "./tools/tool.js";
+export {
+  ToolRegistry,
+  ToolError,
+  isolatedModuleTool,
+  type Tool,
+  type ToolContext,
+  type ToolExecutionBoundary,
+  type IsolatedModuleToolManifest,
+} from "./tools/tool.js";
 export {
   PatchSetService,
   PatchSetConflictError,
@@ -469,6 +491,7 @@ export {
   type TransactionalExecutionRuntimeOptions,
 } from "./runtime/transactional-runtime.js";
 export {
+  KubernetesCredentialRevocationError,
   KubernetesJobRuntime,
   type KubernetesJobRuntimeOptions,
 } from "./runtime/kubernetes-runtime.js";
@@ -517,16 +540,30 @@ export {
 } from "./security/policy.js";
 export {
   CredentialBroker,
+  CredentialRotationError,
   credentialBrokerFromEnv,
   credentialBrokerFromBackend,
+  credentialBrokerFromLazyBackend,
+  credentialEnvironmentAllowlist,
   credentialScopesForEnvironment,
   isCredentialEnvironmentName,
+  isSensitiveEnvironmentName,
+  type CredentialAvailability,
+  type CredentialRotationMetadata,
+  type CredentialRotationOptions,
+  type CredentialRotationOutcome,
+  type CredentialAuditEvent,
+  type CredentialBrokerOptions,
   type CredentialScope,
   type CredentialRegistration,
   type CredentialLeaseRequest,
 } from "./security/credentials.js";
+export { type CredentialIoOptions } from "./security/credential-io.js";
 export {
   OsKeychainSecretBackend,
+  OsKeychainDisabledError,
+  OsKeychainMutationError,
+  OS_KEYCHAIN_DISABLED_ENV,
   VaultKvV2SecretBackend,
   VaultJwtTokenProvider,
   StaticVaultTokenProvider,
@@ -536,12 +573,16 @@ export {
   configuredSecretBackendFromEnv,
   type SecretBackend,
   type SyncSecretBackend,
+  type OsKeychainMutationFailureReason,
+  type OsKeychainSecretBackendOptions,
   type OidcTokenProvider,
   type VaultTokenProvider,
   type AwsKmsSecretBackendOptions,
+  type KmsLikeClient,
 } from "./security/secret-backends.js";
 export {
   CredentialRotationManager,
+  type IssuedCredentialRotation,
   type CredentialRotationPolicy,
   type CredentialRotationEvent,
 } from "./security/rotation.js";
@@ -606,6 +647,7 @@ export {
   telemetryForLocalStack,
   type LocalExecutionMode,
   type LocalRuntimeStack,
+  type LocalRuntimeStackOptions,
 } from "./runtime/local-stack.js";
 export {
   defaultTools,

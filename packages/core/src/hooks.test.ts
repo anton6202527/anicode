@@ -143,4 +143,19 @@ test("HookRunner: process boundary cleanup failure is fail-closed, not best-effo
     () => runner.run({ event: "Stop", cwd: "/tmp/project" }),
     /tree still alive/,
   );
+  await assert.rejects(() => runner.awaitIdle(), /tree still alive/);
+});
+
+test("HookRunner: awaitIdle does not wait for an uncooperative in-process hook", async () => {
+  const never = new Promise<void>(() => undefined);
+  const runner = new HookRunner([
+    {
+      event: "Stop",
+      async handler() {
+        await never;
+      },
+    },
+  ]);
+  void runner.run({ event: "Stop", cwd: "/tmp/project" });
+  await runner.awaitIdle();
 });

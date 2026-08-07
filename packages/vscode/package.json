@@ -19,8 +19,8 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "vscode:prepublish": "node esbuild.mjs --production",
-    "package": "vsce package --no-dependencies -o anicode.vsix",
-    "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
+    "package": "cross-env ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node scripts/package-vsix.mjs",
+    "test": "cross-env ANICODE_LANG=zh ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node --import tsx --test 'src/**/*.test.ts' 'scripts/**/*.test.mjs'",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "activationEvents": [

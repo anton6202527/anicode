@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ToolExecutor } from "./tool-executor.js";
-import { ToolRegistry, type Tool } from "./tools/tool.js";
+import { managedExternalTool, ToolError, ToolRegistry, type Tool } from "./tools/tool.js";
 import { PermissionEngine } from "./permission.js";
 import { HookRunner } from "./hooks.js";
 import type { AgentEvent } from "./agent.js";
+import type { ImagePart, ToolResultPart } from "./types.js";
 import { SecurityPolicyEngine } from "./security/policy.js";
+import { RuntimeTerminationError } from "./runtime/isolated-runtime.js";
 
 function makeTool(
   name: string,
@@ -53,6 +55,84 @@ async function drain(
   while (!r.done) r = await gen.next();
   return r.value.results;
 }
+
+async function collectRun(gen: ReturnType<ToolExecutor["run"]>): Promise<{
+  events: AgentEvent[];
+  outcome: { results: ToolResultPart[]; images: ImagePart[] };
+}> {
+  const events: AgentEvent[] = [];
+  let next = await gen.next();
+  while (!next.done) {
+    events.push(next.value);
+    next = await gen.next();
+  }
+  return { events, outcome: next.value };
+}
+
+function quotaWarnings(
+  events: AgentEvent[],
+  code: string,
+): Extract<AgentEvent, { type: "tool_progress" }>[] {
+  return events.filter((event): event is Extract<AgentEvent, { type: "tool_progress" }> => {
+    if (event.type !== "tool_progress" || !event.event || typeof event.event !== "object") {
+      return false;
+    }
+    return (event.event as { code?: unknown }).code === code;
+  });
+}
+
+test("ToolExecutor.close drains raw executions even when isolated cleanup proof fails", async () => {
+  const exec = makeExecutor(new ToolRegistry());
+  let idleAwaited = false;
+  const internals = exec as unknown as {
+    isolatedRunner: { close(): Promise<void> };
+    awaitIdle(): Promise<void>;
+  };
+  internals.isolatedRunner = {
+    close: async () => {
+      throw new RuntimeTerminationError();
+    },
+  };
+  internals.awaitIdle = async () => {
+    idleAwaited = true;
+  };
+  const first = exec.close();
+  assert.equal(exec.close(), first);
+  await assert.rejects(first, (error: unknown) => error instanceof RuntimeTerminationError);
+  assert.equal(idleAwaited, true);
+});
+
+test("ToolExecutor preserves outcome-unknown semantics for managed HTTP timeout", async () => {
+  const remote = managedExternalTool(
+    {
+      def: { name: "remote__write", description: "remote", parameters: { type: "object" } },
+      capabilities: ["network"],
+      readOnly: false,
+      ruleKey: () => "remote-write",
+      run: async (_input, context) =>
+        await new Promise<string>((_resolve, reject) => {
+          const abort = () => reject(context.signal.reason ?? new Error("cancelled"));
+          if (context.signal.aborted) abort();
+          else context.signal.addEventListener("abort", abort, { once: true });
+        }),
+    },
+    {
+      kind: "managed-external",
+      protocol: "mcp-http",
+      namespace: "remote",
+      cancellation: "outcome-indeterminate",
+    },
+  );
+  const tools = new ToolRegistry().registerExtension(remote);
+  const result = await collectRun(
+    makeExecutor(tools, true, { toolTimeoutMs: 1_000 }).run(
+      [{ id: "http-timeout", name: remote.def.name, args: {} }],
+      new AbortController().signal,
+    ),
+  );
+  assert.equal(result.outcome.results[0]?.isError, true);
+  assert.match(result.outcome.results[0]?.content ?? "", /超时.*远端操作结果未知/);
+});
 
 test("ToolExecutor: 连续只读并行执行，结果仍按调用顺序落位", async () => {
   const log: string[] = [];
@@ -150,6 +230,115 @@ test("ToolExecutor: 并行安全工具仍受全局并发上限和背压约束", 
   );
 });
 
+test("ToolExecutor: progress flood 按条数和 JSON 字节限流，每次工具仅告警一次", async () => {
+  const tools = new ToolRegistry()
+    .register({
+      def: { name: "event-flood", description: "event-flood", parameters: { type: "object" } },
+      readOnly: true,
+      ruleKey: () => "event-flood",
+      async run(_input, ctx) {
+        for (let i = 0; i < 10_000; i++) ctx.emit?.({ i });
+        return "count bounded";
+      },
+    })
+    .register({
+      def: { name: "byte-flood", description: "byte-flood", parameters: { type: "object" } },
+      readOnly: true,
+      ruleKey: () => "byte-flood",
+      async run(_input, ctx) {
+        for (let i = 0; i < 10_000; i++) ctx.emit?.("x".repeat(40));
+        return "bytes bounded";
+      },
+    });
+  const exec = new ToolExecutor({
+    tools,
+    perm: new PermissionEngine({ mode: "auto", readOnlyTools: tools.readOnlyNames() }),
+    hooks: new HookRunner([]),
+    cwd: "/tmp",
+    maxToolResultChars: 1_000,
+    maxProgressEvents: 2,
+    maxProgressBytes: 64,
+    parallelInputsStable: true,
+    supportsImages: () => false,
+    addUsage: () => undefined,
+  });
+
+  const { events, outcome } = await collectRun(
+    exec.run(
+      [
+        { id: "event-id", name: "event-flood", args: {} },
+        { id: "byte-id", name: "byte-flood", args: {} },
+      ],
+      new AbortController().signal,
+    ),
+  );
+  const progress = events.filter(
+    (event): event is Extract<AgentEvent, { type: "tool_progress" }> =>
+      event.type === "tool_progress",
+  );
+  const warnings = quotaWarnings(events, "TOOL_PROGRESS_QUOTA_EXCEEDED");
+
+  assert.equal(progress.filter((event) => event.id === "event-id").length, 3); // 2 payloads + warning
+  assert.equal(progress.filter((event) => event.id === "byte-id").length, 2); // 1 payload + warning
+  assert.deepEqual(warnings.map((event) => event.id).sort(), ["byte-id", "event-id"]);
+  assert.equal(
+    outcome.results.every((result) => !result.isError),
+    true,
+  );
+});
+
+test("ToolExecutor: attachImage flood 按张数和 base64 字节限流，每次工具仅告警一次", async () => {
+  const image = (data: string): ImagePart => ({ type: "image", mediaType: "image/png", data });
+  const tools = new ToolRegistry()
+    .register({
+      def: { name: "image-count", description: "image-count", parameters: { type: "object" } },
+      readOnly: true,
+      ruleKey: () => "image-count",
+      async run(_input, ctx) {
+        for (let i = 0; i < 10_000; i++) ctx.attachImage?.(image("a"));
+        return "count bounded";
+      },
+    })
+    .register({
+      def: { name: "image-bytes", description: "image-bytes", parameters: { type: "object" } },
+      readOnly: true,
+      ruleKey: () => "image-bytes",
+      async run(_input, ctx) {
+        for (let i = 0; i < 10_000; i++) ctx.attachImage?.(image("123456"));
+        return "bytes bounded";
+      },
+    });
+  const exec = new ToolExecutor({
+    tools,
+    perm: new PermissionEngine({ mode: "auto", readOnlyTools: tools.readOnlyNames() }),
+    hooks: new HookRunner([]),
+    cwd: "/tmp",
+    maxToolResultChars: 1_000,
+    maxAttachedImages: 2,
+    maxAttachedImageBytes: 10,
+    parallelInputsStable: true,
+    supportsImages: () => true,
+    addUsage: () => undefined,
+  });
+
+  const { events, outcome } = await collectRun(
+    exec.run(
+      [
+        { id: "image-count-id", name: "image-count", args: {} },
+        { id: "image-bytes-id", name: "image-bytes", args: {} },
+      ],
+      new AbortController().signal,
+    ),
+  );
+  const warnings = quotaWarnings(events, "TOOL_IMAGE_QUOTA_EXCEEDED");
+
+  assert.deepEqual(
+    outcome.images.map((part) => part.data),
+    ["a", "a", "123456"],
+  );
+  assert.deepEqual(warnings.map((event) => event.id).sort(), ["image-bytes-id", "image-count-id"]);
+});
+
 test("ToolExecutor: 不合作的工具也会在统一超时后返回配对错误结果", async () => {
   const tools = new ToolRegistry().register({
     def: { name: "hung", description: "hung", parameters: { type: "object" } },
@@ -184,6 +373,136 @@ test("ToolExecutor: 未知工具合成配对的错误 tool_result（不抛、不
   );
   assert.equal(results.length, 1);
   assert.equal(results[0]!.isError, true);
+});
+
+test("ToolExecutor: provider 无法解析的工具参数在授权与执行链之前被脱敏拦截", async () => {
+  const touched: string[] = [];
+  const tools = new ToolRegistry().register({
+    def: { name: "bash", description: "bash", parameters: { type: "object" } },
+    readOnly: false,
+    isConcurrencySafe: () => {
+      touched.push("isConcurrencySafe");
+      return false;
+    },
+    ruleKey: () => {
+      touched.push("ruleKey");
+      return "bash";
+    },
+    async run() {
+      touched.push("run");
+      return "unexpected";
+    },
+  });
+  const hooks = new HookRunner([
+    {
+      event: "PreToolUse",
+      handler() {
+        touched.push("PreToolUse");
+      },
+    },
+    {
+      event: "PostToolUse",
+      handler() {
+        touched.push("PostToolUse");
+      },
+    },
+  ]);
+  const perm = new PermissionEngine({
+    mode: "default",
+    confirm: async () => {
+      touched.push("permission");
+      return { behavior: "allow" };
+    },
+  });
+  const exec = new ToolExecutor({
+    tools,
+    perm,
+    hooks,
+    cwd: "/tmp",
+    maxToolResultChars: 1_000,
+    parallelInputsStable: true,
+    supportsImages: () => false,
+    addUsage: () => undefined,
+  });
+  const rawArguments = '{"command":"echo secret"';
+  const events: AgentEvent[] = [];
+  const generator = exec.run(
+    [{ id: "invalid-json", name: "bash", args: { __unparsed: rawArguments } }],
+    new AbortController().signal,
+  );
+  let next = await generator.next();
+  while (!next.done) {
+    events.push(next.value);
+    next = await generator.next();
+  }
+
+  assert.deepEqual(touched, []);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["tool_result"],
+  );
+  assert.equal(next.value.results[0]?.isError, true);
+  assert.match(next.value.results[0]?.content ?? "", /INVALID_TOOL_ARGUMENTS/);
+  assert.equal(next.value.results[0]?.content.includes(rawArguments), false);
+});
+
+test("ToolExecutor: Pre/Post hook context 合并后仍受最终字符硬上限约束", async () => {
+  const maxToolResultChars = 256;
+  let postToolResult = "";
+  const tools = new ToolRegistry().register({
+    def: {
+      name: "fail-large-hooks",
+      description: "fail-large-hooks",
+      parameters: { type: "object" },
+    },
+    readOnly: true,
+    ruleKey: () => "fail-large-hooks",
+    async run() {
+      throw new ToolError("PRIMARY_TOOL_ERROR");
+    },
+  });
+  const hooks = new HookRunner([
+    {
+      event: "PreToolUse",
+      handler: () => ({ additionalContext: `PRE-BEGIN-${"p".repeat(10_000)}-PRE-END` }),
+    },
+    {
+      event: "PostToolUse",
+      handler: ({ toolResult }) => {
+        postToolResult = toolResult ?? "";
+        return { additionalContext: `POST-BEGIN-${"q".repeat(10_000)}-POST-END` };
+      },
+    },
+  ]);
+  const exec = new ToolExecutor({
+    tools,
+    perm: new PermissionEngine({ mode: "auto", readOnlyTools: tools.readOnlyNames() }),
+    hooks,
+    cwd: "/tmp",
+    maxToolResultChars,
+    parallelInputsStable: false,
+    supportsImages: () => false,
+    addUsage: () => undefined,
+  });
+
+  const { events, outcome } = await collectRun(
+    exec.run(
+      [{ id: "large-hooks", name: "fail-large-hooks", args: {} }],
+      new AbortController().signal,
+    ),
+  );
+  const result = outcome.results[0]!;
+  const visible = events.find(
+    (event): event is Extract<AgentEvent, { type: "tool_result" }> => event.type === "tool_result",
+  )!;
+
+  assert.ok(postToolResult.length <= maxToolResultChars);
+  assert.equal(result.content.length <= maxToolResultChars, true);
+  assert.equal(visible.content.length <= maxToolResultChars, true);
+  assert.equal(result.isError, true);
+  assert.match(result.content, /PRIMARY_TOOL_ERROR/);
+  assert.match(result.content, /截断/);
+  assert.match(result.content, /POST-END/);
 });
 
 test("ToolExecutor: 用户确认改写参数后仍重新经过硬安全策略", async () => {

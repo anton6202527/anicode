@@ -11,6 +11,7 @@ import {
   toSubagentDefinitions,
 } from "./config.js";
 import { WorkspaceTrustStore, type WorkspaceTrustAssessment } from "./workspace-trust.js";
+import { assertProductionHttpMcpConfigs } from "./mcp.js";
 
 async function tmp(): Promise<{ home: string; cwd: string; cleanup: () => Promise<void> }> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cfg-"));
@@ -76,8 +77,8 @@ test("config: 非法 JSON 只记 warning 不抛，未知键提示", async () => 
   );
   const { config, warnings } = await loadConfig({ cwd, home });
   assert.equal(config.model, "ok/model");
-  assert.ok(warnings.some((w) => /JSON 解析失败/.test(w)));
-  assert.ok(warnings.some((w) => /未知配置项 "bogus"/.test(w)));
+  assert.ok(warnings.some((w) => /JSON (?:parse failed|解析失败)/.test(w)));
+  assert.ok(warnings.some((w) => /(?:unknown config key|未知配置项) "bogus"/.test(w)));
   await cleanup();
 });
 
@@ -94,6 +95,16 @@ test("config: 转换 mcp / agents 为运行期结构", () => {
   assert.deepEqual(agents, [
     { name: "reviewer", description: "评审", system: "你是评审", tools: ["read", "grep"] },
   ]);
+});
+
+test("config: production MCP gate rejects stdio before the connector can run", () => {
+  const http = toMcpServerConfigs({ mcp: { remote: { url: "https://mcp.example.test" } } });
+  assert.doesNotThrow(() => assertProductionHttpMcpConfigs(http));
+  const stdio = toMcpServerConfigs({ mcp: { local: { command: "must-not-spawn" } } });
+  assert.throws(
+    () => assertProductionHttpMcpConfigs(stdio),
+    /Production stdio MCP server local is disabled/,
+  );
 });
 
 test("config: 无任何文件时返回空配置且无告警", async () => {
@@ -311,7 +322,9 @@ test("config: 未信任时保留安全偏好并忽略项目执行配置", async 
   assert.equal(loaded.config.instructions, undefined);
   assert.equal(loaded.config.permissionProfile, undefined);
   assert.equal(loaded.config.browser, undefined);
-  assert.ok(loaded.warnings.some((warning) => /未信任工作区/.test(warning)));
+  assert.ok(
+    loaded.warnings.some((warning) => /(?:untrusted workspace|未信任工作区)/.test(warning)),
+  );
   await cleanup();
 });
 

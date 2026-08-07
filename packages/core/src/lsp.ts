@@ -238,6 +238,11 @@ export class LspClient {
     cfg: LspServerConfig,
     executionRuntime?: ExecutionRuntime,
   ): LspClient {
+    if (executionRuntime && executionRuntime.managedProcessBoundary !== "close-confirmed") {
+      throw new Error(
+        "Persistent LSP requires a close-confirmed cgroup/container/job-object process boundary",
+      );
+    }
     const canonicalRoot = realpathSync(path.resolve(rootPath));
     if (!statSync(canonicalRoot).isDirectory())
       throw new Error("LSP workspace root is not a directory");

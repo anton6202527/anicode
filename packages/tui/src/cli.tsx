@@ -42,13 +42,19 @@ import {
   toMcpServerConfigs,
   toLspServers,
   connectMcpServers,
+  assertProductionHttpMcpConfigs,
   DEVELOPMENT_MCP_CATALOG,
   findDevelopmentMcp,
   loadCommands,
   createDiagnosticsTool,
   LspPool,
   AuthStore,
+  configuredSecretBackendFromEnv,
   createConfiguredLocalRuntimeStack,
+  credentialEnvironmentAllowlist,
+  isCredentialEnvironmentName,
+  OS_KEYCHAIN_DISABLED_ENV,
+  OsKeychainDisabledError,
   telemetryFromEnv,
   telemetryForLocalStack,
   ANTHROPIC_SUBSCRIPTION_OAUTH_DISABLED_MESSAGE,
@@ -61,6 +67,8 @@ import {
   type McpClient,
   type LocalRuntimeStack,
   type Telemetry,
+  type AuthStoreOptions,
+  type SecretBackend,
   type McpServerConfig,
   type WorkspaceTrustAssessment,
   type WorkspaceTrustSource,
@@ -750,8 +758,24 @@ export function helpText(): string {
       `  auth logout [provider]    登出并删除本地凭证\n`,
     ) +
     t(
-      `  auth list                 View logged-in credentials\n\n`,
-      `  auth list                 查看已登录凭证\n\n`,
+      `  auth list                 View logged-in credentials\n`,
+      `  auth list                 查看已登录凭证\n`,
+    ) +
+    t(
+      `  auth migrate              Explicitly migrate legacy auth.json credentials\n\n`,
+      `  auth migrate              显式迁移旧 auth.json 凭证\n\n`,
+    ) +
+    t(
+      `  credentials import <ENV>  Explicitly store one environment credential\n`,
+      `  credentials import <ENV>  显式保存一个环境凭证\n`,
+    ) +
+    t(
+      `  credentials remove <ENV>  Delete one exact persisted credential\n`,
+      `  credentials remove <ENV>  删除一个精确匹配的持久凭证\n`,
+    ) +
+    t(
+      `  credentials list          List configured lazy references without reading secrets\n\n`,
+      `  credentials list          列出已配置的懒加载引用，不读取密钥\n\n`,
     ) +
     t(
       `  trust status|grant|revoke Inspect or change Workspace Trust for a directory\n`,
@@ -1324,10 +1348,7 @@ export async function runTrustCommand(
   return granted;
 }
 
-/**
- * `anicode auth <login|logout|list> [provider]` —— OAuth 凭证检查/清理；生产登录入口默认禁用。
- * login 走 PKCE：打开浏览器授权 → 用户粘回 `code#state` → 换 token 存 ~/.anicode/auth.json。
- */
+/** `anicode auth` —— OAuth 凭证检查、清理和显式旧存储迁移；生产登录入口默认禁用。 */
 /**
  * `anicode mcp` —— 把 anicode 作为 MCP server 暴露（对齐 `codex mcp-server`）。
  * stdio 换行分隔 JSON-RPC；工具 anicode（新会话跑任务）/ anicode_reply（续会话）。
@@ -1576,16 +1597,23 @@ async function mutateMcpSettings(
 
 export async function runAuthCommand(
   argv: string[],
-  io: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {},
+  io: {
+    input?: NodeJS.ReadableStream;
+    output?: NodeJS.WritableStream;
+    store?: AuthStore;
+    /** Test/embedding paths and environment; production uses AuthStore defaults. */
+    storeOptions?: AuthStoreOptions;
+  } = {},
 ): Promise<void> {
   const sub = argv[0] ?? "";
   const provider = argv[1] ?? "anthropic";
-  const store = new AuthStore();
   const out = io.output ?? process.stdout;
   const log = (s: string) => out.write(s + "\n");
 
   if (sub === "list") {
-    const creds = await store.list();
+    const creds = io.store
+      ? await io.store.list()
+      : await AuthStore.listMetadata(io.storeOptions ?? {});
     if (creds.length === 0) {
       log(
         t(
@@ -1608,11 +1636,29 @@ export async function runAuthCommand(
   }
 
   if (sub === "logout") {
+    const store = io.store ?? new AuthStore(io.storeOptions ?? {});
     const removed = await store.remove(provider);
     log(
       removed
         ? t(`Logged out ${provider}`, `已登出 ${provider}`)
         : t(`${provider} not logged in`, `${provider} 未登录`),
+    );
+    return;
+  }
+
+  if (sub === "migrate") {
+    if (argv.length !== 1) {
+      throw new Error(t("Usage: anicode auth migrate", "用法: anicode auth migrate"));
+    }
+    const store = io.store ?? new AuthStore(io.storeOptions ?? {});
+    const { migratedProviderIds } = await store.migrateLegacy();
+    log(
+      migratedProviderIds.length === 0
+        ? t("No legacy OAuth credentials to migrate", "没有需要迁移的旧 OAuth 凭证")
+        : t(
+            `Migrated ${migratedProviderIds.length} legacy OAuth credential(s): ${migratedProviderIds.join(", ")}`,
+            `已迁移 ${migratedProviderIds.length} 个旧 OAuth 凭证：${migratedProviderIds.join("、")}`,
+          ),
     );
     return;
   }
@@ -1628,9 +1674,143 @@ export async function runAuthCommand(
 
   throw new Error(
     t(
-      `Usage: anicode auth <login|logout|list> [provider]`,
-      `用法: anicode auth <login|logout|list> [provider]`,
+      `Usage: anicode auth <login|logout|list|migrate> [provider]`,
+      `用法: anicode auth <login|logout|list|migrate> [provider]`,
     ),
+  );
+}
+
+interface CredentialsCommandOptions {
+  env?: NodeJS.ProcessEnv;
+  output?: NodeJS.WritableStream;
+  /** Test/embedding injection; production commands resolve the explicitly configured backend. */
+  backend?: SecretBackend;
+}
+
+const MAX_EXPLICIT_CREDENTIAL_BYTES = 64 * 1024;
+
+function exactCredentialEnvironmentName(value: string | undefined): string {
+  const name = value?.trim() ?? "";
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name) || !isCredentialEnvironmentName(name)) {
+    throw new Error(
+      t(
+        "Credential name must be one exact, supported uppercase environment variable (for example OPENAI_API_KEY); wildcards and env: prefixes are not accepted",
+        "凭证名称必须是一个精确、已支持的大写环境变量名（例如 OPENAI_API_KEY）；不接受通配符或 env: 前缀",
+      ),
+    );
+  }
+  return name;
+}
+
+function configuredCredentialNames(env: NodeJS.ProcessEnv): string[] {
+  return credentialEnvironmentAllowlist(env).sort();
+}
+
+async function persistentCredentialBackend(
+  env: NodeJS.ProcessEnv,
+  injected: SecretBackend | undefined,
+): Promise<SecretBackend> {
+  if (env.ANICODE_CREDENTIAL_BACKEND === "memory") {
+    throw new Error(
+      t(
+        "The memory credential backend cannot persist credentials; select keychain, vault, or kms explicitly",
+        "memory 凭证后端不能持久化；请显式选择 keychain、vault 或 kms",
+      ),
+    );
+  }
+  if (
+    injected &&
+    env[OS_KEYCHAIN_DISABLED_ENV] === "1" &&
+    (injected.kind === "os-keychain" || injected.kind === "keychain")
+  ) {
+    throw new OsKeychainDisabledError();
+  }
+  if (injected) return injected;
+  return configuredSecretBackendFromEnv({ ...env });
+}
+
+/**
+ * Explicit API-key persistence. Normal application startup never writes environment credentials to
+ * a backend; it only registers exact names from ANICODE_CREDENTIAL_KEYS for lazy reads.
+ */
+export async function runCredentialsCommand(
+  argv: string[],
+  options: CredentialsCommandOptions = {},
+): Promise<void> {
+  const env = options.env ?? process.env;
+  const output = options.output ?? process.stdout;
+  const command = argv[0] ?? "";
+
+  if (command === "list") {
+    if (argv.length !== 1) throw new Error("Usage: anicode credentials list");
+    const names = configuredCredentialNames(env);
+    if (names.length === 0) {
+      output.write(
+        t(
+          "No lazy credential references configured. Set ANICODE_CREDENTIAL_KEYS to exact names.\n",
+          "尚未配置懒加载凭证引用。请将 ANICODE_CREDENTIAL_KEYS 设置为精确名称。\n",
+        ),
+      );
+      return;
+    }
+    for (const name of names) output.write(`${name}\n`);
+    return;
+  }
+
+  if (command !== "import" && command !== "remove") {
+    throw new Error(
+      t(
+        "Usage: anicode credentials <import|remove|list> [ENV_NAME]",
+        "用法: anicode credentials <import|remove|list> [环境变量名]",
+      ),
+    );
+  }
+  if (argv.length !== 2) {
+    throw new Error(`Usage: anicode credentials ${command} <ENV_NAME>`);
+  }
+  const name = exactCredentialEnvironmentName(argv[1]);
+  const backend = await persistentCredentialBackend(env, options.backend);
+  const key = `env:${name}`;
+
+  if (command === "import") {
+    const value = env[name];
+    if (!value) {
+      throw new Error(
+        t(
+          `${name} is empty or unavailable in the current process`,
+          `当前进程中 ${name} 为空或不存在`,
+        ),
+      );
+    }
+    if (Buffer.byteLength(value, "utf8") > MAX_EXPLICIT_CREDENTIAL_BYTES) {
+      throw new Error(
+        t(
+          `${name} exceeds the ${MAX_EXPLICIT_CREDENTIAL_BYTES}-byte credential limit`,
+          `${name} 超过 ${MAX_EXPLICIT_CREDENTIAL_BYTES} 字节的凭证上限`,
+        ),
+      );
+    }
+    await backend.put(key, value);
+    // A Vault/KMS write may yield to other host work. Never erase a value that was replaced while
+    // the explicit import was in flight; only remove the exact value that was persisted.
+    if (env[name] === value) delete env[name];
+    output.write(
+      t(
+        `Stored ${name} in ${backend.kind}. Add it to ANICODE_CREDENTIAL_KEYS for lazy use.\n`,
+        `已将 ${name} 保存到 ${backend.kind}。请加入 ANICODE_CREDENTIAL_KEYS 以便按需使用。\n`,
+      ),
+    );
+    return;
+  }
+
+  const removed = await backend.delete(key);
+  output.write(
+    removed
+      ? t(
+          `Removed ${name} from ${backend.kind}. Restart AniCode processes already using it to clear their in-memory cache.\n`,
+          `已从 ${backend.kind} 删除 ${name}。请重启已在使用该凭证的 AniCode 进程，以清除其内存缓存。\n`,
+        )
+      : t(`${name} was not present in ${backend.kind}.\n`, `${backend.kind} 中不存在 ${name}。\n`),
   );
 }
 
@@ -1843,6 +2023,7 @@ export async function runExecCommand(
       const mcpConfigs = toMcpServerConfigs(config);
       if (mcpConfigs.length > 0) {
         try {
+          assertProductionHttpMcpConfigs(mcpConfigs);
           const connected = await connectMcpServers(mcpConfigs, {
             telemetry,
             networkProxy: runtimeStack.networkProxy,
@@ -1858,8 +2039,14 @@ export async function runExecCommand(
     }
     const lspServers =
       args.daemon || args.http || !workspaceTrust.trusted ? [] : toLspServers(config);
+    const lspManaged = runtimeStack?.isolatedRuntime.managedProcessBoundary === "close-confirmed";
+    if (lspServers.length > 0 && !lspManaged) {
+      warn(
+        "LSP is disabled: the production runtime cannot prove termination of persistent language-server process trees.",
+      );
+    }
     lspPool =
-      lspServers.length > 0
+      lspServers.length > 0 && lspManaged
         ? new LspPool(args.cwd, lspServers, runtimeStack?.isolatedRuntime)
         : undefined;
     const deferMcp = mcpTools.length > 8;
@@ -1982,6 +2169,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   if (argv[0] === "auth") {
     await runAuthCommand(argv.slice(1));
+    return;
+  }
+  if (argv[0] === "credentials") {
+    await runCredentialsCommand(argv.slice(1));
     return;
   }
   if (argv[0] === "mcp") {
@@ -2159,6 +2350,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const mcpConfigs = toMcpServerConfigs(config);
       if (mcpConfigs.length > 0) {
         try {
+          assertProductionHttpMcpConfigs(mcpConfigs);
           const connected = await connectMcpServers(mcpConfigs, {
             telemetry,
             networkProxy: localRuntimeStack!.networkProxy,
@@ -2190,8 +2382,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     // 配置了 LSP 服务器则建池，并暴露 diagnostics 工具（惰性按扩展名启动服务器）。
     const lspServers =
       args.daemon || args.http || !workspaceTrust.trusted ? [] : toLspServers(config);
+    const lspManaged =
+      localRuntimeStack?.isolatedRuntime.managedProcessBoundary === "close-confirmed";
+    if (lspServers.length > 0 && !lspManaged) {
+      console.error(
+        terminalSafe(
+          t(
+            `${DISPLAY_NAME}: LSP is disabled because the production runtime cannot prove termination of persistent language-server process trees.`,
+            `${DISPLAY_NAME}: LSP 已禁用：生产运行时无法证明持久语言服务器进程树已终止。`,
+          ),
+        ),
+      );
+    }
     lspPool =
-      lspServers.length > 0
+      lspServers.length > 0 && lspManaged
         ? new LspPool(args.cwd, lspServers, localRuntimeStack?.isolatedRuntime)
         : undefined;
     // MCP 工具超过阈值时转 deferred（延迟暴露）：schema 不占每次请求，
@@ -2400,7 +2604,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             catalog={listModelCatalog()}
             commands={commands}
             {...(mcpStatus ? { mcpStatus } : {})}
-            inspectProviderCredentials={!args.daemon && !args.http}
             version={CLI_VERSION}
             workspaceTrusted={!args.daemon && !args.http && workspaceTrust.trusted}
             requireWorkspaceTrust

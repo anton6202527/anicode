@@ -25,7 +25,13 @@ npm run watch --workspace anicode-vscode    # 监听重建
 npm run package --workspace anicode-vscode
 ```
 
-Tree-sitter 与 OS Keychain 使用 N-API，因此本地命令生成的是当前平台 VSIX。Release workflow 会在 Linux x64/arm64、macOS arm64/x64 和 Windows x64 runner 上分别执行 `vsce --target`，产出带平台后缀的安装包，避免把某一平台的 `.node` 文件误发给全部用户。
+Tree-sitter 与 OS Keychain 使用 N-API，因此本地命令生成的是当前平台 VSIX。构建会显式复制最小
+Keychain JS loader 和当前平台 binding 到 `out/keyring`，扩展宿主把该绝对路径交给隔离 helper；不会
+依赖 CJS 中不可用的 `import.meta` 或残留的 hashed native 文件。Release workflow 会在 Linux x64/arm64、
+macOS arm64/x64 和 Windows x64 runner 上分别执行 `vsce --target`，产出带平台后缀的安装包，避免把某一
+平台的 `.node` 文件误发给全部用户。
 
-默认使用项目配置或已就绪凭证对应的模型，并自动读取工作区根目录的 `.env.local` / `.env`；
+默认使用项目配置或已就绪凭证对应的模型，并自动读取工作区根目录的 `.env.local` / `.env`；其中的
+密钥只进入当前扩展宿主进程，不会写入全局 OS Keychain。长期凭证必须由用户显式导入，并由宿主级
+`ANICODE_CREDENTIAL_KEYS` 精确允许后才会按需读取；启动和模型目录展示不会全量枚举 Keychain。
 没有可用云端凭证时回退到零网络的 `debug/demo`。

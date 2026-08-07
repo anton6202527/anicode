@@ -95,7 +95,18 @@ export const DEVELOPMENT_MCP_CATALOG: readonly DevelopmentMcpCatalogEntry[] = [
     server: {
       name: "chrome-devtools",
       command: "npx",
-      args: ["-y", "chrome-devtools-mcp@1.6.0", "--no-usage-statistics", "--no-performance-crux"],
+      args: [
+        "-y",
+        "chrome-devtools-mcp@1.6.0",
+        "--isolated",
+        // The server launches a system Chrome binary. Keep that automation-only profile away
+        // from the host login Keychain/Secret Service on both supported POSIX desktop families.
+        // Unknown platform-specific Chromium switches are ignored on the other platform.
+        "--chrome-arg=--use-mock-keychain",
+        "--chrome-arg=--password-store=basic",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+      ],
       network: true,
     },
     requiresBins: ["npx"],

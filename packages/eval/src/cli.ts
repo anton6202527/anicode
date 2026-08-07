@@ -15,8 +15,8 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import {
   createConfiguredLocalRuntimeStack,
-  createProvider,
   telemetryForLocalStack,
+  type LocalRuntimeStack,
 } from "@anicode/core";
 import { BUILTIN_TASKS } from "./tasks/builtin.js";
 import { missingRequirements, runTask, skippedResult } from "./runner.js";
@@ -164,6 +164,14 @@ async function mapConcurrent<T, R>(
   return results;
 }
 
+/** Keep eval provider construction bound to the stack that owns its Broker and NetworkProxy. */
+export function resolveEvalProvider(
+  runtimeStack: Pick<LocalRuntimeStack, "resolveProvider">,
+  modelSpec: string,
+): ReturnType<LocalRuntimeStack["resolveProvider"]> {
+  return runtimeStack.resolveProvider(modelSpec);
+}
+
 function trialJobs<T>(items: T[], trials: number): Array<{ item: T; trial: number }> {
   return items.flatMap((item) =>
     Array.from({ length: trials }, (_, index) => ({ item, trial: index + 1 })),
@@ -210,7 +218,7 @@ async function main(): Promise<void> {
   );
   const telemetry = telemetryForLocalStack(runtimeStack);
   try {
-    const created = createProvider(args.model);
+    const created = resolveEvalProvider(runtimeStack, args.model);
     const results: TaskResult[] = [];
     const concurrency = args.concurrency ?? 1;
     const shardIndex = args.shardIndex ?? 0;

@@ -5,7 +5,7 @@
  */
 
 import { randomUUID, createHash } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync } from "node:fs";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Artifact, ArtifactInput, ArtifactRecord, ArtifactStore } from "./artifacts.js";
@@ -210,6 +210,41 @@ export interface SqlitePruneResult {
 /** 同一 Node 进程打开相同文件的多个连接也共享串行队列，避免 DatabaseSync busy wait 卡住事件循环。 */
 const SQLITE_FILE_TAILS = new Map<string, Promise<unknown>>();
 
+function preparePrivateRuntimeDatabaseFile(file: string): void {
+  try {
+    const stat = lstatSync(file);
+    if (!stat.isFile()) throw new Error(`SQLite runtime path is not a regular file: ${file}`);
+    chmodSync(file, 0o600);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  try {
+    closeSync(openSync(file, "wx", 0o600));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const stat = lstatSync(file);
+    if (!stat.isFile())
+      throw new Error(`SQLite runtime path is not a regular file: ${file}`, { cause: error });
+  }
+  chmodSync(file, 0o600);
+}
+
+function secureRuntimeDatabaseFiles(file: string): void {
+  for (const candidate of [file, `${file}-wal`, `${file}-shm`, `${file}-journal`]) {
+    try {
+      const stat = lstatSync(candidate);
+      if (!stat.isFile())
+        throw new Error(`SQLite runtime path is not a regular file: ${candidate}`);
+      chmodSync(candidate, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && candidate !== file) continue;
+      throw error;
+    }
+  }
+}
+
 function json<T>(value: unknown): T {
   return JSON.parse(String(value)) as T;
 }
@@ -241,36 +276,39 @@ function migrationChecksum(sql: string): string {
 }
 
 function migrateDatabase(db: DatabaseSync): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      applied_at TEXT NOT NULL,
-      checksum TEXT,
-      description TEXT
-    );
-  `);
-  const columns = new Set(
-    db
-      .prepare("PRAGMA table_info(schema_migrations)")
-      .all()
-      .map((row) => String((row as Row).name)),
-  );
-  if (!columns.has("checksum")) db.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT");
-  if (!columns.has("description"))
-    db.exec("ALTER TABLE schema_migrations ADD COLUMN description TEXT");
-
-  const latest = SQLITE_MIGRATIONS.at(-1)!.version;
-  const future = db
-    .prepare("SELECT version FROM schema_migrations WHERE version > ? ORDER BY version LIMIT 1")
-    .get(latest) as Row | undefined;
-  if (future) {
-    throw new Error(
-      `SQLite schema version ${String(future.version)} is newer than supported version ${latest}`,
-    );
-  }
-
+  // The schema ledger bootstrap/upgrade is part of the same write transaction as migrations.
+  // This prevents two processes opening an old database from both observing a missing ledger
+  // column and racing the same ALTER TABLE.
   db.exec("BEGIN IMMEDIATE");
   try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL,
+        checksum TEXT,
+        description TEXT
+      );
+    `);
+    const columns = new Set(
+      db
+        .prepare("PRAGMA table_info(schema_migrations)")
+        .all()
+        .map((row) => String((row as Row).name)),
+    );
+    if (!columns.has("checksum")) db.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT");
+    if (!columns.has("description"))
+      db.exec("ALTER TABLE schema_migrations ADD COLUMN description TEXT");
+
+    const latest = SQLITE_MIGRATIONS.at(-1)!.version;
+    const future = db
+      .prepare("SELECT version FROM schema_migrations WHERE version > ? ORDER BY version LIMIT 1")
+      .get(latest) as Row | undefined;
+    if (future) {
+      throw new Error(
+        `SQLite schema version ${String(future.version)} is newer than supported version ${latest}`,
+      );
+    }
+
     for (const migration of SQLITE_MIGRATIONS) {
       const checksum = migrationChecksum(migration.sql);
       const applied = db
@@ -311,20 +349,28 @@ export class SqliteRuntimeDatabase {
   private readonly db: DatabaseSync;
   private tail: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private closeTask: Promise<void> | undefined;
 
   constructor(file: string) {
     this.file = path.resolve(file);
     mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    preparePrivateRuntimeDatabaseFile(this.file);
     this.db = new DatabaseSync(this.file);
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA synchronous = FULL");
-    this.db.exec("PRAGMA foreign_keys = ON");
-    this.db.exec("PRAGMA busy_timeout = 10000");
     try {
+      // Configure the lock wait before journal-mode/schema work so concurrent process startup is
+      // bounded by the declared timeout instead of failing immediately.
+      this.db.exec("PRAGMA busy_timeout = 10000");
+      this.db.exec("PRAGMA journal_mode = WAL");
+      this.db.exec("PRAGMA synchronous = FULL");
+      this.db.exec("PRAGMA foreign_keys = ON");
       migrateDatabase(this.db);
-      chmodSync(this.file, 0o600);
+      secureRuntimeDatabaseFiles(this.file);
     } catch (error) {
-      this.db.close();
+      try {
+        this.db.close();
+      } catch {
+        // Preserve the initialization error if SQLite already invalidated the handle.
+      }
       throw error;
     }
   }
@@ -332,7 +378,26 @@ export class SqliteRuntimeDatabase {
   run<T>(work: (db: DatabaseSync) => T | Promise<T>): Promise<T> {
     if (this.closed) return Promise.reject(new Error("SQLite runtime database is closed"));
     const previous = SQLITE_FILE_TAILS.get(this.file) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(() => work(this.db));
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        secureRuntimeDatabaseFiles(this.file);
+        let result: T;
+        try {
+          result = await work(this.db);
+        } catch (error) {
+          try {
+            secureRuntimeDatabaseFiles(this.file);
+          } catch {
+            // Preserve the operation error.
+          }
+          throw error;
+        }
+        // WAL/SHM can be recreated after a checkpoint. Re-apply the private boundary after every
+        // accepted operation without changing the caller-owned parent directory.
+        secureRuntimeDatabaseFiles(this.file);
+        return result;
+      });
     SQLITE_FILE_TAILS.set(this.file, current);
     this.tail = current;
     const cleanup = () => {
@@ -452,11 +517,14 @@ export class SqliteRuntimeDatabase {
     });
   }
 
-  async close(): Promise<void> {
-    await this.tail.catch(() => undefined);
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closeTask) return this.closeTask;
+    // Fence new work synchronously. Waiting for the queue before setting this flag allows a
+    // concurrent run() to append behind the captured tail and then execute against a closed DB.
     this.closed = true;
-    this.db.close();
+    const acceptedTail = this.tail;
+    this.closeTask = acceptedTail.catch(() => undefined).then(() => this.db.close());
+    return this.closeTask;
   }
 }
 
@@ -999,6 +1067,7 @@ function sessionMetaFromRow(row: Row): SessionMeta {
  * append/rewrite 均走 BEGIN IMMEDIATE，跨进程追加不会复用 message index。
  */
 export class SqliteRuntimeSessionStore implements ISessionStore {
+  readonly storageSemantics = "transactional-primary" as const;
   constructor(readonly database: SqliteRuntimeDatabase) {}
 
   create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
@@ -1048,51 +1117,70 @@ export class SqliteRuntimeSessionStore implements ISessionStore {
 
   rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
     assertIdentifier(meta.id, "session id");
-    return this.database.transaction((db) => {
-      const updatedAt = new Date().toISOString();
-      db.prepare(
-        `INSERT INTO sessions
-         (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           created_at = excluded.created_at,
-           updated_at = excluded.updated_at,
-           cwd = excluded.cwd,
-           workspace_device = excluded.workspace_device,
-           workspace_inode = excluded.workspace_inode,
-           model = excluded.model,
-           title = excluded.title`,
-      ).run(
-        meta.id,
-        meta.createdAt,
-        updatedAt,
-        meta.cwd,
-        meta.workspaceIdentity?.device ?? null,
-        meta.workspaceIdentity?.inode ?? null,
-        meta.model,
-        meta.title ?? null,
-      );
-      db.prepare("DELETE FROM session_messages WHERE session_id = ?").run(meta.id);
-      const insert = db.prepare(
-        "INSERT INTO session_messages(session_id, idx, data) VALUES (?, ?, ?)",
-      );
-      messages.forEach((message, index) => insert.run(meta.id, index, JSON.stringify(message)));
-      meta.updatedAt = updatedAt;
-    });
+    return this.database
+      .transaction((db) => {
+        const updatedAt = new Date().toISOString();
+        db.prepare(
+          `INSERT INTO sessions
+           (id, created_at, updated_at, cwd, workspace_device, workspace_inode, model, title)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at,
+             cwd = excluded.cwd,
+             workspace_device = excluded.workspace_device,
+             workspace_inode = excluded.workspace_inode,
+             model = excluded.model,
+             title = excluded.title`,
+        ).run(
+          meta.id,
+          meta.createdAt,
+          updatedAt,
+          meta.cwd,
+          meta.workspaceIdentity?.device ?? null,
+          meta.workspaceIdentity?.inode ?? null,
+          meta.model,
+          meta.title ?? null,
+        );
+        db.prepare("DELETE FROM session_messages WHERE session_id = ?").run(meta.id);
+        const insert = db.prepare(
+          "INSERT INTO session_messages(session_id, idx, data) VALUES (?, ?, ?)",
+        );
+        messages.forEach((message, index) => insert.run(meta.id, index, JSON.stringify(message)));
+        return updatedAt;
+      })
+      .then((updatedAt) => {
+        // Do not expose a timestamp from a transaction whose COMMIT failed and rolled back.
+        meta.updatedAt = updatedAt;
+      });
   }
 
   load(id: string): Promise<SessionData> {
     assertIdentifier(id, "session id");
     return this.database.run((db) => {
-      const row = db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as Row | undefined;
-      if (!row) throw new Error(`Session ${id} not found`);
-      return {
-        ...sessionMetaFromRow(row),
-        messages: db
-          .prepare("SELECT data FROM session_messages WHERE session_id = ? ORDER BY idx")
-          .all(id)
-          .map((item) => json<ChatMessage>((item as Row).data)),
-      };
+      // Pin both SELECTs to one WAL snapshot. Otherwise a writer in another process may commit a
+      // rewrite/delete between them and produce metadata and messages from different versions.
+      db.exec("BEGIN");
+      try {
+        const row = db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as Row | undefined;
+        if (!row) throw new Error(`Session ${id} not found`);
+        const data = {
+          ...sessionMetaFromRow(row),
+          messages: db
+            .prepare("SELECT data FROM session_messages WHERE session_id = ? ORDER BY idx")
+            .all(id)
+            .map((item) => json<ChatMessage>((item as Row).data)),
+        };
+        db.exec("COMMIT");
+        return data;
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // Preserve the query/parse/commit failure.
+        }
+        throw error;
+      }
     });
   }
 

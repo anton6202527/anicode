@@ -1,0 +1,6 @@
+allowBuilds:
+  '@ast-grep/lang-go': set this to true or false
+  '@ast-grep/lang-java': set this to true or false
+  '@ast-grep/lang-python': set this to true or false
+  '@ast-grep/lang-rust': set this to true or false
+  esbuild: set this to true or false

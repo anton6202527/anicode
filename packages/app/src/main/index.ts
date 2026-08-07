@@ -6,22 +6,24 @@
  */
 
 import * as path from "node:path";
+import { createRequire } from "node:module";
 import {
   app,
   BrowserWindow,
   crashReporter,
   ipcMain,
   shell,
+  utilityProcess,
   type IpcMainInvokeEvent,
 } from "electron";
 import { autoUpdater } from "electron-updater";
-import {
-  loadConfig,
-  loadProjectEnv,
-  resolveDefaultModel,
-  WorkspaceTrustStore,
-} from "@anicode/core";
+import { loadConfig, loadProjectEnv, WorkspaceTrustStore } from "@anicode/core";
 import { Bridge } from "./bridge.js";
+import {
+  ElectronUtilityKeychainBackend,
+  type ElectronKeychainUtilityFactory,
+  type ElectronKeychainUtilityProcess,
+} from "./electron-keychain-backend.js";
 import { trustedExternalUrl, trustedRendererDevUrl } from "../shared/security.js";
 
 // electron-vite 会注入渲染层入口：dev 下是 devServer URL，prod 下是打包 HTML。
@@ -90,6 +92,18 @@ async function createBridge(): Promise<Bridge> {
   const workspaceTrust = await workspaceTrustStore.assess(cwd);
   await loadProjectEnv({ cwd, workspaceTrust });
   const { config } = await loadConfig({ cwd, workspaceTrust });
+  const credentialKind = process.env["ANICODE_CREDENTIAL_BACKEND"]?.trim() || "keychain";
+  const credentialBackend =
+    credentialKind === "keychain"
+      ? new ElectronUtilityKeychainBackend({
+          service: process.env["ANICODE_KEYCHAIN_SERVICE"] ?? "dev.anicode.credentials",
+          helperPath: path.join(__dirname, "keychain-utility-helper.js"),
+          modulePath: createRequire(__filename).resolve("@napi-rs/keyring"),
+          utilityFactory: electronKeychainUtilityFactory,
+          workingDirectory: path.dirname(process.execPath),
+          environment: process.env,
+        })
+      : undefined;
   return Bridge.create({
     cwd,
     sessionsDir: path.join(userData, "sessions"),
@@ -97,13 +111,31 @@ async function createBridge(): Promise<Bridge> {
     modelsFile: path.join(userData, "models.json"),
     appName: app.getName(),
     appVersion: app.getVersion(),
-    defaultModel: config.model ?? resolveDefaultModel(),
+    ...(config.model ? { defaultModel: config.model } : {}),
     config,
     workspaceTrust: workspaceTrustStore,
     workspaceTrusted: workspaceTrust.trusted,
     isTrustedSender: trustedIpcSender,
+    ...(credentialBackend ? { credentialBackend } : {}),
   });
 }
+
+const electronKeychainUtilityFactory: ElectronKeychainUtilityFactory = {
+  fork(modulePath, args, options): ElectronKeychainUtilityProcess {
+    const environment = Object.fromEntries(
+      Object.entries(options.env).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      ),
+    );
+    return utilityProcess.fork(modulePath, [...args], {
+      cwd: options.cwd,
+      env: environment,
+      execArgv: [...options.execArgv],
+      serviceName: options.serviceName,
+      stdio: options.stdio,
+    }) as unknown as ElectronKeychainUtilityProcess;
+  },
+};
 
 function createWindow(): void {
   const win = new BrowserWindow({

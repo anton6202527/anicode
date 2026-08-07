@@ -35,7 +35,6 @@ import {
   InputPanel,
   matchesKeybinding,
   promptHistoryFromMessages,
-  probeLive,
   subagentActivityLine,
   Welcome,
   WelcomeTip,
@@ -62,28 +61,6 @@ function scriptedProvider(scripts: ChatMessage[][]): Provider {
 }
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
-
-test("TUI model probe: provider discovery concurrency is bounded", async () => {
-  const providers = Array.from(
-    { length: 12 },
-    (_, index) => ({ id: `provider-${index}`, name: `Provider ${index}` }) as ProviderDescriptor,
-  );
-  let active = 0;
-  let peak = 0;
-  const result = await probeLive(
-    providers,
-    async (providerId) => {
-      active++;
-      peak = Math.max(peak, active);
-      await tick(5);
-      active--;
-      return [`${providerId}-model`];
-    },
-    { concurrency: 3, timeoutMs: 1_000 },
-  );
-  assert.equal(peak, 3);
-  assert.equal(result.live.size, providers.length);
-});
 
 /** 轮询等待帧内容满足条件——CI 冷启动与原生模块加载时也不依赖固定 sleep。 */
 async function waitFor(cond: () => boolean, timeoutMs = 30_000): Promise<void> {
@@ -1081,7 +1058,7 @@ test("TUI: /providers 显示安全元数据，/model 以当前 cwd 新建并切�
   }
 });
 
-test("TUI: 每次打开 /model 都刷新目录，旧模型消失且新模型立即出现", async () => {
+test("TUI: 打开和重新打开 /model 只读本地目录，最终选择才在线校验", async () => {
   const providers: ProviderDescriptor[] = [
     {
       id: "fresh",
@@ -1119,7 +1096,10 @@ test("TUI: 每次打开 /model 都刷新目录，旧模型消失且新模型立�
       sessionId="s_refresh_models"
       providers={providers}
       catalog={catalog}
-      discoverModels={async () => (++calls === 1 ? ["old-model"] : ["new-model"])}
+      discoverModels={async () => {
+        calls++;
+        return [];
+      }}
     />,
   );
   await tick(80);
@@ -1127,14 +1107,108 @@ test("TUI: 每次打开 /model 都刷新目录，旧模型消失且新模型立�
     for (const ch of "/model") view.stdin.write(ch);
     view.stdin.write("\r");
     await waitFor(() => /Old Model/.test(view.lastFrame() ?? ""));
+    assert.equal(calls, 0, "打开 picker 不得读取 provider 凭据或请求 /models");
     view.stdin.write("\u001b");
     await waitFor(() => !/选择模型/.test(view.lastFrame() ?? ""));
 
     for (const ch of "/model") view.stdin.write(ch);
     view.stdin.write("\r");
-    await waitFor(() => /new-model/.test(view.lastFrame() ?? ""));
-    assert.doesNotMatch(view.lastFrame() ?? "", /Old Model|old-model/);
-    assert.equal(calls, 2);
+    await waitFor(() => /Old Model/.test(view.lastFrame() ?? ""));
+    assert.equal(calls, 0, "重新打开 picker 仍不得进行鉴权探测");
+
+    view.stdin.write("\r");
+    await waitFor(() => calls === 1);
+    view.stdin.write("\u001b");
+    await waitFor(() => /当前未被模型端点列为可用/.test(view.lastFrame() ?? ""));
+    assert.equal(calls, 1, "最终选择只校验一次所选 provider");
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI: DeepSeek V4 Flash 被实时端点列出时可选中且只探测一次", async () => {
+  let discoveryCalls = 0;
+  let created: { cwd: string; model: string; title?: string } | undefined;
+  const view = render(
+    <App
+      host={offlineHost({ cwd: "/work", onCreate: (input) => (created = input) })}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_deepseek_v4"
+      discoverModels={async (providerId) => {
+        discoveryCalls++;
+        assert.equal(providerId, "deepseek");
+        return ["deepseek-v4-flash", "deepseek-v4-pro"];
+      }}
+    />,
+  );
+  await tick(80);
+  try {
+    for (const ch of "/model deepseek/deepseek-v4-flash") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => created !== undefined);
+
+    assert.equal(discoveryCalls, 1);
+    assert.deepEqual(created, { cwd: "/work", model: "deepseek/deepseek-v4-flash" });
+    assert.doesNotMatch(view.lastFrame() ?? "", /未被模型端点|无法从模型端点校验/);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI: 非 provider/model 格式在访问模型端点前被拒绝", async () => {
+  let discoveryCalls = 0;
+  const view = render(
+    <App
+      host={offlineHost()}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_invalid_model_spec"
+      discoverModels={async () => {
+        discoveryCalls++;
+        return [];
+      }}
+    />,
+  );
+  await tick(80);
+  try {
+    for (const ch of "/model deepseek") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => /应使用 <provider\/model> 格式/.test(view.lastFrame() ?? ""));
+    assert.equal(discoveryCalls, 0);
+  } finally {
+    view.unmount();
+  }
+});
+
+test("TUI: 未信任工作区探测失败时提示项目 env 未加载和显式授信", async () => {
+  let discoveryCalls = 0;
+  const view = render(
+    <App
+      host={offlineHost({ cwd: "/work" })}
+      cwd="/work"
+      model="debug/demo"
+      sessionId="s_untrusted_model"
+      workspaceTrusted={false}
+      requireWorkspaceTrust
+      discoverModels={async () => {
+        discoveryCalls++;
+        return undefined;
+      }}
+      terminalSize={{ cols: 180, rows: 40 }}
+    />,
+  );
+  await tick(80);
+  try {
+    for (const ch of "/model deepseek/deepseek-v4-flash") view.stdin.write(ch);
+    view.stdin.write("\r");
+    await waitFor(() => /受限工作区不会加载项目 \.env 凭据/.test(view.lastFrame() ?? ""));
+
+    const frame = view.lastFrame() ?? "";
+    assert.equal(discoveryCalls, 1, "只有最终选中的 provider 可探测一次");
+    assert.match(frame, /anicode trust grant --cwd \/work/);
+    assert.match(frame, /重启 AniCode 后重试/);
+    assert.doesNotMatch(frame, /当前未被模型端点列为可用/);
   } finally {
     view.unmount();
   }
@@ -1142,6 +1216,7 @@ test("TUI: 每次打开 /model 都刷新目录，旧模型消失且新模型立�
 
 test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新建会话，Esc 取消", async () => {
   let created: { cwd: string; model: string; title?: string } | undefined;
+  const discoveredProviders: string[] = [];
   const providers: ProviderDescriptor[] = [
     {
       id: "debug",
@@ -1215,13 +1290,14 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
       sessionId="s_pick"
       providers={providers}
       catalog={catalog}
-      discoverModels={async (providerId) =>
-        providerId === "debug"
+      discoverModels={async (providerId) => {
+        discoveredProviders.push(providerId);
+        return providerId === "debug"
           ? ["demo"]
           : providerId === "openrouter"
             ? ["meta-llama/llama-3.3-70b-instruct:free"]
-            : undefined
-      }
+            : undefined;
+      }}
       inspectProviderCredentials
     />,
   );
@@ -1243,12 +1319,14 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
     assert.doesNotMatch(pickerFrame, /↑\/↓|Enter 确认/); // 固定视口无需额外操作提示行
     // 打开时未新建会话
     assert.equal(created, undefined);
+    assert.deepEqual(discoveredProviders, [], "浏览 picker 不得触发任何 provider 鉴权");
 
     // Esc 取消不新建会话
     view.stdin.write("\u001b");
     await waitFor(() => !/选择模型/.test(view.lastFrame() ?? ""));
     assert.doesNotMatch(view.lastFrame() ?? "", /选择模型/);
     assert.equal(created, undefined);
+    assert.deepEqual(discoveredProviders, [], "Esc 取消前不得触发 provider 鉴权");
 
     // 再次打开，鼠标滚轮向下到第二项（Llama），Enter 新建
     for (const ch of "/model") view.stdin.write(ch);
@@ -1265,6 +1343,11 @@ test("TUI: /model 无参打开选择器，滚轮选中并 Enter 以该模型新�
       cwd: "/pick/project",
       model: "openrouter/meta-llama/llama-3.3-70b-instruct:free",
     });
+    assert.deepEqual(
+      discoveredProviders,
+      ["openrouter"],
+      "最终选择只允许校验被选中的唯一 provider",
+    );
     assert.match(view.lastFrame() ?? "", /会话边界 s_new/);
   } finally {
     view.unmount();
@@ -1359,7 +1442,7 @@ test("TUI: 结果页模型选择器遮住底层文字，选中后带历史切换
   }
 });
 
-test("TUI: /model 隐藏探测失败模型，并在没有可用模型时提示排查", async () => {
+test("TUI: /model 浏览不探测失败 provider，选中后才单独校验并拒绝不可用模型", async () => {
   const providers: ProviderDescriptor[] = [
     {
       id: "down",
@@ -1387,23 +1470,36 @@ test("TUI: /model 隐藏探测失败模型，并在没有可用模型时提示�
       requiresApiKey: true,
     },
   ];
+  const discoveredProviders: string[] = [];
+  let created = false;
   const view = render(
     <App
-      host={offlineHost()}
+      host={offlineHost({ onCreate: () => (created = true) })}
       cwd="/work"
       model="debug/demo"
       sessionId="s_offline"
       providers={providers}
       catalog={catalog}
-      discoverModels={async () => undefined}
+      discoverModels={async (providerId) => {
+        discoveredProviders.push(providerId);
+        return undefined;
+      }}
     />,
   );
   await tick(80);
   try {
     for (const ch of "/model") view.stdin.write(ch);
     view.stdin.write("\r");
-    await waitFor(() => /没有模型端点探测成功/.test(view.lastFrame() ?? ""));
-    assert.doesNotMatch(view.lastFrame() ?? "", /ghost-model|选择模型/);
+    await waitFor(() => /ghost-model/.test(view.lastFrame() ?? ""));
+    assert.deepEqual(discoveredProviders, []);
+
+    view.stdin.write("\r");
+    await waitFor(() => discoveredProviders.length === 1);
+    assert.deepEqual(discoveredProviders, ["down"]);
+    assert.equal(created, false);
+    view.stdin.write("\u001b");
+    await waitFor(() => /无法从模型端点校验/.test(view.lastFrame() ?? ""));
+    assert.doesNotMatch(view.lastFrame() ?? "", /当前未被模型端点列为可用/);
   } finally {
     view.unmount();
   }

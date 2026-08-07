@@ -16,6 +16,9 @@ import { PluginRuntime, type McpConnector } from "./plugin-runtime.js";
 function fakeTool(name: string): Tool {
   return {
     readOnly: false,
+    // This test double is app-owned code, not a real McpClient adapter. Production MCP tools are
+    // branded by core's managed transport factory before registerExtension sees them.
+    execution: { kind: "trusted-in-process" },
     def: { name, description: `fake ${name}`, parameters: { type: "object", properties: {} } },
     ruleKey: () => name,
     async run() {
@@ -61,17 +64,16 @@ test("PluginRuntime: 停用内建工具插件会从工具集移除对应工具",
   assert.ok(names.includes("todo_write"), "未停用的 todo 应保留");
 });
 
-test("PluginRuntime: 启用无需凭证的 MCP 会连接并注入其工具", async () => {
+test("PluginRuntime: stdio MCP 在调用连接器前 fail-closed", async () => {
   const fake = fakeConnector();
   const rt = new PluginRuntime(fake.connect, {});
   await rt.setState(["mcp.playwright"]);
-  assert.equal(fake.calls.length, 1);
-  assert.equal(fake.calls[0]![0]!.name, "playwright");
+  assert.equal(fake.calls.length, 0);
   const names = rt.buildToolRegistry().names();
-  assert.ok(names.includes("playwright__do"), "应注入 MCP 工具");
+  assert.ok(!names.includes("playwright__do"));
   const status = rt.entriesWithStatus().find((e) => e.id === "mcp.playwright")?.runtime;
-  assert.equal(status?.connected, true);
-  assert.equal(status?.toolCount, 1);
+  assert.equal(status?.connected, false);
+  assert.match(status?.error ?? "", /stdio MCP requires managed.*containment/i);
 });
 
 test("PluginRuntime: 缺环境变量的 MCP 不连接，状态标记缺失凭证", async () => {
@@ -121,25 +123,53 @@ test("PluginRuntime: 原始进程密钥不能绕过 Credential Broker", async ()
 
 test("PluginRuntime: 停用已连接的 MCP 会断开并移除其工具", async () => {
   const fake = fakeConnector();
-  const rt = new PluginRuntime(fake.connect, {});
-  await rt.setState(["mcp.playwright"]);
-  assert.ok(rt.buildToolRegistry().names().includes("playwright__do"));
+  const env = { GITHUB_TOKEN: "x" };
+  const rt = new PluginRuntime(fake.connect, env, credentialBrokerFromEnv(env, { remove: true }));
+  await rt.setState(["mcp.github"]);
+  assert.ok(rt.buildToolRegistry().names().includes("github__do"));
 
   await rt.setState([]); // 停用
   assert.equal(fake.closed, 1, "应关闭 MCP client");
-  assert.ok(!rt.buildToolRegistry().names().includes("playwright__do"));
+  assert.ok(!rt.buildToolRegistry().names().includes("github__do"));
 });
 
 test("PluginRuntime: trust suspension closes MCP and reconnects only after resume", async () => {
   const fake = fakeConnector();
-  const rt = new PluginRuntime(fake.connect, {});
-  await rt.setState(["mcp.playwright"]);
-  assert.ok(rt.buildToolRegistry().names().includes("playwright__do"));
+  const env = { GITHUB_TOKEN: "x" };
+  const rt = new PluginRuntime(fake.connect, env, credentialBrokerFromEnv(env, { remove: true }));
+  await rt.setState(["mcp.github"]);
+  assert.ok(rt.buildToolRegistry().names().includes("github__do"));
   await rt.setSuspended(true);
   assert.equal(fake.closed, 1);
-  assert.ok(!rt.buildToolRegistry().names().includes("playwright__do"));
+  assert.ok(!rt.buildToolRegistry().names().includes("github__do"));
   await rt.setSuspended(false);
   assert.equal(fake.calls.length, 2);
-  assert.ok(rt.buildToolRegistry().names().includes("playwright__do"));
+  assert.ok(rt.buildToolRegistry().names().includes("github__do"));
   rt.dispose();
+});
+
+test("PluginRuntime: connector returning a stdio tool is closed before any tool becomes visible", async () => {
+  let closed = 0;
+  const connect: McpConnector = async () => ({
+    tools: [
+      {
+        ...fakeTool("github__unsafe"),
+        execution: {
+          kind: "managed-external",
+          protocol: "mcp-stdio",
+          namespace: "github",
+          cancellation: "outcome-indeterminate",
+        },
+      },
+    ],
+    clients: [{ close: async () => void closed++ } as McpClient],
+  });
+  const env = { GITHUB_TOKEN: "x" };
+  const rt = new PluginRuntime(connect, env, credentialBrokerFromEnv(env, { remove: true }));
+  await rt.setState(["mcp.github"]);
+  assert.equal(closed, 1);
+  assert.ok(!rt.buildToolRegistry().names().includes("github__unsafe"));
+  const status = rt.entriesWithStatus().find((entry) => entry.id === "mcp.github")?.runtime;
+  assert.equal(status?.connected, false);
+  assert.match(status?.error ?? "", /stdio MCP requires managed process containment/i);
 });

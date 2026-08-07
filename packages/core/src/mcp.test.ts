@@ -11,7 +11,7 @@ import * as http from "node:http";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
-import { McpClient } from "./mcp.js";
+import { connectMcpServers, McpClient } from "./mcp.js";
 import { Agent } from "./agent.js";
 import { CredentialBroker } from "./security/credentials.js";
 import { NetworkProxy } from "./runtime/network-proxy.js";
@@ -81,6 +81,65 @@ test("MCP: 握手 → 列工具 → 调用 → 错误路径", async () => {
   await client.close();
 });
 
+test("connectMcpServers: partial startup failure closes every previously started server", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-cleanup-"));
+  const marker = path.join(directory, "closed.txt");
+  const cleanupServer = String.raw`
+const { writeFileSync } = require("node:fs");
+const marker = process.argv[1];
+let buffer = "";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+process.on("SIGTERM", () => {
+  writeFileSync(marker, "closed", { mode: 0o600 });
+  process.exit(0);
+});
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf8");
+  let newline;
+  while ((newline = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, newline).trim();
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "server/discover") {
+      send({ jsonrpc: "2.0", id: message.id, result: {
+        resultType: "complete",
+        supportedVersions: ["2026-07-28"],
+        capabilities: { tools: {} }
+      }});
+    } else if (message.method === "tools/list") {
+      send({ jsonrpc: "2.0", id: message.id, result: {
+        resultType: "complete",
+        tools: []
+      }});
+    }
+  }
+});
+`;
+  try {
+    await assert.rejects(
+      () =>
+        connectMcpServers([
+          {
+            name: "healthy-first",
+            command: process.execPath,
+            args: ["-e", cleanupServer, marker],
+            timeoutMs: 1_000,
+          },
+          {
+            name: "missing-second",
+            command: path.join(directory, "missing-mcp-server"),
+            timeoutMs: 1_000,
+          },
+        ]),
+      /ENOENT|spawn|missing-mcp-server/,
+    );
+    assert.equal(await fs.readFile(marker, "utf8"), "closed");
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("MCP(HTTP legacy): discover 失败后回退握手并维持 session", async () => {
   const seenSession: string[] = [];
   const seenAuthorization: string[] = [];
@@ -126,12 +185,36 @@ test("MCP(HTTP legacy): discover 失败后回退握手并维持 session", async 
         return;
       }
       if (msg.method === "tools/call") {
+        if (msg.params.arguments.x === "rpc-error") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              error: {
+                code: -32001,
+                message: "remote secret-token RPC failure",
+                data: { detail: "secret-token" },
+              },
+            }),
+          );
+          return;
+        }
+        if (msg.params.arguments.x === "http-error") {
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end("remote secret-token HTTP failure");
+          return;
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
             jsonrpc: "2.0",
             id: msg.id,
-            result: { content: [{ type: "text", text: `pong:${msg.params.arguments.x}` }] },
+            result: {
+              content: [
+                { type: "text", text: `normal:secret-token:pong:${msg.params.arguments.x}` },
+              ],
+            },
           }),
         );
         return;
@@ -174,7 +257,51 @@ test("MCP(HTTP legacy): discover 失败后回退握手并维持 session", async 
     assert.ok(ping, "应包装出 remote__ping");
     assert.equal(ping!.readOnly, false);
     const out = await ping!.run({ x: 42 }, { cwd: ".", signal: new AbortController().signal });
-    assert.equal(out, "pong:42");
+    assert.equal(out, "normal:[REDACTED]:pong:42", "只替换 secret，正常前后文必须保留");
+    assert.doesNotMatch(out, /secret-token/);
+    await assert.rejects(
+      () => ping!.run({ x: "rpc-error" }, { cwd: ".", signal: new AbortController().signal }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "MCP -32001: remote [REDACTED] RPC failure");
+        assert.equal((error as Error & { data?: { detail?: string } }).data?.detail, "[REDACTED]");
+        assert.doesNotMatch(error.stack ?? "", /secret-token/);
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => ping!.run({ x: "http-error" }, { cwd: ".", signal: new AbortController().signal }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "MCP HTTP 500: remote [REDACTED] HTTP failure");
+        assert.doesNotMatch(error.stack ?? "", /secret-token/);
+        return true;
+      },
+    );
+    const stableRule = ping!.ruleKey({
+      token: "secret-token",
+      nested: { value: "VISIBLE_PARAMETER_MARKER" },
+    });
+    assert.match(stableRule, /^ping sha256:[a-f0-9]{32}$/);
+    assert.equal(
+      stableRule,
+      ping!.ruleKey({ nested: { value: "VISIBLE_PARAMETER_MARKER" }, token: "secret-token" }),
+      "对象键顺序不应改变权限摘要",
+    );
+    assert.notEqual(
+      stableRule,
+      ping!.ruleKey({ token: "secret-token", nested: { value: "CHANGED_PARAMETER_MARKER" } }),
+      "参数变化必须生成不同权限摘要",
+    );
+    assert.doesNotMatch(stableRule, /secret-token|VISIBLE_PARAMETER_MARKER|"token"|"nested"/);
+    assert.throws(
+      () => ping!.ruleKey({ payload: "x".repeat(1024 * 1024) }),
+      /rule-key hashing size limit/,
+      "超大参数必须 fail closed，不能退化成可碰撞的截断规则",
+    );
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    assert.throws(() => ping!.ruleKey(cyclic), /must not contain cycles/);
     // 初始化返回的 session id 必须在后续请求回带。
     assert.ok(seenSession.includes("sess-123"), "后续请求应回带 Mcp-Session-Id");
     assert.deepEqual(seenMethods.slice(0, 4), [
@@ -291,6 +418,10 @@ test("MCP(HTTP 2026): 每请求带自包含元数据/标准 header，且绝不�
               tools: [
                 {
                   name: "你好",
+                  inputSchema: { type: "object" },
+                },
+                {
+                  name: "hello",
                   inputSchema: {
                     type: "object",
                     properties: {
@@ -366,10 +497,10 @@ test("MCP(HTTP 2026): 每请求带自包含元数据/标准 header，且绝不�
     const tools = await client.listTools();
     assert.deepEqual(
       tools.map((candidate) => candidate.def.name),
-      ["modern__你好"],
-      "含非法 x-mcp-header 注解的工具必须整项排除",
+      ["modern__hello"],
+      "非法名称或 x-mcp-header 注解必须逐项排除，不能拖垮同 server 的合法工具",
     );
-    const tool = tools.find((candidate) => candidate.def.name === "modern__你好");
+    const tool = tools.find((candidate) => candidate.def.name === "modern__hello");
     assert.ok(tool);
     const input = {
       token: "=?base64?literal?=",
@@ -404,7 +535,7 @@ test("MCP(HTTP 2026): 每请求带自包含元数据/标准 header，且绝不�
       assert.equal(request.headers["mcp-method"], request.method);
       assert.equal(request.headers["mcp-session-id"], undefined);
     }
-    assert.equal(requests[2]?.headers["mcp-name"], "=?base64?5L2g5aW9?=");
+    assert.equal(requests[2]?.headers["mcp-name"], "hello");
     assert.equal(
       requests[2]?.headers["mcp-param-token"],
       `=?base64?${Buffer.from(input.token).toString("base64")}?=`,
@@ -568,6 +699,345 @@ test("MCP(HTTP probe): timeout 与网络故障绝不降级", async () => {
   }
 });
 
+test("MCP(HTTP legacy): initialized notification and session cleanup have hard deadlines", async () => {
+  const methods: string[] = [];
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    agentCloseTimeoutMs: 20,
+    fetch: async (_input, init) => {
+      if (init?.method === "DELETE") return new Promise<Response>(() => {});
+      const message = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+      methods.push(message.method ?? "");
+      if (message.method === "server/discover") {
+        return new Response("", { status: 404 });
+      }
+      if (message.method === "initialize") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: {} },
+            },
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "mcp-session-id": "stalled-session",
+            },
+          },
+        );
+      }
+      if (message.method === "notifications/initialized") {
+        // Deliberately ignore AbortSignal. The transport deadline itself must settle start().
+        return new Promise<Response>(() => {});
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(
+      () =>
+        McpClient.start(
+          {
+            name: "legacy-stalled-notification",
+            url: "https://mcp.example.test/mcp",
+            timeoutMs: 40,
+          },
+          { networkProxy },
+        ),
+      /timed out.*notifications\/initialized|超时.*notifications\/initialized/,
+    );
+    assert.deepEqual(methods, ["server/discover", "initialize", "notifications/initialized"]);
+    assert.ok(Date.now() - startedAt < 500, "startup and cleanup must remain bounded");
+  } finally {
+    await networkProxy.close();
+  }
+});
+
+test("MCP(HTTP): in-flight work is bounded and close is an idempotent hard fence", async () => {
+  let markListStarted!: () => void;
+  const listStarted = new Promise<void>((resolve) => {
+    markListStarted = resolve;
+  });
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    agentCloseTimeoutMs: 20,
+    fetch: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)) as { id: number; method: string };
+      if (message.method === "server/discover") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (message.method === "tools/list") {
+        markListStarted();
+        return new Promise<Response>(() => {});
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  try {
+    const client = await McpClient.start(
+      { name: "close-fence", url: "https://mcp.example.test/mcp", timeoutMs: 10_000 },
+      { networkProxy },
+    );
+    const pending = Array.from({ length: 256 }, () => client.listTools());
+    const rejected = pending.map((request) => assert.rejects(request, /closed|关闭/));
+    await assert.rejects(client.listTools(), /256/);
+    await listStarted;
+    const firstClose = client.close();
+    const secondClose = client.close();
+    assert.equal(firstClose, secondClose);
+    await firstClose;
+    await Promise.all(rejected);
+    await assert.rejects(client.listTools(), /closed|关闭/);
+  } finally {
+    await networkProxy.close();
+  }
+});
+
+test("MCP(HTTP): close fences a request before its deferred fetch can start", async () => {
+  let listRequests = 0;
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    agentCloseTimeoutMs: 20,
+    fetch: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)) as { id: number; method: string };
+      if (message.method === "server/discover") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (message.method === "tools/list") {
+        listRequests++;
+        return new Promise<Response>(() => {});
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  try {
+    const client = await McpClient.start(
+      { name: "pre-fetch-fence", url: "https://mcp.example.test/mcp", timeoutMs: 10_000 },
+      { networkProxy },
+    );
+    const request = client.listTools();
+    const close = client.close();
+    await assert.rejects(request, /closed|关闭/);
+    await close;
+    assert.equal(listRequests, 0);
+  } finally {
+    await networkProxy.close();
+  }
+});
+
+test("MCP(HTTP): closing an in-flight tool call reports an indeterminate remote outcome", async () => {
+  let markCallStarted!: () => void;
+  const callStarted = new Promise<void>((resolve) => (markCallStarted = resolve));
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    agentCloseTimeoutMs: 20,
+    fetch: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)) as { id: number; method: string };
+      const response = (result: unknown) =>
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }), {
+          headers: { "content-type": "application/json" },
+        });
+      if (message.method === "server/discover") {
+        return response({
+          resultType: "complete",
+          supportedVersions: ["2026-07-28"],
+          capabilities: { tools: {} },
+        });
+      }
+      if (message.method === "tools/list") {
+        return response({
+          resultType: "complete",
+          tools: [{ name: "mutate", inputSchema: { type: "object" } }],
+        });
+      }
+      if (message.method === "tools/call") {
+        markCallStarted();
+        return new Promise<Response>(() => {});
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  try {
+    const client = await McpClient.start(
+      { name: "close-tool", url: "https://mcp.example.test/mcp", timeoutMs: 10_000 },
+      { networkProxy },
+    );
+    const tool = (await client.listTools()).find(
+      (candidate) => candidate.def.name === "close-tool__mutate",
+    )!;
+    const running = tool.run({}, { cwd: ".", signal: new AbortController().signal });
+    await callStarted;
+    await client.close();
+    await assert.rejects(running, /remote operation outcome is unknown/i);
+  } finally {
+    await networkProxy.close();
+  }
+});
+
+test("MCP(HTTP): timed-out non-cooperative fetches retain their physical capacity slots", async () => {
+  let physicalRequests = 0;
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    agentCloseTimeoutMs: 20,
+    fetch: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)) as { id: number; method: string };
+      if (message.method === "server/discover") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (message.method === "tools/list") {
+        physicalRequests++;
+        // Deliberately retain the underlying operation after the caller-visible deadline.
+        return new Promise<Response>(() => {});
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  try {
+    const client = await McpClient.start(
+      { name: "physical-capacity", url: "https://mcp.example.test/mcp", timeoutMs: 20 },
+      { networkProxy },
+    );
+    await Promise.all(
+      Array.from({ length: 256 }, () => assert.rejects(client.listTools(), /timed out|超时/)),
+    );
+    assert.equal(physicalRequests, 256);
+    await assert.rejects(client.listTools(), /256/);
+    assert.equal(physicalRequests, 256, "capacity rejection must happen before another fetch");
+    await client.close();
+  } finally {
+    await networkProxy.close();
+  }
+});
+
+test("MCP(HTTP): timeout explicitly cancels a response body that has already arrived", async () => {
+  let bodyCancelled = false;
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    agentCloseTimeoutMs: 20,
+    fetch: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)) as { id: number; method: string };
+      if (message.method === "server/discover") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (message.method === "tools/list") {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              bodyCancelled = true;
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  try {
+    const client = await McpClient.start(
+      { name: "body-cancel", url: "https://mcp.example.test/mcp", timeoutMs: 20 },
+      { networkProxy },
+    );
+    await assert.rejects(client.listTools(), /timed out|超时/);
+    assert.equal(bodyCancelled, true);
+    await client.close();
+  } finally {
+    await networkProxy.close();
+  }
+});
+
+test("MCP(HTTP): JSON responses with a mismatched request id fail closed", async () => {
+  const networkProxy = new NetworkProxy({
+    resolver: async () => ["93.184.216.34"],
+    fetch: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)) as { id: number; method: string };
+      if (message.method === "server/discover") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (message.method === "tools/list") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id + 1,
+            result: { resultType: "complete", tools: [] },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected MCP method ${message.method}`);
+    },
+  });
+  try {
+    const client = await McpClient.start(
+      { name: "response-id", url: "https://mcp.example.test/mcp" },
+      { networkProxy },
+    );
+    await assert.rejects(client.listTools(), /response id mismatch/);
+    await client.close();
+  } finally {
+    await networkProxy.close();
+  }
+});
+
 test("MCP(stdio legacy): server/discover 任意旧错误均回退 initialize", async () => {
   const client = await McpClient.start({
     name: "legacy",
@@ -680,6 +1150,7 @@ test("MCP(stdio): Broker credential stays a lease until the controlled runtime p
   });
   let prepared = false;
   const runtime: ExecutionRuntime = {
+    managedProcessBoundary: "close-confirmed",
     async run() {
       throw new Error("not used");
     },
@@ -710,7 +1181,14 @@ process.stdin.on("data", (chunk) => {
     const complete = (result) => ({ ...result, resultType: "complete" });
     if (msg.method === "server/discover") send({ jsonrpc: "2.0", id: msg.id, result: complete({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} } }) });
     else if (msg.method === "tools/list") send({ jsonrpc: "2.0", id: msg.id, result: complete({ tools: [{ name: "credential_ok", inputSchema: { type: "object" } }] }) });
-    else if (msg.method === "tools/call") send({ jsonrpc: "2.0", id: msg.id, result: complete({ content: [{ type: "text", text: String(process.env.MCP_TEST_TOKEN === "broker-only-secret") }] }) });
+    else if (msg.method === "tools/call") {
+      const token = String(process.env.MCP_TEST_TOKEN ?? "");
+      if (msg.params.arguments.fail) {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32002, message: "stdio " + token + " failure", data: { echoed: token } } });
+      } else {
+        send({ jsonrpc: "2.0", id: msg.id, result: complete({ content: [{ type: "text", text: "normal:" + token + ":tail" }] }) });
+      }
+    }
   }
 });`;
   const client = await McpClient.start(
@@ -726,7 +1204,19 @@ process.stdin.on("data", (chunk) => {
   const tool = (await client.listTools()).find(
     (candidate) => candidate.def.name === "credential__credential_ok",
   )!;
-  assert.equal(await tool.run({}, { cwd: ".", signal: new AbortController().signal }), "true");
+  const output = await tool.run({}, { cwd: ".", signal: new AbortController().signal });
+  assert.equal(output, "normal:[REDACTED]:tail");
+  assert.doesNotMatch(output, /broker-only-secret/);
+  await assert.rejects(
+    () => tool.run({ fail: true }, { cwd: ".", signal: new AbortController().signal }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "MCP -32002: stdio [REDACTED] failure");
+      assert.equal((error as Error & { data?: { echoed?: string } }).data?.echoed, "[REDACTED]");
+      assert.doesNotMatch(error.stack ?? "", /broker-only-secret/);
+      return true;
+    },
+  );
   await client.close();
 });
 

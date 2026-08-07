@@ -31,6 +31,44 @@ test("SteeringInbox: clear 先关窗再清队列 —— 清空后同步到达的
   assert.equal(inbox.hasQueued(), false);
 });
 
+test("SteeringInbox: input count and UTF-8 bytes are hard bounded", () => {
+  const countBounded = new SteeringInbox(undefined, {
+    maxQueuedInputs: 2,
+    maxQueuedBytes: 100,
+    maxInputBytes: 100,
+  });
+  countBounded.open(true);
+  assert.equal(countBounded.enqueue("a"), true);
+  assert.equal(countBounded.enqueue("b"), true);
+  assert.throws(() => countBounded.enqueue("c"), /capacity exceeded/);
+  assert.equal(countBounded.shiftQueued(), "a");
+  assert.equal(
+    countBounded.enqueue("c"),
+    true,
+    "draining must return both count and byte capacity",
+  );
+
+  const byteBounded = new SteeringInbox(undefined, {
+    maxQueuedInputs: 10,
+    maxQueuedBytes: 6,
+    maxInputBytes: 4,
+  });
+  byteBounded.open(true);
+  assert.equal(byteBounded.enqueue("中"), true);
+  assert.equal(byteBounded.enqueue("文"), true);
+  assert.throws(() => byteBounded.enqueue("a"), /capacity exceeded/);
+  byteBounded.clear();
+  assert.equal(byteBounded.enqueue("a"), false, "clear also closes the acceptance window");
+
+  const itemBounded = new SteeringInbox(undefined, {
+    maxQueuedInputs: 10,
+    maxQueuedBytes: 100,
+    maxInputBytes: 2,
+  });
+  itemBounded.open(true);
+  assert.throws(() => itemBounded.enqueue("中"), /exceeds 2 bytes/);
+});
+
 test("SteeringInbox: 通知投递① 运行中且窗口开 → 通知队列（turn 边界注入）", () => {
   const inbox = new SteeringInbox(() => assert.fail("不应走 onIdle"));
   inbox.open(true);

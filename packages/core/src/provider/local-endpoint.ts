@@ -34,6 +34,15 @@ export function localProviderModelsURL(baseURL: string): URL | undefined {
 
 /** Build the fixed OpenAI-compatible discovery URL for a validated provider base URL. */
 export function providerModelsURL(baseURL: string): URL | undefined {
+  return providerEndpointURL(baseURL, "models");
+}
+
+/** Build the fixed OpenAI-compatible inference URL for a validated provider base URL. */
+export function providerChatCompletionsURL(baseURL: string): URL | undefined {
+  return providerEndpointURL(baseURL, "chat/completions");
+}
+
+function providerEndpointURL(baseURL: string, relativePath: string): URL | undefined {
   let root: URL;
   try {
     root = new URL(baseURL);
@@ -46,5 +55,5 @@ export function providerModelsURL(baseURL: string): URL | undefined {
   root.search = "";
   root.hash = "";
   if (!root.pathname.endsWith("/")) root.pathname += "/";
-  return new URL("models", root);
+  return new URL(relativePath, root);
 }

@@ -1,7 +1,7 @@
 /** Production Remote Runtime launcher：PostgreSQL/SQLite queue + OIDC + ephemeral Kubernetes Jobs。 */
 
 import * as path from "node:path";
-import { CredentialBroker, isCredentialEnvironmentName } from "../security/credentials.js";
+import { CredentialBroker, isSensitiveEnvironmentName } from "../security/credentials.js";
 import { configuredSecretBackendFromEnv, type SecretBackend } from "../security/secret-backends.js";
 import { ContainerIsolatedRuntime } from "./container-runtime.js";
 import { KubernetesJobRuntime } from "./kubernetes-runtime.js";
@@ -64,12 +64,22 @@ async function main(): Promise<void> {
       : new ContainerIsolatedRuntime({
           image: required("ANICODE_RUNTIME_IMAGE"),
           engine: process.env.ANICODE_CONTAINER_ENGINE === "podman" ? "podman" : "docker",
+          ...(process.env.ANICODE_CONTAINER_ENGINE_BIN
+            ? { engineExecutable: process.env.ANICODE_CONTAINER_ENGINE_BIN }
+            : {}),
+          ...(process.env.ANICODE_CONTAINER_ENGINE_ENDPOINT
+            ? { engineEndpoint: process.env.ANICODE_CONTAINER_ENGINE_ENDPOINT }
+            : {}),
           ...(process.env.ANICODE_CONTAINER_NETWORK
             ? { internalNetwork: process.env.ANICODE_CONTAINER_NETWORK }
             : {}),
           ...(proxyUrl ? { proxyUrl } : {}),
           ...(proxyCredentialIssuer ? { proxyCredentialIssuer } : {}),
           broker: credentials.broker,
+          orphanJournalPath: path.join(
+            path.resolve(required("ANICODE_RUNTIME_STATE_DIR")),
+            "container-orphans.json",
+          ),
         });
   const executionRuntime =
     executionBackend instanceof ContainerIsolatedRuntime
@@ -130,16 +140,25 @@ async function main(): Promise<void> {
   await new Promise<void>((resolve) =>
     controller.signal.addEventListener("abort", () => resolve(), { once: true }),
   );
-  await server.close();
-  await worker;
-  try {
+  const shutdownFailures: unknown[] = [];
+  const attempt = async (operation: () => Promise<unknown>) => {
+    try {
+      await operation();
+    } catch (error) {
+      shutdownFailures.push(error);
+    }
+  };
+  await attempt(() => server.close());
+  await attempt(() => worker);
+  await attempt(() => executionRuntime.shutdown?.() ?? Promise.resolve());
+  await attempt(async () => {
     if (telemetry.shutdown) await telemetry.shutdown();
     else await telemetry.forceFlush?.();
-  } catch {
-    console.error("AniCode Remote Runtime: OTLP flush failed during shutdown");
-  } finally {
-    await networkProxy.close();
-    await postgres.close();
+  });
+  await attempt(() => networkProxy.close());
+  await attempt(() => postgres.close());
+  if (shutdownFailures.length > 0) {
+    throw new AggregateError(shutdownFailures, "Remote Runtime shutdown was incomplete");
   }
 }
 
@@ -261,7 +280,7 @@ async function runtimeCredentials(): Promise<RemoteCredentials> {
     };
   } finally {
     for (const name of Object.keys(process.env)) {
-      if (isCredentialEnvironmentName(name)) delete process.env[name];
+      if (isSensitiveEnvironmentName(name)) delete process.env[name];
     }
   }
 }

@@ -35,6 +35,9 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Verify the pinned 280-task catalog
+        env:
+          ANICODE_CREDENTIAL_BACKEND: memory
+          ANICODE_DISABLE_OS_KEYCHAIN: "1"
         run: node --import tsx --test packages/eval/src/real-repo.test.ts
 
   plan:

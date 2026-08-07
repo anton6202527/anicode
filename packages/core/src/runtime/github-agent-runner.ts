@@ -6,9 +6,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { Agent, type AgentEvent } from "../agent.js";
-import { createProvider } from "../provider/registry.js";
 import { SecurityPolicyEngine } from "../security/policy.js";
-import { createConfiguredLocalRuntimeStack, telemetryForLocalStack } from "./local-stack.js";
+import {
+  createConfiguredLocalRuntimeStack,
+  telemetryForLocalStack,
+  type LocalRuntimeStack,
+} from "./local-stack.js";
 import { Verifier, type VerificationReport } from "./verifier.js";
 import {
   createIsolatedGitPlumbing,
@@ -100,6 +103,14 @@ function prompt(type: JobType, input: { headSha: string; failedUrl?: string }): 
   ].join("\n");
 }
 
+/** Keep the ephemeral agent on the stack-local credential and egress authority. */
+export function resolveGitHubAgentProvider(
+  stack: Pick<LocalRuntimeStack, "resolveProvider">,
+  modelSpec: string,
+): ReturnType<LocalRuntimeStack["resolveProvider"]> {
+  return stack.resolveProvider(modelSpec);
+}
+
 async function main(): Promise<void> {
   const cwd = path.resolve(process.env.GITHUB_WORKSPACE ?? process.cwd());
   const jobType = safeJobType(required("ANICODE_GITHUB_JOB_TYPE"));
@@ -112,7 +123,7 @@ async function main(): Promise<void> {
   try {
     stack = await createConfiguredLocalRuntimeStack(runtimeDir, process.env);
     telemetry = telemetryForLocalStack(stack, process.env);
-    const model = createProvider(modelSpec);
+    const model = resolveGitHubAgentProvider(stack, modelSpec);
     if (
       model.descriptor.kind === "debug" ||
       (model.diagnostics.requiresApiKey && !model.diagnostics.hasCredentials)
@@ -202,7 +213,9 @@ function consume(event: AgentEvent, text: string[], fatal: (message: string) => 
   if (event.type === "error") fatal(event.message);
 }
 
-void main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && /github-agent-runner\.(?:ts|js)$/.test(process.argv[1])) {
+  void main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

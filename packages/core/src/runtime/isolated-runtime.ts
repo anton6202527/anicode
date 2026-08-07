@@ -3,6 +3,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { realpathSync } from "node:fs";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { CredentialBroker } from "../security/credentials.js";
 import {
   resolveSandboxPolicy,
@@ -23,6 +24,8 @@ export interface IsolatedRunRequest {
   /** Internal callers may suppress the human PatchSet preview while retaining the atomic commit. */
   includeTransactionSummary?: boolean;
   policy?: SandboxPolicy;
+  /** Trusted adapter hint: omit the host workspace entirely and provide an empty private root. */
+  workspaceExposure?: "normal" | "none";
   network?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -36,9 +39,19 @@ export interface IsolatedRunRequest {
 export interface IsolatedRunResult {
   exitCode: number | null;
   output: string;
+  /** Bounded stdout-only control plane; stderr remains diagnostics and cannot forge protocol. */
+  controlOutput?: string;
   timedOut: boolean;
   sandboxed: boolean;
   durationMs: number;
+}
+
+/** Stable, credential-free signal that the runtime could not prove a workload tree was gone. */
+export class RuntimeTerminationError extends Error {
+  constructor() {
+    super("Execution runtime could not prove workload termination");
+    this.name = "RuntimeTerminationError";
+  }
 }
 
 export interface PreparedIsolatedCommand {
@@ -60,8 +73,51 @@ export interface IsolatedRuntimeOptions {
   terminationGraceMs?: number;
 }
 
+const PROXY_ENVIRONMENT_KEYS = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+] as const;
+
+/**
+ * Build a process-scoped proxy environment without ever mutating the caller's object. Keeping both
+ * casings in lockstep matters because common CLIs disagree about which spelling takes precedence.
+ */
+export function scopedProxyEnvironment(
+  source: NodeJS.ProcessEnv,
+  proxyUrl?: string,
+): NodeJS.ProcessEnv {
+  const env = { ...source };
+  for (const key of PROXY_ENVIRONMENT_KEYS) delete env[key];
+  if (!proxyUrl) return env;
+  for (const key of [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+  ] as const) {
+    env[key] = proxyUrl;
+  }
+  env["NO_PROXY"] = "";
+  env["no_proxy"] = "";
+  return env;
+}
+
 /** 本地与远程执行后端的共同边界；远程后端不支持交互式/background prepare。 */
 export interface ExecutionRuntime {
+  /** Where a core-owned Node adapter can be resolved without consulting a workspace-controlled PATH. */
+  readonly toolModuleEnvironment?: "host" | "container" | "unsupported";
+  /** Whether isolated modules can receive an execution-scoped, revocable egress proxy lease. */
+  readonly toolModuleNetworkBoundary?: "scoped-proxy" | "unsupported";
+  /** Strong containment for persistent sidecars (cgroup/container/job object), not only killpg. */
+  readonly managedProcessBoundary?: "close-confirmed" | "unsupported";
   run(request: IsolatedRunRequest): Promise<IsolatedRunResult>;
   prepare?(request: IsolatedRunRequest): PreparedIsolatedCommand;
   /** Drain runtime-owned process/journal reconciliation resources before host exit. */
@@ -87,6 +143,8 @@ export interface ExecutionRuntime {
  * integrations such as hooks, MCP and LSP also fail closed before spawning a child process.
  */
 export class DisabledExecutionRuntime implements ExecutionRuntime {
+  readonly toolModuleEnvironment = "unsupported" as const;
+  readonly managedProcessBoundary = "unsupported" as const;
   constructor(
     private readonly reason = "Local process execution is disabled on this host. Configure the pinned OCI container backend to enable foreground commands.",
   ) {}
@@ -105,6 +163,12 @@ function canonical(value: string): string {
 }
 
 export class IsolatedRuntime implements ExecutionRuntime {
+  // The general-purpose native sandbox is deliberately not advertised as an untrusted module
+  // boundary. In particular, macOS Seatbelt profiles used for normal commands do not isolate Unix
+  // signals from same-user host processes. Declarative third-party modules therefore require the
+  // PID/mount/network namespaces of ContainerIsolatedRuntime.
+  readonly toolModuleEnvironment = "unsupported" as const;
+  readonly managedProcessBoundary = "unsupported" as const;
   private readonly failClosed: boolean;
   private readonly outputLimit: number;
   private readonly broker?: CredentialBroker;
@@ -165,11 +229,9 @@ export class IsolatedRuntime implements ExecutionRuntime {
       if (!this.broker) throw new Error("No credential broker configured");
       env = this.broker.injectEnv(lease, env);
     }
-    if (network && this.proxyUrl) {
-      env["HTTP_PROXY"] = this.proxyUrl;
-      env["HTTPS_PROXY"] = this.proxyUrl;
-      env["NO_PROXY"] = "";
-    }
+    // Normalize only the child copy. Disabled networking inherits no host proxy variables; enabled
+    // networking gives every common casing the same controlled endpoint.
+    env = scopedProxyEnvironment(env, network ? this.proxyUrl : undefined);
     return { file, args, env, sandboxed, cwd };
   }
 
@@ -189,13 +251,22 @@ export class IsolatedRuntime implements ExecutionRuntime {
       windowsHide: true,
     });
     let output = "";
-    const capture = (chunk: Buffer) => {
+    let controlOutput = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const capture = (value: string) => {
       if (output.length < this.outputLimit) {
-        output += chunk.toString().slice(0, this.outputLimit - output.length);
+        output += value.slice(0, this.outputLimit - output.length);
       }
     };
-    child.stdout?.on("data", capture);
-    child.stderr?.on("data", capture);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const value = stdoutDecoder.write(chunk);
+      capture(value);
+      if (controlOutput.length < this.outputLimit) {
+        controlOutput += value.slice(0, this.outputLimit - controlOutput.length);
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer) => capture(stderrDecoder.write(chunk)));
     if (child.stdin) {
       child.stdin.on("error", () => {
         // A command may exit before consuming all input; close/exit remains authoritative.
@@ -212,7 +283,9 @@ export class IsolatedRuntime implements ExecutionRuntime {
     });
     const terminate = () => {
       if (termination) return;
-      termination = terminateProcessTree(child, { graceMs: this.terminationGraceMs });
+      termination = terminateProcessTree(child, { graceMs: this.terminationGraceMs }).catch(() => {
+        throw new RuntimeTerminationError();
+      });
       // Race a bounded cleanup failure against `close`; otherwise a failed tree kill could leave
       // the caller waiting forever for a descendant that still owns the stdio pipes.
       void termination.catch(rejectTermination);
@@ -230,11 +303,18 @@ export class IsolatedRuntime implements ExecutionRuntime {
 
     try {
       const exitCode = await Promise.race([close, terminationFailure]);
+      const stdoutTail = stdoutDecoder.end();
+      capture(stdoutTail);
+      if (controlOutput.length < this.outputLimit) {
+        controlOutput += stdoutTail.slice(0, this.outputLimit - controlOutput.length);
+      }
+      capture(stderrDecoder.end());
       if (!termination && process.platform !== "win32") terminate();
       await termination;
       return {
         exitCode,
         output: this.broker?.redact(output) ?? output,
+        controlOutput: this.broker?.redact(controlOutput) ?? controlOutput,
         timedOut,
         sandboxed: prepared.sandboxed,
         durationMs: Date.now() - started,

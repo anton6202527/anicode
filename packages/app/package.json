@@ -9,10 +9,10 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
-    "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
+    "test": "cross-env ANICODE_LANG=zh ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "pack": "electron-vite build && electron-builder --dir",
-    "dist": "electron-vite build && electron-builder"
+    "pack": "cross-env ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node scripts/package-unsigned.mjs --dir",
+    "dist": "cross-env ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node scripts/package-unsigned.mjs"
   },
   "build": {
     "appId": "dev.anicode.app",
@@ -27,6 +27,9 @@
       "package.json"
     ],
     "asar": true,
+    "asarUnpack": [
+      "node_modules/@napi-rs/keyring*/**/*.node"
+    ],
     "afterPack": "scripts/after-pack.mjs",
     "extraMetadata": {
       "main": "out/main/index.js"

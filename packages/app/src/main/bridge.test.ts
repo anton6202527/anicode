@@ -10,11 +10,19 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { IpcMain } from "electron";
-import { registerOpenAICompatibleProvider } from "@anicode/core";
+import { registerOpenAICompatibleProvider, type SecretBackend } from "@anicode/core";
 import type { EventEnvelope, ModelRow, PluginEntry, UserModel } from "../shared/api.js";
 import { Bridge, type BridgeOptions } from "./bridge.js";
 
 type Handler = (event: { sender: FakeSender }, ...args: unknown[]) => unknown;
+
+function memoryCredentialEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    ANICODE_DISABLE_OS_KEYCHAIN: "1",
+  };
+}
 
 class FakeSender {
   readonly received: EventEnvelope[] = [];
@@ -56,10 +64,53 @@ async function tempBridge(
     modelsFile: path.join(dir, "models.json"),
     appName: "anicode",
     appVersion: "0.0.1-test",
+    env: memoryCredentialEnv(),
     isTrustedSender,
   });
   return { bridge, dir };
 }
+
+test("Bridge.create registers an async Keychain backend without reading it at startup", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-async-keychain-"));
+  let reads = 0;
+  let closes = 0;
+  const backend: SecretBackend & { close(): void } = {
+    kind: "fake-async-keychain",
+    credentialNamespace: "fake-async-keychain:test",
+    async get() {
+      reads++;
+      return "must-not-read-at-startup";
+    },
+    async put() {},
+    async delete() {
+      return true;
+    },
+    close() {
+      closes++;
+    },
+  };
+  const bridge = await Bridge.create({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile: path.join(dir, "plugins.json"),
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    env: {
+      ANICODE_CREDENTIAL_BACKEND: "keychain",
+      ANICODE_CREDENTIAL_KEYS: "OPENAI_API_KEY",
+    },
+    credentialBackend: backend,
+    isTrustedSender: () => true,
+  });
+  try {
+    assert.equal(reads, 0);
+  } finally {
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+  assert.equal(closes, 1);
+});
 
 test("Bridge: rejects IPC from an untrusted renderer", async () => {
   const { bridge } = await tempBridge(() => false);
@@ -121,7 +172,7 @@ test("Bridge: 模型目录标注凭证就绪状态，debug/demo 免 key 可用",
     catalog: [{ model: "requires-key" }],
   });
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-catalog-"));
-  const env: NodeJS.ProcessEnv = { ...process.env, ANICODE_CREDENTIAL_BACKEND: "memory" };
+  const env = memoryCredentialEnv();
   delete env.ANICODE_BRIDGE_TEST_MISSING_KEY;
   const bridge = new Bridge({
     cwd: dir,
@@ -159,6 +210,7 @@ test("Bridge: 配置 custom/<model> 时可创建首个会话", async () => {
     modelsFile: path.join(dir, "models.json"),
     appName: "anicode",
     appVersion: "0.0.1-test",
+    env: memoryCredentialEnv(),
     isTrustedSender: () => true,
     defaultModel: "custom/my-model",
   });
@@ -176,6 +228,36 @@ test("Bridge: 配置 custom/<model> 时可创建首个会话", async () => {
     assert.equal(session.model, "custom/my-model");
   } finally {
     await bridge.dispose();
+  }
+});
+
+test("Bridge: 未显式指定默认模型时使用自身 runtimeStack provider 状态", async () => {
+  const previous = process.env.DEEPSEEK_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-bound-default-"));
+  const env = memoryCredentialEnv();
+  env.DEEPSEEK_API_KEY = "sentinel-app-deepseek";
+  const bridge = new Bridge({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile: path.join(dir, "plugins.json"),
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    env,
+    isTrustedSender: () => true,
+  });
+  const { ipcMain, invoke } = fakeIpc();
+  bridge.register(ipcMain);
+  try {
+    const info = (await invoke("app:info", new FakeSender())) as { defaultModel: string };
+    assert.equal(info.defaultModel, "deepseek/deepseek-v4-flash");
+    assert.equal(env.DEEPSEEK_API_KEY, undefined, "runtime stack owns the captured credential");
+  } finally {
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previous;
   }
 });
 
@@ -246,6 +328,7 @@ test("Bridge: 自定义模型进入目录、可被 createProvider 解析、可�
       modelsFile: path.join(dir, "models.json"),
       appName: "anicode",
       appVersion: "0.0.1-test",
+      env: memoryCredentialEnv(),
       isTrustedSender: () => true,
     });
     const ipc2 = fakeIpc();
@@ -312,6 +395,7 @@ test("Bridge: 自动发现的文件系统技能进入市场、默认启用、可
       modelsFile: path.join(dir, "models.json"),
       appName: "anicode",
       appVersion: "0.0.1-test",
+      env: memoryCredentialEnv(),
       isTrustedSender: () => true,
     });
     await reopened.init();
@@ -353,6 +437,7 @@ test("Bridge: 插件默认启用内建项，开关状态写盘并回读", async 
       modelsFile: path.join(dir, "models.json"),
       appName: "anicode",
       appVersion: "0.0.1-test",
+      env: memoryCredentialEnv(),
       isTrustedSender: () => true,
     });
     await reopened.init();

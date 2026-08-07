@@ -2,6 +2,14 @@
 
 import { spawn, spawnSync } from "node:child_process";
 
+// The release gate validates code; it must never read or mutate a developer/runner OS keychain.
+// Override inherited values so direct `node scripts/verify-release.mjs` is as isolated as npm scripts.
+const releaseEnvironment = {
+  ...process.env,
+  ANICODE_CREDENTIAL_BACKEND: "memory",
+  ANICODE_DISABLE_OS_KEYCHAIN: "1",
+};
+
 function parseVersion(value, label) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value.trim());
   if (!match) throw new Error(`Cannot determine ${label} version from ${JSON.stringify(value)}`);
@@ -17,10 +25,9 @@ function versionAtLeast(version, minimum) {
 
 function assertReleaseToolchain() {
   const node = parseVersion(process.versions.node, "Node.js");
-  const supportedNode = (node[0] === 22 && versionAtLeast(node, [22, 15, 0])) || node[0] === 24;
-  if (!supportedNode) {
+  if (!versionAtLeast(node, [22, 15, 0])) {
     throw new Error(
-      `Release gate requires Node.js 22.15+ or 24.x; current version is ${process.versions.node}`,
+      `Release gate requires Node.js >=22.15.0; current version is ${process.versions.node}`,
     );
   }
 
@@ -31,6 +38,7 @@ function assertReleaseToolchain() {
     ? undefined
     : spawnSync(process.platform === "win32" ? "npm.cmd" : "npm", ["--version"], {
         encoding: "utf8",
+        env: releaseEnvironment,
         windowsHide: true,
       });
   if (npmProbe && (npmProbe.error || npmProbe.status !== 0 || !npmProbe.stdout.trim())) {
@@ -75,7 +83,7 @@ for (const script of steps) {
   const exitCode = await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: process.cwd(),
-      env: process.env,
+      env: releaseEnvironment,
       stdio: "inherit",
       windowsHide: true,
     });

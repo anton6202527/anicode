@@ -509,10 +509,12 @@ export class PersistentWorker {
     const linked = linkedAbortController(signal);
     this.active.add(linked.controller);
     const heartbeat = setInterval(
-      () =>
+      () => {
+        if (linked.controller.signal.aborted) return;
         void this.queue
           .heartbeat(job.id, this.id, this.leaseMs, job.fencingToken)
-          .catch((error) => linked.controller.abort(error)),
+          .catch((error) => linked.controller.abort(error));
+      },
       Math.max(500, Math.floor(this.leaseMs / 3)),
     );
     let checkingCancellation = false;
@@ -538,6 +540,12 @@ export class PersistentWorker {
       },
       Math.max(100, Math.min(1_000, Math.floor(this.leaseMs / 10))),
     );
+    const stopLeaseMaintenance = () => {
+      clearInterval(heartbeat);
+      clearInterval(cancellationPoll);
+    };
+    linked.controller.signal.addEventListener("abort", stopLeaseMaintenance, { once: true });
+    if (linked.controller.signal.aborted) stopLeaseMaintenance();
     try {
       const result = await this.handlers[job.type]!(
         job.payload,
@@ -570,8 +578,8 @@ export class PersistentWorker {
       }
       span.recordException(error).setStatus({ code: "error" });
     } finally {
-      clearInterval(heartbeat);
-      clearInterval(cancellationPoll);
+      stopLeaseMaintenance();
+      linked.controller.signal.removeEventListener("abort", stopLeaseMaintenance);
       linked.dispose();
       this.active.delete(linked.controller);
       span.end();

@@ -17,9 +17,11 @@ npm run changeset
 
 合并到 `main` 后，CI 的 release 工作流用 changesets/action 打开一个「Version
 Packages」PR（累计变更 + 更新 CHANGELOG + 升版本号）；合并该 PR 即触发
-`npm publish`（需仓库配置 `NPM_TOKEN`）。
+隔离的 npm Trusted Publishing job。该 job 使用 GitHub OIDC 短期身份和 provenance，
+不 checkout 或执行仓库代码；需先在 npm 包设置中绑定本仓库的 release workflow。
 
 VSCode 扩展（`.vsix`）与 Electron 安装包不走 npm：
+
 - `.vsix` 在发布 GitHub Release 时由 release 工作流构建并作为产物上传。
 - Electron 安装包在 GitHub Release 时由 CI 构建；macOS 强制签名与公证，Windows 强制签名，
   缺少受保护的发布凭证会让 release job 失败。

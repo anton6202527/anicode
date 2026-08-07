@@ -8,15 +8,18 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   promises as fs,
   readFileSync,
   realpathSync,
+  rmSync,
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { terminateProcessTree } from "../runtime/isolated-runtime.js";
 import { sanitizedShellEnv } from "../tools/shell-spawn.js";
 import { WsClient } from "./ws.js";
@@ -135,6 +138,140 @@ interface Pending {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+const BROWSER_PROFILE_PREFIX = "anicode-browser-";
+
+/**
+ * These switches define the local automation boundary and must never be delegated to project or
+ * model-controlled browser arguments. Chromium generally lets a later duplicate switch win, so we
+ * both reject duplicates and append the authoritative values after all allowed extra switches.
+ */
+const PROTECTED_BROWSER_SWITCHES = new Set([
+  "password-store",
+  "profile-directory",
+  "remote-debugging-address",
+  "remote-debugging-port",
+  "use-mock-keychain",
+  "user-data-dir",
+]);
+
+export interface BrowserLaunchArgumentOptions {
+  userDataDir: string;
+  platform?: NodeJS.Platform;
+  headless?: boolean;
+  extraArgs?: readonly string[];
+}
+
+function chromiumSwitchName(argument: string): string | undefined {
+  const match = /^--([^=\s]+)(?:=.*)?$/.exec(argument);
+  return match?.[1]?.toLowerCase();
+}
+
+function validateExtraBrowserArguments(extraArgs: readonly string[]): void {
+  if (extraArgs.length > 64) throw new Error("Too many additional browser arguments");
+  for (const argument of extraArgs) {
+    if (Buffer.byteLength(argument, "utf8") > 4_096 || argument.includes("\0")) {
+      throw new Error("Additional browser argument exceeds the safe boundary");
+    }
+    const name = chromiumSwitchName(argument);
+    if (!name) {
+      throw new Error("Additional browser arguments must be Chromium switches");
+    }
+    if (PROTECTED_BROWSER_SWITCHES.has(name)) {
+      throw new Error(`Additional browser arguments cannot override --${name}`);
+    }
+  }
+}
+
+/**
+ * Build arguments for AniCode's one-shot automation profile without starting a browser.
+ *
+ * macOS Chrome otherwise consults the login Keychain for its safe-storage key. The mock Keychain
+ * switch confines encryption to this disposable profile. Linux Chromium can otherwise discover
+ * libsecret/KWallet through the user session, so its basic store is confined to the same profile.
+ * Neither switch changes host Keychain, desktop keyring, proxy, DNS, route or certificate state.
+ */
+export function buildBrowserLaunchArguments(options: BrowserLaunchArgumentOptions): string[] {
+  if (!isAbsolute(options.userDataDir) || options.userDataDir.includes("\0")) {
+    throw new Error("Browser user-data directory must be an absolute path");
+  }
+  const extraArgs = options.extraArgs ?? [];
+  validateExtraBrowserArguments(extraArgs);
+  const platform = options.platform ?? process.platform;
+  const credentialIsolationArgs =
+    platform === "darwin"
+      ? ["--use-mock-keychain"]
+      : platform === "linux"
+        ? ["--password-store=basic"]
+        : [];
+
+  return [
+    ...(options.headless === false ? [] : ["--headless=new"]),
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    ...extraArgs,
+    // Authoritative boundary switches stay after extensibility arguments as defense in depth.
+    ...credentialIsolationArgs,
+    "--remote-debugging-address=127.0.0.1",
+    "--remote-debugging-port=0",
+    `--user-data-dir=${options.userDataDir}`,
+    "--window-size=1280,800",
+    "about:blank",
+  ];
+}
+
+interface BrowserAutomationProfile {
+  readonly parent: string;
+  readonly directory: string;
+}
+
+/** @internal Exported so hermetic tests can prove profile permissions without launching Chrome. */
+export function createPrivateBrowserAutomationProfile(): BrowserAutomationProfile {
+  const parent = realpathSync(tmpdir());
+  const parentStat = statSync(parent);
+  if (!parentStat.isDirectory()) throw new Error("Browser temporary root is not a directory");
+  const directory = mkdtempSync(join(parent, BROWSER_PROFILE_PREFIX));
+  try {
+    const initial = lstatSync(directory);
+    if (!initial.isDirectory() || initial.isSymbolicLink()) {
+      throw new Error("Browser automation profile is not a real directory");
+    }
+    if (process.platform !== "win32") {
+      chmodSync(directory, 0o700);
+      const secured = lstatSync(directory);
+      const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+      if (
+        !secured.isDirectory() ||
+        secured.isSymbolicLink() ||
+        (uid !== undefined && secured.uid !== uid) ||
+        (secured.mode & 0o077) !== 0
+      ) {
+        throw new Error("Browser automation profile must be private to the current user");
+      }
+    }
+    return Object.freeze({ parent, directory });
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** Pure path check used before recursively deleting an automation profile. */
+export function isManagedBrowserAutomationProfile(profile: BrowserAutomationProfile): boolean {
+  if (!isAbsolute(profile.parent) || !isAbsolute(profile.directory)) return false;
+  const parent = resolve(profile.parent);
+  const directory = resolve(profile.directory);
+  const leaf = basename(directory);
+  return (
+    dirname(directory) === parent &&
+    leaf.startsWith(BROWSER_PROFILE_PREFIX) &&
+    leaf.length > BROWSER_PROFILE_PREFIX.length
+  );
+}
+
 /** 所有存活的浏览器实例；进程退出或显式 closeAllBrowsers() 时统一收尸。 */
 const LIVE = new Set<Browser>();
 let exitHooked = false;
@@ -215,7 +352,7 @@ export class Browser {
 
   private constructor(
     private readonly proc: ChildProcess,
-    private readonly userDataDir: string,
+    private readonly profile: BrowserAutomationProfile,
     private readonly commandTimeoutMs: number,
     private readonly registry?: BrowserRegistry,
   ) {}
@@ -233,28 +370,25 @@ export class Browser {
       opts.executablePath,
       opts.requireTrustedExecutable ? { requireTrustedExecutable: true } : {},
     );
-    const userDataDir = mkdtempSync(join(tmpdir(), "anicode-browser-"));
-    const headless = opts.headless !== false;
-    const args = [
-      ...(headless ? ["--headless=new"] : []),
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-sync",
-      "--remote-debugging-port=0",
-      `--user-data-dir=${userDataDir}`,
-      "--window-size=1280,800",
-      ...(opts.args ?? []),
-      "about:blank",
-    ];
-    const proc = spawn(bin, args, {
-      stdio: "ignore",
-      env: sanitizedShellEnv(),
-      detached: process.platform !== "win32",
-      windowsHide: true,
+    validateExtraBrowserArguments(opts.args ?? []);
+    const profile = createPrivateBrowserAutomationProfile();
+    const args = buildBrowserLaunchArguments({
+      userDataDir: profile.directory,
+      ...(opts.headless !== undefined ? { headless: opts.headless } : {}),
+      ...(opts.args ? { extraArgs: opts.args } : {}),
     });
+    let proc: ChildProcess;
+    try {
+      proc = spawn(bin, args, {
+        stdio: "ignore",
+        env: sanitizedShellEnv(),
+        detached: process.platform !== "win32",
+        windowsHide: true,
+      });
+    } catch (error) {
+      await removeUserDataDir(profile);
+      throw error;
+    }
     // unref：Chrome 子进程不拖住 Node 事件循环退出（退出钩子仍会 kill 它）。
     proc.unref();
     proc.on("error", () => {
@@ -263,10 +397,10 @@ export class Browser {
     const timeoutMs = opts.launchTimeoutMs ?? 15_000;
     let wsUrl: string;
     try {
-      wsUrl = await readDevToolsWsUrl(userDataDir, timeoutMs, proc);
+      wsUrl = await readDevToolsWsUrl(profile.directory, timeoutMs, proc);
     } catch (e) {
       await terminateChild(proc);
-      await removeUserDataDir(userDataDir);
+      await removeUserDataDir(profile);
       throw e;
     }
     const requestedCommandTimeout = opts.commandTimeoutMs ?? 30_000;
@@ -274,7 +408,7 @@ export class Browser {
       Number.isSafeInteger(requestedCommandTimeout) && requestedCommandTimeout > 0
         ? Math.min(requestedCommandTimeout, 5 * 60_000)
         : 30_000;
-    const self = new Browser(proc, userDataDir, commandTimeoutMs, opts.registry);
+    const self = new Browser(proc, profile, commandTimeoutMs, opts.registry);
     try {
       self.ws = await WsClient.connect(
         wsUrl,
@@ -287,7 +421,7 @@ export class Browser {
       );
     } catch (error) {
       await terminateChild(proc);
-      await removeUserDataDir(userDataDir);
+      await removeUserDataDir(profile);
       throw error;
     }
     proc.once("exit", () => {
@@ -298,6 +432,10 @@ export class Browser {
     if (opts.registry) await opts.registry.add(self);
     if (!exitHooked) {
       exitHooked = true;
+      // A normal event-loop drain can await process termination and profile removal completely.
+      process.once("beforeExit", () => {
+        void closeAllBrowsers().catch(() => undefined);
+      });
       // exit 事件不能等待 Promise，但 close() 在首次 await 前会同步关闭 WS 并 kill Chrome。
       process.once("exit", () => void closeAllBrowsers());
     }
@@ -369,7 +507,7 @@ export class Browser {
       this.pending.clear();
       this.sessionListeners.clear();
       await terminateChild(this.proc);
-      await removeUserDataDir(this.userDataDir);
+      await removeUserDataDir(this.profile);
     })();
     return this.closePromise;
   }
@@ -422,8 +560,11 @@ async function terminateChild(proc: ChildProcess): Promise<void> {
   await terminateProcessTree(proc, { graceMs: 2_000, killWaitMs: 1_000 });
 }
 
-async function removeUserDataDir(userDataDir: string): Promise<void> {
-  await fs.rm(userDataDir, {
+async function removeUserDataDir(profile: BrowserAutomationProfile): Promise<void> {
+  if (!isManagedBrowserAutomationProfile(profile)) {
+    throw new Error("Refusing to remove an unmanaged browser automation profile");
+  }
+  await fs.rm(profile.directory, {
     recursive: true,
     force: true,
     // 防病毒/Spotlight/Chromium helper 仍可能短暂持有或重建文件。

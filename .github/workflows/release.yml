@@ -252,9 +252,12 @@ jobs:
         run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
 
       - name: Package VSCode extension
+        env:
+          ANICODE_CREDENTIAL_BACKEND: memory
+          ANICODE_DISABLE_OS_KEYCHAIN: "1"
+          VSCE_STORE: file
         run: >-
-          npm exec --workspace anicode-vscode -- vsce package
-          --no-dependencies
+          npm run package --workspace anicode-vscode --
           --target "${{ matrix.target }}"
           -o "packages/vscode/anicode-${{ matrix.target }}.vsix"
 
@@ -355,12 +358,21 @@ jobs:
         run: node scripts/set-release-version.mjs "${{ github.event.release.tag_name }}"
 
       - name: Build desktop application without signing credentials
+        env:
+          ANICODE_CREDENTIAL_BACKEND: memory
+          ANICODE_DISABLE_OS_KEYCHAIN: "1"
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run build --workspace @anicode/app
 
       - name: Build and sign desktop installers
         if: matrix.signed == 'true'
         shell: bash
         env:
+          ANICODE_CREDENTIAL_BACKEND: memory
+          ANICODE_DISABLE_OS_KEYCHAIN: "1"
+          # electron-builder code-signing discovery is distinct from AniCode's credential store.
+          # Only this secret-scoped release step may consult the runner signing identity.
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
           CSC_LINK: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_LINK || secrets.WINDOWS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && secrets.MACOS_CSC_KEY_PASSWORD || secrets.WINDOWS_CSC_KEY_PASSWORD }}
           APPLE_API_KEY_BASE64: ${{ matrix.platform == 'mac' && secrets.APPLE_API_KEY_BASE64 || '' }}
@@ -382,6 +394,10 @@ jobs:
 
       - name: Build unsigned Linux installers
         if: matrix.signed != 'true'
+        env:
+          ANICODE_CREDENTIAL_BACKEND: memory
+          ANICODE_DISABLE_OS_KEYCHAIN: "1"
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm exec --workspace @anicode/app -- electron-builder ${{ matrix.args }} --publish never
 
       - name: Generate desktop checksums

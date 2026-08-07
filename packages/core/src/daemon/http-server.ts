@@ -79,6 +79,8 @@ export interface HttpDaemonOptions {
   onClose?: () => void | Promise<void>;
   /** 单个 socket 地址在窗口内允许的请求数。默认每分钟 600。 */
   rateLimit?: { windowMs?: number; maxRequests?: number };
+  /** Graceful shutdown window before active HTTP sockets are force-closed. Default: 5 seconds. */
+  shutdownGraceMs?: number;
 }
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -492,6 +494,8 @@ export class HttpDaemonServer {
   private onClose?: () => void | Promise<void>;
   private rateWindowMs: number;
   private rateMaxRequests: number;
+  private shutdownGraceMs: number;
+  private closing: Promise<void> | undefined;
   private requestRates = new Map<string, { startedAt: number; count: number }>();
   /** 活跃 SSE 连接的清理器，close 时逐个断开。 */
   private sseCleanups = new Set<() => void>();
@@ -519,6 +523,7 @@ export class HttpDaemonServer {
     this.feedLingerMs = opts.feedLingerMs ?? 15_000;
     this.rateWindowMs = Math.max(1_000, opts.rateLimit?.windowMs ?? 60_000);
     this.rateMaxRequests = Math.max(1, opts.rateLimit?.maxRequests ?? 600);
+    this.shutdownGraceMs = Math.max(100, Math.min(60_000, opts.shutdownGraceMs ?? 5_000));
     if (opts.onClose) this.onClose = opts.onClose;
     this.server = http.createServer((req, res) => {
       void this.route(req, res).catch((err) => {
@@ -542,6 +547,7 @@ export class HttpDaemonServer {
     this.server.keepAliveTimeout = 5_000;
     this.server.maxRequestsPerSocket = 100;
     this.server.maxConnections = 128;
+    this.server.maxHeadersCount = 100;
   }
 
   /** 明文 Node HTTP server 只能绑回环；远程入口必须经同机 HTTPS/mTLS 反向代理。 */
@@ -570,7 +576,13 @@ export class HttpDaemonServer {
     return this.token;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.closing = this.closeOnce();
+    return this.closing;
+  }
+
+  private async closeOnce(): Promise<void> {
     for (const cleanup of this.sseCleanups) cleanup();
     this.sseCleanups.clear();
     await Promise.allSettled(
@@ -587,7 +599,29 @@ export class HttpDaemonServer {
     this.attachedCleanups.clear();
     this.deletingSessions.clear();
     this.requestRates.clear();
-    await new Promise<void>((res) => this.server.close(() => res()));
+    const listenerClosed = new Promise<void>((resolve, reject) => {
+      this.server.close((error?: Error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+    this.server.closeIdleConnections();
+    let graceTimer: NodeJS.Timeout | undefined;
+    const graceful = await Promise.race([
+      listenerClosed.then(() => true),
+      new Promise<false>((resolve) => {
+        graceTimer = setTimeout(() => resolve(false), this.shutdownGraceMs);
+        graceTimer.unref();
+      }),
+    ]);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (!graceful) {
+      this.server.closeAllConnections();
+      await listenerClosed;
+    }
     await this.onClose?.();
   }
 

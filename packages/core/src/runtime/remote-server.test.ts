@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExecutionRuntime } from "./isolated-runtime.js";
+import { RuntimeTerminationError, type ExecutionRuntime } from "./isolated-runtime.js";
 import {
   createClaimRemoteRuntimeAuthorizer,
   RemoteRuntimeHttpServer,
@@ -185,6 +185,104 @@ test("Remote Runtime: cancelling an active job aborts side effects without late 
     assert.equal(await running, true, "cancelled work must not throw from late finish/fail paths");
     assert.equal(observedAbort, true);
     assert.equal((await queue.get(job.id))?.status, "cancelled");
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Remote Runtime: cancellation is never acknowledged when termination cannot be proved", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-remote-cancel-unknown-"));
+  await fs.mkdir(path.join(root, "project"));
+  const queue = new DurableWorkerQueue();
+  let started!: () => void;
+  const didStart = new Promise<void>((resolve) => (started = resolve));
+  const identity = { actor: "user-1", claims: { tenant_id: "tenant-1" } };
+  const server = new RemoteRuntimeHttpServer({
+    queue,
+    executionRuntime: {
+      async run(request) {
+        started();
+        await new Promise<void>((resolve) => {
+          if (request.signal?.aborted) resolve();
+          else request.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new RuntimeTerminationError();
+      },
+    },
+    workspaceRoot: root,
+    authenticate: async () => identity,
+    authorizer: {
+      async authorizeSubmit(_identity, request) {
+        return testGrant(request);
+      },
+      async authorizeJob() {},
+      async authorizeExecution() {},
+    },
+  });
+  try {
+    const job = await server.service.submit(identity, {
+      command: "side-effect",
+      workspaceId: "project",
+      policy: "read-only",
+      network: false,
+      idempotencyKey: "cancel-indeterminate",
+    });
+    const running = server.service.runOnce();
+    await didStart;
+    assert.equal(await server.service.cancel(identity, job.id), "cancellation_requested");
+    assert.equal(await running, true);
+    assert.equal(
+      (await queue.get(job.id))?.status,
+      "cancellation_requested",
+      "unknown termination must remain durable and consume capacity until reconciled",
+    );
+  } finally {
+    await server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Remote Runtime: non-cancellation termination proof failures are indeterminate and never retried", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-remote-proof-failure-"));
+  await fs.mkdir(path.join(root, "project"));
+  const queue = new DurableWorkerQueue();
+  let calls = 0;
+  const identity = { actor: "user-1", claims: { tenant_id: "tenant-1" } };
+  const server = new RemoteRuntimeHttpServer({
+    queue,
+    executionRuntime: {
+      async run() {
+        calls++;
+        throw new RuntimeTerminationError();
+      },
+    },
+    workspaceRoot: root,
+    authenticate: async () => identity,
+    authorizer: {
+      async authorizeSubmit(_identity, request) {
+        return testGrant(request);
+      },
+      async authorizeJob() {},
+      async authorizeExecution() {},
+    },
+  });
+  try {
+    const job = await server.service.submit(identity, {
+      command: "read-only-but-possibly-still-running",
+      workspaceId: "project",
+      policy: "read-only",
+      network: false,
+      retryPolicy: "safe",
+      idempotencyKey: "proof-failure-no-retry",
+    });
+    assert.equal(await server.service.runOnce(), true);
+    assert.equal(await server.service.runOnce(), false);
+    assert.equal(calls, 1);
+    const view = await server.service.get(identity, job.id);
+    assert.equal(view?.status, "failed");
+    assert.equal(view?.outcome, "indeterminate");
+    assert.match(view?.error ?? "", /termination indeterminate.*cleanup proof required/i);
   } finally {
     await server.close();
     await fs.rm(root, { recursive: true, force: true });

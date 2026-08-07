@@ -1,27 +1,22 @@
 /**
- * 凭证存储 —— ~/.anicode/auth.json（0600），按 provider 存 OAuth token 等敏感凭证。
+ * OAuth credential store with explicit file, memory or OS-keychain selection.
  *
- * 与 SessionStore 分离：会话历史不含凭证；凭证单独一份、严格权限。core 只读写这一个文件，
- * 不打日志、不进 snapshot。
+ * It is separate from SessionStore, never logged or snapshotted. auth.json is
+ * retained as a 0600 compatibility/migration source; ordinary reads never
+ * persist a migration into the operating-system credential store.
  */
 
-import {
-  chmodSync,
-  closeSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  promises as fs,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { randomUUID } from "node:crypto";
+import { promises as fs, readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { OAuthTokens } from "./oauth.js";
-import { OsKeychainSecretBackend, type SyncSecretBackend } from "../security/secret-backends.js";
+import {
+  OS_KEYCHAIN_DISABLED_ENV,
+  OsKeychainDisabledError,
+  OsKeychainSecretBackend,
+  type SyncSecretBackend,
+} from "../security/secret-backends.js";
 
 export interface OAuthCredential {
   type: "oauth";
@@ -34,13 +29,102 @@ export type Credential = OAuthCredential;
 
 type AuthFile = Record<string, Credential>;
 
+interface AuthIndexEntry {
+  type: Credential["type"];
+  expiresAt?: number;
+}
+
+interface AuthIndex {
+  version: 1;
+  credentials: Record<string, AuthIndexEntry>;
+}
+
+type AuthProviderState =
+  | { mode: "backend-authoritative"; type: Credential["type"]; expiresAt: number }
+  | { mode: "revoked" };
+
+interface AuthState {
+  version: 1;
+  providers: Record<string, AuthProviderState>;
+}
+
+export type AuthStoreCommitOutcome = "not-committed" | "indeterminate";
+
+export class AuthStorePersistenceError extends Error {
+  readonly name = "AuthStorePersistenceError";
+
+  constructor(
+    readonly target: "auth-file" | "state-file",
+    readonly outcome: AuthStoreCommitOutcome,
+    cause: unknown,
+  ) {
+    super(
+      `${target} write ${outcome === "indeterminate" ? "has an indeterminate outcome" : "did not commit"}`,
+      {
+        cause,
+      },
+    );
+  }
+}
+
+export type AuthStoreBackendKind = "file" | "memory" | "keychain";
+
+export interface AuthStoreOptions {
+  /** Legacy plaintext store location and the default state/lock coordination directory. */
+  file?: string;
+  /** Explicit storage selection or an injected synchronous backend. */
+  backend?: AuthStoreBackendKind | SyncSecretBackend;
+  /** Injectable environment snapshot; primarily useful to enforce policy in tests. */
+  env?: NodeJS.ProcessEnv;
+  keychainService?: string;
+  /** Stable state/lock path for an injected durable backend shared by multiple stores. */
+  coordinationFile?: string;
+  /** @internal Deterministic persistence fault injection for crash-consistency tests. */
+  faultInjection?: {
+    afterRename?: (target: "auth-file" | "state-file") => void | Promise<void>;
+  };
+}
+
 interface CredentialLockOwner {
   pid: number;
   token: string;
 }
 
 const LOCK_TIMEOUT_MS = 10_000;
-const INVALID_LOCK_STALE_MS = 30_000;
+const AUTH_INDEX_KEY = "auth-index:v1";
+
+class MemoryAuthSecretBackend implements SyncSecretBackend {
+  readonly kind = "memory";
+  private readonly values = new Map<string, string>();
+
+  getSync(key: string): string | undefined {
+    return this.values.get(key);
+  }
+
+  putSync(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+
+  deleteSync(key: string): boolean {
+    return this.values.delete(key);
+  }
+
+  async get(key: string): Promise<string | undefined> {
+    return this.getSync(key);
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    this.putSync(key, value);
+  }
+
+  async delete(key: string): Promise<boolean> {
+    return this.deleteSync(key);
+  }
+}
+
+function isValidProviderId(providerId: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(providerId);
+}
 
 function validateCredential(providerId: string, credential: unknown): Credential {
   if (
@@ -54,7 +138,13 @@ function validateCredential(providerId: string, credential: unknown): Credential
   ) {
     throw new Error(`Invalid credential entry for ${providerId}`);
   }
-  return credential as Credential;
+  const value = credential as Record<string, unknown>;
+  return {
+    type: "oauth",
+    access: value["access"] as string,
+    refresh: value["refresh"] as string,
+    expiresAt: value["expiresAt"] as number,
+  };
 }
 
 function parseAuthFile(text: string, source: string): AuthFile {
@@ -67,42 +157,308 @@ function parseAuthFile(text: string, source: string): AuthFile {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Invalid credential file schema: ${source}`);
   }
+  const parsed: AuthFile = {};
   for (const [providerId, credential] of Object.entries(value)) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(providerId)) {
+    if (!isValidProviderId(providerId)) {
       throw new Error(`Invalid provider id in credential file: ${providerId}`);
     }
-    validateCredential(providerId, credential);
+    parsed[providerId] = validateCredential(providerId, credential);
   }
-  return value as AuthFile;
+  return parsed;
 }
 
-function defaultAuthFile(): string {
-  const override = process.env["ANICODE_AUTH_FILE"];
+function parseStoredCredential(providerId: string, text: string, source: string): Credential {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Invalid credential JSON for ${providerId}: ${source}`, { cause: error });
+  }
+  return validateCredential(providerId, value);
+}
+
+function parseAuthIndex(text: string, source: string): AuthIndex {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Invalid auth credential index JSON: ${source}`, { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid auth credential index schema: ${source}`);
+  }
+  const record = value as Record<string, unknown>;
+  const credentials = record["credentials"];
+  if (
+    record["version"] !== 1 ||
+    !credentials ||
+    typeof credentials !== "object" ||
+    Array.isArray(credentials)
+  ) {
+    throw new Error(`Invalid auth credential index schema: ${source}`);
+  }
+  if (Object.keys(record).some((key) => key !== "version" && key !== "credentials")) {
+    throw new Error(`Invalid auth credential index schema: ${source}`);
+  }
+  const parsedCredentials: Record<string, AuthIndexEntry> = {};
+  for (const [providerId, metadata] of Object.entries(credentials)) {
+    if (!isValidProviderId(providerId)) {
+      throw new Error(`Invalid provider id in auth credential index: ${providerId}`);
+    }
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+      throw new Error(`Invalid auth credential index entry for ${providerId}`);
+    }
+    const entry = metadata as Record<string, unknown>;
+    if (
+      entry["type"] !== "oauth" ||
+      typeof entry["expiresAt"] !== "number" ||
+      !Number.isFinite(entry["expiresAt"]) ||
+      Object.keys(entry).some((key) => key !== "type" && key !== "expiresAt")
+    ) {
+      throw new Error(`Invalid auth credential index entry for ${providerId}`);
+    }
+    parsedCredentials[providerId] = { type: "oauth", expiresAt: entry["expiresAt"] };
+  }
+  return { version: 1, credentials: parsedCredentials };
+}
+
+function parseAuthState(text: string, source: string): AuthState {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Invalid auth state JSON: ${source}`, { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid auth state schema: ${source}`);
+  }
+  const record = value as Record<string, unknown>;
+  const providers = record["providers"];
+  if (
+    record["version"] !== 1 ||
+    !providers ||
+    typeof providers !== "object" ||
+    Array.isArray(providers) ||
+    Object.keys(record).some((key) => key !== "version" && key !== "providers")
+  ) {
+    throw new Error(`Invalid auth state schema: ${source}`);
+  }
+
+  const parsedProviders: Record<string, AuthProviderState> = {};
+  for (const [providerId, providerState] of Object.entries(providers)) {
+    if (
+      !isValidProviderId(providerId) ||
+      !providerState ||
+      typeof providerState !== "object" ||
+      Array.isArray(providerState)
+    ) {
+      throw new Error(`Invalid auth state entry for ${providerId}`);
+    }
+    const entry = providerState as Record<string, unknown>;
+    if (entry["mode"] === "revoked") {
+      if (Object.keys(entry).some((key) => key !== "mode")) {
+        throw new Error(`Invalid auth state entry for ${providerId}`);
+      }
+      parsedProviders[providerId] = { mode: "revoked" };
+      continue;
+    }
+    if (
+      entry["mode"] !== "backend-authoritative" ||
+      entry["type"] !== "oauth" ||
+      typeof entry["expiresAt"] !== "number" ||
+      !Number.isFinite(entry["expiresAt"]) ||
+      Object.keys(entry).some((key) => key !== "mode" && key !== "type" && key !== "expiresAt")
+    ) {
+      throw new Error(`Invalid auth state entry for ${providerId}`);
+    }
+    parsedProviders[providerId] = {
+      mode: "backend-authoritative",
+      type: "oauth",
+      expiresAt: entry["expiresAt"],
+    };
+  }
+  return { version: 1, providers: parsedProviders };
+}
+
+function indexEntry(credential: Credential): AuthIndexEntry {
+  return {
+    type: credential.type,
+    ...(credential.type === "oauth" ? { expiresAt: credential.expiresAt } : {}),
+  };
+}
+
+function defaultAuthFile(env: NodeJS.ProcessEnv): string {
+  const override = env["ANICODE_AUTH_FILE"];
   if (override && override.trim()) return override;
   return path.join(os.homedir(), ".anicode", "auth.json");
 }
 
+function keychainCoordinationFile(service: string): string {
+  const namespace = createHash("sha256").update(service, "utf8").digest("hex").slice(0, 32);
+  return path.join(os.homedir(), ".anicode", "auth-state", `${namespace}.json`);
+}
+
+function isOsKeychainBackend(backend: SyncSecretBackend): boolean {
+  return backend.kind === "os-keychain" || backend.kind === "keychain";
+}
+
+function assertAuthKeychainAllowed(env: NodeJS.ProcessEnv): void {
+  if (env[OS_KEYCHAIN_DISABLED_ENV] === "1") throw new OsKeychainDisabledError();
+  if (env["ANICODE_CREDENTIAL_BACKEND"] === "memory") {
+    throw new Error("ANICODE_CREDENTIAL_BACKEND=memory forbids OS keychain access");
+  }
+}
+
+function resolveBackendKind(
+  options: AuthStoreOptions,
+  explicitlyProvidedFile: boolean,
+): AuthStoreBackendKind {
+  if (typeof options.backend === "string") return options.backend;
+  if (explicitlyProvidedFile) return "file";
+
+  const legacy = options.env?.["ANICODE_AUTH_BACKEND"];
+  const unified = options.env?.["ANICODE_CREDENTIAL_BACKEND"];
+  if (unified !== undefined) {
+    if (legacy !== undefined && legacy !== unified) {
+      throw new Error(
+        `ANICODE_AUTH_BACKEND=${legacy} conflicts with ANICODE_CREDENTIAL_BACKEND=${unified}`,
+      );
+    }
+    if (unified === "keychain" || unified === "memory") return unified;
+    throw new Error(
+      `AuthStore requires a synchronous backend; ANICODE_CREDENTIAL_BACKEND=${unified} must be injected explicitly`,
+    );
+  }
+
+  if (options.env?.["ANICODE_AUTH_FILE"]) return "file";
+  if (legacy !== undefined) {
+    if (legacy === "file" || legacy === "memory" || legacy === "keychain") return legacy;
+    throw new Error(`Unsupported ANICODE_AUTH_BACKEND: ${legacy}`);
+  }
+  return "keychain";
+}
+
 export class AuthStore {
   private readonly file: string;
-  private readonly backend?: SyncSecretBackend;
+  private readonly backend: SyncSecretBackend | undefined;
+  private readonly legacyReadFallback: boolean;
+  private readonly stateFile: string;
+  private readonly lockFile: string;
+  private readonly faultInjection?: AuthStoreOptions["faultInjection"];
+  private readonly memoryState: AuthState = { version: 1, providers: {} };
   private mutationTail: Promise<unknown> = Promise.resolve();
 
-  constructor(file?: string, backend?: SyncSecretBackend) {
-    this.file = file ?? defaultAuthFile();
-    const forceFile = Boolean(
-      file || process.env["ANICODE_AUTH_FILE"] || process.env["ANICODE_AUTH_BACKEND"] === "file",
-    );
-    if (!forceFile) {
-      this.backend =
-        backend ??
-        new OsKeychainSecretBackend(
-          process.env["ANICODE_KEYCHAIN_SERVICE"] ?? "dev.anicode.credentials",
+  constructor();
+  constructor(file: string, backend?: SyncSecretBackend);
+  constructor(options: AuthStoreOptions);
+  constructor(fileOrOptions?: string | AuthStoreOptions, legacyBackend?: SyncSecretBackend) {
+    const explicitlyProvidedFile = typeof fileOrOptions === "string";
+    const options: AuthStoreOptions =
+      typeof fileOrOptions === "string"
+        ? { file: fileOrOptions, ...(legacyBackend ? { backend: legacyBackend } : {}) }
+        : { ...(fileOrOptions ?? {}) };
+    const env = options.env ?? process.env;
+    options.env = env;
+    this.file = path.resolve(options.file ?? defaultAuthFile(env));
+    if (options.faultInjection) this.faultInjection = options.faultInjection;
+
+    let backend: SyncSecretBackend | undefined;
+    let legacyReadFallback = false;
+
+    if (options.backend && typeof options.backend !== "string") {
+      if (isOsKeychainBackend(options.backend)) assertAuthKeychainAllowed(env);
+      backend = options.backend;
+      legacyReadFallback = options.backend.kind !== "memory";
+    } else {
+      const kind = resolveBackendKind(options, explicitlyProvidedFile);
+      if (kind === "memory") backend = new MemoryAuthSecretBackend();
+      else if (kind === "keychain") {
+        assertAuthKeychainAllowed(env);
+        backend = new OsKeychainSecretBackend(
+          options.keychainService ?? env["ANICODE_KEYCHAIN_SERVICE"] ?? "dev.anicode.credentials",
         );
+        legacyReadFallback = true;
+      }
     }
+
+    this.backend = backend;
+    this.legacyReadFallback = legacyReadFallback;
+    const canonicalStateFile =
+      backend instanceof OsKeychainSecretBackend
+        ? keychainCoordinationFile(backend.service)
+        : `${this.file}.state.json`;
+    this.stateFile = path.resolve(options.coordinationFile ?? canonicalStateFile);
+    if (backend && this.stateFile === this.file) {
+      throw new Error("Auth coordination file must be distinct from the legacy credential file");
+    }
+    this.lockFile = backend ? `${this.stateFile}.lock` : `${this.file}.lock`;
+  }
+
+  /**
+   * List secret-free auth metadata without constructing or reading a credential backend. This is
+   * the safe path for startup/status commands: legacy auth.json contributes only parsed metadata,
+   * while a keychain deployment's coordination file is the authoritative non-secret index.
+   */
+  static async listMetadata(
+    options: AuthStoreOptions = {},
+  ): Promise<{ providerId: string; type: Credential["type"]; expiresAt?: number }[]> {
+    if (options.backend && typeof options.backend !== "string") {
+      throw new TypeError("Auth metadata listing does not accept a credential backend instance");
+    }
+    const env = options.env ?? process.env;
+    const resolvedOptions = { ...options, env };
+    const kind = resolveBackendKind(resolvedOptions, options.file !== undefined);
+    if (kind === "memory") return [];
+
+    const file = path.resolve(options.file ?? defaultAuthFile(env));
+    let legacy: AuthFile;
+    try {
+      legacy = parseAuthFile(await fs.readFile(file, "utf8"), file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") legacy = {};
+      else throw error;
+    }
+    if (kind === "file") {
+      return Object.entries(legacy).map(([providerId, credential]) => ({
+        providerId,
+        ...indexEntry(credential),
+      }));
+    }
+
+    const service =
+      options.keychainService ?? env["ANICODE_KEYCHAIN_SERVICE"] ?? "dev.anicode.credentials";
+    const stateFile = path.resolve(options.coordinationFile ?? keychainCoordinationFile(service));
+    let state: AuthState;
+    try {
+      state = parseAuthState(await fs.readFile(stateFile, "utf8"), stateFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        state = { version: 1, providers: {} };
+      } else {
+        throw error;
+      }
+    }
+
+    const merged: Record<string, AuthIndexEntry> = {};
+    for (const [providerId, credential] of Object.entries(legacy)) {
+      merged[providerId] = indexEntry(credential);
+    }
+    for (const [providerId, providerState] of Object.entries(state.providers)) {
+      if (providerState.mode === "revoked") delete merged[providerId];
+      else {
+        merged[providerId] = {
+          type: providerState.type,
+          expiresAt: providerState.expiresAt,
+        };
+      }
+    }
+    return Object.entries(merged)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([providerId, metadata]) => ({ providerId, ...metadata }));
   }
 
   private backendKey(providerId: string): string {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(providerId)) {
+    if (!isValidProviderId(providerId)) {
       throw new Error(`Invalid provider id: ${providerId}`);
     }
     return `auth:${providerId}`;
@@ -117,14 +473,40 @@ export class AuthStore {
     }
   }
 
-  private async writeAll(data: AuthFile): Promise<void> {
-    const dir = path.dirname(this.file);
+  private async readState(): Promise<AuthState> {
+    try {
+      return parseAuthState(await fs.readFile(this.stateFile, "utf8"), this.stateFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { version: 1, providers: {} };
+      }
+      throw error;
+    }
+  }
+
+  private readStateSync(): AuthState {
+    try {
+      return parseAuthState(readFileSync(this.stateFile, "utf8"), this.stateFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { version: 1, providers: {} };
+      }
+      throw error;
+    }
+  }
+
+  private async writeAtomic(
+    target: string,
+    data: string,
+    label: "auth-file" | "state-file",
+  ): Promise<void> {
+    const dir = path.dirname(target);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.chmod(dir, 0o700).catch(() => {});
-    // 原子写：先 tmp 再 rename，避免并发/崩溃留下半截凭证文件。
-    const tmp = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
+    const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    let renameAttempted = false;
     try {
-      await fs.writeFile(tmp, JSON.stringify(data, null, 2) + "\n", {
+      await fs.writeFile(tmp, data, {
         encoding: "utf8",
         mode: 0o600,
         flag: "wx",
@@ -135,8 +517,12 @@ export class AuthStore {
       } finally {
         await handle.close();
       }
-      await fs.rename(tmp, this.file);
-      await fs.chmod(this.file, 0o600);
+      // The temporary is already 0600. Do every operation that can safely be
+      // performed before the commit point before attempting rename.
+      await fs.chmod(tmp, 0o600);
+      renameAttempted = true;
+      await fs.rename(tmp, target);
+      await this.faultInjection?.afterRename?.(label);
       // Windows does not support opening directories as file handles. The rename
       // is still atomic there; POSIX additionally fsyncs the parent directory so
       // the rename itself survives a sudden power loss.
@@ -148,9 +534,25 @@ export class AuthStore {
           await directory.close();
         }
       }
+    } catch (error) {
+      throw new AuthStorePersistenceError(
+        label,
+        renameAttempted ? "indeterminate" : "not-committed",
+        error,
+      );
     } finally {
-      await fs.rm(tmp, { force: true });
+      // A stale temporary is recoverable and must not turn a committed rename
+      // into a false rollback signal.
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
     }
+  }
+
+  private writeAll(data: AuthFile): Promise<void> {
+    return this.writeAtomic(this.file, `${JSON.stringify(data, null, 2)}\n`, "auth-file");
+  }
+
+  private writeState(state: AuthState): Promise<void> {
+    return this.writeAtomic(this.stateFile, `${JSON.stringify(state, null, 2)}\n`, "state-file");
   }
 
   private mutate<T>(operation: () => Promise<T>): Promise<T> {
@@ -160,10 +562,10 @@ export class AuthStore {
   }
 
   private async withFileLock<T>(operation: () => Promise<T>): Promise<T> {
-    const dir = path.dirname(this.file);
+    const lock = this.lockFile;
+    const dir = path.dirname(lock);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.chmod(dir, 0o700);
-    const lock = `${this.file}.lock`;
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
     const owner: CredentialLockOwner = { pid: process.pid, token: randomUUID() };
     let handle: import("node:fs/promises").FileHandle;
@@ -172,25 +574,11 @@ export class AuthStore {
         handle = await fs.open(lock, "wx", 0o600);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const current = await readLockOwner(lock);
-        if (current.owner) {
-          // Age alone is not evidence that a lock is abandoned: a slow writer
-          // can legitimately hold it for longer than the stale threshold. Never
-          // unlink a lock while its owning process is alive, otherwise that old
-          // owner can later remove a replacement lock and admit two writers.
-          if (!isProcessAlive(current.owner.pid)) {
-            await removeLockIfOwned(lock, current.owner.token);
-          }
-        } else if (
-          current.mtimeMs !== undefined &&
-          Date.now() - current.mtimeMs > INVALID_LOCK_STALE_MS
-        ) {
-          // A creator can briefly leave an empty file between open and write.
-          // Only malformed locks older than the grace period are recoverable.
-          await removeInvalidLockIfUnchanged(lock, current.mtimeMs);
-        }
         if (Date.now() >= deadline) {
-          throw new Error(`Credential store lock timeout: ${lock}`, { cause: error });
+          throw new Error(
+            `Credential store lock timeout: ${lock}. Stop all writers before manually removing an abandoned lock`,
+            { cause: error },
+          );
         }
         await new Promise((resolve) => setTimeout(resolve, 10));
         continue;
@@ -205,17 +593,86 @@ export class AuthStore {
       }
       break;
     }
+    let operationCompleted = false;
     try {
-      return await operation();
+      const result = await operation();
+      operationCompleted = true;
+      return result;
     } finally {
-      await handle.close();
-      await removeLockIfOwned(lock, owner.token);
+      // Lock release happens after the mutation's own commit protocol. A close
+      // or unlink failure must not turn a successful commit into a false
+      // failure (which would encourage unsafe retries), nor hide the original
+      // operation error. Always attempt both cleanup steps and surface a
+      // process warning; a lock left behind will also produce the explicit
+      // abandoned-lock timeout diagnostic on the next writer.
+      const cleanupErrors: unknown[] = [];
+      try {
+        await handle.close();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        await removeLockIfOwned(lock, owner.token);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (cleanupErrors.length > 0) {
+        reportLockCleanupFailure(lock, operationCompleted, cleanupErrors.length);
+      }
     }
+  }
+
+  private readBackendCredential(providerId: string): Credential | undefined {
+    if (!this.backend) return undefined;
+    const stored = this.backend.getSync(this.backendKey(providerId));
+    return stored
+      ? parseStoredCredential(providerId, stored, `${this.backend.kind} credential backend`)
+      : undefined;
+  }
+
+  private parseBackendIndex(stored: string | undefined): AuthIndex {
+    return stored
+      ? parseAuthIndex(stored, `${this.backend?.kind ?? "unknown"} credential backend`)
+      : { version: 1, credentials: {} };
+  }
+
+  private restoreBackendValue(key: string, previous: string | undefined): void {
+    if (!this.backend) return;
+    if (previous === undefined) this.backend.deleteSync(key);
+    else this.backend.putSync(key, previous);
+  }
+
+  private async mutateBackend<T>(operation: () => Promise<T>): Promise<T> {
+    // A process-local backend has no cross-process state and must not create a
+    // lock (or even touch ~/.anicode) in no-keychain test mode.
+    if (this.backend?.kind === "memory") return operation();
+    return this.mutate(operation);
+  }
+
+  private rethrowWithRollback(error: unknown, rollbackErrors: unknown[]): never {
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        "Auth credential mutation failed and could not be fully rolled back",
+      );
+    }
+    throw error;
   }
 
   async get(providerId: string): Promise<Credential | undefined> {
     this.backendKey(providerId);
-    if (this.backend) return this.getSync(providerId);
+    if (this.backend) {
+      const providerState =
+        this.backend.kind === "memory" ? undefined : (await this.readState()).providers[providerId];
+      if (providerState?.mode === "revoked") return undefined;
+      const stored = this.readBackendCredential(providerId);
+      if (stored || !this.legacyReadFallback) return stored;
+      if (providerState?.mode === "backend-authoritative") return undefined;
+      // Compatibility is deliberately read-only. Persistence requires an
+      // explicit migrateLegacy() call, so an ordinary provider lookup cannot
+      // unexpectedly open a write prompt or delete the legacy source.
+      return (await this.readAll())[providerId];
+    }
     return (await this.readAll())[providerId];
   }
 
@@ -223,21 +680,13 @@ export class AuthStore {
   getSync(providerId: string): Credential | undefined {
     this.backendKey(providerId);
     if (this.backend) {
-      const key = this.backendKey(providerId);
-      const stored = this.backend.getSync(key);
-      if (stored) {
-        return parseAuthFile(`{${JSON.stringify(providerId)}:${stored}}`, "OS keychain")[
-          providerId
-        ];
-      }
-      // 首次读取时把旧 auth.json 条目迁入 OS keychain，并从明文文件删除。
-      const legacy = this.readLegacySync();
-      const credential = legacy[providerId];
-      if (!credential) return undefined;
-      this.backend.putSync(key, JSON.stringify(credential));
-      delete legacy[providerId];
-      this.writeLegacySync(legacy);
-      return credential;
+      const providerState =
+        this.backend.kind === "memory" ? undefined : this.readStateSync().providers[providerId];
+      if (providerState?.mode === "revoked") return undefined;
+      const stored = this.readBackendCredential(providerId);
+      if (stored || !this.legacyReadFallback) return stored;
+      if (providerState?.mode === "backend-authoritative") return undefined;
+      return this.readLegacySync()[providerId];
     }
     try {
       return parseAuthFile(readFileSync(this.file, "utf8"), this.file)[providerId];
@@ -251,7 +700,51 @@ export class AuthStore {
     this.backendKey(providerId);
     const validated = validateCredential(providerId, cred);
     if (this.backend) {
-      this.backend.putSync(this.backendKey(providerId), JSON.stringify(validated));
+      await this.mutateBackend(async () => {
+        const key = this.backendKey(providerId);
+        const previousCredential = this.backend!.getSync(key);
+        const legacy = this.legacyReadFallback ? await this.readAll() : {};
+        const state = this.backend!.kind === "memory" ? this.memoryState : await this.readState();
+        let destinationMustBeRetained = false;
+        try {
+          this.backend!.putSync(key, JSON.stringify(validated));
+          state.providers[providerId] = {
+            mode: "backend-authoritative",
+            type: validated.type,
+            expiresAt: validated.expiresAt,
+          };
+          if (this.backend!.kind !== "memory") {
+            try {
+              await this.writeState(state);
+              destinationMustBeRetained = true;
+            } catch (error) {
+              if (
+                error instanceof AuthStorePersistenceError &&
+                error.target === "state-file" &&
+                error.outcome === "indeterminate"
+              ) {
+                destinationMustBeRetained = true;
+              }
+              throw error;
+            }
+          } else {
+            destinationMustBeRetained = true;
+          }
+          if (providerId in legacy) {
+            delete legacy[providerId];
+            await this.writeAll(legacy);
+          }
+        } catch (error) {
+          if (destinationMustBeRetained) throw error;
+          const rollbackErrors: unknown[] = [];
+          try {
+            this.restoreBackendValue(key, previousCredential);
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+          this.rethrowWithRollback(error, rollbackErrors);
+        }
+      });
       return;
     }
     await this.mutate(async () => {
@@ -263,7 +756,52 @@ export class AuthStore {
 
   async remove(providerId: string): Promise<boolean> {
     this.backendKey(providerId);
-    if (this.backend) return this.backend.deleteSync(this.backendKey(providerId));
+    if (this.backend) {
+      if (this.backend.kind === "memory") {
+        return this.mutateBackend(async () => {
+          const key = this.backendKey(providerId);
+          const removed = this.backend!.deleteSync(key);
+          delete this.memoryState.providers[providerId];
+          return removed;
+        });
+      }
+      return this.mutateBackend(async () => {
+        const key = this.backendKey(providerId);
+        const legacy = this.legacyReadFallback ? await this.readAll() : {};
+        const hadLegacy = providerId in legacy;
+        const state = await this.readState();
+        const wasLogicallyPresent =
+          hadLegacy || state.providers[providerId]?.mode === "backend-authoritative";
+
+        // This is the linearization point for revocation. Once durable, every
+        // reader fails closed even if the process dies during physical cleanup.
+        state.providers[providerId] = { mode: "revoked" };
+        await this.writeState(state);
+
+        const cleanupErrors: unknown[] = [];
+        let removedFromBackend = false;
+        try {
+          removedFromBackend = this.backend!.deleteSync(key);
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        if (hadLegacy) {
+          try {
+            delete legacy[providerId];
+            await this.writeAll(legacy);
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+        }
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            cleanupErrors,
+            `Credential ${providerId} is revoked but physical cleanup is incomplete`,
+          );
+        }
+        return wasLogicallyPresent || removedFromBackend;
+      });
+    }
     return this.mutate(async () => {
       const all = await this.readAll();
       if (!(providerId in all)) return false;
@@ -274,26 +812,29 @@ export class AuthStore {
   }
 
   async list(): Promise<{ providerId: string; type: Credential["type"]; expiresAt?: number }[]> {
-    if (this.backend?.listSync) {
-      return this.backend
-        .listSync()
-        .filter((key) => key.startsWith("auth:"))
-        .flatMap((key) => {
-          const providerId = key.slice(5);
-          const stored = this.backend!.getSync(key);
-          if (!stored) return [];
-          const credential = parseAuthFile(
-            `{${JSON.stringify(providerId)}:${stored}}`,
-            "OS keychain",
-          )[providerId]!;
-          return [
-            {
-              providerId,
-              type: credential.type,
-              ...(credential.type === "oauth" ? { expiresAt: credential.expiresAt } : {}),
-            },
-          ];
-        });
+    if (this.backend) {
+      // The local secret-free state is the sole runtime index. Listing must not
+      // open the OS keychain at all, even for the historical auth-index:v1 key.
+      const merged: Record<string, AuthIndexEntry> = {};
+      if (this.legacyReadFallback) {
+        const legacy = await this.readAll();
+        for (const [providerId, credential] of Object.entries(legacy)) {
+          merged[providerId] ??= indexEntry(credential);
+        }
+      }
+      const state = this.backend.kind === "memory" ? this.memoryState : await this.readState();
+      for (const [providerId, providerState] of Object.entries(state.providers)) {
+        if (providerState.mode === "revoked") delete merged[providerId];
+        else {
+          merged[providerId] = {
+            type: providerState.type,
+            expiresAt: providerState.expiresAt,
+          };
+        }
+      }
+      return Object.entries(merged)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([providerId, metadata]) => ({ providerId, ...metadata }));
     }
     const all = await this.readAll();
     return Object.entries(all).map(([providerId, c]) => ({
@@ -301,6 +842,117 @@ export class AuthStore {
       type: c.type,
       ...(c.type === "oauth" ? { expiresAt: c.expiresAt } : {}),
     }));
+  }
+
+  /**
+   * Explicitly migrate every legacy auth.json entry and the historical
+   * auth-index:v1 metadata into the selected durable backend/state. Ordinary
+   * get/getSync/list/set/remove calls never touch the historical index.
+   *
+   * Existing identical backend values are retained. A conflicting value aborts
+   * before either source is modified. Existing state (especially a revoked
+   * tombstone) always wins over historical index metadata.
+   */
+  async migrateLegacy(): Promise<{ migratedProviderIds: string[] }> {
+    if (!this.backend) throw new Error("Legacy migration requires a non-file auth backend");
+    if (this.backend.kind === "memory") {
+      throw new Error("Legacy credentials cannot be migrated into a non-durable memory backend");
+    }
+    return this.mutateBackend(async () => {
+      const legacy = await this.readAll();
+      const previousIndex = this.backend!.getSync(AUTH_INDEX_KEY);
+      const historicalIndex = this.parseBackendIndex(previousIndex);
+      const legacyProviderIds = Object.keys(legacy).sort();
+      const historicalProviderIds = Object.keys(historicalIndex.credentials).sort();
+      if (legacyProviderIds.length === 0 && previousIndex === undefined) {
+        return { migratedProviderIds: [] };
+      }
+
+      const state = await this.readState();
+      const previousCredentials = new Map<string, string | undefined>();
+      for (const providerId of legacyProviderIds) {
+        // A tombstone is a durable revocation decision. Legacy metadata or a
+        // leftover auth.json entry must never silently revive it.
+        if (state.providers[providerId]?.mode === "revoked") continue;
+        const previous = this.backend!.getSync(this.backendKey(providerId));
+        previousCredentials.set(providerId, previous);
+        if (previous !== undefined) {
+          const stored = parseStoredCredential(
+            providerId,
+            previous,
+            `${this.backend!.kind} credential backend`,
+          );
+          const source = legacy[providerId]!;
+          if (
+            stored.type !== source.type ||
+            stored.access !== source.access ||
+            stored.refresh !== source.refresh ||
+            stored.expiresAt !== source.expiresAt
+          ) {
+            throw new Error(`Credential migration conflict for ${providerId}`);
+          }
+        }
+      }
+
+      const migratedProviderIds = new Set<string>();
+      let destinationMustBeRetained = false;
+      try {
+        for (const providerId of historicalProviderIds) {
+          if (state.providers[providerId] !== undefined) continue;
+          const metadata = historicalIndex.credentials[providerId]!;
+          state.providers[providerId] = {
+            mode: "backend-authoritative",
+            type: metadata.type,
+            expiresAt: metadata.expiresAt!,
+          };
+          migratedProviderIds.add(providerId);
+        }
+        for (const providerId of legacyProviderIds) {
+          if (state.providers[providerId]?.mode === "revoked") continue;
+          const credential = legacy[providerId]!;
+          if (previousCredentials.get(providerId) === undefined) {
+            this.backend!.putSync(this.backendKey(providerId), JSON.stringify(credential));
+          }
+          state.providers[providerId] = {
+            mode: "backend-authoritative",
+            type: credential.type,
+            expiresAt: credential.expiresAt,
+          };
+          migratedProviderIds.add(providerId);
+        }
+        try {
+          await this.writeState(state);
+          destinationMustBeRetained = true;
+        } catch (error) {
+          if (
+            error instanceof AuthStorePersistenceError &&
+            error.target === "state-file" &&
+            error.outcome === "indeterminate"
+          ) {
+            destinationMustBeRetained = true;
+          }
+          throw error;
+        }
+        if (legacyProviderIds.length > 0) await this.writeAll({});
+        if (previousIndex !== undefined) this.backend!.deleteSync(AUTH_INDEX_KEY);
+      } catch (error) {
+        if (destinationMustBeRetained) throw error;
+        const rollbackErrors: unknown[] = [];
+        for (const providerId of legacyProviderIds) {
+          if (!previousCredentials.has(providerId)) continue;
+          try {
+            this.restoreBackendValue(
+              this.backendKey(providerId),
+              previousCredentials.get(providerId),
+            );
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+        }
+        this.rethrowWithRollback(error, rollbackErrors);
+      }
+      return { migratedProviderIds: [...migratedProviderIds].sort() };
+    });
   }
 
   fromTokens(tokens: OAuthTokens): OAuthCredential {
@@ -320,76 +972,62 @@ export class AuthStore {
       throw error;
     }
   }
-
-  private writeLegacySync(data: AuthFile): void {
-    const dir = path.dirname(this.file);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    chmodSync(dir, 0o700);
-    const temporary = `${this.file}.${process.pid}.${randomUUID()}.migrate.tmp`;
-    let fileDescriptor: number | undefined;
-    let directoryDescriptor: number | undefined;
-    try {
-      writeFileSync(temporary, JSON.stringify(data, null, 2) + "\n", {
-        mode: 0o600,
-        flag: "wx",
-      });
-      fileDescriptor = openSync(temporary, "r");
-      fsyncSync(fileDescriptor);
-      closeSync(fileDescriptor);
-      fileDescriptor = undefined;
-      renameSync(temporary, this.file);
-      chmodSync(this.file, 0o600);
-      if (process.platform !== "win32") {
-        directoryDescriptor = openSync(dir, "r");
-        fsyncSync(directoryDescriptor);
-      }
-    } finally {
-      if (fileDescriptor !== undefined) closeSync(fileDescriptor);
-      if (directoryDescriptor !== undefined) closeSync(directoryDescriptor);
-      rmSync(temporary, { force: true });
-    }
-  }
 }
 
-async function readLockOwner(
-  lock: string,
-): Promise<{ owner?: CredentialLockOwner; mtimeMs?: number }> {
-  const stat = await fs.stat(lock).catch(() => undefined);
-  if (!stat) return {};
+async function readLockOwner(lock: string): Promise<CredentialLockOwner | undefined> {
+  let serialized: string;
   try {
-    const value = JSON.parse(await fs.readFile(lock, "utf8")) as Record<string, unknown>;
-    if (
-      Number.isSafeInteger(value["pid"]) &&
-      (value["pid"] as number) > 0 &&
-      typeof value["token"] === "string" &&
-      value["token"].length >= 16
-    ) {
-      return {
-        owner: { pid: value["pid"] as number, token: value["token"] },
-        mtimeMs: stat.mtimeMs,
-      };
-    }
-  } catch {
-    // The owner may still be between exclusive create and its first write.
-  }
-  return { mtimeMs: stat.mtimeMs };
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
+    serialized = await fs.readFile(lock, "utf8");
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch (error) {
+    throw new Error(`Credential store lock metadata is invalid: ${lock}`, { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Credential store lock metadata is invalid: ${lock}`);
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(record["pid"]) ||
+    (record["pid"] as number) <= 0 ||
+    typeof record["token"] !== "string" ||
+    record["token"].length < 16 ||
+    Object.keys(record).some((key) => key !== "pid" && key !== "token")
+  ) {
+    throw new Error(`Credential store lock metadata is invalid: ${lock}`);
+  }
+  return { pid: record["pid"] as number, token: record["token"] };
 }
 
 async function removeLockIfOwned(lock: string, token: string): Promise<void> {
   const current = await readLockOwner(lock);
-  if (current.owner?.token === token) await fs.rm(lock, { force: true });
+  if (current?.token === token) await fs.rm(lock, { force: true });
 }
 
-async function removeInvalidLockIfUnchanged(lock: string, mtimeMs: number): Promise<void> {
-  const current = await readLockOwner(lock);
-  if (!current.owner && current.mtimeMs === mtimeMs) await fs.rm(lock, { force: true });
+function reportLockCleanupFailure(
+  lock: string,
+  operationCompleted: boolean,
+  failureCount: number,
+): void {
+  const status = operationCompleted
+    ? "Credential store mutation completed successfully"
+    : "Credential store mutation failed";
+  try {
+    process.emitWarning(
+      `${status}, but ${failureCount} lock cleanup step(s) failed: ${lock}. ` +
+        "Future writers may time out; stop all writers before manually removing the abandoned lock",
+      {
+        type: "AuthStoreLockCleanupWarning",
+        code: "ANICODE_AUTH_LOCK_CLEANUP_FAILED",
+      },
+    );
+  } catch {
+    // Diagnostics must never alter the already-determined mutation outcome.
+  }
 }

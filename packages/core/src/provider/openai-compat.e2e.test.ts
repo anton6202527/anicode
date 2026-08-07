@@ -27,6 +27,76 @@ function sse(res: http.ServerResponse, payloads: unknown[]) {
 
 const chunkBase = { id: "cmpl-1", object: "chat.completion.chunk", created: 1, model: "fake" };
 
+async function streamToolArgumentFragments(fragments: string[]): Promise<StreamEvent[]> {
+  const fixtureServer = http.createServer((req, res) => {
+    req.on("end", () => {
+      sse(res, [
+        {
+          ...chunkBase,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+        ...fragments.map((argumentsText, index) => ({
+          ...chunkBase,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    ...(index === 0 ? { id: "call_stream", type: "function" } : {}),
+                    function: {
+                      ...(index === 0 ? { name: "bash" } : {}),
+                      arguments: argumentsText,
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        })),
+        { ...chunkBase, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ]);
+    });
+    req.resume();
+  });
+  await new Promise<void>((resolve) => fixtureServer.listen(0, "127.0.0.1", resolve));
+  const address = fixtureServer.address();
+  assert.ok(address && typeof address !== "string");
+
+  try {
+    const provider = new OpenAICompatProvider({
+      name: "fragment-fixture",
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      apiKey: "test",
+      streamUsage: false,
+    });
+    const events: StreamEvent[] = [];
+    for await (const event of provider.stream({ model: "fake", messages: [] })) {
+      events.push(event);
+    }
+    return events;
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      fixtureServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+}
+
+function assertToolArgumentStream(events: StreamEvent[], expectedJson: string): void {
+  const done = events.find((event) => event.type === "done");
+  assert.ok(done && done.type === "done");
+  assert.deepEqual(toolCallsOf(done.message)[0]?.args, JSON.parse(expectedJson));
+  assert.equal(
+    events
+      .filter((event) => event.type === "tool_call_delta")
+      .map((event) => (event.type === "tool_call_delta" ? event.argsText : ""))
+      .join(""),
+    expectedJson,
+  );
+}
+
 before(async () => {
   server = http.createServer((req, res) => {
     let body = "";
@@ -184,4 +254,23 @@ test("OpenAI 兼容层: 完整工具调用回路", async () => {
   const done2 = events2.find((e) => e.type === "done");
   assert.ok(done2 && done2.type === "done");
   assert.equal(done2.stopReason, "end_turn");
+});
+
+test("OpenAI 兼容层: 保留相邻重复的合法工具参数增量", async () => {
+  const expectedJson = '{"command":"echo haha"}';
+  const events = await streamToolArgumentFragments(['{"command":"echo ', "ha", "ha", '"}']);
+
+  assertToolArgumentStream(events, expectedJson);
+});
+
+test("OpenAI 兼容层: 累计全文快照不会被重复拼接", async () => {
+  const expectedJson = '{"command":"echo echo"}';
+  const events = await streamToolArgumentFragments([
+    '{"command":"echo',
+    '{"command":"echo',
+    '{"command":"echo echo',
+    expectedJson,
+  ]);
+
+  assertToolArgumentStream(events, expectedJson);
 });

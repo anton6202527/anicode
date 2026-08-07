@@ -226,11 +226,13 @@ function withoutEnvironmentVariable<T>(name: string, create: () => T): T {
   }
 }
 
-/** 兼容“增量片段”和“每次给累计全文”两种非标准实现，避免重复拼接。 */
+/** 兼容“增量片段”和“每次给累计全文”两种非标准实现。 */
 function mergeFragment(current: string, fragment: string | null | undefined): string {
   if (!fragment) return current;
   if (!current) return fragment;
-  if (fragment === current || current.endsWith(fragment)) return current;
+  // 只有“新片段包含当前全文”才能确定它是累计快照。
+  // current.endsWith(fragment) 也可能是两个相邻且内容相同的合法增量，
+  // 不能据此丢弃后一片（例如 "ha" + "ha"）。
   if (fragment.startsWith(current)) return fragment;
   return current + fragment;
 }

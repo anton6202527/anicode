@@ -32,7 +32,7 @@ GitHub Webhook → Check Run → Repair Worker → Merge Queue → Provenance
 | 项目                          | 已完成                                                                                                                                                                                                                                                                 | 强制不变量                                                                                                                                                      |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | SQLite / PostgreSQL           | SQLite WAL + `BEGIN IMMEDIATE`；PostgreSQL `SERIALIZABLE` 自动重试与 advisory/row locks；session/message、event、snapshot、command、outbox、worker、artifact、audit 统一后端；JSONL 会话带迁移门                                                                       | 幂等键唯一；会话追加与元数据更新时间同事务；claim/heartbeat/finish 都校验 owner + fencing token；旧 worker 不能提交结果                                         |
-| Keychain / Vault / KMS / OIDC | OS Keychain 同步引用；Vault KV v2 经 GitHub Actions OIDC 或 projected token JWT 登录；KMS ciphertext-at-rest；后端发现 `env:*`；轮换管理器撤销旧 lease；SQLite 审计                                                                                                    | 长期密钥不写 JSON/JSONL；provider/MCP/OTLP/shell 只在受信边界读取或短租约注入；桌面插件只传 Broker credential reference；静态敏感 MCP/OTLP header 与 env 被拒绝 |
+| Keychain / Vault / KMS / OIDC | OS Keychain 同步按需引用；Vault KV v2 经 GitHub Actions OIDC 或 projected token JWT 登录；KMS ciphertext-at-rest；后端只精确读取 `ANICODE_CREDENTIAL_KEYS` 声明的 `env:*`；轮换管理器撤销旧 lease；SQLite 审计                                                               | 长期密钥不写 JSON/JSONL；provider/MCP/OTLP/shell 只在受信边界读取或短租约注入；桌面插件只传 Broker credential reference；静态敏感 MCP/OTLP header 与 env 被拒绝 |
 | 强制出口                      | 内建 fetch、provider SDK、HTTP/stdio MCP、真实 Eval 模型请求、Remote Runtime、GitHub 都经 `NetworkProxy`；DNS 授权结果固定到 socket；Chrome 强制 proxy、禁直接 DNS；macOS Seatbelt 仅放行代理；OCI `--internal`/`--network none`；Kubernetes runner 无 DNS/公网 egress | 无代理时联网调用 fail-close；任意 runner 二进制即便忽略 `HTTP_PROXY` 也无法直连公网                                                                             |
 | PatchSet                      | `write`、`edit`、`apply_patch` 全部转 PatchSet；text/binary、rename、预览、base hash、角色审批、原子 journal、崩溃恢复、rollback、三方 merge；SessionManager、OpenAPI 与生成 SDK 暴露 prepare/get/approve/apply/rebase/rollback                                        | 冲突在写前发现；批次不能半提交；外部改动后不盲回滚；`.git`/`.anicode` 保持保护                                                                                  |
 | 类型化代码图                  | ast-grep/Tree-sitter 覆盖 JS/TS/TSX/Python/Go/Rust/Java；可选 LSP enrich；增量文件复用；定义/引用解析；lexical + graph + vector 混合检索                                                                                                                               | 未变文件不重解析；文件删除同步清理向量；本地 SQLite exact 与共享 pgvector HNSW 使用同一接口                                                                     |
@@ -62,10 +62,14 @@ npm install
 npm run dev:tui:demo
 ```
 
-真实 provider 默认把环境里的 API key 迁入 OS Keychain，再从原进程环境删除：
+真实 provider 会把环境里的 API key 移入当前进程 Credential Broker，再从该进程环境删除；普通启动
+不会自动写入或枚举 OS Keychain。需要长期保存时必须显式导入精确名称，并声明懒加载 allowlist：
 
 ```bash
-ANICODE_CREDENTIAL_BACKEND=keychain npm run dev:tui
+OPENAI_API_KEY='...' anicode credentials import OPENAI_API_KEY
+ANICODE_CREDENTIAL_BACKEND=keychain \
+ANICODE_CREDENTIAL_KEYS=OPENAI_API_KEY \
+npm run dev:tui
 ```
 
 TUI、daemon、Electron 与 VSCode 的新会话以同一目录下的 `runtime.db` 为主存储；检测到旧 `sessions/*.jsonl` 时会在首次访问时事务导入。旧文件保留作恢复备份，但数据库已有更新时不会被旧数据覆盖，删除会话也会同时删除迁移源，避免下次启动“复活”。
@@ -92,7 +96,7 @@ ANICODE_CONTAINER_PROXY_URL=http://anicode-egress-proxy:8080 \
 npm run dev:tui
 ```
 
-Vault/KMS 后端中的 key 使用 `env:OPENAI_API_KEY` 这类名称；无法 list 时显式给出要水合的名字：
+Vault/KMS 后端中的 key 使用 `env:OPENAI_API_KEY` 这类名称；启动不会自动 list，必须显式给出要水合的名字：
 
 ```bash
 ANICODE_CREDENTIAL_BACKEND=vault \

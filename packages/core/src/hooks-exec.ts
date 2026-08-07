@@ -23,7 +23,11 @@ import {
   type HookRegistration,
   type HookResult,
 } from "./hooks.js";
-import { terminateProcessTree, type ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import {
+  RuntimeTerminationError,
+  terminateProcessTree,
+  type ExecutionRuntime,
+} from "./runtime/isolated-runtime.js";
 import { sanitizedShellEnv } from "./tools/shell-spawn.js";
 
 export interface CommandHookConfig {
@@ -122,6 +126,13 @@ async function runCommandHook(
       if (payload.signal?.aborted || result.timedOut) return undefined;
       return interpretCommandHook(result.exitCode, result.output);
     } catch (error) {
+      // Cancellation is best-effort only after the runtime has proved the workload gone. Never
+      // let the caller's already-aborted signal hide an indeterminate external process tree.
+      if (error instanceof RuntimeTerminationError) {
+        throw new HookExecutionBoundaryError("Command hook termination proof failed", {
+          cause: error,
+        });
+      }
       if (payload.signal?.aborted) return undefined;
       throw new HookExecutionBoundaryError(
         `Command hook isolated execution failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -226,6 +237,7 @@ export function commandHook(
   return {
     event: cfg.event,
     mutatesWorkspace: true,
+    cancellation: "close-confirmed",
     ...(cfg.matcher !== undefined ? { matcher: cfg.matcher } : {}),
     handler: (payload) => runCommandHook(cfg, payload, options),
   };

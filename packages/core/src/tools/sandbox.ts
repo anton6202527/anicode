@@ -109,6 +109,24 @@ export function wrapWithSandbox(
 /** 生成 Seatbelt SBPL profile 文本。 */
 export function buildSeatbeltProfile(spec: SandboxSpec): string {
   const lines = ["(version 1)", "(allow default)", "(deny file-write*)"];
+  // Blocking credential CLI names is only a convenience guard: an interpreter could call
+  // Security.framework directly. Deny the per-user/system Keychain XPC services at the process
+  // sandbox boundary so model-visible commands cannot bypass CredentialBroker through another
+  // executable. This changes only the spawned process profile, never host Keychain configuration.
+  for (const service of [
+    "com.apple.securityd",
+    "com.apple.securityd.xpc",
+    "com.apple.securityd.general",
+    "com.apple.securityd.systemkeychain",
+    "com.apple.securityd.aps",
+    "com.apple.securityd.sos",
+    "com.apple.securityd.ckks",
+    "com.apple.security.XPCKeychainSandboxCheck",
+    "com.apple.security.keychain-circle-notification",
+    "com.apple.security.cloudkeychainproxy3",
+  ]) {
+    lines.push(`(deny mach-lookup (global-name ${sbplString(service)}))`);
+  }
   const roots =
     spec.policy === "workspace-write"
       ? dedupe([

@@ -130,25 +130,40 @@ export class PluginRuntime {
         continue;
       }
       const spec = entry.mcpServer!;
+      if (!("url" in spec)) {
+        // Native stdio children can detach into a new session outside killpg. Reject before the
+        // connector gets any chance to spawn; HTTP remains the production plugin transport.
+        this.status.set(entry.id, {
+          connected: false,
+          error: "stdio MCP requires managed cgroup/container/job-object containment",
+        });
+        continue;
+      }
       try {
-        let config: McpServerConfig;
-        if ("url" in spec) {
-          config = { ...spec, ...(spec.headers ? { headers: { ...spec.headers } } : {}) };
-        } else {
-          const scopedEnv: Record<string, string> = { ...spec.env };
-          const credentialEnv: Record<string, string> = { ...spec.credentialEnv };
-          for (const name of entry.requiresEnv ?? []) {
-            if (isCredentialEnvironmentName(name)) credentialEnv[name] = `env:${name}`;
-            else scopedEnv[name] = this.env[name] ?? "";
-          }
-          config = {
-            ...spec,
-            ...(spec.args ? { args: [...spec.args] } : {}),
-            ...(Object.keys(scopedEnv).length ? { env: scopedEnv } : {}),
-            ...(Object.keys(credentialEnv).length ? { credentialEnv } : {}),
-          };
-        }
+        const config: McpServerConfig = {
+          ...spec,
+          ...(spec.headers ? { headers: { ...spec.headers } } : {}),
+        };
         const { tools, clients } = await this.connect([config], this.connectHandlers);
+        if (
+          tools.some(
+            (tool) =>
+              tool.execution?.kind === "managed-external" &&
+              tool.execution.protocol === "mcp-stdio",
+          )
+        ) {
+          const closed = await Promise.allSettled(clients.map((client) => client.close()));
+          const failures = closed.flatMap((result) =>
+            result.status === "rejected" ? [result.reason] : [],
+          );
+          if (failures.length > 0) {
+            throw new AggregateError(
+              failures,
+              "Rejected stdio MCP connection and failed to close its clients",
+            );
+          }
+          throw new Error("stdio MCP requires managed process containment");
+        }
         this.connections.set(entry.id, { clients, tools });
         this.status.set(entry.id, { connected: true, toolCount: tools.length });
       } catch (err) {
@@ -170,7 +185,17 @@ export class PluginRuntime {
     const base = defaultTools();
     const registry = base.subset(base.names().filter((name) => !disabled.has(name)));
     for (const conn of this.suspended ? [] : this.connections.values()) {
-      for (const tool of conn.tools) registry.register(tool);
+      for (const tool of conn.tools) {
+        if (
+          tool.execution?.kind === "managed-external" &&
+          tool.execution.protocol === "mcp-stdio"
+        ) {
+          throw new TypeError(
+            `stdio MCP tool ${tool.def.name} requires managed process containment`,
+          );
+        }
+        registry.registerExtension(tool);
+      }
     }
     return registry;
   }

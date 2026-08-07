@@ -41,6 +41,37 @@ test("PersistentWorker: lease/cancel loss aborts the handler and cannot overwrit
   assert.equal((await queue.get(job.id))?.status, "cancelled");
 });
 
+test("PersistentWorker: stop immediately ends lease maintenance for a non-cooperative handler", async () => {
+  const queue = new DurableWorkerQueue();
+  await queue.enqueue("never", {});
+  const originalHeartbeat = queue.heartbeat.bind(queue);
+  let heartbeats = 0;
+  queue.heartbeat = (...args) => {
+    heartbeats++;
+    return originalHeartbeat(...args);
+  };
+  let started!: () => void;
+  const didStart = new Promise<void>((resolve) => (started = resolve));
+  const worker = new PersistentWorker(
+    "worker-stop",
+    queue,
+    {
+      async never() {
+        started();
+        await new Promise<never>(() => {});
+      },
+    },
+    1_000,
+  );
+
+  void worker.runOnce();
+  await didStart;
+  worker.stop();
+  await new Promise((resolve) => setTimeout(resolve, 650));
+
+  assert.equal(heartbeats, 0, "a stopped worker must let its lease expire for takeover");
+});
+
 test("Worker: 过期 lease 被另一个 worker 续跑，heartbeat 保持所有权", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-worker-"));
   try {

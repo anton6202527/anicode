@@ -2,11 +2,20 @@
 
 import { importPKCS8, SignJWT } from "jose";
 import type { CredentialBroker } from "../security/credentials.js";
+import {
+  credentialFetch,
+  credentialRequestTimeout,
+  credentialResponseLimit,
+  discardCredentialResponse,
+  readCredentialJson,
+  safeCredentialError,
+  withCredentialDeadline,
+} from "../security/credential-io.js";
 import type { NetworkProxy } from "./network-proxy.js";
 
 export interface GitHubAccessTokenProvider {
   /** Return a raw access token (without a `Bearer ` prefix). */
-  token(forceRefresh?: boolean): Promise<string>;
+  token(forceRefresh?: boolean, signal?: AbortSignal): Promise<string>;
 }
 
 export interface GitHubAppInstallationTokenOptions {
@@ -21,6 +30,10 @@ export interface GitHubAppInstallationTokenOptions {
   apiVersion?: string;
   permissions?: Record<string, "read" | "write">;
   now?: () => number;
+  /** Absolute installation-token request deadline. Default: 30 seconds. */
+  requestTimeoutMs?: number;
+  /** Maximum installation-token response size. Default: 256 KiB. */
+  maxResponseBytes?: number;
 }
 
 interface InstallationTokenResponse {
@@ -28,6 +41,8 @@ interface InstallationTokenResponse {
   expires_at?: string;
   repositories?: Array<{ full_name?: string; name?: string }>;
 }
+
+const MAX_INSTALLATION_TOKEN_TTL_MS = 2 * 60 * 60_000;
 
 function positiveInteger(value: string | number, name: string): string {
   const parsed = String(value);
@@ -46,6 +61,8 @@ export class GitHubAppInstallationTokenSource implements GitHubAccessTokenProvid
   private readonly apiVersion: string;
   private cached: { token: string; expiresAt: number } | undefined;
   private refreshing: Promise<{ token: string; expiresAt: number }> | undefined;
+  private readonly requestTimeoutMs: number;
+  private readonly maxResponseBytes: number;
 
   constructor(private readonly options: GitHubAppInstallationTokenOptions) {
     this.appId = positiveInteger(options.appId, "GitHub App id");
@@ -55,22 +72,39 @@ export class GitHubAppInstallationTokenSource implements GitHubAccessTokenProvid
     }
     this.base = (options.apiBase ?? "https://api.github.com").replace(/\/+$/, "");
     this.apiVersion = options.apiVersion ?? "2026-03-10";
+    this.requestTimeoutMs = credentialRequestTimeout(options.requestTimeoutMs, 30_000);
+    this.maxResponseBytes = credentialResponseLimit(options.maxResponseBytes, 256 * 1024);
   }
 
-  async token(forceRefresh = false): Promise<string> {
+  async token(forceRefresh = false, signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted)
+      throw safeCredentialError("GitHub installation token request was cancelled");
     const now = this.now();
     if (!forceRefresh && this.cached && this.cached.expiresAt - 5 * 60_000 > now) {
       return this.cached.token;
     }
-    if (!forceRefresh && this.refreshing) return (await this.refreshing).token;
-    const refresh = this.mint();
+    const refresh = this.refreshing ?? this.startRefresh();
+    // Minting is shared and owns its own deadline. One disconnected waiter must not abort the
+    // refresh required by the remaining callers.
+    return withCredentialDeadline(
+      "GitHub installation token request",
+      this.requestTimeoutMs,
+      signal,
+      async () => (await refresh).token,
+    );
+  }
+
+  private startRefresh(): Promise<{ token: string; expiresAt: number }> {
+    const refresh = this.mint()
+      .then((value) => {
+        this.cached = value;
+        return value;
+      })
+      .finally(() => {
+        if (this.refreshing === refresh) this.refreshing = undefined;
+      });
     this.refreshing = refresh;
-    try {
-      this.cached = await refresh;
-      return this.cached.token;
-    } finally {
-      if (this.refreshing === refresh) this.refreshing = undefined;
-    }
+    return refresh;
   }
 
   clear(): void {
@@ -81,7 +115,18 @@ export class GitHubAppInstallationTokenSource implements GitHubAccessTokenProvid
     return this.options.now?.() ?? Date.now();
   }
 
-  private async mint(): Promise<{ token: string; expiresAt: number }> {
+  private mint(): Promise<{ token: string; expiresAt: number }> {
+    return withCredentialDeadline(
+      "GitHub installation token request",
+      this.requestTimeoutMs,
+      undefined,
+      (signal) => this.mintWithinBoundary(signal),
+    );
+  }
+
+  private async mintWithinBoundary(
+    signal: AbortSignal,
+  ): Promise<{ token: string; expiresAt: number }> {
     const target = new URL(
       `${this.base}/app/installations/${encodeURIComponent(this.installationId)}/access_tokens`,
     );
@@ -101,48 +146,74 @@ export class GitHubAppInstallationTokenSource implements GitHubAccessTokenProvid
       .setIssuedAt(nowSeconds - 60)
       .setExpirationTime(nowSeconds + 9 * 60)
       .sign(key);
-    const response = await this.options.proxy.fetch(target, {
-      method: "POST",
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${jwt}`,
-        "content-type": "application/json",
-        "x-github-api-version": this.apiVersion,
-      },
-      body: JSON.stringify({
-        repositories: [this.options.repo],
-        permissions: this.options.permissions ?? {
-          actions: "write",
-          checks: "write",
-          contents: "write",
-          pull_requests: "write",
+    return credentialFetch(
+      {
+        label: "GitHub installation token request",
+        fetch: (input, init) =>
+          this.options.proxy.fetch(input instanceof Request ? input.url : input, init),
+        input: target,
+        init: {
+          method: "POST",
+          headers: {
+            accept: "application/vnd.github+json",
+            authorization: `Bearer ${jwt}`,
+            "content-type": "application/json",
+            "x-github-api-version": this.apiVersion,
+          },
+          body: JSON.stringify({
+            repositories: [this.options.repo],
+            permissions: this.options.permissions ?? {
+              actions: "write",
+              checks: "write",
+              contents: "write",
+              pull_requests: "write",
+            },
+          }),
         },
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(
-        `GitHub installation token HTTP ${response.status}: ${(await response.text()).slice(0, 1_000)}`,
-      );
-    }
-    const body = (await response.json()) as InstallationTokenResponse;
-    if (!body.token || !body.expires_at) {
-      throw new Error("GitHub installation token response is incomplete");
-    }
-    const expiresAt = Date.parse(body.expires_at);
-    if (!Number.isFinite(expiresAt) || expiresAt <= this.now() + 60_000) {
-      throw new Error("GitHub installation token expiry is invalid or too short");
-    }
-    if (
-      body.repositories?.length &&
-      !body.repositories.some(
-        (repository) =>
-          repository.full_name?.toLowerCase() ===
-            `${this.options.owner}/${this.options.repo}`.toLowerCase() ||
-          repository.name?.toLowerCase() === this.options.repo.toLowerCase(),
-      )
-    ) {
-      throw new Error("GitHub installation token was not scoped to the configured repository");
-    }
-    return { token: body.token, expiresAt };
+        requestTimeoutMs: this.requestTimeoutMs,
+        maxResponseBytes: this.maxResponseBytes,
+        signal,
+      },
+      async (response, responseSignal, maximumBytes) => {
+        if (!response.ok) {
+          discardCredentialResponse(response, "GitHub installation token request rejected");
+          throw safeCredentialError(
+            `GitHub installation token request failed: HTTP ${response.status}`,
+          );
+        }
+        const body = await readCredentialJson<InstallationTokenResponse>(
+          response,
+          maximumBytes,
+          responseSignal,
+          "GitHub installation token request",
+        );
+        if (!body.token || !body.expires_at) {
+          throw safeCredentialError("GitHub installation token response is incomplete");
+        }
+        const expiresAt = Date.parse(body.expires_at);
+        const now = this.now();
+        if (
+          !Number.isFinite(expiresAt) ||
+          expiresAt <= now + 60_000 ||
+          expiresAt > now + MAX_INSTALLATION_TOKEN_TTL_MS
+        ) {
+          throw safeCredentialError("GitHub installation token expiry is invalid or too short");
+        }
+        if (
+          body.repositories?.length &&
+          !body.repositories.some(
+            (repository) =>
+              repository.full_name?.toLowerCase() ===
+                `${this.options.owner}/${this.options.repo}`.toLowerCase() ||
+              repository.name?.toLowerCase() === this.options.repo.toLowerCase(),
+          )
+        ) {
+          throw safeCredentialError(
+            "GitHub installation token was not scoped to the configured repository",
+          );
+        }
+        return { token: body.token, expiresAt };
+      },
+    );
   }
 }

@@ -15,16 +15,58 @@
  *   兜底 → 积压，下一次 send 开始时经 promotePending 注入。
  */
 
+export interface SteeringInboxLimits {
+  maxQueuedInputs?: number;
+  maxQueuedBytes?: number;
+  maxInputBytes?: number;
+}
+
+const DEFAULT_MAX_QUEUED_INPUTS = 128;
+const DEFAULT_MAX_QUEUED_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_INPUT_BYTES = 8 * 1024 * 1024;
+
+function positiveLimit(value: number | undefined, fallback: number, name: string): number {
+  const candidate = value ?? fallback;
+  if (!Number.isSafeInteger(candidate) || candidate < 1) {
+    throw new TypeError(`${name} must be a positive integer`);
+  }
+  return candidate;
+}
+
 export class SteeringInbox {
   private accepting = false;
   /** steering：运行中追加的用户输入，turn 边界注入。 */
   private queuedInputs: string[] = [];
+  private queuedInputBytes = 0;
   /** drive 运行中到达的任务完成通知：turn 边界作为 internal user 注入。 */
   private notices: string[] = [];
   /** 空闲时到达且无 onIdle 出口的通知：下一次 send 开始时注入。 */
   private pending: string[] = [];
 
-  constructor(private readonly onIdle?: (text: string) => void) {}
+  private readonly maxQueuedInputs: number;
+  private readonly maxQueuedBytes: number;
+  private readonly maxInputBytes: number;
+
+  constructor(
+    private readonly onIdle?: (text: string) => void,
+    limits: SteeringInboxLimits = {},
+  ) {
+    this.maxQueuedInputs = positiveLimit(
+      limits.maxQueuedInputs,
+      DEFAULT_MAX_QUEUED_INPUTS,
+      "maxQueuedInputs",
+    );
+    this.maxQueuedBytes = positiveLimit(
+      limits.maxQueuedBytes,
+      DEFAULT_MAX_QUEUED_BYTES,
+      "maxQueuedBytes",
+    );
+    this.maxInputBytes = positiveLimit(
+      limits.maxInputBytes,
+      DEFAULT_MAX_INPUT_BYTES,
+      "maxInputBytes",
+    );
+  }
 
   // ---------- 接收窗口 ----------
 
@@ -49,7 +91,20 @@ export class SteeringInbox {
   /** 追加一条 steering 输入。窗口关着返回 false（调用方应把消息排到下一次 send）。 */
   enqueue(text: string): boolean {
     if (!this.accepting) return false;
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > this.maxInputBytes) {
+      throw new Error(`Steering input exceeds ${this.maxInputBytes} bytes`);
+    }
+    if (
+      this.queuedInputs.length >= this.maxQueuedInputs ||
+      this.queuedInputBytes + bytes > this.maxQueuedBytes
+    ) {
+      throw new Error(
+        `Steering queue capacity exceeded (${this.maxQueuedInputs} inputs / ${this.maxQueuedBytes} bytes)`,
+      );
+    }
     this.queuedInputs.push(text);
+    this.queuedInputBytes += bytes;
     return true;
   }
 
@@ -58,6 +113,7 @@ export class SteeringInbox {
     this.accepting = false;
     const count = this.queuedInputs.length;
     this.queuedInputs = [];
+    this.queuedInputBytes = 0;
     return count;
   }
 
@@ -65,8 +121,14 @@ export class SteeringInbox {
     return this.queuedInputs.length > 0;
   }
 
+  get queuedCount(): number {
+    return this.queuedInputs.length;
+  }
+
   shiftQueued(): string | undefined {
-    return this.queuedInputs.shift();
+    const value = this.queuedInputs.shift();
+    if (value !== undefined) this.queuedInputBytes -= Buffer.byteLength(value, "utf8");
+    return value;
   }
 
   // ---------- 任务通知（三级投递） ----------

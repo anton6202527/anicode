@@ -17,6 +17,41 @@ command -v jq >/dev/null
 enforce="$(kubectl get namespace "$namespace" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')"
 test "$enforce" = "restricted"
 
+# Keep the deployed controller's least-privilege RBAC synchronized with KubernetesJobRuntime's
+# two-phase protocol: create a suspended Job, UID-bound PATCH it active, and manage only exact-name
+# execution-scoped Secrets. `kubectl auth can-i` checks the effective RoleBindings, not just YAML.
+controller_identity="system:serviceaccount:${namespace}:anicode-control-plane"
+require_controller_permission() {
+  local verb="$1"
+  local resource="$2"
+  local allowed
+  allowed="$(kubectl auth can-i "$verb" "$resource" --as="$controller_identity" -n "$namespace")"
+  if test "$allowed" != "yes"; then
+    echo "controller RBAC is missing: $verb $resource" >&2
+    exit 1
+  fi
+}
+deny_controller_permission() {
+  local verb="$1"
+  local resource="$2"
+  local allowed
+  allowed="$(kubectl auth can-i "$verb" "$resource" --as="$controller_identity" -n "$namespace")"
+  if test "$allowed" != "no"; then
+    echo "controller RBAC is broader than required: $verb $resource" >&2
+    exit 1
+  fi
+}
+
+for verb in create get list watch delete patch; do
+  require_controller_permission "$verb" jobs.batch
+done
+for verb in create get delete; do
+  require_controller_permission "$verb" secrets
+done
+for verb in list watch update patch; do
+  deny_controller_permission "$verb" secrets
+done
+
 control_image="$(kubectl -n "$namespace" get deployment anicode-remote-runtime \
   -o jsonpath='{.spec.template.spec.containers[0].image}')"
 runner_image="$(kubectl -n "$namespace" get deployment anicode-remote-runtime \

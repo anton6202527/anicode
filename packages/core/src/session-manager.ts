@@ -18,11 +18,12 @@ import { t } from "./i18n.js";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import type { ChatMessage, Usage } from "./types.js";
+import type { ChatMessage, Provider, StreamEvent, StreamRequest, Usage } from "./types.js";
 import {
   Agent,
   validateRunBudgetSnapshot,
   type AgentEvent,
+  type AgentModelInfo,
   type AgentOptions,
   type AgentResolvedModel,
   type RunBudgetSnapshot,
@@ -201,8 +202,13 @@ interface ScopedWorkspaceIdentity {
 }
 
 export interface SessionManagerOptions {
-  /** 按 model 字符串产出 provider 实例（通常包 createProvider） */
-  resolveProvider: (model: string) => AgentResolvedModel;
+  /** 按 model 字符串产出 provider 实例（通常包 createProvider）；仅在首次模型流开始时调用。 */
+  resolveProvider: (model: string) => AgentResolvedModel | Promise<AgentResolvedModel>;
+  /**
+   * 不读取凭据、不构造 SDK client 的纯模型检查入口。生产宿主应绑定 registry 的
+   * `inspectProvider`；省略时为旧嵌入方保留非空 model 检查，并把完整解析延迟到 send。
+   */
+  inspectProvider?: (model: string) => SessionModelInspection;
   store: ISessionStore;
   /** 传入即为所有会话启用工具集（默认 Agent 内置默认工具） */
   tools?: () => ToolRegistry;
@@ -390,6 +396,7 @@ interface RecoveredSessionProjection {
 
 interface PendingSend extends SendWaiter {
   text: string;
+  bytes: number;
   /** per-prompt 模型覆盖：仅这一次 drive 用该模型。 */
   model?: string;
   /** 崩溃恢复：输入是内部续跑指令，不重复原始用户 prompt。 */
@@ -401,7 +408,22 @@ interface PendingSend extends SendWaiter {
   onRunBudgetCheckpoint?: AgentOptions["onRunBudgetCheckpoint"];
 }
 
-type ResolvedProvider = ReturnType<SessionManagerOptions["resolveProvider"]>;
+type ResolvedProvider = Awaited<ReturnType<SessionManagerOptions["resolveProvider"]>>;
+
+/** Session lifecycle can retain this metadata without opening a credential backend. */
+export interface SessionModelInspection {
+  model: string;
+  providerId?: string;
+  modelInfo?: AgentModelInfo;
+}
+
+interface DeferredProviderState {
+  readonly spec: string;
+  readonly inspected: SessionModelInspection;
+  readonly authoritativeInspection: boolean;
+  resolved?: ResolvedProvider;
+  inFlight?: Promise<ResolvedProvider>;
+}
 
 const SESSION_OPERATION_LEASE_MS = 30_000;
 const SESSION_LIFECYCLE_POLL_MS = 25;
@@ -414,6 +436,9 @@ const SUBAGENT_STATE_MEDIA_TYPE = "application/vnd.anicode.subagent-state+json";
 const SUBAGENT_CHECKPOINTS_PER_TASK = 2;
 const MAX_RUNTIME_FAILURES_PER_SESSION = 128;
 const MAX_DURABILITY_FAILURE_DETAILS = 64;
+const MAX_SESSION_PROMPT_BYTES = 8 * 1024 * 1024;
+const MAX_PENDING_SESSION_SENDS = 128;
+const MAX_PENDING_SESSION_SEND_BYTES = 16 * 1024 * 1024;
 
 function nonNegativeInteger(value: unknown): number | undefined {
   const parsed = Number(value);
@@ -482,6 +507,7 @@ class ManagedSession {
   private driving = false;
   private checkpoints: Checkpoint[];
   private pendingSends: PendingSend[] = [];
+  private pendingSendBytes = 0;
   private currentWaiters: SendWaiter[] = [];
   private idleWaiters = new Set<() => void>();
   private closed = false;
@@ -657,6 +683,10 @@ class ManagedSession {
     if (this.closed) {
       return Promise.reject(new Error(t("Session is being deleted", "会话正在删除")));
     }
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_SESSION_PROMPT_BYTES) {
+      return Promise.reject(new Error(`Session input exceeds ${MAX_SESSION_PROMPT_BYTES} bytes`));
+    }
     this.touch();
     return new Promise((resolve, reject) => {
       if (this.agent.queue(text)) {
@@ -667,8 +697,20 @@ class ManagedSession {
       }
       // Agent 已决定 done/error 但 generator 尚在收尾时，作为下一次 drive 排队，
       // 不能塞回一个再也不会 drain 的 Agent 队列。
+      if (
+        this.pendingSends.length >= MAX_PENDING_SESSION_SENDS ||
+        this.pendingSendBytes + bytes > MAX_PENDING_SESSION_SEND_BYTES
+      ) {
+        reject(
+          new Error(
+            `Session send queue capacity exceeded (${MAX_PENDING_SESSION_SENDS} inputs / ${MAX_PENDING_SESSION_SEND_BYTES} bytes)`,
+          ),
+        );
+        return;
+      }
       this.pendingSends.push({
         text,
+        bytes,
         resolve,
         reject,
         steering: false,
@@ -681,6 +723,7 @@ class ManagedSession {
           ? { onRunBudgetCheckpoint: opts.onRunBudgetCheckpoint }
           : {}),
       });
+      this.pendingSendBytes += bytes;
       if (!this.driving) void this.pump();
     });
   }
@@ -692,6 +735,7 @@ class ManagedSession {
     try {
       while (this.pendingSends.length > 0) {
         const next = this.pendingSends.shift()!;
+        this.pendingSendBytes -= next.bytes;
         this.currentWaiters = [next];
         this.abort = new AbortController();
         try {
@@ -806,11 +850,16 @@ class ManagedSession {
     // 必须先同步关闭 Agent 的 steering 门，再广播 abort。AbortSignal listener
     // 可能同步重入 send；该消息应排入下一 drive，而非注入即将终止的本轮。
     this.agent.clearQueue();
+    // Snapshot only work that existed at the interrupt boundary. A synchronous AbortSignal
+    // listener may enqueue a new send after the steering gate closes; that belongs to the next
+    // drive and must not be swept up with the already-pending work being interrupted.
+    const interruptedPending = this.pendingSends.splice(0);
+    this.pendingSendBytes = 0;
     this.abort?.abort();
     const interrupted = new Error(t("Session interrupted", "会话已中断"));
     for (const waiter of this.currentWaiters.filter((w) => w.steering)) waiter.reject(interrupted);
     this.currentWaiters = this.currentWaiters.filter((w) => !w.steering);
-    for (const pending of this.pendingSends.splice(0)) pending.reject(interrupted);
+    for (const pending of interruptedPending) pending.reject(interrupted);
     // 中断时，把待决权限拒掉让 loop 尽快收束
     for (const [permId] of this.pending) this.answerPermission(permId, "deny");
   }
@@ -1224,9 +1273,9 @@ export class SessionManager {
     // session never recovers workspace-wide journals: only an existing owning session may do so.
     const workspace = await this.assertWorkspaceInScope(input.cwd);
     const cwd = workspace.canonicalPath;
-    // provider 解析可能因未知配置失败；必须在落盘前完成，避免留下一个永远
-    // 无法 open/resume 的孤儿 JSONL。解析结果直接交给 instantiate，勿重复创建。
-    const resolved = this.opts.resolveProvider(input.model);
+    // 这里只做纯 descriptor/model 检查。凭据读取与 SDK client 构造必须等到第一次
+    // 真正消费 provider stream，避免 App/VS Code/TUI 启动或浏览历史时唤起钥匙串。
+    const inspected = this.inspectSessionModel(input.model);
     const workspaceTrust = await this.assessWorkspaceTrust(cwd);
     const id = newSessionId((this.opts.now ?? Date.now)(), this.opts.rand ?? Math.random);
     return this.runNewSessionOperation(id, workspace, async () => {
@@ -1239,7 +1288,7 @@ export class SessionManager {
         model: input.model,
         ...(input.title ? { title: input.title } : {}),
       });
-      this.instantiate(meta, [], resolved, workspaceTrust);
+      this.instantiate(meta, [], inspected, workspaceTrust);
       await this.runtime.record({
         streamId: meta.id,
         type: "session.created",
@@ -1281,8 +1330,8 @@ export class SessionManager {
         true,
       );
       const cwd = workspace.canonicalPath;
-      // Resolve before writing anything so an invalid model cannot leave an unusable fork behind.
-      const resolved = this.opts.resolveProvider(model);
+      // Pure validation stays before persistence; credential materialization remains send-only.
+      const inspected = this.inspectSessionModel(model);
       const workspaceTrust = await this.assessWorkspaceTrust(cwd);
       const id = newSessionId((this.opts.now ?? Date.now)(), this.opts.rand ?? Math.random);
       const title = opts?.title ?? (snap.meta.title ? `${snap.meta.title} (fork)` : undefined);
@@ -1298,7 +1347,7 @@ export class SessionManager {
         });
         // 复制的历史整体落盘（rewrite 原子替换含 meta 头的整份文件）。
         await this.opts.store.rewrite(meta, messages);
-        this.instantiate(meta, messages, resolved, workspaceTrust);
+        this.instantiate(meta, messages, inspected, workspaceTrust);
         return { ...meta, running: false };
       });
     });
@@ -1347,13 +1396,13 @@ export class SessionManager {
       });
     }
     this.assertSessionAvailable(sessionId);
-    const resolved = this.opts.resolveProvider(meta.model);
+    const inspected = this.inspectSessionModel(meta.model);
     const recovered = await this.recoverSessionProjection(meta.id);
     this.assertSessionAvailable(sessionId);
     const session = this.instantiate(
       meta,
       data.messages,
-      resolved,
+      inspected,
       workspaceTrust,
       listeners,
       recovered,
@@ -1378,6 +1427,10 @@ export class SessionManager {
     text: string,
     opts?: { model?: string; idempotencyKey?: string; traceparent?: string },
   ): Promise<void> {
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_SESSION_PROMPT_BYTES) {
+      throw new Error(`Session input exceeds ${MAX_SESSION_PROMPT_BYTES} bytes`);
+    }
     const interruptEpoch = this.interruptEpochs.get(sessionId) ?? 0;
     return this.runSessionOperation(sessionId, () =>
       this.sendInternal(sessionId, text, opts, interruptEpoch),
@@ -3361,6 +3414,112 @@ export class SessionManager {
     return defaultSmallModel(resolved.modelInfo?.providerId);
   }
 
+  /** Validate provider/model metadata without touching a credential backend. */
+  private inspectSessionModel(spec: string): SessionModelInspection {
+    const normalizedSpec = spec.trim();
+    if (!normalizedSpec) {
+      throw new TypeError(t("model must be a non-empty string", "model 必须是非空字符串"));
+    }
+    const inspected = this.opts.inspectProvider?.(spec) ?? { model: normalizedSpec };
+    if (
+      !inspected ||
+      typeof inspected !== "object" ||
+      typeof inspected.model !== "string" ||
+      inspected.model.trim().length === 0
+    ) {
+      throw new TypeError(
+        t("inspectProvider returned an invalid model", "inspectProvider 返回了无效 model"),
+      );
+    }
+    return {
+      model: inspected.model.trim(),
+      ...(inspected.providerId ? { providerId: inspected.providerId } : {}),
+      ...(inspected.modelInfo ? { modelInfo: inspected.modelInfo } : {}),
+    };
+  }
+
+  /**
+   * Build session-scoped Provider proxies. Resolution is single-flight per model and a failed
+   * attempt is deliberately not cached, so adding/fixing credentials can recover on the next send.
+   */
+  private deferredProviderResolver(
+    initialSpec: string,
+    initialInspection: SessionModelInspection,
+  ): (spec: string) => ResolvedProvider {
+    const states = new Map<string, DeferredProviderState>();
+
+    const resolveDeferred = (spec: string): ResolvedProvider => {
+      const key = spec.trim();
+      let state = states.get(key);
+      if (!state) {
+        const inspected =
+          key === initialSpec.trim() ? initialInspection : this.inspectSessionModel(spec);
+        state = {
+          spec,
+          inspected,
+          authoritativeInspection: this.opts.inspectProvider !== undefined,
+        };
+        states.set(key, state);
+      }
+
+      const current = state;
+      const materialize = async (): Promise<ResolvedProvider> => {
+        if (current.resolved) return current.resolved;
+        let task = current.inFlight;
+        if (!task) {
+          task = Promise.resolve().then(async () => {
+            const resolved = await this.opts.resolveProvider(current.spec);
+            if (
+              !resolved ||
+              typeof resolved.model !== "string" ||
+              resolved.model.trim().length === 0 ||
+              !resolved.provider ||
+              typeof resolved.provider.stream !== "function"
+            ) {
+              throw new TypeError("resolveProvider returned an invalid provider/model");
+            }
+            if (current.authoritativeInspection && resolved.model !== current.inspected.model) {
+              throw new Error(
+                `Provider model changed after inspection: ${current.inspected.model} -> ${resolved.model}`,
+              );
+            }
+            return resolved;
+          });
+          current.inFlight = task;
+        }
+        try {
+          const resolved = await task;
+          current.resolved = resolved;
+          return resolved;
+        } finally {
+          if (current.inFlight === task) delete current.inFlight;
+        }
+      };
+
+      const providerName =
+        current.inspected.providerId ??
+        current.inspected.modelInfo?.providerId ??
+        key.split("/", 1)[0] ??
+        "deferred";
+      const provider: Provider = {
+        name: providerName,
+        stream(request: StreamRequest): AsyncIterable<StreamEvent> {
+          return (async function* deferredStream() {
+            const resolved = await materialize();
+            yield* resolved.provider.stream({ ...request, model: resolved.model });
+          })();
+        },
+      };
+      return {
+        provider,
+        model: current.inspected.model,
+        ...(current.inspected.modelInfo ? { modelInfo: current.inspected.modelInfo } : {}),
+      };
+    };
+
+    return resolveDeferred;
+  }
+
   private async assessWorkspaceTrust(cwd: string): Promise<WorkspaceTrustAssessment | undefined> {
     const source = this.opts.workspaceTrust;
     if (!source) return undefined;
@@ -3392,11 +3551,13 @@ export class SessionManager {
   private instantiate(
     meta: SessionMeta,
     resumeMessages: ChatMessage[],
-    resolved: ResolvedProvider,
+    inspected: SessionModelInspection,
     workspaceTrust?: WorkspaceTrustAssessment,
     listeners?: Set<SessionListener>,
     recovered: RecoveredSessionProjection = { checkpoints: [] },
   ): ManagedSession {
+    const resolveProvider = this.deferredProviderResolver(meta.model, inspected);
+    const resolved = resolveProvider(meta.model);
     const restricted = workspaceTrust?.trusted === false;
     const requestedDefault = (this.opts.permission?.mode ?? "default") === "default";
     // Entry-point intent is independent of the requested trusted-workspace permission mode. A
@@ -3451,7 +3612,7 @@ export class SessionManager {
             void this.send(meta.id, text).catch(() => {});
           },
           ...(resolved.modelInfo ? { modelInfo: resolved.modelInfo } : {}),
-          resolveModel: this.opts.resolveProvider,
+          resolveModel: resolveProvider,
           ...(this.smallModelSpec(resolved) ? { smallModel: this.smallModelSpec(resolved)! } : {}),
           ...(this.opts.fallbackModels?.length ? { fallbackModels: this.opts.fallbackModels } : {}),
           ...(this.opts.runBudget ? { runBudget: this.opts.runBudget } : {}),

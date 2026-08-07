@@ -23,6 +23,17 @@ test("MCP catalog: local packages are pinned and deprecated servers are absent",
   assert.ok(!commands.some((arg) => arg.includes("server-web-search")));
 });
 
+test("MCP catalog: browser servers use disposable profiles without host credential stores", () => {
+  const playwright = findDevelopmentMcp("playwright")!;
+  const chrome = findDevelopmentMcp("chrome-devtools")!;
+  assert.ok("command" in playwright.server && "command" in chrome.server);
+  if (!("command" in playwright.server) || !("command" in chrome.server)) return;
+  assert.ok(playwright.server.args?.includes("--isolated"));
+  assert.ok(chrome.server.args?.includes("--isolated"));
+  assert.ok(chrome.server.args?.includes("--chrome-arg=--use-mock-keychain"));
+  assert.ok(chrome.server.args?.includes("--chrome-arg=--password-store=basic"));
+});
+
 test("MCP catalog: hosted credentials are broker references, never token values", () => {
   const github = findDevelopmentMcp("github")!;
   assert.ok("url" in github.server);

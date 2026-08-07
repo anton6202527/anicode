@@ -6,10 +6,12 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  AuthStore,
   createLocalRuntimeStack,
   registerOpenAICompatibleProvider,
   WorkspaceTrustStore,
   type SessionHost,
+  type SyncSecretBackend,
 } from "@anicode/core";
 import {
   assertProviderConfigured,
@@ -24,8 +26,10 @@ import {
   resolveConfiguredProvider,
   resolveDefaultModel,
   resolveInteractivePermissionMode,
+  runAuthCommand,
   runMcpCatalogCommand,
   runMcpCommand,
+  runCredentialsCommand,
   runTrustCommand,
   runExecCommand,
   selectSessionId,
@@ -35,6 +39,252 @@ import {
   validateArgs,
 } from "./cli.js";
 import { terminalMouseModeSequence } from "./app.js";
+
+class RecordingCredentialBackend implements SyncSecretBackend {
+  readonly kind: string;
+  readonly values = new Map<string, string>();
+  getCalls = 0;
+  listCalls = 0;
+
+  constructor(kind = "recording-test-backend") {
+    this.kind = kind;
+  }
+
+  getSync(key: string): string | undefined {
+    this.getCalls++;
+    return this.values.get(key);
+  }
+  putSync(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+  deleteSync(key: string): boolean {
+    return this.values.delete(key);
+  }
+  listSync(): string[] {
+    this.listCalls++;
+    throw new Error("credentials list must not enumerate the secret backend");
+  }
+  async get(key: string): Promise<string | undefined> {
+    return this.getSync(key);
+  }
+  async put(key: string, value: string): Promise<void> {
+    this.putSync(key, value);
+  }
+  async delete(key: string): Promise<boolean> {
+    return this.deleteSync(key);
+  }
+  async list(): Promise<string[]> {
+    return this.listSync();
+  }
+}
+
+test("CLI credentials: import/remove 精确 key；list 只读 allowlist 元数据", async () => {
+  const backend = new RecordingCredentialBackend();
+  const env: NodeJS.ProcessEnv = {
+    ANICODE_CREDENTIAL_BACKEND: "keychain",
+    ANICODE_CREDENTIAL_KEYS: "DEEPSEEK_API_KEY, OPENAI_API_KEY,DEEPSEEK_API_KEY",
+    OPENAI_API_KEY: "explicit-test-secret",
+  };
+  const chunks: string[] = [];
+  const output = {
+    write(chunk: string) {
+      chunks.push(chunk);
+      return true;
+    },
+  } as unknown as NodeJS.WritableStream;
+
+  await runCredentialsCommand(["list"], { env, output, backend });
+  assert.deepEqual(chunks.splice(0), ["DEEPSEEK_API_KEY\n", "OPENAI_API_KEY\n"]);
+  assert.equal(backend.listCalls, 0);
+  assert.equal(backend.getCalls, 0);
+
+  await runCredentialsCommand(["import", "OPENAI_API_KEY"], { env, output, backend });
+  assert.equal(backend.values.get("env:OPENAI_API_KEY"), "explicit-test-secret");
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.doesNotMatch(chunks.join(""), /explicit-test-secret/);
+
+  await runCredentialsCommand(["remove", "OPENAI_API_KEY"], { env, output, backend });
+  assert.equal(backend.values.has("env:OPENAI_API_KEY"), false);
+  assert.equal(backend.getCalls, 0);
+  assert.equal(backend.listCalls, 0);
+});
+
+test("CLI credentials: 拒绝通配符、env: 前缀及 memory 持久化", async () => {
+  const output = { write: () => true } as unknown as NodeJS.WritableStream;
+  await assert.rejects(
+    runCredentialsCommand(["import", "*_TOKEN"], {
+      env: { "*_TOKEN": "secret" },
+      output,
+      backend: new RecordingCredentialBackend(),
+    }),
+    /精确|exact/,
+  );
+  await assert.rejects(
+    runCredentialsCommand(["remove", "env:OPENAI_API_KEY"], {
+      env: {},
+      output,
+      backend: new RecordingCredentialBackend(),
+    }),
+    /精确|exact/,
+  );
+  await assert.rejects(
+    runCredentialsCommand(["import", "openai_api_key"], {
+      env: { openai_api_key: "secret" },
+      output,
+      backend: new RecordingCredentialBackend(),
+    }),
+    /大写|uppercase/,
+  );
+  await assert.rejects(
+    runCredentialsCommand(["import", "OPENAI_API_KEY"], {
+      env: { ANICODE_CREDENTIAL_BACKEND: "memory", OPENAI_API_KEY: "secret" },
+      output,
+      backend: new RecordingCredentialBackend(),
+    }),
+    /memory.*不能持久化|memory.*cannot persist/,
+  );
+  await assert.rejects(
+    runCredentialsCommand(["remove", "OPENAI_API_KEY"], {
+      env: { ANICODE_CREDENTIAL_BACKEND: "keychain", ANICODE_DISABLE_OS_KEYCHAIN: "1" },
+      output,
+      backend: new RecordingCredentialBackend("os-keychain"),
+    }),
+    /forbids access to the operating-system credential store/,
+  );
+  await assert.rejects(
+    runCredentialsCommand(["import", "OPENAI_API_KEY"], {
+      env: { OPENAI_API_KEY: "x".repeat(64 * 1024 + 1) },
+      output,
+      backend: new RecordingCredentialBackend(),
+    }),
+    /65536.*字节|65536-byte/,
+  );
+});
+
+test("CLI credentials: 异步导入不删除并发替换的新环境值", async () => {
+  const env: NodeJS.ProcessEnv = { OPENAI_API_KEY: "value-being-imported" };
+  const backend = new RecordingCredentialBackend();
+  backend.put = async (key, value) => {
+    backend.putSync(key, value);
+    env.OPENAI_API_KEY = "newer-process-value";
+  };
+
+  await runCredentialsCommand(["import", "OPENAI_API_KEY"], {
+    env,
+    output: { write: () => true } as unknown as NodeJS.WritableStream,
+    backend,
+  });
+
+  assert.equal(backend.values.get("env:OPENAI_API_KEY"), "value-being-imported");
+  assert.equal(env.OPENAI_API_KEY, "newer-process-value");
+});
+
+test("CLI auth migrate: 仅在显式命令迁移旧凭证且不输出密钥", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-auth-migrate-"));
+  const file = path.join(dir, "auth.json");
+  const backend = new RecordingCredentialBackend();
+  const chunks: string[] = [];
+  const output = {
+    write(chunk: string) {
+      chunks.push(chunk);
+      return true;
+    },
+  } as unknown as NodeJS.WritableStream;
+  try {
+    await fs.writeFile(
+      file,
+      `${JSON.stringify({
+        anthropic: {
+          type: "oauth",
+          access: "must-not-print-access",
+          refresh: "must-not-print-refresh",
+          expiresAt: 123,
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const store = new AuthStore({ file, backend });
+
+    await runAuthCommand(["migrate"], { output, store });
+
+    assert.ok(backend.values.has("auth:anthropic"));
+    assert.equal(backend.values.has("auth-index:v1"), false);
+    const stateText = await fs.readFile(`${file}.state.json`, "utf8");
+    assert.deepEqual(JSON.parse(stateText), {
+      version: 1,
+      providers: {
+        anthropic: { mode: "backend-authoritative", type: "oauth", expiresAt: 123 },
+      },
+    });
+    assert.doesNotMatch(stateText, /"(?:access|refresh)"\s*:/);
+    assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")), {});
+    assert.match(chunks.join(""), /anthropic/);
+    assert.doesNotMatch(chunks.join(""), /must-not-print/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI auth metadata commands do not construct a Keychain backend under the sentinel", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-auth-metadata-"));
+  const file = path.join(dir, "auth.json");
+  const coordinationFile = path.join(dir, "auth-state.json");
+  const chunks: string[] = [];
+  const output = {
+    write(chunk: string) {
+      chunks.push(chunk);
+      return true;
+    },
+  } as unknown as NodeJS.WritableStream;
+  const storeOptions = {
+    file,
+    coordinationFile,
+    backend: "keychain" as const,
+    env: {
+      ANICODE_CREDENTIAL_BACKEND: "keychain",
+      ANICODE_DISABLE_OS_KEYCHAIN: "1",
+    },
+  };
+  try {
+    await fs.writeFile(
+      file,
+      `${JSON.stringify({
+        legacy: { type: "oauth", access: "hidden", refresh: "hidden", expiresAt: 11 },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await fs.writeFile(
+      coordinationFile,
+      `${JSON.stringify({
+        version: 1,
+        providers: {
+          migrated: { mode: "backend-authoritative", type: "oauth", expiresAt: 22 },
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    await runAuthCommand(["list"], { output, storeOptions });
+    assert.match(chunks.join(""), /legacy/);
+    assert.match(chunks.join(""), /migrated/);
+    assert.doesNotMatch(chunks.join(""), /hidden/);
+
+    await assert.rejects(
+      runAuthCommand(["login", "anthropic"], { output, storeOptions }),
+      /OAuth|oauth|disabled|禁用/,
+    );
+    await assert.rejects(
+      runAuthCommand(["logout", "anthropic"], { output, storeOptions }),
+      /forbids access to the operating-system credential store/,
+    );
+    await assert.rejects(
+      runAuthCommand(["migrate"], { output, storeOptions }),
+      /forbids access to the operating-system credential store/,
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("CLI: Ink 管理备用屏，清理器只做一次紧急恢复", () => {
   const chunks: string[] = [];

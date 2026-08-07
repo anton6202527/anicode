@@ -7,7 +7,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  bindProviderRegistry,
+  configureProviderCredentialBroker,
   configureProviderNetworkProxy,
+  CredentialBroker,
+  credentialScopesForEnvironment,
   createProvider,
   defaultSmallModel,
   diagnoseProvider,
@@ -16,11 +20,38 @@ import {
   listProviderDetails,
   listProviders,
   registerOpenAICompatibleProvider,
+  resolveDefaultModel,
   textMessage,
   toolCallsOf,
+  type SyncSecretBackend,
+  type SecretBackend,
 } from "../index.js";
 import { NetworkProxy } from "../runtime/network-proxy.js";
 import type { ChatMessage } from "../index.js";
+
+class CountingProviderSecretBackend implements SyncSecretBackend {
+  readonly kind = "sentinel-provider-backend";
+  reads = 0;
+
+  getSync(key: string): string | undefined {
+    this.reads++;
+    return key === "env:DEEPSEEK_API_KEY" ? "sentinel-deepseek-value" : undefined;
+  }
+
+  putSync(): void {}
+  deleteSync(): boolean {
+    return false;
+  }
+
+  async get(key: string): Promise<string | undefined> {
+    return this.getSync(key);
+  }
+
+  async put(): Promise<void> {}
+  async delete(): Promise<boolean> {
+    return false;
+  }
+}
 
 test("registry: 解析 provider/model 前缀", () => {
   const d = createProvider("deepseek/deepseek-chat");
@@ -237,6 +268,115 @@ test("registry: details/diagnostics 只暴露安全元数据，支持 env 端点
   }
 });
 
+test("registry: diagnostics/default model 不读取 configured reference，createProvider 才读取一次", () => {
+  const backend = new CountingProviderSecretBackend();
+  const broker = new CredentialBroker();
+  broker.registerReference({
+    id: "env:DEEPSEEK_API_KEY",
+    backend,
+    scopes: credentialScopesForEnvironment("DEEPSEEK_API_KEY"),
+  });
+  configureProviderCredentialBroker(broker, { allowEnvironmentFallback: false });
+  try {
+    const diagnostics = diagnoseProvider("deepseek/deepseek-chat");
+    assert.equal(diagnostics.credentialEnv, "DEEPSEEK_API_KEY");
+    assert.equal(diagnostics.credentialAvailability, "configured");
+    assert.equal(diagnostics.hasCredentials, true);
+    assert.equal(backend.reads, 0);
+
+    assert.equal(resolveDefaultModel(), "deepseek/deepseek-v4-flash");
+    assert.equal(backend.reads, 0);
+
+    const created = createProvider("deepseek/deepseek-chat");
+    assert.equal(created.diagnostics.credentialAvailability, "available");
+    assert.equal(created.diagnostics.hasCredentials, true);
+    assert.equal(backend.reads, 1);
+  } finally {
+    configureProviderCredentialBroker(undefined);
+  }
+});
+
+test("registry: async reference is hydrated once only by selected provider materialization", async () => {
+  const reads: string[] = [];
+  const backend: SecretBackend = {
+    kind: "utility-keychain-fixture",
+    get: async (key) => {
+      reads.push(key);
+      return key === "env:DEEPSEEK_API_KEY" ? "async-provider-secret" : undefined;
+    },
+    put: async () => undefined,
+    delete: async () => false,
+  };
+  const broker = new CredentialBroker();
+  broker.registerAsyncReference({
+    id: "env:DEEPSEEK_API_KEY",
+    backend,
+    scopes: credentialScopesForEnvironment("DEEPSEEK_API_KEY"),
+  });
+  const registry = bindProviderRegistry({
+    broker,
+    environment: {},
+    allowEnvironmentFallback: false,
+  });
+
+  assert.equal(
+    registry.diagnoseProvider("deepseek/deepseek-chat").credentialAvailability,
+    "configured",
+  );
+  assert.equal(await registry.discoverModels("deepseek"), undefined);
+  assert.deepEqual(reads, []);
+  const created = await registry.resolveProviderAsync("deepseek/deepseek-chat");
+  assert.equal(created.diagnostics.credentialAvailability, "available");
+  assert.deepEqual(reads, ["env:DEEPSEEK_API_KEY"]);
+  assert.equal(registry.resolveProvider("deepseek/deepseek-chat").diagnostics.hasCredentials, true);
+  assert.deepEqual(reads, ["env:DEEPSEEK_API_KEY"]);
+});
+
+test("registry: configured backend refusal is sanitized and does not probe fallback entries", () => {
+  const refusal = new Error("sentinel credential access was denied: raw-provider-secret");
+  let reads = 0;
+  const backend: SyncSecretBackend = {
+    kind: "sentinel-refusal-backend",
+    getSync: () => {
+      reads++;
+      throw refusal;
+    },
+    putSync: () => undefined,
+    deleteSync: () => false,
+    get: async () => {
+      reads++;
+      throw refusal;
+    },
+    put: async () => undefined,
+    delete: async () => false,
+  };
+  const broker = new CredentialBroker();
+  for (const name of ["GEMINI_API_KEY", "GOOGLE_API_KEY"]) {
+    broker.registerReference({
+      id: `env:${name}`,
+      backend,
+      scopes: credentialScopesForEnvironment(name),
+    });
+  }
+  configureProviderCredentialBroker(broker, { allowEnvironmentFallback: false });
+  try {
+    assert.throws(
+      () => createProvider("gemini/gemini-3.6-flash"),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.notEqual(error, refusal);
+        assert.equal(error.message, "Credential backend read failed");
+        assert.equal("cause" in error, false);
+        assert.doesNotMatch(String(error), /raw-provider-secret|sentinel credential access/u);
+        return true;
+      },
+    );
+    assert.equal(reads, 1);
+  } finally {
+    configureProviderCredentialBroker(undefined);
+  }
+});
+
 test("registry: 可注册 OpenAI-compatible profile 与 alias", () => {
   registerOpenAICompatibleProvider("fixture-compatible", {
     aliases: ["fixture-alias"],
@@ -315,7 +455,12 @@ test("registry: 云端 /models 通过统一网络策略鉴权探测并返回真�
     resolver: async () => ["93.184.216.34"],
     fetch: (async (input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
-      requests.push({ url: String(input), authorization: headers.get("authorization") });
+      const url = String(input);
+      assert.equal(url, "https://models.example.test/v1/models");
+      // NetworkProxy normalizes an omitted fetch method to an explicit GET.
+      assert.equal(init?.method, "GET");
+      assert.equal(init?.body, undefined);
+      requests.push({ url, authorization: headers.get("authorization") });
       return Response.json({ data: [{ id: "live-a" }, { id: "live-b" }] });
     }) as typeof fetch,
   });

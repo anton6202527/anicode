@@ -1,13 +1,75 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  bindProviderRegistry,
   configureProviderCredentialBroker,
+  CredentialBroker,
   credentialBrokerFromEnv,
   listModelCatalog,
   listProviderDetails,
 } from "@anicode/core";
-import type { ModelCatalogEntry, ProviderDescriptor } from "@anicode/core";
+import type {
+  ModelCatalogEntry,
+  ProviderDescriptor,
+  SecretBackend,
+  SyncSecretBackend,
+} from "@anicode/core";
 import { buildPickerRows } from "./app.js";
+
+test("/model 元数据浏览不会实例化 Keychain/Vault 引用", () => {
+  let keychainReads = 0;
+  let vaultReads = 0;
+  const keychain: SyncSecretBackend = {
+    kind: "fake-keychain",
+    getSync: () => {
+      keychainReads++;
+      return "must-not-be-read";
+    },
+    putSync: () => undefined,
+    deleteSync: () => false,
+    get: async (key) => keychain.getSync(key),
+    put: async (key, value) => keychain.putSync(key, value),
+    delete: async (key) => keychain.deleteSync(key),
+  };
+  const vault: SecretBackend = {
+    kind: "fake-vault",
+    get: async () => {
+      vaultReads++;
+      return "must-not-be-read";
+    },
+    put: async () => undefined,
+    delete: async () => false,
+  };
+  const broker = new CredentialBroker();
+  broker.registerReference({
+    id: "env:DEEPSEEK_API_KEY",
+    backend: keychain,
+    scopes: [{ audiences: ["provider:deepseek"] }],
+  });
+  broker.registerAsyncReference({
+    id: "env:GEMINI_API_KEY",
+    backend: vault,
+    scopes: [{ audiences: ["provider:gemini"] }],
+  });
+  configureProviderCredentialBroker(broker);
+
+  try {
+    const rows = buildPickerRows(
+      listModelCatalog().filter(
+        (entry) => entry.providerId === "deepseek" || entry.providerId === "gemini",
+      ),
+      listProviderDetails(),
+      true,
+    );
+
+    assert.ok(rows.some((row) => row.providerId === "deepseek" && row.ready === true));
+    assert.ok(rows.some((row) => row.providerId === "gemini" && row.ready === true));
+    assert.equal(keychainReads, 0);
+    assert.equal(vaultReads, 0);
+  } finally {
+    configureProviderCredentialBroker(undefined);
+  }
+});
 
 test("/model 通过 CredentialBroker 识别已从环境移除的 API Key", () => {
   const env: NodeJS.ProcessEnv = {
@@ -36,6 +98,47 @@ test("/model 通过 CredentialBroker 识别已从环境移除的 API Key", () =>
     );
   } finally {
     configureProviderCredentialBroker(undefined);
+  }
+});
+
+test("/model 信任 host 的实时探测，不会因 TUI 环境已清理而误报缺 Key", () => {
+  const hostEnv: NodeJS.ProcessEnv = {
+    DEEPSEEK_API_KEY: "host-broker-only-test-key",
+  };
+  const broker = credentialBrokerFromEnv(hostEnv, { remove: true });
+  const hostProviders = bindProviderRegistry({
+    broker,
+    environment: hostEnv,
+    allowEnvironmentFallback: false,
+  });
+  const previousClientKey = process.env.DEEPSEEK_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+
+  try {
+    assert.equal(hostEnv.DEEPSEEK_API_KEY, undefined, "host env must be scrubbed after import");
+    assert.equal(
+      hostProviders.diagnoseProvider("deepseek/deepseek-v4-flash").hasCredentials,
+      true,
+      "the authoritative host must still see the brokered credential",
+    );
+
+    const rows = buildPickerRows(
+      listModelCatalog().filter((entry) => entry.providerId === "deepseek"),
+      listProviderDetails().filter((provider) => provider.id === "deepseek"),
+      true,
+      {
+        probed: new Set(["deepseek"]),
+        live: new Set(["deepseek"]),
+        models: new Map([["deepseek", ["deepseek-v4-flash"]]]),
+      },
+    );
+    const row = rows.find((candidate) => candidate.spec === "deepseek/deepseek-v4-flash");
+    assert.ok(row, "host-advertised model must remain visible");
+    assert.equal(row.ready, true);
+    assert.doesNotMatch(row.readyHint, /Missing|缺(?:少| )|DEEPSEEK_API_KEY/i);
+  } finally {
+    if (previousClientKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previousClientKey;
   }
 });
 

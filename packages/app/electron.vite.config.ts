@@ -16,7 +16,10 @@ export default defineConfig({
     plugins: [bundleCore],
     build: {
       rollupOptions: {
-        input: { index: resolve(__dirname, "src/main/index.ts") },
+        input: {
+          index: resolve(__dirname, "src/main/index.ts"),
+          "keychain-utility-helper": resolve(__dirname, "src/main/keychain-utility-helper.ts"),
+        },
         // N-API bindings must remain real runtime dependencies; Rollup cannot inline platform
         // `.node` binaries. electron-builder picks them (and their optional platform package) up
         // from package.json.

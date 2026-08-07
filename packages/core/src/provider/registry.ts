@@ -8,7 +8,7 @@
 
 import { t } from "../i18n.js";
 import type { NetworkProxy } from "../runtime/network-proxy.js";
-import type { CredentialBroker } from "../security/credentials.js";
+import type { CredentialAvailability, CredentialBroker } from "../security/credentials.js";
 import type { Provider } from "../types.js";
 import { DebugProvider } from "./debug.js";
 import { isLoopbackProviderURL, providerModelsURL } from "./local-endpoint.js";
@@ -142,6 +142,9 @@ export interface ProviderDiagnostics {
   apiKeyEnv: readonly string[];
   /** 命中的环境变量名；不包含凭证值。 */
   credentialEnv?: string;
+  /** `configured` 表示仅存在惰性后端引用，尚未读取或验证其值。 */
+  credentialAvailability: CredentialAvailability;
+  /** 兼容字段：凭证已存在或已显式配置，但不表示 configured 引用已验证。 */
   hasCredentials: boolean;
   requiresApiKey: boolean;
   local: boolean;
@@ -166,6 +169,14 @@ export interface CreatedModel extends ResolvedModel {
   diagnostics: ProviderDiagnostics;
 }
 
+/**
+ * Provider/model metadata that is safe to inspect during session lifecycle operations.
+ *
+ * Unlike `CreatedModel`, producing this value never constructs a provider client or reads a
+ * credential backend. It is therefore suitable for create/open/resume validation.
+ */
+export type InspectedModel = Omit<CreatedModel, "provider">;
+
 export interface ProviderRuntimeBindings {
   /** Per-host credential boundary. Production callers must bind this instead of using globals. */
   broker?: CredentialBroker;
@@ -179,6 +190,9 @@ export interface ProviderRuntimeBindings {
 
 export interface BoundProviderRegistry {
   resolveProvider(spec: string): CreatedModel;
+  /** Hydrate one exact lazy credential reference before constructing a synchronous SDK client. */
+  resolveProviderAsync(spec: string): Promise<CreatedModel>;
+  inspectProvider(spec: string): InspectedModel;
   diagnoseProvider(spec: string): ProviderDiagnostics;
   resolveDefaultModel(): string;
   discoverModels(
@@ -193,6 +207,10 @@ type Factory = (bindings?: ProviderRuntimeBindings) => Provider;
 interface RegisteredProvider {
   descriptor: ProviderDescriptor;
   factory: Factory;
+  /** Resolve the exact registration-time credential without exposing it through diagnostics. */
+  runtime?: (bindings: ProviderRuntimeBindings) => { baseURL?: string; apiKey: string };
+  /** Non-secret headers required by this provider's model-directory endpoint. */
+  discoveryHeaders?: Readonly<Record<string, string>>;
   /** 程序化注册的直接凭证是否存在；仅用于诊断布尔值，绝不保存/返回 key。 */
   directCredential?: boolean;
 }
@@ -235,8 +253,27 @@ function legacyRuntimeBindings(): ProviderRuntimeBindings {
 
 const MAX_MODEL_DISCOVERY_BODY_BYTES = 1024 * 1024;
 const MAX_DISCOVERED_MODELS = 500;
+const MODEL_DISCOVERY_CACHE_TTL_MS = 15_000;
+const MODEL_DISCOVERY_FAILURE_CACHE_TTL_MS = 2_000;
 const MAX_MODEL_ID_BYTES = 512;
 const UNSAFE_MODEL_ID = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
+
+interface CachedModelDiscovery {
+  expiresAt: number;
+  models: string[] | undefined;
+}
+
+interface ModelDiscoveryCacheSlot {
+  cached?: CachedModelDiscovery;
+  inFlight?: Promise<string[] | undefined>;
+}
+
+interface ModelDiscoveryCache {
+  entries: WeakMap<RegisteredProvider, Map<string, ModelDiscoveryCacheSlot>>;
+}
+
+let legacyModelDiscoveryCache: ModelDiscoveryCache = createModelDiscoveryCache();
+const boundModelDiscoveryCaches = new WeakMap<ProviderRuntimeBindings, ModelDiscoveryCache>();
 
 /**
  * Provider ids cross IPC/HTTP boundaries during live model discovery. Keep the accepted shape
@@ -301,9 +338,9 @@ export function sanitizeDiscoveredModels(value: unknown): string[] | undefined {
   ].slice(0, MAX_DISCOVERED_MODELS);
 }
 
-async function readBoundedModelPayload(response: Response): Promise<unknown> {
+async function readBoundedJsonPayload(response: Response, maxBytes: number): Promise<unknown> {
   const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_MODEL_DISCOVERY_BODY_BYTES) {
+  if (Number.isFinite(declared) && declared > maxBytes) {
     await response.body?.cancel().catch(() => undefined);
     return undefined;
   }
@@ -317,7 +354,7 @@ async function readBoundedModelPayload(response: Response): Promise<unknown> {
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
-      if (total > MAX_MODEL_DISCOVERY_BODY_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel().catch(() => undefined);
         return undefined;
       }
@@ -337,6 +374,104 @@ async function readBoundedModelPayload(response: Response): Promise<unknown> {
   }
 }
 
+function createModelDiscoveryCache(): ModelDiscoveryCache {
+  return { entries: new WeakMap() };
+}
+
+function modelDiscoveryCacheFor(
+  bindings: ProviderRuntimeBindings | undefined,
+): ModelDiscoveryCache {
+  if (!bindings) return legacyModelDiscoveryCache;
+  const existing = boundModelDiscoveryCaches.get(bindings);
+  if (existing) return existing;
+  const created = createModelDiscoveryCache();
+  boundModelDiscoveryCaches.set(bindings, created);
+  return created;
+}
+
+async function cachedModelDiscovery(
+  cache: ModelDiscoveryCache,
+  entry: RegisteredProvider,
+  cacheKey: string,
+  load: () => Promise<string[] | undefined>,
+): Promise<string[] | undefined> {
+  let providerSlots = cache.entries.get(entry);
+  if (!providerSlots) {
+    providerSlots = new Map();
+    cache.entries.set(entry, providerSlots);
+  }
+  let slot = providerSlots.get(cacheKey);
+  if (!slot) {
+    // A bound registry normally has one endpoint per provider. Cap legacy env churn as defense in
+    // depth rather than retaining every historical base URL until process exit.
+    if (providerSlots.size >= 4) providerSlots.clear();
+    slot = {};
+    providerSlots.set(cacheKey, slot);
+  }
+  if (slot.cached && slot.cached.expiresAt > Date.now()) {
+    return slot.cached.models ? [...slot.cached.models] : undefined;
+  }
+  if (slot.inFlight) {
+    const models = await slot.inFlight;
+    return models ? [...models] : undefined;
+  }
+
+  const inFlight = load()
+    .catch(() => undefined)
+    .then((models) => {
+      const safeModels = models ? [...models] : undefined;
+      slot!.cached = {
+        expiresAt:
+          Date.now() +
+          (safeModels && safeModels.length > 0
+            ? MODEL_DISCOVERY_CACHE_TTL_MS
+            : MODEL_DISCOVERY_FAILURE_CACHE_TTL_MS),
+        models: safeModels,
+      };
+      return safeModels;
+    });
+  slot.inFlight = inFlight;
+  try {
+    const models = await inFlight;
+    return models ? [...models] : undefined;
+  } finally {
+    if (slot.inFlight === inFlight) delete slot.inFlight;
+  }
+}
+
+function normalizeDiscoveryTimeout(value: number): number {
+  if (!Number.isFinite(value)) return 2_000;
+  return Math.max(100, Math.min(10_000, Math.floor(value)));
+}
+
+async function withHardTimeout<T>(
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T | undefined> {
+  const controller = new AbortController();
+  type Outcome = { type: "value"; value: T } | { type: "error" } | { type: "timeout" };
+  const running: Promise<Outcome> = Promise.resolve()
+    .then(() => operation(controller.signal))
+    .then(
+      (value) => ({ type: "value" as const, value }),
+      () => ({ type: "error" as const }),
+    );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<Outcome>((resolve) => {
+    timer = setTimeout(() => resolve({ type: "timeout" }), timeoutMs);
+  });
+  const outcome = await Promise.race([running, expired]);
+  if (timer) clearTimeout(timer);
+  controller.abort();
+  return outcome.type === "value" ? outcome.value : undefined;
+}
+
+function requestHeaders(entry: RegisteredProvider, apiKey: string): { headers: Headers } {
+  const headers = new Headers(entry.discoveryHeaders);
+  if (apiKey && apiKey !== "anicode-local") headers.set("authorization", `Bearer ${apiKey}`);
+  return { headers };
+}
+
 /** 宿主把环境/Keychain/Vault 密钥导入 Broker 后调用；provider adapter 优先从 Broker 取。 */
 export function configureProviderCredentialBroker(
   broker: CredentialBroker | undefined,
@@ -344,11 +479,13 @@ export function configureProviderCredentialBroker(
 ): void {
   providerCredentialBroker = broker;
   providerEnvironmentFallback = options.allowEnvironmentFallback ?? broker === undefined;
+  legacyModelDiscoveryCache = createModelDiscoveryCache();
 }
 
 /** 生产宿主把 provider SDK 的 fetch 也收口到同一策略化出口。 */
 export function configureProviderNetworkProxy(proxy: NetworkProxy | undefined): void {
   providerNetworkProxy = proxy;
+  legacyModelDiscoveryCache = createModelDiscoveryCache();
 }
 
 const cloudDefaults: ProviderCapabilities = { tools: true, reasoning: false, images: false };
@@ -650,12 +787,16 @@ export function registerOpenAICompatibleProvider(
     ...(input.models ? { models: input.models } : {}),
     ...(input.catalog ? { catalog: input.catalog } : {}),
   });
+  const resolveRuntime = (bindings: ProviderRuntimeBindings) =>
+    runtimeConfig(d, input.apiKey, bindings);
 
   install({
     descriptor: d,
     directCredential: Boolean(input.apiKey),
+    runtime: resolveRuntime,
+    ...(input.defaultHeaders ? { discoveryHeaders: { ...input.defaultHeaders } } : {}),
     factory: (bindings = legacyRuntimeBindings()) => {
-      const runtime = runtimeConfig(d, input.apiKey, bindings);
+      const runtime = resolveRuntime(bindings);
       const directLoopback = Boolean(
         d.local && runtime.baseURL && isLoopbackProviderURL(runtime.baseURL),
       );
@@ -759,7 +900,7 @@ export async function discoverProviderModels(
   providerId: string,
   timeoutMs = 2_000,
   fetchImpl: typeof fetch = fetch,
-  bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
+  bindings?: ProviderRuntimeBindings,
 ): Promise<string[] | undefined> {
   const safeProviderId = sanitizeProviderId(providerId);
   if (!safeProviderId) return undefined;
@@ -768,46 +909,73 @@ export async function discoverProviderModels(
   const d = entry.descriptor;
   if (d.kind === "debug") return sanitizeDiscoveredModels(d.catalog.map((model) => model.model));
   if (d.kind !== "openai-compatible") return undefined;
-  const runtime = runtimeConfig(d, undefined, bindings);
-  if (!runtime.baseURL || (d.requiresApiKey && !runtime.apiKey)) return undefined;
-  // A descriptor marked local never gets to turn its proxy exception into cloud egress.
-  if (d.local && !isLoopbackProviderURL(runtime.baseURL)) return undefined;
-  const modelsURL = providerModelsURL(runtime.baseURL);
+  const activeBindings = bindings ?? legacyRuntimeBindings();
+  const configuredBaseURL =
+    (d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv, activeBindings.environment) : undefined) ?? d.baseURL;
+  if (!configuredBaseURL) return undefined;
+  // Reject an unusable egress route before opening a lazy credential reference.
+  if (d.local && !isLoopbackProviderURL(configuredBaseURL)) return undefined;
+  const directLoopback = d.local && isLoopbackProviderURL(configuredBaseURL);
+  if (!directLoopback && !activeBindings.networkProxy) return undefined;
+  const modelsURL = providerModelsURL(configuredBaseURL);
   if (!modelsURL) return undefined;
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const directLoopback = d.local && isLoopbackProviderURL(runtime.baseURL);
-      // Cloud discovery carries credentials and must never silently bypass the production egress
-      // boundary. Loopback discovery is the only direct-fetch exception.
-      if (!directLoopback && !bindings.networkProxy) return undefined;
-      const request = directLoopback
-        ? fetchImpl
-        : bindings.networkProxy!.fetch.bind(bindings.networkProxy);
+  await prepareRuntimeCredential(entry, activeBindings);
+  const runtime = entry.runtime?.(activeBindings) ?? runtimeConfig(d, undefined, activeBindings);
+  if (!runtime.baseURL || (d.requiresApiKey && !runtime.apiKey)) return undefined;
+  // Cloud discovery carries credentials and must never silently bypass the production egress
+  // boundary. Loopback discovery is the only direct-fetch exception.
+  const request = directLoopback
+    ? fetchImpl
+    : activeBindings.networkProxy!.fetch.bind(activeBindings.networkProxy);
+  const boundedTimeoutMs = normalizeDiscoveryTimeout(timeoutMs);
+  const cache = modelDiscoveryCacheFor(bindings);
+  const cacheKey = modelsURL.toString();
+
+  return cachedModelDiscovery(cache, entry, cacheKey, () =>
+    withHardTimeout(boundedTimeoutMs, async (signal) => {
       const response = await request(modelsURL, {
-        signal: controller.signal,
+        signal,
         redirect: "error",
-        ...(runtime.apiKey && runtime.apiKey !== "anicode-local"
-          ? { headers: { Authorization: `Bearer ${runtime.apiKey}` } }
-          : {}),
+        ...requestHeaders(entry, runtime.apiKey),
       });
-      if (!response.ok) return undefined;
-      const payload = (await readBoundedModelPayload(response)) as
+      if (signal.aborted) {
+        void response.body?.cancel().catch(() => undefined);
+        return undefined;
+      }
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        return undefined;
+      }
+      const payload = (await readBoundedJsonPayload(response, MAX_MODEL_DISCOVERY_BODY_BYTES)) as
         { data?: Array<{ id?: unknown }> } | undefined;
       if (!Array.isArray(payload?.data)) return undefined;
       return sanitizeDiscoveredModels(payload.data.map((model) => model.id));
-    } finally {
-      clearTimeout(timer);
-    }
-  } catch {
-    return undefined;
-  }
+    }),
+  );
 }
 
 export function createProvider(spec: string): CreatedModel {
   return createProviderWithBindings(spec, legacyRuntimeBindings());
+}
+
+function inspectProviderWithBindings(
+  spec: string,
+  bindings: ProviderRuntimeBindings,
+): InspectedModel {
+  const parsed = resolveSpec(spec);
+  return {
+    model: parsed.model,
+    providerId: parsed.entry.descriptor.id,
+    descriptor: cloneDescriptor(parsed.entry.descriptor),
+    modelInfo: resolveModelInfo(parsed.entry.descriptor, parsed.model),
+    diagnostics: diagnosticsFor(parsed.entry, parsed.model, bindings),
+  };
+}
+
+/** Pure provider/model lookup: no client construction, network request, or secret-backend read. */
+export function inspectProvider(spec: string): InspectedModel {
+  return inspectProviderWithBindings(spec, legacyRuntimeBindings());
 }
 
 function createProviderWithBindings(spec: string, bindings: ProviderRuntimeBindings): CreatedModel {
@@ -823,10 +991,18 @@ function createProviderWithBindings(spec: string, bindings: ProviderRuntimeBindi
   };
 }
 
+async function createProviderWithBindingsAsync(
+  spec: string,
+  bindings: ProviderRuntimeBindings,
+): Promise<CreatedModel> {
+  const parsed = resolveSpec(spec);
+  await prepareRuntimeCredential(parsed.entry, bindings);
+  return createProviderWithBindings(spec, bindings);
+}
+
 /** 启动前诊断，无网络请求，也不会实例化 SDK client。 */
 export function diagnoseProvider(spec: string): ProviderDiagnostics {
-  const parsed = resolveSpec(spec);
-  return diagnosticsFor(parsed.entry, parsed.model, legacyRuntimeBindings());
+  return inspectProvider(spec).diagnostics;
 }
 
 /**
@@ -840,10 +1016,8 @@ export function bindProviderRegistry(bindings: ProviderRuntimeBindings): BoundPr
     environment: { ...(bindings.environment ?? {}) },
     allowEnvironmentFallback: bindings.allowEnvironmentFallback ?? false,
   };
-  const diagnose = (spec: string) => {
-    const parsed = resolveSpec(spec);
-    return diagnosticsFor(parsed.entry, parsed.model, bound);
-  };
+  const inspect = (spec: string) => inspectProviderWithBindings(spec, bound);
+  const diagnose = (spec: string) => inspect(spec).diagnostics;
   return Object.freeze({
     resolveProvider(spec: string) {
       const result = createProviderWithBindings(spec, bound);
@@ -852,6 +1026,14 @@ export function bindProviderRegistry(bindings: ProviderRuntimeBindings): BoundPr
       }
       return result;
     },
+    async resolveProviderAsync(spec: string) {
+      const result = await createProviderWithBindingsAsync(spec, bound);
+      if (result.diagnostics.requiresApiKey && !result.diagnostics.hasCredentials) {
+        throw new Error(result.diagnostics.warnings.join("; "));
+      }
+      return result;
+    },
+    inspectProvider: inspect,
     diagnoseProvider: diagnose,
     resolveDefaultModel() {
       for (const spec of DEFAULT_MODEL_PREFERENCES) {
@@ -956,10 +1138,13 @@ function diagnosticsFor(
   const d = entry.descriptor;
   const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv, bindings.environment) : undefined;
   const baseURL = envBase ?? d.baseURL;
-  const credential = findCredential(d.apiKeyEnv, `provider:${d.id}`, baseURL, bindings);
+  const credential = findCredentialAvailability(d.apiKeyEnv, bindings);
+  const credentialAvailability: CredentialAvailability = entry.directCredential
+    ? "available"
+    : (credential?.availability ?? "unavailable");
   const warnings: string[] = [];
   // Third-party subscription OAuth is intentionally not accepted as production credentials.
-  const hasCredentials = Boolean(credential) || Boolean(entry.directCredential);
+  const hasCredentials = credentialAvailability !== "unavailable";
   if (d.requiresApiKey && !hasCredentials) {
     warnings.push(
       t(
@@ -987,11 +1172,30 @@ function diagnosticsFor(
     baseURLSource: envBase ? "environment" : d.baseURL ? "default" : "none",
     apiKeyEnv: [...d.apiKeyEnv],
     ...(credential ? { credentialEnv: credential.name } : {}),
+    credentialAvailability,
     hasCredentials,
     requiresApiKey: d.requiresApiKey,
     local: d.local,
     warnings,
   };
+}
+
+/** Pure metadata lookup: never calls trustedValue/getSync or otherwise opens a secret backend. */
+function findCredentialAvailability(
+  names: readonly string[],
+  bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
+): { name: string; availability: CredentialAvailability } | undefined {
+  for (const name of names) {
+    const availability = bindings.broker?.availability(`env:${name}`) ?? "unavailable";
+    if (availability !== "unavailable") return { name, availability };
+    if (
+      (bindings.allowEnvironmentFallback ?? false) &&
+      nonEmptyEnv(name, bindings.environment) !== undefined
+    ) {
+      return { name, availability: "available" };
+    }
+  }
+  return undefined;
 }
 
 function findCredential(
@@ -1009,17 +1213,16 @@ function findCredential(
       } catch {
         /* 非法 URL 由 provider 自身诊断；scope 保守按无 host 处理。 */
       }
-      try {
-        return {
-          name,
-          value: bindings.broker.trustedValue(brokerId, {
-            audience,
-            ...(host ? { host } : {}),
-          }),
-        };
-      } catch {
-        continue;
-      }
+      // An explicitly configured reference is authoritative. Propagate its safe typed failure
+      // instead of disguising a denied/locked/timed-out Keychain read as a missing key and then
+      // opening additional fallback entries.
+      return {
+        name,
+        value: bindings.broker.trustedValue(brokerId, {
+          audience,
+          ...(host ? { host } : {}),
+        }),
+      };
     }
     if (bindings.allowEnvironmentFallback ?? false) {
       const value = nonEmptyEnv(name, bindings.environment);
@@ -1027,6 +1230,46 @@ function findCredential(
     }
   }
   return undefined;
+}
+
+/**
+ * Hydrate only the credential alias the synchronous runtime factory will select. Environment and
+ * direct credentials stay process-local and require no backend I/O. A configured broker reference
+ * is authoritative: its safe failure is propagated and later aliases are not probed.
+ */
+async function prepareRuntimeCredential(
+  entry: RegisteredProvider,
+  bindings: ProviderRuntimeBindings,
+): Promise<void> {
+  if (entry.directCredential) return;
+  const descriptor = entry.descriptor;
+  const envBase = descriptor.baseURLEnv
+    ? nonEmptyEnv(descriptor.baseURLEnv, bindings.environment)
+    : undefined;
+  const baseURL = envBase ?? descriptor.baseURL;
+  for (const name of descriptor.apiKeyEnv) {
+    const brokerId = `env:${name}`;
+    if (bindings.broker?.has(brokerId)) {
+      let host: string | undefined;
+      try {
+        host = baseURL ? new URL(baseURL).hostname : undefined;
+      } catch {
+        // Invalid endpoint diagnostics remain the provider adapter's responsibility. Scope checks
+        // conservatively omit a host exactly as the synchronous path does.
+      }
+      await bindings.broker.trustedValueAsync(brokerId, {
+        audience: `provider:${descriptor.id}`,
+        ...(host ? { host } : {}),
+      });
+      return;
+    }
+    if (
+      (bindings.allowEnvironmentFallback ?? false) &&
+      nonEmptyEnv(name, bindings.environment) !== undefined
+    ) {
+      return;
+    }
+  }
 }
 
 function nonEmptyEnv(

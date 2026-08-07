@@ -76,6 +76,88 @@ test("SQLite runtime: BEGIN IMMEDIATE 回滚、事件幂等与 fencing token", a
   }
 });
 
+test("SQLite runtime: close synchronously fences new work and is idempotent", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-close-fence-"));
+  const file = path.join(root, "runtime.db");
+  const database = new SqliteRuntimeDatabase(file);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const accepted = database.run(async (db) => {
+    entered();
+    await gate;
+    db.prepare(
+      `INSERT INTO runtime_audit
+       (id, timestamp, category, action, metadata) VALUES (?, ?, ?, ?, ?)`,
+    ).run("before-close", new Date().toISOString(), "runtime", "close-fence", "{}");
+  });
+  await started;
+
+  const firstClose = database.close();
+  const secondClose = database.close();
+  assert.equal(firstClose, secondClose, "concurrent close callers must share one lifecycle fence");
+  await assert.rejects(() => database.run(() => undefined), /database is closed/);
+
+  release();
+  await accepted;
+  await firstClose;
+
+  const reopened = new SqliteRuntimeDatabase(file);
+  try {
+    assert.equal(
+      (await reopened.auditLog()).some((entry) => entry.id === "before-close"),
+      true,
+    );
+  } finally {
+    await reopened.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite runtime: DB/WAL/SHM 权限私有且不修改自定义父目录", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-runtime-mode-"));
+  const file = path.join(root, "runtime.db");
+  await fs.chmod(root, 0o755);
+  const database = new SqliteRuntimeDatabase(file);
+  try {
+    await database.audit({ category: "runtime", action: "permission-check" });
+    assert.equal((await fs.stat(root)).mode & 0o777, 0o755);
+
+    const existing: string[] = [];
+    for (const candidate of [file, `${file}-wal`, `${file}-shm`]) {
+      try {
+        await fs.access(candidate);
+        existing.push(candidate);
+      } catch {
+        // A checkpoint may remove a sidecar; every sidecar that remains must be private.
+      }
+    }
+    assert.ok(existing.includes(file));
+    for (const candidate of existing) {
+      assert.equal((await fs.stat(candidate)).mode & 0o777, 0o600);
+      await fs.chmod(candidate, 0o666);
+    }
+
+    await database.auditLog();
+    for (const candidate of existing) {
+      assert.equal((await fs.stat(candidate)).mode & 0o777, 0o600);
+    }
+
+    await database.close();
+    await fs.chmod(file, 0o666);
+    const reopened = new SqliteRuntimeDatabase(file);
+    try {
+      assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("SQLite runtime: JSONL 会话幂等迁移，事务追加不丢消息", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-sessions-"));
   const file = path.join(root, "runtime.db");
@@ -155,6 +237,84 @@ test("SQLite runtime: JSONL 会话幂等迁移，事务追加不丢消息", asyn
     await database.close();
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("SQLite runtime session store: load 使用单一快照，rewrite 提交后才更新 meta", async () => {
+  let inReadTransaction = false;
+  const executed: string[] = [];
+  const readConnection = {
+    exec(sql: string) {
+      executed.push(sql);
+      if (sql === "BEGIN") inReadTransaction = true;
+      if (sql === "COMMIT" || sql === "ROLLBACK") inReadTransaction = false;
+    },
+    prepare(sql: string) {
+      return {
+        get: () =>
+          sql.startsWith("SELECT * FROM sessions")
+            ? {
+                id: "session-snapshot",
+                created_at: "2026-01-01T00:00:00.000Z",
+                updated_at: "2026-01-01T00:00:00.000Z",
+                cwd: "/workspace",
+                workspace_device: null,
+                workspace_inode: null,
+                model: "m",
+                title: "snapshot-a",
+              }
+            : undefined,
+        all: () =>
+          sql.startsWith("SELECT data FROM session_messages")
+            ? [
+                {
+                  data: JSON.stringify({
+                    role: "user",
+                    content: [
+                      { type: "text", text: inReadTransaction ? "snapshot-a" : "snapshot-b" },
+                    ],
+                  }),
+                },
+              ]
+            : [],
+        run: () => ({ changes: 0, lastInsertRowid: 0 }),
+      };
+    },
+  };
+  const snapshotDatabase = {
+    run<T>(work: (db: typeof readConnection) => T): Promise<T> {
+      return Promise.resolve(work(readConnection));
+    },
+  } as unknown as SqliteRuntimeDatabase;
+  const snapshotStore = new SqliteRuntimeSessionStore(snapshotDatabase);
+  const loaded = await snapshotStore.load("session-snapshot");
+  assert.equal(loaded.title, "snapshot-a");
+  assert.equal((loaded.messages[0]!.content[0] as { text: string }).text, "snapshot-a");
+  assert.deepEqual(executed, ["BEGIN", "COMMIT"]);
+
+  const originalUpdatedAt = "2025-12-31T00:00:00.000Z";
+  const meta = {
+    id: "session-commit-failure",
+    createdAt: originalUpdatedAt,
+    updatedAt: originalUpdatedAt,
+    cwd: "/workspace",
+    model: "m",
+  };
+  const writeConnection = {
+    prepare() {
+      return { run: () => ({ changes: 1, lastInsertRowid: 0 }) };
+    },
+  };
+  const failingDatabase = {
+    transaction<T>(work: (db: typeof writeConnection) => T): Promise<T> {
+      work(writeConnection);
+      return Promise.reject(new Error("simulated commit failure"));
+    },
+  } as unknown as SqliteRuntimeDatabase;
+  await assert.rejects(
+    new SqliteRuntimeSessionStore(failingDatabase).rewrite(meta, []),
+    /simulated commit failure/,
+  );
+  assert.equal(meta.updatedAt, originalUpdatedAt);
 });
 
 test("SQLite runtime: ordered migration checksums and explicit retention", async () => {

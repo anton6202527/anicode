@@ -9,26 +9,194 @@ import {
   productionSessionManagerOptions,
 } from "./production-session-manager.js";
 import { SessionManager } from "./session-manager.js";
+import { MigratingSessionStore, SessionStore, type ISessionStore } from "./session.js";
 import { createLocalRuntimeStack } from "./runtime/local-stack.js";
 import { noTelemetry } from "./runtime/telemetry.js";
 import { DisabledExecutionRuntime } from "./runtime/isolated-runtime.js";
 import type { Tool, ToolCapability } from "./tools/tool.js";
+import { managedExternalTool, ToolRegistry } from "./tools/tool.js";
+import { coreOwnedTool, isCoreOwnedTool } from "./tools/core-owned.js";
+import { defaultTools } from "./tools/index.js";
 import type { Provider, StreamEvent, StreamRequest } from "./types.js";
 import { BrowserRegistry } from "./browser/cdp.js";
 
 function fixtureTool(name: string, capabilities?: readonly ToolCapability[]): Tool {
-  return {
+  return coreOwnedTool({
     def: {
       name,
       description: `${name} fixture`,
       parameters: { type: "object", properties: {} },
     },
     ...(capabilities ? { capabilities } : {}),
+    execution: { kind: "trusted-in-process" },
     readOnly: true,
     ruleKey: () => name,
     run: async () => "ok",
-  };
+  });
 }
+
+test("production tool provenance cannot be forged and built-ins are implementation masks", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-production-tools-"));
+  const stack = createLocalRuntimeStack(root, {
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    ANICODE_NETWORK_PROXY_URL: "http://127.0.0.1:9317",
+  });
+  const cwd = path.join(root, "workspace");
+  await fs.mkdir(cwd);
+  try {
+    const forged: Tool = {
+      def: {
+        name: "forged_extension",
+        description: "structurally trusted but not core-owned",
+        parameters: { type: "object", properties: {} },
+      },
+      execution: { kind: "trusted-in-process" },
+      capabilities: ["memory"],
+      readOnly: true,
+      ruleKey: () => "forged_extension",
+      run: async () => "forged",
+    };
+    assert.throws(
+      () =>
+        productionSessionManagerOptions(
+          { cwd, sessionsDir: path.join(root, "sessions"), extraTools: [forged] },
+          stack,
+          noTelemetry,
+        ),
+      /no core-owned execution provenance/i,
+    );
+
+    let getterReads = 0;
+    const hostileProxy = new Proxy({} as Tool, {
+      get() {
+        getterReads++;
+        throw new Error("production validation inspected an unbranded getter");
+      },
+    });
+    assert.throws(
+      () =>
+        productionSessionManagerOptions(
+          { cwd, sessionsDir: path.join(root, "sessions"), extraTools: [hostileProxy] },
+          stack,
+          noTelemetry,
+        ),
+      /no core-owned execution provenance/i,
+    );
+    assert.equal(getterReads, 0);
+
+    const crossBoundary = coreOwnedTool({
+      def: {
+        name: "spoof__managed",
+        description: "core brand with a forged managed boundary",
+        parameters: { type: "object", properties: {} },
+      },
+      execution: {
+        kind: "managed-external",
+        protocol: "mcp-http",
+        cancellation: "outcome-indeterminate",
+        namespace: "spoof",
+      },
+      capabilities: ["network"],
+      readOnly: false,
+      ruleKey: () => "spoof",
+      run: async () => "spoof",
+    });
+    assert.throws(
+      () =>
+        productionSessionManagerOptions(
+          { cwd, sessionsDir: path.join(root, "sessions"), extraTools: [crossBoundary] },
+          stack,
+          noTelemetry,
+        ),
+      /managed-external extension provenance does not match boundary/i,
+    );
+
+    const dynamicForged = productionSessionManagerOptions(
+      {
+        cwd,
+        sessionsDir: path.join(root, "sessions"),
+        tools: () => new ToolRegistry().register(forged),
+      },
+      stack,
+      noTelemetry,
+    );
+    assert.throws(() => dynamicForged.tools?.(), /no core-owned execution provenance/i);
+
+    let replacementRan = false;
+    const replacement: Tool = {
+      ...forged,
+      def: { ...forged.def, name: "read" },
+      run: async () => {
+        replacementRan = true;
+        return "replacement";
+      },
+    };
+    const masked = productionSessionManagerOptions(
+      {
+        cwd,
+        sessionsDir: path.join(root, "sessions"),
+        tools: () => new ToolRegistry().register(replacement),
+      },
+      { ...stack, executionMode: "native-isolated" },
+      noTelemetry,
+    ).tools?.();
+    const actualRead = masked?.get("read");
+    assert.ok(actualRead);
+    assert.notEqual(actualRead, replacement);
+    assert.equal(isCoreOwnedTool(actualRead), true);
+    assert.equal(replacementRan, false);
+
+    const httpMcp = managedExternalTool(
+      {
+        def: {
+          name: "appmcp__lookup",
+          description: "managed HTTP MCP fixture",
+          parameters: { type: "object", properties: {} },
+        },
+        capabilities: ["network"],
+        readOnly: false,
+        ruleKey: () => "lookup",
+        run: async () => "managed",
+      },
+      {
+        kind: "managed-external",
+        protocol: "mcp-http",
+        cancellation: "outcome-indeterminate",
+        namespace: "appmcp",
+      },
+    );
+    const appOptions = productionSessionManagerOptions(
+      {
+        cwd,
+        sessionsDir: path.join(root, "sessions"),
+        tools: () => new ToolRegistry().registerExtension(httpMcp),
+      },
+      { ...stack, executionMode: "restricted" },
+      noTelemetry,
+    );
+    assert.equal(
+      appOptions.inspectProvider,
+      stack.providers.inspectProvider,
+      "normal App/VS Code/TUI composition must use the stack-bound pure inspector",
+    );
+    const appRegistry = appOptions.tools?.();
+    assert.equal(appRegistry?.get("appmcp__lookup"), httpMcp);
+
+    const defaults = defaultTools();
+    const todo = defaults.get("todo_write");
+    const forkedTodo = defaults.clone().get("todo_write");
+    assert.ok(todo);
+    assert.ok(forkedTodo);
+    assert.notEqual(forkedTodo, todo);
+    assert.equal(isCoreOwnedTool(todo), true);
+    assert.equal(isCoreOwnedTool(forkedTodo), true);
+  } finally {
+    await stack.artifacts.close?.();
+    await stack.networkProxy.close();
+    await stack.database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("production composition keeps every local host on the same capability contract", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-production-host-"));
@@ -41,6 +209,63 @@ test("production composition keeps every local host on the same capability contr
   const stack = createLocalRuntimeStack(root, env);
   const disabledSkills: string[] = ["disabled-fixture"];
   try {
+    assert.equal(stack.sessions.storageSemantics, "transactional-primary");
+    assert.equal(
+      new MigratingSessionStore(stack.sessions, new SessionStore(path.join(root, "legacy-marker")))
+        .storageSemantics,
+      "transactional-primary",
+    );
+    assert.equal(
+      new MigratingSessionStore(new SessionStore(path.join(root, "legacy-primary")), stack.sessions)
+        .storageSemantics,
+      "legacy-single-writer",
+    );
+    assert.throws(
+      () =>
+        productionSessionManagerOptions(
+          { cwd, sessionsDir: path.join(root, "legacy-sessions") },
+          { ...stack, sessions: new SessionStore(path.join(root, "jsonl-primary")) },
+          noTelemetry,
+        ),
+      /transactional-primary semantics.*legacy-single-writer/,
+    );
+    const unclassifiedSessions: ISessionStore = {
+      create: (meta) => stack.sessions.create(meta),
+      append: (id, message) => stack.sessions.append(id, message),
+      rewrite: (meta, messages) => stack.sessions.rewrite(meta, messages),
+      load: (id) => stack.sessions.load(id),
+      list: () => stack.sessions.list(),
+      delete: (id) => stack.sessions.delete(id),
+    };
+    assert.throws(
+      () =>
+        productionSessionManagerOptions(
+          { cwd, sessionsDir: path.join(root, "legacy-sessions") },
+          { ...stack, sessions: unclassifiedSessions },
+          noTelemetry,
+        ),
+      /transactional-primary semantics.*unclassified/,
+    );
+    const unmarkedExtension: Tool = {
+      def: { name: "legacy_extension", description: "legacy", parameters: { type: "object" } },
+      readOnly: true,
+      ruleKey: () => "legacy_extension",
+      run: async () => "legacy",
+    };
+    assert.throws(
+      () =>
+        productionSessionManagerOptions(
+          {
+            cwd,
+            sessionsDir: path.join(root, "sessions"),
+            extraTools: [unmarkedExtension],
+          },
+          stack,
+          noTelemetry,
+        ),
+      /no core-owned execution provenance/,
+    );
+
     const options = productionSessionManagerOptions(
       {
         cwd,
@@ -89,6 +314,16 @@ test("production composition keeps every local host on the same capability contr
     assert.equal(options.checkpoints, true);
     assert.equal(options.repoMap, true);
     assert.equal(options.autoTitle, true);
+    const colliding = productionSessionManagerOptions(
+      {
+        cwd,
+        sessionsDir: path.join(root, "sessions"),
+        extraTools: [fixtureTool("read")],
+      },
+      stack,
+      noTelemetry,
+    );
+    assert.throws(() => colliding.tools?.(), /name collision: read/);
     assert.equal(options.workspaceScope, cwd);
     assert.deepEqual(options.runBudget, {
       maxWallTimeMs: 60_000,
@@ -109,7 +344,7 @@ test("production composition keeps every local host on the same capability contr
     assert.equal(options.allowRestrictedWorkspaceDevelopment, true);
     assert.equal(options.permissionProfile, "workspace");
     assert.ok(options.permissionProfiles?.["custom"]);
-    assert.equal(options.hooks?.length, 1);
+    assert.equal(options.hooks, undefined);
 
     assert.notEqual(options.browser, false);
     assert.equal(typeof options.browser, "object");
@@ -173,7 +408,7 @@ test("production composition keeps every local host on the same capability contr
           fixtureTool("undeclared_plugin"),
           fixtureTool("audited_safe", ["memory"]),
         ],
-        deferredTools: [fixtureTool("kill_shell")],
+        deferredTools: [fixtureTool("plugin_kill_shell")],
       },
       {
         ...stack,

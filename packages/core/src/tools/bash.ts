@@ -168,6 +168,369 @@ export function splitShellCommand(command: string): string[] {
   return analyzeShellCommand(command).parts;
 }
 
+const SYSTEM_NETWORK_COMMANDS = new Set([
+  "networksetup",
+  "scutil",
+  "route",
+  "ifconfig",
+  "ip",
+  "resolvectl",
+  "nmcli",
+  "netplan",
+  "netsh",
+  "pfctl",
+  "iptables",
+  "ip6tables",
+  "nft",
+  "ufw",
+  "firewall-cmd",
+  "systemctl",
+  "service",
+  "killall",
+  "dscacheutil",
+  "set-dnsclientserveraddress",
+  "set-netipinterface",
+  "set-netroute",
+  "disable-netadapter",
+  "enable-netadapter",
+  "restart-netadapter",
+]);
+
+/**
+ * Native credential-store clients are never a model-facing credential API. They bypass the
+ * CredentialBroker's allowlist, audit trail, scope checks, cache and hermetic Keychain sentinel,
+ * so even read-only verbs must fail before a child process is started.
+ */
+const SYSTEM_CREDENTIAL_STORE_COMMANDS = new Set([
+  "security",
+  "secret-tool",
+  "kwallet-query",
+  "cmdkey",
+  "cmdkey.exe",
+]);
+
+const EXECUTION_WRAPPERS = new Set([
+  "sudo",
+  "doas",
+  "env",
+  "command",
+  "builtin",
+  "exec",
+  "eval",
+  "source",
+  ".",
+  "nohup",
+  "nice",
+  "timeout",
+  "xargs",
+  "parallel",
+  "sh",
+  "bash",
+  "dash",
+  "zsh",
+  "ksh",
+  "fish",
+  "powershell",
+  "powershell.exe",
+  "pwsh",
+  "pwsh.exe",
+  "cmd",
+  "cmd.exe",
+]);
+
+function normalizedPolicyWords(part: string): string[] {
+  return part
+    .split(/\s+/)
+    .map((word) => word.replace(/^["']|["',;]$/g, ""))
+    .filter(Boolean);
+}
+
+function wrappedCommandIndex(words: readonly string[], commands: ReadonlySet<string>): number {
+  if (words.length === 0) return -1;
+  let firstIndex = 0;
+  while (firstIndex < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[firstIndex]!)) {
+    firstIndex++;
+  }
+  if (firstIndex >= words.length) return -1;
+  const first = path.basename(words[firstIndex]!).toLowerCase();
+  if (commands.has(first)) return firstIndex;
+  if (!EXECUTION_WRAPPERS.has(first)) return -1;
+  // `analyzeShellCommand` removes quoting while preserving words. Searching the normalized
+  // wrapper tail catches absolute paths and nested forms such as `env ... security`,
+  // `command -- secret-tool`, `sh -c 'kwallet-query ...'` and `cmd /c cmdkey`.
+  return words.findIndex((word, index) => {
+    if (index <= firstIndex) return false;
+    return commands.has(path.basename(word).toLowerCase());
+  });
+}
+
+function firstCommandAfterOptions(
+  words: readonly string[],
+  start: number,
+  optionsWithValue: ReadonlySet<string> = new Set(),
+): number {
+  let index = start;
+  while (index < words.length) {
+    const token = words[index]!;
+    const lower = token.toLowerCase();
+    if (token === "--") return index + 1 < words.length ? index + 1 : -1;
+    if (!token.startsWith("-") || token === "-") return index;
+    const option = lower.includes("=") ? lower.slice(0, lower.indexOf("=")) : lower;
+    if (optionsWithValue.has(option) && !lower.includes("=")) index += 2;
+    else index++;
+  }
+  return -1;
+}
+
+const SUDO_OPTIONS_WITH_VALUE = new Set([
+  "-u",
+  "--user",
+  "-g",
+  "--group",
+  "-h",
+  "--host",
+  "-p",
+  "--prompt",
+  "-c",
+  "--close-from",
+  "-r",
+  "--role",
+  "-t",
+  "--type",
+  "-d",
+  "--chdir",
+]);
+const ENV_OPTIONS_WITH_VALUE = new Set(["-u", "--unset", "-c", "--chdir"]);
+const XARGS_OPTIONS_WITH_VALUE = new Set([
+  "-a",
+  "--arg-file",
+  "-e",
+  "--eof",
+  "-i",
+  "--replace",
+  "-l",
+  "--max-lines",
+  "-n",
+  "--max-args",
+  "-p",
+  "--max-procs",
+  "-s",
+  "--max-chars",
+]);
+
+function nextWrappedExecutableIndex(words: readonly string[], wrapperIndex: number): number {
+  const wrapper = path
+    .basename(words[wrapperIndex]!)
+    .toLowerCase()
+    .replace(/\.exe$/u, "");
+  const start = wrapperIndex + 1;
+  if (wrapper === "env") {
+    let index = start;
+    while (index < words.length) {
+      const token = words[index]!;
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+        index++;
+        continue;
+      }
+      const next = firstCommandAfterOptions(words, index, ENV_OPTIONS_WITH_VALUE);
+      if (next !== index) {
+        if (next < 0) return -1;
+        index = next;
+        continue;
+      }
+      return index;
+    }
+    return -1;
+  }
+  if (wrapper === "command") {
+    if (words.slice(start).some((word) => word === "-v" || word === "-V")) return -1;
+    return firstCommandAfterOptions(words, start);
+  }
+  if (["sudo", "doas"].includes(wrapper)) {
+    return firstCommandAfterOptions(words, start, SUDO_OPTIONS_WITH_VALUE);
+  }
+  if (["sh", "bash", "dash", "zsh", "ksh", "fish"].includes(wrapper)) {
+    const commandOption = words.findIndex(
+      (word, index) =>
+        index >= start && (word === "--command" || word === "-c" || /^-[^-]*c[^-]*$/u.test(word)),
+    );
+    return commandOption >= 0 && commandOption + 1 < words.length ? commandOption + 1 : -1;
+  }
+  if (["powershell", "pwsh"].includes(wrapper)) {
+    const commandOption = words.findIndex(
+      (word, index) => index >= start && ["-command", "-c", "/c"].includes(word.toLowerCase()),
+    );
+    return commandOption >= 0 && commandOption + 1 < words.length ? commandOption + 1 : -1;
+  }
+  if (wrapper === "cmd") {
+    const commandOption = words.findIndex(
+      (word, index) => index >= start && ["/c", "/k"].includes(word.toLowerCase()),
+    );
+    return commandOption >= 0 && commandOption + 1 < words.length ? commandOption + 1 : -1;
+  }
+  if (wrapper === "timeout") {
+    const duration = firstCommandAfterOptions(words, start);
+    return duration >= 0 && duration + 1 < words.length ? duration + 1 : -1;
+  }
+  if (wrapper === "nice") {
+    return firstCommandAfterOptions(words, start, new Set(["-n", "--adjustment"]));
+  }
+  if (["xargs", "parallel"].includes(wrapper)) {
+    return firstCommandAfterOptions(words, start, XARGS_OPTIONS_WITH_VALUE);
+  }
+  return firstCommandAfterOptions(words, start);
+}
+
+function credentialStoreCommandIndex(words: readonly string[]): number {
+  let index = 0;
+  while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) index++;
+  while (index >= 0 && index < words.length) {
+    const executable = path.basename(words[index]!).toLowerCase();
+    if (SYSTEM_CREDENTIAL_STORE_COMMANDS.has(executable)) return index;
+    if (!EXECUTION_WRAPPERS.has(executable)) return -1;
+    index = nextWrappedExecutableIndex(words, index);
+  }
+  return -1;
+}
+
+/**
+ * Hard credential boundary for model-visible shell execution. A command that needs a credential
+ * must use a scoped Broker lease; invoking a host credential-store client is never allowed.
+ */
+export function systemCredentialStoreAccessReason(command: string): string | undefined {
+  for (const part of analyzeShellCommand(command).parts) {
+    const words = normalizedPolicyWords(part);
+    const commandIndex = credentialStoreCommandIndex(words);
+    if (commandIndex < 0) continue;
+    return `${path.basename(words[commandIndex]!).toLowerCase()} would bypass the CredentialBroker`;
+  }
+  return undefined;
+}
+
+/**
+ * Hard process-safety boundary for commands that can reconfigure the host's shared networking.
+ * Read-only diagnostics remain available; mutations must be performed deliberately outside AniCode.
+ */
+export function systemNetworkMutationReason(command: string): string | undefined {
+  for (const part of analyzeShellCommand(command).parts) {
+    const words = normalizedPolicyWords(part);
+    if (words.length === 0) continue;
+    const commandIndex = wrappedCommandIndex(words, SYSTEM_NETWORK_COMMANDS);
+    if (commandIndex < 0) {
+      if (mutatesNetworkConfigurationFile(part)) {
+        return "writing host DNS/network configuration files is not allowed";
+      }
+      continue;
+    }
+    const executable = path.basename(words[commandIndex]!).toLowerCase();
+    const args = words.slice(commandIndex + 1).map((word) => word.toLowerCase());
+    if (networkCommandMutates(executable, args, part)) {
+      return `${executable} would modify shared system network configuration`;
+    }
+  }
+  return undefined;
+}
+
+function networkCommandMutates(executable: string, args: string[], raw: string): boolean {
+  const has = (...values: string[]) => args.some((arg) => values.includes(arg));
+  const starts = (...prefixes: string[]) =>
+    args.some((arg) => prefixes.some((p) => arg.startsWith(p)));
+  switch (executable) {
+    case "networksetup":
+      return starts("-set", "-create", "-remove", "-order", "-detectnewhardware");
+    case "scutil":
+      return !args.some((arg) => ["--proxy", "--dns", "--nwi", "--get", "--status"].includes(arg));
+    case "route":
+      return has("add", "delete", "del", "change", "flush");
+    case "ifconfig":
+      return (
+        has("up", "down", "alias", "-alias", "create", "destroy", "delete", "name") ||
+        starts("mtu", "lladdr", "ether") ||
+        args.some(
+          (arg, index) =>
+            (arg === "inet" || arg === "inet6") &&
+            args[index + 1] !== undefined &&
+            !args[index + 1]!.startsWith("-"),
+        )
+      );
+    case "ip": {
+      const area = args.findIndex((arg) =>
+        ["route", "link", "address", "addr", "rule", "neighbour", "neighbor", "netns"].includes(
+          arg,
+        ),
+      );
+      return (
+        area >= 0 &&
+        args
+          .slice(area + 1)
+          .some((arg) =>
+            ["add", "del", "delete", "change", "replace", "append", "flush", "set"].includes(arg),
+          )
+      );
+    }
+    case "resolvectl":
+      return has("dns", "domain", "default-route", "llmnr", "mdns", "dnssec", "nta", "revert");
+    case "nmcli":
+      return has(
+        "up",
+        "down",
+        "modify",
+        "mod",
+        "add",
+        "delete",
+        "del",
+        "connect",
+        "disconnect",
+        "reapply",
+        "on",
+        "off",
+      );
+    case "netplan":
+      return has("apply", "try", "set");
+    case "netsh":
+      return !has("show", "dump", "help", "/?", "?");
+    case "set-dnsclientserveraddress":
+    case "set-netipinterface":
+    case "set-netroute":
+    case "disable-netadapter":
+    case "enable-netadapter":
+    case "restart-netadapter":
+      return true;
+    case "pfctl":
+      return !has("-s", "-sr", "-sn", "-sa");
+    case "iptables":
+    case "ip6tables":
+      return !args.some((arg) =>
+        ["-l", "-s", "--list", "--list-rules", "--check", "-c"].includes(arg),
+      );
+    case "nft":
+      return !has("list", "get", "describe", "monitor");
+    case "ufw":
+      return !has("status", "show");
+    case "firewall-cmd":
+      return !has("--state", "--get-active-zones", "--list-all", "--list-all-zones");
+    case "systemctl":
+    case "service":
+      return (
+        /(?:networkmanager|systemd-resolved|networking|network\.service)/i.test(raw) &&
+        has("start", "stop", "restart", "reload", "enable", "disable", "mask")
+      );
+    case "killall":
+      return args.some((arg) => arg.includes("mdnsresponder") || arg.includes("systemd-resolved"));
+    case "dscacheutil":
+      return has("-flushcache");
+    default:
+      return false;
+  }
+}
+
+function mutatesNetworkConfigurationFile(command: string): boolean {
+  if (!/(?:\/etc\/(?:resolv\.conf|hosts)|SystemConfiguration)/i.test(command)) return false;
+  return /(?:^|\s)(?:tee|sed|perl|python\d*|ruby|cp|mv|rm|install|truncate)(?:\s|$)|>>?|\|/i.test(
+    command,
+  );
+}
+
 const SHELL_CONTROL_WORDS = new Set([
   "!",
   "if",
@@ -356,6 +719,24 @@ export const bashTool: Tool = {
     const command = String(input["command"] ?? "");
     if (!command) throw new ToolError("command 不能为空");
     if (ctx.signal.aborted) throw new ToolError("命令被中断");
+    const credentialStoreAccess = systemCredentialStoreAccessReason(command);
+    if (credentialStoreAccess) {
+      throw new ToolError(
+        t(
+          `Refusing host credential-store access: ${credentialStoreAccess}. Use a scoped CredentialBroker reference instead.`,
+          `拒绝访问宿主凭据库：${credentialStoreAccess}。请改用限域的 CredentialBroker 引用。`,
+        ),
+      );
+    }
+    const networkMutation = systemNetworkMutationReason(command);
+    if (networkMutation) {
+      throw new ToolError(
+        t(
+          `Refusing host network reconfiguration: ${networkMutation}. AniCode only uses process-scoped proxy settings.`,
+          `拒绝修改宿主网络配置：${networkMutation}。AniCode 只允许使用进程级代理设置。`,
+        ),
+      );
+    }
 
     // 后台模式：立即返回 shell id，不阻塞、不受 timeout 约束（这正是它存在的意义）。
     // 沙箱与前台完全一致（共用 buildShellSpawn），权限门也已在此之前走过。

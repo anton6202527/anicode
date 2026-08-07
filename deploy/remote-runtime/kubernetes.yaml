@@ -43,7 +43,12 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "delete"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch"]
+  # Execution-scoped proxy URLs are held in immutable, per-Job Secrets. The controller never
+  # updates, lists, or watches Secrets; cleanup uses an exact-name GET and UID-preconditioned DELETE.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]

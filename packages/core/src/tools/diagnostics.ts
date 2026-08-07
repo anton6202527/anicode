@@ -6,9 +6,13 @@ import { promises as fs } from "node:fs";
 import { type Tool, type ToolContext, ToolError } from "./tool.js";
 import { canonicalLspWorkspaceFile, type LspPool } from "../lsp.js";
 import { t } from "../i18n.js";
+import { coreOwnedTool } from "./core-owned.js";
 
 export function createDiagnosticsTool(pool: LspPool): Tool {
-  return {
+  return coreOwnedTool({
+    // Core owns the LSP pool closure. Production extension composition requires this explicit
+    // marker instead of silently treating arbitrary extra Tool closures as trusted.
+    execution: { kind: "trusted-in-process" },
     capabilities: ["filesystem-read", "process", "persistent-process"],
     readOnly: true,
     def: {
@@ -52,5 +56,5 @@ export function createDiagnosticsTool(pool: LspPool): Tool {
         )
         .join("\n");
     },
-  };
+  });
 }

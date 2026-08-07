@@ -50,6 +50,37 @@ test("默认 system 定位为通用 Agent，不注入单一职业身份", () => 
   assert.match(system, /identity label|身份标签/);
 });
 
+test("Agent.closeToolResources attempts every cleanup and aggregates failures", async () => {
+  const agent = new Agent({
+    provider: scriptedProvider([]),
+    model: "x",
+    cwd: process.cwd(),
+    permission: { mode: "auto" },
+  });
+  const calls: string[] = [];
+  const internals = agent as unknown as {
+    executor: { close(): Promise<void> };
+    tools: { closeAll(): Promise<void> };
+  };
+  internals.executor = {
+    close: async () => {
+      calls.push("executor");
+      throw new Error("executor cleanup failed");
+    },
+  };
+  internals.tools = {
+    closeAll: async () => {
+      calls.push("tools");
+      throw new Error("tool cleanup failed");
+    },
+  };
+  await assert.rejects(
+    agent.closeToolResources(),
+    (error: unknown) => error instanceof AggregateError && error.errors.length === 2,
+  );
+  assert.deepEqual(calls.sort(), ["executor", "tools"]);
+});
+
 test("Agent: 工具调用 → 执行 → 结果回传 → 收尾", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-"));
   const provider = scriptedProvider([
@@ -135,6 +166,134 @@ test("Agent: 权限拒绝 → 错误结果回传给模型", async () => {
   assert.ok(events.some((e) => e.type === "done"));
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("Agent: 连续三轮无法解析的工具参数在补齐结果后熔断", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-invalid-tool-"));
+  const rawArguments = '{"command":"do-not-expose"';
+  let providerTurns = 0;
+  let confirmCalls = 0;
+  const provider: Provider = {
+    name: "invalid-tool-loop",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerTurns++;
+      const message: ChatMessage = {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: `invalid-${providerTurns}`,
+            name: "bash",
+            args: { __unparsed: rawArguments },
+          },
+        ],
+      };
+      yield {
+        type: "done",
+        stopReason: "tool_use",
+        message,
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+
+  try {
+    const agent = new Agent({
+      provider,
+      model: "x",
+      cwd: dir,
+      projectMemory: false,
+      maxTurns: 50,
+      permission: {
+        mode: "default",
+        confirm: async () => {
+          confirmCalls++;
+          return { behavior: "allow" };
+        },
+      },
+    });
+    const events = await collect(agent, "执行命令");
+
+    assert.equal(providerTurns, 3, "第三次无效调用后不应继续请求模型");
+    assert.equal(confirmCalls, 0, "无效参数不应进入权限确认");
+    const results = events.filter((event) => event.type === "tool_result");
+    assert.equal(results.length, 3);
+    assert.deepEqual(
+      results.map((event) => (event.type === "tool_result" ? event.id : "")),
+      ["invalid-1", "invalid-2", "invalid-3"],
+    );
+    assert.ok(
+      results.every(
+        (event) =>
+          event.type === "tool_result" &&
+          event.isError &&
+          event.content.includes("INVALID_TOOL_ARGUMENTS") &&
+          !event.content.includes(rawArguments),
+      ),
+    );
+    const error = events.at(-1);
+    assert.ok(error?.type === "error");
+    assert.match(error.message, /连续 3 轮/);
+    assert.equal(error.message.includes(rawArguments), false);
+    assert.equal(
+      events.some((event) => event.type === "done"),
+      false,
+    );
+
+    const lastMessage = agent.messages.at(-1);
+    assert.equal(lastMessage?.role, "user");
+    const lastResult = lastMessage?.content.find((part) => part.type === "tool_result");
+    assert.ok(lastResult?.type === "tool_result");
+    assert.equal(lastResult.toolCallId, "invalid-3");
+    assert.equal(lastResult.content.includes(rawArguments), false);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Agent: 合法工具的普通错误会重置无效参数连续计数", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-invalid-tool-reset-"));
+  const invalid = (id: string): ChatMessage[] => [
+    {
+      role: "assistant",
+      content: [{ type: "tool_call", id, name: "bash", args: { __unparsed: "{" } }],
+    },
+  ];
+  const provider = scriptedProvider([
+    invalid("invalid-1"),
+    invalid("invalid-2"),
+    [
+      {
+        role: "assistant",
+        content: [{ type: "tool_call", id: "ordinary-error", name: "missing", args: {} }],
+      },
+    ],
+    invalid("invalid-3"),
+    invalid("invalid-4"),
+    [{ role: "assistant", content: [{ type: "text", text: "已收尾" }] }],
+  ]);
+
+  try {
+    const agent = new Agent({
+      provider,
+      model: "x",
+      cwd: dir,
+      projectMemory: false,
+      permission: { mode: "auto" },
+    });
+    const events = await collect(agent, "测试重置");
+
+    assert.equal(events.filter((event) => event.type === "tool_result").length, 5);
+    assert.equal(
+      events.some(
+        (event) => event.type === "error" && event.message.includes("无法解析的工具参数"),
+      ),
+      false,
+    );
+    assert.ok(events.some((event) => event.type === "done"));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Agent: 单次任务 Token 预算是硬终态，不会在超额后宣告 done", async () => {

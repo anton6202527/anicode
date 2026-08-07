@@ -9,13 +9,35 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager, SessionStore } from "@anicode/core";
-import { buildManager, resolveConfiguredProvider } from "./host.js";
+import { buildManager, packagedKeyringModulePath, resolveConfiguredProvider } from "./host.js";
 import { ChatBridge } from "./bridge.js";
 import type { HostToWebview } from "./protocol.js";
 
+test("VSIX host binds the isolated helper to its packaged loader", () => {
+  assert.equal(
+    packagedKeyringModulePath(path.join(path.sep, "opt", "anicode-extension")),
+    path.join(path.sep, "opt", "anicode-extension", "out", "keyring", "index.js"),
+  );
+});
+
+function buildTestManager(sessionsDir: string): SessionManager {
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousDisable = process.env.ANICODE_DISABLE_OS_KEYCHAIN;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.ANICODE_DISABLE_OS_KEYCHAIN = "1";
+  try {
+    return buildManager(sessionsDir);
+  } finally {
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    if (previousDisable === undefined) delete process.env.ANICODE_DISABLE_OS_KEYCHAIN;
+    else process.env.ANICODE_DISABLE_OS_KEYCHAIN = previousDisable;
+  }
+}
+
 async function setup() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-vsc-"));
-  const manager = buildManager(path.join(dir, "sessions"));
+  const manager = buildTestManager(path.join(dir, "sessions"));
   const posted: HostToWebview[] = [];
   const bridge = new ChatBridge(manager, dir, "debug/demo", (m) => posted.push(m));
   return { dir, manager, posted, bridge };

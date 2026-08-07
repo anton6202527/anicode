@@ -528,7 +528,9 @@ test("NetworkProxyServer: CONNECT only opens upstream after a matching TLS SNI",
       allowPorts: [upstreamPort],
       allowPrivateAddresses: true,
     },
-    resolver: async () => ["127.0.0.1"],
+    // The first authorized address has no listener. CONNECT must keep the hostname plus a pinned
+    // multi-address lookup so Node can fall back without performing a second DNS resolution.
+    resolver: async () => ["127.0.0.2", "127.0.0.1"],
   });
   const token = "connect-proxy-token-that-is-long-enough";
   const server = new NetworkProxyServer({
@@ -539,23 +541,26 @@ test("NetworkProxyServer: CONNECT only opens upstream after a matching TLS SNI",
   });
   try {
     const endpoint = await server.listen();
-    await t.test("a fragmented matching ClientHello reaches the pinned upstream", async () => {
-      const { socket, status } = await openTunnel(
-        endpoint,
-        `allowed.anicode.test:${upstreamPort}`,
-        token,
-      );
-      assert.equal(status, 200);
-      const hello = tlsClientHello("allowed.anicode.test");
-      const response = waitForSocketText(socket, "upstream-ok");
-      socket.write(hello.subarray(0, 7));
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      socket.write(hello.subarray(7));
-      assert.match(await response, /upstream-ok/);
-      socket.destroy();
-      await waitForSocketClose(socket);
-      assert.equal(upstreamHits, 1);
-    });
+    await t.test(
+      "a fragmented matching ClientHello falls back to the reachable pinned IP",
+      async () => {
+        const { socket, status } = await openTunnel(
+          endpoint,
+          `allowed.anicode.test:${upstreamPort}`,
+          token,
+        );
+        assert.equal(status, 200);
+        const hello = tlsClientHello("allowed.anicode.test");
+        const response = waitForSocketText(socket, "upstream-ok");
+        socket.write(hello.subarray(0, 7));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        socket.write(hello.subarray(7));
+        assert.match(await response, /upstream-ok/);
+        socket.destroy();
+        await waitForSocketClose(socket);
+        assert.equal(upstreamHits, 1);
+      },
+    );
 
     const denied: Array<[string, Buffer | undefined]> = [
       ["mismatched SNI", tlsClientHello("different.anicode.test")],
@@ -765,6 +770,270 @@ test("NetworkProxyServer: downstream disconnect aborts the upstream response", a
     await withTimeout(upstreamClosed);
   } finally {
     await server.close();
+    await proxy.close();
+    await closeServer(upstream);
+  }
+});
+
+test("NetworkProxy: DNS success cache coalesces concurrent lookups", async () => {
+  let resolverCalls = 0;
+  let releaseLookup!: () => void;
+  const lookupGate = new Promise<void>((resolve) => {
+    releaseLookup = resolve;
+  });
+  const proxy = new NetworkProxy({
+    dnsCacheTtlMs: 1_000,
+    resolver: async () => {
+      resolverCalls++;
+      await lookupGate;
+      return ["8.8.8.8"];
+    },
+  });
+  try {
+    const first = proxy.authorize("https://cache-dns.anicode.test/first");
+    const second = proxy.authorize("https://cache-dns.anicode.test/second");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(resolverCalls, 1, "concurrent authorization must share one DNS refresh");
+    releaseLookup();
+    assert.deepEqual((await first).addresses, ["8.8.8.8"]);
+    assert.deepEqual((await second).addresses, ["8.8.8.8"]);
+    assert.deepEqual((await proxy.authorize("https://cache-dns.anicode.test/cached")).addresses, [
+      "8.8.8.8",
+    ]);
+    assert.equal(resolverCalls, 1, "a fresh success must be served from the instance cache");
+  } finally {
+    releaseLookup();
+    await proxy.close();
+  }
+});
+
+test("NetworkProxy: DNS failures use verified cache only inside the stale window", async () => {
+  let resolverCalls = 0;
+  let unavailable = false;
+  const proxy = new NetworkProxy({
+    dnsCacheTtlMs: 0,
+    dnsStaleTtlMs: 30,
+    resolver: async () => {
+      resolverCalls++;
+      if (unavailable) throw new Error("resolver temporarily unavailable");
+      return ["8.8.4.4"];
+    },
+  });
+  try {
+    assert.deepEqual((await proxy.authorize("https://stale-dns.anicode.test/initial")).addresses, [
+      "8.8.4.4",
+    ]);
+    unavailable = true;
+    assert.deepEqual((await proxy.authorize("https://stale-dns.anicode.test/fallback")).addresses, [
+      "8.8.4.4",
+    ]);
+    assert.equal(resolverCalls, 2);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    await assert.rejects(
+      () => proxy.authorize("https://stale-dns.anicode.test/expired"),
+      /resolver temporarily unavailable/,
+    );
+    assert.equal(resolverCalls, 3);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("NetworkProxy: DNS refresh has a bounded timeout and aborts a cooperative resolver", async () => {
+  let resolverAborted = false;
+  const proxy = new NetworkProxy({
+    dnsTimeoutMs: 25,
+    resolver: async (_hostname, signal) =>
+      new Promise<string[]>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            resolverAborted = true;
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      }),
+  });
+  try {
+    await assert.rejects(
+      withTimeout(proxy.authorize("https://timeout-dns.anicode.test/"), 500),
+      /DNS resolution timed out after 25 ms/,
+    );
+    assert.equal(resolverAborted, true);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("NetworkProxy: close fences a late DNS result and is idempotent", async () => {
+  let releaseLookup!: () => void;
+  let markLookupStarted!: () => void;
+  let resolverSignal: AbortSignal | undefined;
+  let reentrantClose: Promise<void> | undefined;
+  let fetchCalls = 0;
+  const lookupStarted = new Promise<void>((resolve) => {
+    markLookupStarted = resolve;
+  });
+  const lookupGate = new Promise<void>((resolve) => {
+    releaseLookup = resolve;
+  });
+  const proxy = new NetworkProxy({
+    agentCloseTimeoutMs: 25,
+    resolver: async (_hostname, signal) => {
+      resolverSignal = signal;
+      signal?.addEventListener(
+        "abort",
+        () => {
+          reentrantClose = proxy.close();
+        },
+        { once: true },
+      );
+      markLookupStarted();
+      // Deliberately ignore cancellation until the gate opens. A late successful result must not
+      // repopulate the cache or let the already-authorized request proceed after close().
+      await lookupGate;
+      return ["8.8.8.8"];
+    },
+    fetch: async () => {
+      fetchCalls++;
+      return new Response("unexpected");
+    },
+  });
+  try {
+    const request = proxy.fetch("https://closing-dns.anicode.test/");
+    await withTimeout(lookupStarted);
+    const requestRejected = assert.rejects(request, /Network proxy is closing/);
+
+    const firstClose = proxy.close();
+    const secondClose = proxy.close();
+    assert.equal(secondClose, firstClose, "close must always return the same operation");
+    assert.equal(
+      reentrantClose,
+      firstClose,
+      "abort listeners must observe the stable close operation",
+    );
+    assert.equal(resolverSignal?.aborted, true, "close must cancel the active DNS operation");
+    assert.throws(
+      () => proxy.fetch("https://closing-dns.anicode.test/late"),
+      /Network proxy is closing/,
+    );
+    assert.throws(
+      () => proxy.authorize("https://closing-dns.anicode.test/late"),
+      /Network proxy is closing/,
+    );
+
+    await withTimeout(Promise.all([requestRejected, firstClose]), 500);
+    releaseLookup();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const internals = proxy as unknown as {
+      dnsCache: Map<string, unknown>;
+      dnsInFlight: Map<string, unknown>;
+      pinnedAgents: Map<string, unknown>;
+    };
+    assert.equal(fetchCalls, 0);
+    assert.equal(internals.dnsCache.size, 0);
+    assert.equal(internals.dnsInFlight.size, 0);
+    assert.equal(internals.pinnedAgents.size, 0);
+    assert.throws(
+      () => proxy.authorize("https://closing-dns.anicode.test/closed"),
+      /Network proxy is closed/,
+    );
+  } finally {
+    releaseLookup();
+    await proxy.close();
+  }
+});
+
+test("NetworkProxy: close is bounded when a response body is not consumed", async () => {
+  let markUpstreamClosed!: () => void;
+  const upstreamClosed = new Promise<void>((resolve) => {
+    markUpstreamClosed = resolve;
+  });
+  const upstream = http.createServer((_request, response) => {
+    response.once("close", markUpstreamClosed);
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.write("partial response");
+    // Keep the body open so graceful dispatcher shutdown cannot depend on the caller consuming it.
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = new NetworkProxy({
+    agentCloseTimeoutMs: 25,
+    policy: {
+      allowDomains: ["unconsumed.anicode.test"],
+      allowPorts: [upstreamPort],
+      allowPrivateAddresses: true,
+    },
+    resolver: async () => ["127.0.0.1"],
+  });
+  try {
+    const response = await proxy.fetch(`http://unconsumed.anicode.test:${upstreamPort}/stream`);
+    assert.equal(response.status, 200);
+
+    const firstClose = proxy.close();
+    assert.equal(proxy.close(), firstClose);
+    await withTimeout(firstClose, 500);
+    await withTimeout(upstreamClosed, 500);
+    assert.throws(
+      () => proxy.fetch(`http://unconsumed.anicode.test:${upstreamPort}/late`),
+      /Network proxy is closed/,
+    );
+  } finally {
+    await proxy.close();
+    await closeServer(upstream);
+  }
+});
+
+test("NetworkProxy: per-origin upstream connection pool is bounded", async () => {
+  let active = 0;
+  let peak = 0;
+  let releaseResponses!: () => void;
+  let markAtCapacity!: () => void;
+  const responsesAtCapacity = new Promise<void>((resolve) => {
+    markAtCapacity = resolve;
+  });
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponses = resolve;
+  });
+  const upstream = http.createServer(async (_request, response) => {
+    active++;
+    peak = Math.max(peak, active);
+    if (active === 2) markAtCapacity();
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.flushHeaders();
+    await responseGate;
+    response.end("ok");
+    active--;
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = new NetworkProxy({
+    maxConnectionsPerOrigin: 2,
+    policy: {
+      allowDomains: ["pool-limit.anicode.test"],
+      allowPorts: [upstreamPort],
+      allowPrivateAddresses: true,
+    },
+    resolver: async () => ["127.0.0.1"],
+  });
+  try {
+    const requests = Promise.all(
+      Array.from({ length: 6 }, async (_, index) => {
+        const response = await proxy.fetch(
+          `http://pool-limit.anicode.test:${upstreamPort}/${index}`,
+        );
+        return response.text();
+      }),
+    );
+    await withTimeout(responsesAtCapacity);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(peak, 2);
+    releaseResponses();
+    assert.deepEqual(await requests, new Array<string>(6).fill("ok"));
+    assert.equal(peak, 2, "queued requests must not open more upstream sockets than configured");
+  } finally {
+    releaseResponses();
     await proxy.close();
     await closeServer(upstream);
   }

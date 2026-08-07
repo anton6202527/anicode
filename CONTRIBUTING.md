@@ -1,8 +1,11 @@
 # Contributing
 
-AniCode supports Node.js 22.15+ and 24.x; Node 24 is selected by `.nvmrc` and used for release
-builds. Development and CI support npm 10.9.2 through 11.x; the release gate requires npm 11.5.1+.
-Run `nvm use` before installing the locked dependency graph with `npm ci`.
+AniCode supports Node.js >=22.15.0 without an artificial future-major ceiling. CI verifies the
+minimum version, the Node 24 LTS release baseline, and `current`, which follows the latest stable
+Node.js release. Node 24 remains selected by `.nvmrc` for reproducible release builds. Development
+and CI require npm >=10.9.2; the reproducible release gate remains pinned to npm >=11.5.1 <12. Run
+`nvm use` before installing the locked dependency graph with `npm ci` when reproducing the release
+environment.
 
 Before opening a pull request, run:
 

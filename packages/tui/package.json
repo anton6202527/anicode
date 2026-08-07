@@ -7,7 +7,7 @@
   "scripts": {
     "start": "tsx src/cli.tsx",
     "typecheck": "tsc --noEmit",
-    "test": "cross-env ANICODE_LANG=zh node --import tsx --test --test-concurrency=1 'src/**/*.test.ts' 'src/**/*.test.tsx'"
+    "test": "cross-env ANICODE_LANG=zh ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node --import tsx --test --test-concurrency=1 'src/**/*.test.ts' 'src/**/*.test.tsx'"
   },
   "dependencies": {
     "@anicode/core": "*",

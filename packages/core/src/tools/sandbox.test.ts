@@ -160,6 +160,25 @@ test("sandbox: Seatbelt 显式拒绝读取宿主凭据文件和目录", () => {
   assert.match(p, /\(deny file-read\* \(literal "\/Users\/dev\/\.npmrc"\)\)/);
 });
 
+test("sandbox: Seatbelt 拒绝 Keychain XPC，解释器无法绕过 Broker", () => {
+  const p = buildSeatbeltProfile({
+    policy: "workspace-write",
+    cwd: "/Users/dev/project",
+    network: true,
+  });
+  for (const service of [
+    "com.apple.securityd.xpc",
+    "com.apple.securityd.general",
+    "com.apple.securityd.systemkeychain",
+    "com.apple.security.XPCKeychainSandboxCheck",
+  ]) {
+    assert.match(
+      p,
+      new RegExp(`\\(deny mach-lookup \\(global-name "${service.replaceAll(".", "\\.")}"\\)\\)`),
+    );
+  }
+});
+
 test("sandbox(linux): bubblewrap 在工作区 rebind 后遮蔽宿主凭据", () => {
   const args = buildBubblewrapArgs({
     policy: "workspace-write",

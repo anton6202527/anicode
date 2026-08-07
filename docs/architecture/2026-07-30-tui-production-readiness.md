@@ -12,7 +12,8 @@ incremental rendering 与 alternate-screen 生命周期。旧的全局 `stdout.w
 
 - 所有模型、工具、错误、授权字段在进入终端前删除 CSI、OSC（含 OSC 52）、DCS/APC/PM/SOS、C0/C1 与 bidi spoofing 控制符。
 - SIGINT/SIGTERM/SIGHUP、异常、普通退出都幂等恢复 raw mode、光标、bracketed paste、鼠标、配色与备用屏。
-- 发布 CLI 要求 Node `>=22.15.0 <25`；构建会拒绝 bundle 中未声明的 runtime external，npm tarball 做 clean-room 启动验证。
+- 发布 CLI 要求 Node `>=22.15.0`；CI 同时验证最低版本、发布用 Node 24 LTS 和最新稳定版
+  `current`。构建会拒绝 bundle 中未声明的 runtime external，npm tarball 做 clean-room 启动验证。
 - OpenAI-compatible usage 将普通 input 与 cache read 分离，避免总量重复计费。
 - 授权卡片展示结构化 cwd/risk/network/file mutation/完整操作/脱敏参数；高风险默认拒绝，永久规则二次确认。
 - debug wrapper 保留 `OpenHandle.closed`、`send` options、undo mode 与所有可选 `SessionHost` 方法；JSONL 写入异步批处理，并以 1 MiB 队列上限做慢盘背压。

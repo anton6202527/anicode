@@ -46,6 +46,8 @@ const DEFAULT_IGNORED = [
   "coverage",
 ];
 
+const TRANSACTIONAL_DELEGATES = new WeakMap<TransactionalExecutionRuntime, ExecutionRuntime>();
+
 function canonical(value: string): string {
   try {
     return realpathSync.native(value);
@@ -59,6 +61,17 @@ function hash(value: Uint8Array | string): string {
 }
 
 export class TransactionalExecutionRuntime implements ExecutionRuntime {
+  get toolModuleEnvironment(): "host" | "container" | "unsupported" {
+    return this.delegate.toolModuleEnvironment ?? "unsupported";
+  }
+
+  get toolModuleNetworkBoundary(): "scoped-proxy" | "unsupported" {
+    return this.delegate.toolModuleNetworkBoundary ?? "unsupported";
+  }
+
+  get managedProcessBoundary(): "close-confirmed" | "unsupported" {
+    return this.delegate.managedProcessBoundary ?? "unsupported";
+  }
   private readonly ignored: Set<string>;
   private readonly maxFiles: number;
   private readonly maxChangedBytes: number;
@@ -69,6 +82,7 @@ export class TransactionalExecutionRuntime implements ExecutionRuntime {
     private readonly delegate: ExecutionRuntime,
     options: TransactionalExecutionRuntimeOptions = {},
   ) {
+    TRANSACTIONAL_DELEGATES.set(this, delegate);
     this.ignored = new Set(options.ignoredTopLevel ?? DEFAULT_IGNORED);
     const maxFiles = options.maxFiles ?? 200_000;
     const maxChangedBytes = options.maxChangedBytes ?? 100 * 1024 * 1024;
@@ -198,6 +212,9 @@ export class TransactionalExecutionRuntime implements ExecutionRuntime {
       const changes: PatchSetChangeInput[] = [];
       let changedBytes = 0;
       for (const relative of changedPaths) {
+        if (protectedMetadataPath(relative)) {
+          throw new Error(`Transactional shell cannot commit protected metadata: ${relative}`);
+        }
         const entry = after.get(relative);
         if (!entry) {
           changes.push({ path: relative, content: null });
@@ -229,6 +246,18 @@ export class TransactionalExecutionRuntime implements ExecutionRuntime {
       await fs.rm(temporary, { recursive: true, force: true });
     }
   }
+}
+
+/**
+ * Production attestation seam. A structural capability string is forgeable; this only unwraps a
+ * genuine core TransactionalExecutionRuntime instance registered by its constructor.
+ */
+export function transactionalExecutionDelegate(
+  runtime: ExecutionRuntime,
+): ExecutionRuntime | undefined {
+  return runtime instanceof TransactionalExecutionRuntime
+    ? TRANSACTIONAL_DELEGATES.get(runtime)
+    : undefined;
 }
 
 /**
@@ -330,8 +359,8 @@ async function snapshotTree(
   const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
     for (const name of await fs.readdir(directory)) {
       signal?.throwIfAborted();
-      if (!relativeDirectory && ignored.has(name)) continue;
       const relative = path.join(relativeDirectory, name);
+      if ((!relativeDirectory && ignored.has(name)) || protectedMetadataPath(relative)) continue;
       const absolute = path.join(directory, name);
       const stat = await fs.lstat(absolute);
       if (stat.isDirectory()) {
@@ -368,6 +397,16 @@ async function snapshotTree(
   };
   await walk(root, "");
   return snapshot;
+}
+
+function protectedMetadataPath(relative: string): boolean {
+  return relative
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .some((segment) => {
+      const normalized = segment.toLowerCase();
+      return normalized === ".git" || normalized === ".anicode";
+    });
 }
 
 /** Stream hashes in bounded chunks; never materialize an arbitrary workspace file in memory. */

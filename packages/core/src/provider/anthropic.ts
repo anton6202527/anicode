@@ -80,9 +80,9 @@ export class AnthropicProvider implements Provider {
   }
 
   /** OAuth 模式：确保 client 持有当前有效 token（变化时重建），返回是否为 OAuth。 */
-  private async ensureAuth(): Promise<boolean> {
+  private async ensureAuth(signal?: AbortSignal): Promise<boolean> {
     if (!this.tokenSource) return false;
-    const token = await this.tokenSource.getAccessToken();
+    const token = await this.tokenSource.getAccessToken(signal);
     if (token !== this.builtToken) {
       this.client = new Anthropic({
         authToken: token,
@@ -96,7 +96,7 @@ export class AnthropicProvider implements Provider {
   }
 
   async *stream(req: StreamRequest): AsyncIterable<StreamEvent> {
-    const oauth = await this.ensureAuth();
+    const oauth = await this.ensureAuth(req.signal);
     const adaptiveThinking =
       typeof this.adaptiveThinking === "function"
         ? this.adaptiveThinking(req.model)

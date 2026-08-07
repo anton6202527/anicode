@@ -57,6 +57,7 @@ test("LSP: production runtime 以只读、断网策略 prepare 持久进程", as
   await fs.writeFile(file, "bad code here\n");
   const requests: string[] = [];
   const runtime: ExecutionRuntime = {
+    managedProcessBoundary: "close-confirmed",
     async run() {
       throw new Error("persistent LSP must use prepare");
     },
@@ -77,6 +78,27 @@ test("LSP: production runtime 以只读、断网策略 prepare 持久进程", as
   assert.deepEqual(requests, [`read-only:false:${await fs.realpath(dir)}`]);
   await pool.closeAll();
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("LSP: runtime without close-confirmed containment is rejected before prepare or spawn", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-unmanaged-"));
+  let prepared = false;
+  const runtime: ExecutionRuntime = {
+    managedProcessBoundary: "unsupported",
+    async run() {
+      throw new Error("unused");
+    },
+    prepare() {
+      prepared = true;
+      throw new Error("must not prepare");
+    },
+  };
+  try {
+    assert.throws(() => LspClient.start(dir, cfg, runtime), /close-confirmed.*process boundary/);
+    assert.equal(prepared, false);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("LSP: 无响应 server 在请求超时后失败，不得挂住 agent", async () => {

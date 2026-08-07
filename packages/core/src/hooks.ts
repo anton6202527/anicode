@@ -26,6 +26,7 @@
  */
 
 import { globMatch } from "./permission.js";
+import { RuntimeTerminationError } from "./runtime/isolated-runtime.js";
 
 export type HookEventName =
   | "SessionStart"
@@ -95,6 +96,15 @@ export interface HookRegistration {
   matcher?: string;
   /** Conservatively marks the workspace dirty whenever this hook is invoked. */
   mutatesWorkspace?: boolean;
+  /**
+   * The handler owns an external process boundary and does not settle until cancellation has
+   * proved that boundary closed. Agent shutdown must drain these handlers even when its outer
+   * AbortSignal race has already stopped waiting for the hook result.
+   *
+   * Deliberately omitted for ordinary in-process hooks: a callback which ignores AbortSignal must
+   * not be able to hang the whole Agent shutdown forever.
+   */
+  cancellation?: "close-confirmed";
   handler: HookHandler;
 }
 
@@ -126,6 +136,8 @@ const PASS: HookOutcome = { blocked: false, allowed: false, mutatedWorkspace: fa
 
 export class HookRunner {
   private regs: HookRegistration[];
+  private readonly activeCloseConfirmed = new Set<Promise<HookResult | void>>();
+  private boundaryFailure: HookExecutionBoundaryError | RuntimeTerminationError | undefined;
 
   constructor(
     regs: HookRegistration[] = [],
@@ -139,6 +151,18 @@ export class HookRunner {
     return this.regs.some((r) => r.event === event);
   }
 
+  /**
+   * Drain only external-process handlers which promise close confirmation. A cleanup-proof
+   * failure permanently poisons this runner: continuing with another command hook could overlap
+   * an unproved old process tree with new workspace writes.
+   */
+  async awaitIdle(): Promise<void> {
+    while (this.activeCloseConfirmed.size > 0) {
+      await Promise.allSettled([...this.activeCloseConfirmed]);
+    }
+    if (this.boundaryFailure) throw this.boundaryFailure;
+  }
+
   async run(payload: HookPayload): Promise<HookOutcome> {
     const hits = this.regs.filter(
       (r) =>
@@ -147,6 +171,9 @@ export class HookRunner {
           (payload.toolName !== undefined && globMatch(r.matcher, payload.toolName))),
     );
     if (hits.length === 0) return PASS;
+    if (this.boundaryFailure && hits.some((reg) => reg.cancellation === "close-confirmed")) {
+      throw this.boundaryFailure;
+    }
 
     let allowed = false;
     let mutatedWorkspace = false;
@@ -154,6 +181,9 @@ export class HookRunner {
     const contexts: string[] = [];
 
     for (const reg of hits) {
+      if (reg.cancellation === "close-confirmed" && this.boundaryFailure) {
+        throw this.boundaryFailure;
+      }
       if (payload.signal?.aborted) break;
       if (reg.mutatesWorkspace) {
         mutatedWorkspace = true;
@@ -162,12 +192,20 @@ export class HookRunner {
       }
       let res: HookResult | void;
       try {
-        res = await reg.handler({
-          ...payload,
-          ...(updatedInput ? { toolInput: updatedInput } : {}),
-        });
+        const invocation = Promise.resolve().then(() =>
+          reg.handler({
+            ...payload,
+            ...(updatedInput ? { toolInput: updatedInput } : {}),
+          }),
+        );
+        res = await (reg.cancellation === "close-confirmed"
+          ? this.trackCloseConfirmed(invocation)
+          : invocation);
       } catch (error) {
-        if (error instanceof HookExecutionBoundaryError) throw error;
+        if (isHookBoundaryFailure(error)) {
+          this.boundaryFailure ??= error;
+          throw error;
+        }
         continue; // hook 异常按无操作处理
       }
       // A late non-cooperative hook result is observationally inert: do not apply it or start the
@@ -196,4 +234,24 @@ export class HookRunner {
       ...(contexts.length ? { additionalContext: contexts.join("\n") } : {}),
     };
   }
+
+  private trackCloseConfirmed(invocation: Promise<HookResult | void>): Promise<HookResult | void> {
+    this.activeCloseConfirmed.add(invocation);
+    void invocation.then(
+      () => this.activeCloseConfirmed.delete(invocation),
+      (error: unknown) => {
+        this.activeCloseConfirmed.delete(invocation);
+        if (!this.boundaryFailure && isHookBoundaryFailure(error)) {
+          this.boundaryFailure = error;
+        }
+      },
+    );
+    return invocation;
+  }
+}
+
+function isHookBoundaryFailure(
+  error: unknown,
+): error is HookExecutionBoundaryError | RuntimeTerminationError {
+  return error instanceof HookExecutionBoundaryError || error instanceof RuntimeTerminationError;
 }

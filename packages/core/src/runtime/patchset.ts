@@ -241,8 +241,10 @@ function normalizeMode(mode: number): number {
 }
 
 function protectedWorkspacePath(relative: string): boolean {
-  const first = relative.split(path.sep)[0]?.toLowerCase();
-  return first === ".git" || first === ".anicode";
+  return relative.split(/[\\/]+/).some((segment) => {
+    const normalized = segment.toLowerCase();
+    return normalized === ".git" || normalized === ".anicode";
+  });
 }
 
 export interface PatchSetServiceOptions {

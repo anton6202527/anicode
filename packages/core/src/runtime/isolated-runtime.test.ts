@@ -3,11 +3,71 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { IsolatedRuntime } from "./isolated-runtime.js";
+import { IsolatedRuntime, scopedProxyEnvironment } from "./isolated-runtime.js";
 
 const POSIX_ONLY = {
   skip: process.platform === "win32" ? "requires a POSIX process group" : false,
 };
+
+const PROXY_ENVIRONMENT_KEYS = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+] as const;
+
+test("IsolatedRuntime: proxy normalization is child-scoped and parent env stays unchanged", () => {
+  const previous = proxyEnvironmentSnapshot(process.env);
+  try {
+    for (const key of PROXY_ENVIRONMENT_KEYS) {
+      process.env[key] = `http://parent-${key.toLowerCase()}.invalid:9000`;
+    }
+    const parentSentinel = proxyEnvironmentSnapshot(process.env);
+    const requestEnv = Object.fromEntries(
+      PROXY_ENVIRONMENT_KEYS.map((key) => [
+        key,
+        `http://request-${key.toLowerCase()}.invalid:9001`,
+      ]),
+    );
+    const requestSentinel = { ...requestEnv };
+    const proxyUrl = "http://127.0.0.1:8321";
+    const runtime = new IsolatedRuntime({ failClosed: false, proxyUrl });
+
+    const denied = runtime.prepare({
+      command: "true",
+      cwd: process.cwd(),
+      policy: "none",
+      network: false,
+      env: requestEnv,
+    });
+    for (const key of PROXY_ENVIRONMENT_KEYS) assert.equal(denied.env[key], undefined, key);
+
+    // Native network execution intentionally fails closed on Linux, so exercise the shared pure
+    // normalization helper there while other platforms also cover IsolatedRuntime.prepare wiring.
+    const enabledEnv =
+      process.platform === "linux"
+        ? scopedProxyEnvironment({ ...process.env, ...requestEnv }, proxyUrl)
+        : runtime.prepare({
+            command: "true",
+            cwd: process.cwd(),
+            policy: "none",
+            network: true,
+            env: requestEnv,
+          }).env;
+    for (const key of PROXY_ENVIRONMENT_KEYS) {
+      assert.equal(enabledEnv[key], key.toLowerCase() === "no_proxy" ? "" : proxyUrl, key);
+    }
+
+    assert.deepEqual(requestEnv, requestSentinel);
+    assert.deepEqual(proxyEnvironmentSnapshot(process.env), parentSentinel);
+  } finally {
+    restoreProxyEnvironment(process.env, previous);
+  }
+});
 
 test("IsolatedRuntime: delivers bounded stdin without shell argv interpolation", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-stdin-"));
@@ -170,6 +230,21 @@ function shellQuote(value: string): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function proxyEnvironmentSnapshot(env: NodeJS.ProcessEnv): Record<string, string | undefined> {
+  return Object.fromEntries(PROXY_ENVIRONMENT_KEYS.map((key) => [key, env[key]]));
+}
+
+function restoreProxyEnvironment(
+  env: NodeJS.ProcessEnv,
+  snapshot: Record<string, string | undefined>,
+): void {
+  for (const key of PROXY_ENVIRONMENT_KEYS) {
+    const value = snapshot[key];
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
 }
 
 function abortDuringListenerRegistration(): AbortSignal {

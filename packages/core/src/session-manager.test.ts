@@ -26,6 +26,9 @@ import {
   RESTRICTED_WORKSPACE_READ_ONLY_TOOL_NAMES,
 } from "./tools/index.js";
 import { ToolRegistry } from "./tools/tool.js";
+import { bindProviderRegistry } from "./provider/registry.js";
+import { CredentialBroker, credentialScopesForEnvironment } from "./security/credentials.js";
+import type { SyncSecretBackend } from "./security/secret-backends.js";
 
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
@@ -105,6 +108,98 @@ test("SessionManager: 多订阅者都收到同一批事件", async () => {
   subA.close();
   subB.close();
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: oversized UTF-8 input is rejected before provider dispatch", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-input-bound-"));
+  let providerCalls = 0;
+  const provider: Provider = {
+    name: "input-bound",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerCalls++;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [] },
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const manager = await mgr(dir, provider);
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "input-bound" });
+    const oversized = "界".repeat(Math.floor((8 * 1024 * 1024) / 3) + 1);
+    await assert.rejects(manager.send(session.id, oversized), /8388608 bytes/);
+    assert.equal(providerCalls, 0);
+    assert.equal(manager.peek(session.id)?.messages.length, 0);
+  } finally {
+    await manager.shutdown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: send re-entered synchronously from abort belongs to the next drive", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-abort-reentry-"));
+  const firstStarted = deferred();
+  type ManagedSessionHarness = {
+    send(text: string): Promise<{ error?: Error }>;
+    interrupt(): void;
+  };
+  let managed!: ManagedSessionHarness;
+  let reentrant: Promise<{ error?: Error }> | undefined;
+  let providerCalls = 0;
+  const done = (text: string): StreamEvent => ({
+    type: "done",
+    stopReason: "end_turn",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+    usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+  });
+  const provider: Provider = {
+    name: "abort-reentry",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      providerCalls++;
+      if (providerCalls === 1) {
+        firstStarted.resolve();
+        await new Promise<void>((resolve) => {
+          const onAbort = () => {
+            reentrant = managed.send("after interrupt");
+            resolve();
+          };
+          request.signal?.addEventListener("abort", onAbort, { once: true });
+          if (request.signal?.aborted) onAbort();
+        });
+        yield done("late first reply");
+        return;
+      }
+      yield done("second reply");
+    },
+  };
+  const manager = await mgr(dir, provider);
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "abort-reentry" });
+    managed = (manager as unknown as { sessions: Map<string, ManagedSessionHarness> }).sessions.get(
+      session.id,
+    )!;
+    const first = managed.send("before interrupt");
+    await firstStarted.promise;
+    managed.interrupt();
+    await first;
+    assert.ok(reentrant, "AbortSignal listener must synchronously enqueue the next drive");
+    assert.deepEqual(await reentrant, {});
+    assert.equal(providerCalls, 2);
+    const visibleText = manager
+      .peek(session.id)!
+      .messages.flatMap((message) =>
+        message.content.flatMap((part) =>
+          part.type === "text" && !part.internal ? [part.text] : [],
+        ),
+      );
+    assert.ok(visibleText.includes("after interrupt"));
+    assert.ok(visibleText.includes("second reply"));
+  } finally {
+    await manager.shutdown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("SessionManager: snapshot 权限模式反映初始配置与运行时切换", async () => {
@@ -1534,28 +1629,36 @@ test("SessionManager: 权限广播，任一订阅者可裁决", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("SessionManager: provider 解析先于落盘且成功路径只解析一次", async () => {
+test("SessionManager: create 只做纯 provider 检查，首次 send 才解析一次", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-"));
   const store = new SessionStore(path.join(dir, "sessions"));
-  let failures = 0;
+  let inspections = 0;
+  let resolutions = 0;
   const broken = new SessionManager({
     store,
     resolveProvider: () => {
-      failures++;
+      resolutions++;
+      return { provider: scriptedProvider([]), model: "broken/model" };
+    },
+    inspectProvider: () => {
+      inspections++;
       throw new Error("provider config invalid");
     },
+    recoverCommands: false,
   });
 
   await assert.rejects(
     broken.createSession({ cwd: dir, model: "broken/model" }),
     /provider config invalid/,
   );
-  assert.equal(failures, 1);
-  assert.deepEqual(await store.list(), [], "解析失败不得留下孤儿会话文件");
+  assert.equal(inspections, 1);
+  assert.equal(resolutions, 0, "纯检查失败不得构造 provider 或读取凭据");
+  assert.deepEqual(await store.list(), [], "检查失败不得留下孤儿会话文件");
+  await broken.shutdown();
 
-  let resolutions = 0;
   const healthy = new SessionManager({
     store,
+    inspectProvider: () => ({ model: "scripted", providerId: "scripted" }),
     resolveProvider: () => {
       resolutions++;
       return {
@@ -1565,10 +1668,139 @@ test("SessionManager: provider 解析先于落盘且成功路径只解析一次"
         model: "scripted",
       };
     },
+    recoverCommands: false,
   });
-  await healthy.createSession({ cwd: dir, model: "scripted" });
-  assert.equal(resolutions, 1, "create 不应在预校验后再次 resolve provider");
+  const created = await healthy.createSession({ cwd: dir, model: "scripted" });
+  const opened = await healthy.open(created.id, () => {});
+  await healthy.resumeSession(created.id);
+  assert.equal(resolutions, 0, "create/open/resume 不应 resolve provider");
+  await healthy.send(created.id, "hello");
+  assert.equal(resolutions, 1, "首次真实消息只 resolve 一次 provider");
 
+  opened.close();
+  await healthy.shutdown();
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: cold create/open/resume 不读凭据，首条消息只读一次", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-lazy-credential-"));
+  const store = new SessionStore(path.join(dir, "sessions"));
+  class CountingSecretBackend implements SyncSecretBackend {
+    readonly kind = "session-manager-counting-secret";
+    reads = 0;
+
+    getSync(key: string): string | undefined {
+      this.reads++;
+      return key === "env:DEEPSEEK_API_KEY" ? "test-deepseek-secret" : undefined;
+    }
+    putSync(): void {}
+    deleteSync(): boolean {
+      return false;
+    }
+    async get(key: string): Promise<string | undefined> {
+      return this.getSync(key);
+    }
+    async put(): Promise<void> {}
+    async delete(): Promise<boolean> {
+      return false;
+    }
+  }
+
+  const backend = new CountingSecretBackend();
+  const broker = new CredentialBroker();
+  broker.registerReference({
+    id: "env:DEEPSEEK_API_KEY",
+    backend,
+    scopes: credentialScopesForEnvironment("DEEPSEEK_API_KEY"),
+  });
+  const registry = bindProviderRegistry({
+    broker,
+    environment: {},
+    allowEnvironmentFallback: false,
+  });
+  const resolveProvider = (spec: string) => {
+    const resolved = registry.resolveProvider(spec);
+    return {
+      ...resolved,
+      provider: scriptedProvider([
+        [{ role: "assistant", content: [{ type: "text", text: "credential loaded" }] }],
+      ]),
+    };
+  };
+  const makeManager = () =>
+    new SessionManager({
+      store,
+      inspectProvider: registry.inspectProvider,
+      resolveProvider,
+      recoverCommands: false,
+    });
+
+  const first = makeManager();
+  const created = await first.createSession({
+    cwd: dir,
+    model: "deepseek/deepseek-chat",
+  });
+  const firstOpen = await first.open(created.id, () => {});
+  await first.resumeSession(created.id);
+  assert.equal(backend.reads, 0);
+  firstOpen.close();
+  await first.shutdown();
+
+  const resumed = makeManager();
+  const coldOpen = await resumed.open(created.id, () => {});
+  await resumed.resumeSession(created.id);
+  assert.equal(backend.reads, 0, "冷启动 open/resume 也不能访问 secret backend");
+  await resumed.send(created.id, "hello");
+  assert.equal(backend.reads, 1, "首次真正 provider stream 只读取一次凭据");
+  coldOpen.close();
+  await resumed.shutdown();
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: deferred provider 解析失败不缓存，修复凭据后下一条消息可恢复", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-lazy-provider-retry-"));
+  let attempts = 0;
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    inspectProvider: () => ({ model: "scripted", providerId: "scripted" }),
+    resolveProvider: () => {
+      attempts++;
+      if (attempts === 1) throw new Error("credential temporarily locked");
+      return {
+        provider: scriptedProvider([
+          [{ role: "assistant", content: [{ type: "text", text: "recovered" }] }],
+        ]),
+        model: "scripted",
+      };
+    },
+    recoverCommands: false,
+  });
+  const events: SessionEvent[] = [];
+  const created = await manager.createSession({ cwd: dir, model: "scripted" });
+  const opened = await manager.open(created.id, (event) => events.push(event));
+
+  await manager.send(created.id, "first");
+  assert.equal(attempts, 1);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "agent" &&
+        event.event.type === "error" &&
+        event.event.message.includes("credential temporarily locked"),
+    ),
+  );
+
+  await manager.send(created.id, "second");
+  assert.equal(attempts, 2, "失败的物化不得毒化后续 send");
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "agent" && event.event.type === "text" && event.event.text === "recovered",
+    ),
+  );
+
+  opened.close();
+  await manager.shutdown();
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -2635,6 +2867,6 @@ test("SessionManager: 后台任务空闲期完成 → 自动发起 drive 消化�
   assert.equal(snap.backgroundTasks?.length, 1);
   assert.equal(snap.backgroundTasks![0]!.id, "t1");
   assert.equal(snap.backgroundTasks![0]!.status, "done");
-  m.dispose();
+  await m.shutdown();
   await fs.rm(dir, { recursive: true, force: true });
 });

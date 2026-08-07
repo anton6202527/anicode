@@ -10,13 +10,16 @@ import * as path from "node:path";
 import type { AnicodeConfig } from "./config.js";
 import { browserToolOptions, toSubagentDefinitions } from "./config.js";
 import { ContextCompiler } from "./runtime/context-compiler.js";
+import { ContainerIsolatedRuntime } from "./runtime/container-runtime.js";
 import {
   createLocalRuntimeStack,
   telemetryForLocalStack,
   type LocalExecutionMode,
+  type LocalRuntimeStackOptions,
   type LocalRuntimeStack,
 } from "./runtime/local-stack.js";
 import type { Telemetry } from "./runtime/telemetry.js";
+import { transactionalExecutionDelegate } from "./runtime/transactional-runtime.js";
 import { SecurityPolicyEngine } from "./security/policy.js";
 import { MigratingSessionStore, SessionStore } from "./session.js";
 import {
@@ -30,7 +33,15 @@ import {
   foregroundOnlyBash,
   restrictedWorkspaceDevelopmentTools,
 } from "./tools/index.js";
-import type { Tool, ToolRegistry } from "./tools/tool.js";
+import {
+  isIsolatedModuleTool,
+  isManagedExternalTool,
+  isolatedModuleTool,
+  type IsolatedModuleToolManifest,
+  type Tool,
+  ToolRegistry,
+} from "./tools/tool.js";
+import { isCoreOwnedTool } from "./tools/core-owned.js";
 import type { PermissionMode } from "./permission.js";
 import { Verifier } from "./runtime/verifier.js";
 import type { WorkspaceTrustAssessment } from "./workspace-trust.js";
@@ -41,6 +52,8 @@ export interface ProductionSessionManagerInput {
   sessionsDir: string;
   /** Test/plugin override. Production defaults to the runtime stack's instance-bound registry. */
   resolveProvider?: SessionManagerOptions["resolveProvider"];
+  /** Pure companion for a custom resolver; production registry supplies this automatically. */
+  inspectProvider?: SessionManagerOptions["inspectProvider"];
   config?: AnicodeConfig;
   permissionMode?: PermissionMode;
   /**
@@ -52,6 +65,8 @@ export interface ProductionSessionManagerInput {
   runBudget?: SessionManagerOptions["runBudget"];
   shutdownTimeoutMs?: number;
   runtimeStack?: LocalRuntimeStack;
+  /** Host-owned paths/options needed while constructing the default local runtime stack. */
+  localRuntimeOptions?: LocalRuntimeStackOptions;
   telemetry?: Telemetry;
   env?: NodeJS.ProcessEnv;
   workspaceTrust?: WorkspaceTrustSource;
@@ -61,11 +76,20 @@ export interface ProductionSessionManagerInput {
     previous?: WorkspaceTrustAssessment;
     current: WorkspaceTrustAssessment;
   }) => void | Promise<void>;
-  /** Replace the built-in registry (for example, Electron's live plugin registry). */
+  /**
+   * Select enabled built-ins and supply branded extensions (for example, Electron's live plugin
+   * registry). Built-in objects are never accepted from this registry; core creates fresh ones.
+   */
   tools?: () => ToolRegistry;
-  /** Decorate either the built-in or host-provided registry. */
+  /**
+   * Decorate either registry with explicitly classified host extensions. Each Tool must declare
+   * execution; arbitrary unmarked closures fail closed in this production composition.
+   */
   extraTools?: readonly Tool[];
   deferredTools?: readonly Tool[];
+  /** Preferred data-only boundary for third-party ESM bundles. */
+  isolatedTools?: readonly IsolatedModuleToolManifest[];
+  deferredIsolatedTools?: readonly IsolatedModuleToolManifest[];
   /** Extra discovery roots supplied by installed plugins. */
   skillDirs?: readonly string[];
   subagentDirs?: readonly string[];
@@ -88,7 +112,36 @@ export interface ProductionSessionManagerComposition {
 function toolsAllowedByExecutionMode(
   registry: ToolRegistry,
   executionMode: LocalExecutionMode,
+  isolatedModulesSupported = executionMode === "container",
 ): ToolRegistry {
+  const isolatedNames = registry
+    .names()
+    .filter((name) => registry.get(name)?.execution?.kind === "isolated-module");
+  const uncontainedStdio = registry.names().filter((name) => {
+    const execution = registry.get(name)?.execution;
+    return execution?.kind === "managed-external" && execution.protocol === "mcp-stdio";
+  });
+  if (uncontainedStdio.length > 0) {
+    throw new TypeError(
+      `Production stdio MCP tools require a managed process containment boundary: ${uncontainedStdio.join(", ")}`,
+    );
+  }
+  if (isolatedNames.length > 0 && executionMode !== "container") {
+    throw new TypeError(
+      `Declarative isolated tools require container execution mode: ${isolatedNames.join(", ")}`,
+    );
+  }
+  if (isolatedNames.length > 0 && !isolatedModulesSupported) {
+    throw new TypeError(
+      "Container execution capability mismatch: isolated runtime is not a container boundary",
+    );
+  }
+  assertProductionIsolatedCapabilities(
+    isolatedNames.flatMap((name) => {
+      const tool = registry.get(name);
+      return tool ? [tool] : [];
+    }),
+  );
   const existingBash = registry.get("bash");
   if (executionMode === "native-isolated") {
     // Transactional workspace writes cannot safely support a detached global ShellRegistry: its
@@ -99,6 +152,7 @@ function toolsAllowedByExecutionMode(
         .names()
         .filter(
           (name) =>
+            registry.get(name)?.execution?.kind !== "isolated-module" &&
             !["bash", "bash_output", "write_stdin", "list_shells", "kill_shell"].includes(name),
         ),
     );
@@ -107,7 +161,14 @@ function toolsAllowedByExecutionMode(
   }
   const filtered = registry.subset(
     registry.names().filter((name) => {
-      const capabilities = registry.get(name)?.capabilities;
+      const tool = registry.get(name);
+      // Untrusted module code is production-executable only inside the pinned OCI boundary. Keep
+      // pure and foreground-process manifests there; the manifest contract already forbids
+      // persistent-process. Native/restricted modes must not advertise a tool that can only fail.
+      if (tool?.execution?.kind === "isolated-module") {
+        return executionMode === "container" && isolatedModulesSupported;
+      }
+      const capabilities = tool?.capabilities;
       if (!capabilities || capabilities.length === 0) return false;
       return !capabilities.includes("process") && !capabilities.includes("persistent-process");
     }),
@@ -125,15 +186,140 @@ function toolsAllowedByExecutionMode(
 function configuredTools(
   input: ProductionSessionManagerInput,
   executionMode: LocalExecutionMode,
+  isolatedModulesSupported: boolean,
 ): (() => ToolRegistry) | undefined {
   const extra = input.extraTools ?? [];
   const deferred = input.deferredTools ?? [];
+  if ((input.isolatedTools?.length ?? 0) + (input.deferredIsolatedTools?.length ?? 0) > 0) {
+    if (executionMode !== "container") {
+      throw new TypeError("Declarative isolated tools require container execution mode");
+    }
+    if (!isolatedModulesSupported) {
+      throw new TypeError(
+        "Container execution capability mismatch: isolated runtime is not a container boundary",
+      );
+    }
+  }
+  const isolated = (input.isolatedTools ?? []).map(isolatedModuleTool);
+  const deferredIsolated = (input.deferredIsolatedTools ?? []).map(isolatedModuleTool);
+  assertProductionIsolatedCapabilities([...isolated, ...deferredIsolated]);
+  for (const tool of [...extra, ...deferred]) {
+    assertProductionExtension(tool);
+  }
   return () => {
-    const registry = input.tools?.() ?? defaultTools();
-    for (const tool of extra) registry.register(tool);
-    for (const tool of deferred) registry.register(tool, { deferred: true });
-    return toolsAllowedByExecutionMode(registry, executionMode);
+    const registry = productionRegistryFromMask(input.tools);
+    for (const tool of [...extra, ...isolated]) registerProductionExtension(registry, tool);
+    for (const tool of [...deferred, ...deferredIsolated]) {
+      registerProductionExtension(registry, tool, { deferred: true });
+    }
+    return toolsAllowedByExecutionMode(registry, executionMode, isolatedModulesSupported);
   };
+}
+
+/**
+ * A host-supplied registry is an enable/disable mask for built-ins, never an implementation
+ * override. Unknown names are extensions and must carry an unforgeable process-local brand.
+ */
+function productionRegistryFromMask(factory?: () => ToolRegistry): ToolRegistry {
+  const builtins = defaultTools();
+  if (!factory) return builtins;
+
+  const supplied = factory();
+  if (!(supplied instanceof ToolRegistry)) {
+    throw new TypeError("Production tools factory must return a ToolRegistry");
+  }
+  const builtinByCanonical = new Map(
+    builtins.names().map((name) => [canonicalProductionToolName(name), name] as const),
+  );
+  const enabledBuiltins: string[] = [];
+  const extensions: Array<{ tool: Tool; deferred: boolean }> = [];
+
+  for (const suppliedName of supplied.names()) {
+    const builtinName = builtinByCanonical.get(canonicalProductionToolName(suppliedName));
+    if (builtinName) {
+      if (builtinName !== suppliedName) {
+        throw new TypeError(
+          `Production tool name aliases a built-in: ${suppliedName} / ${builtinName}`,
+        );
+      }
+      // Only the name is used. The potentially replaced object in `supplied` is never executed.
+      enabledBuiltins.push(builtinName);
+      continue;
+    }
+    const tool = supplied.get(suppliedName);
+    if (!tool) throw new TypeError(`Production registry lost tool ${suppliedName}`);
+    extensions.push({ tool, deferred: supplied.isDeferred(suppliedName) });
+  }
+
+  const registry = builtins.subset(enabledBuiltins);
+  for (const { tool, deferred } of extensions) {
+    registerProductionExtension(registry, tool, deferred ? { deferred: true } : undefined);
+  }
+  return registry;
+}
+
+function registerProductionExtension(
+  registry: ToolRegistry,
+  tool: Tool,
+  opts?: { deferred?: boolean },
+): void {
+  assertProductionExtension(tool);
+  registry.registerExtension(tool, opts);
+}
+
+function assertProductionExtension(tool: Tool): void {
+  // WeakSet.has does not inspect the candidate. Reject an unbranded Proxy before a hostile getter
+  // on def/execution can run inside the production host.
+  const coreOwned = isCoreOwnedTool(tool);
+  const isolated = isIsolatedModuleTool(tool);
+  const managed = isManagedExternalTool(tool);
+  if (!coreOwned && !isolated && !managed) {
+    throw new TypeError("Production extension has no core-owned execution provenance");
+  }
+
+  const execution = tool.execution;
+  if (!execution) {
+    throw new TypeError("Branded production extension has no execution boundary");
+  }
+  if (
+    (execution.kind === "trusted-in-process" && !coreOwned) ||
+    (execution.kind === "isolated-module" && !isolated) ||
+    (execution.kind === "managed-external" && !managed)
+  ) {
+    throw new TypeError(
+      `Production ${execution.kind} extension provenance does not match boundary`,
+    );
+  }
+  if (execution.kind === "managed-external" && execution.protocol === "mcp-stdio") {
+    throw new TypeError(
+      `Production stdio MCP tool ${tool.def.name} requires a managed process containment boundary`,
+    );
+  }
+}
+
+/** Permission/tool identifiers use ASCII casing; avoid locale-sensitive folding. */
+function canonicalProductionToolName(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+}
+
+const UNSUPPORTED_PRODUCTION_ISOLATED_CAPABILITIES = new Set([
+  "filesystem-read",
+  "filesystem-write",
+  "network",
+]);
+
+function assertProductionIsolatedCapabilities(tools: readonly Tool[]): void {
+  for (const tool of tools) {
+    if (tool.execution?.kind !== "isolated-module") continue;
+    const unsupported = tool.capabilities?.find((capability) =>
+      UNSUPPORTED_PRODUCTION_ISOLATED_CAPABILITIES.has(capability),
+    );
+    if (unsupported) {
+      throw new TypeError(
+        `Isolated module ${unsupported} capability is unsupported in production; bundles receive no workspace or network projection`,
+      );
+    }
+  }
 }
 
 /**
@@ -145,6 +331,11 @@ export function productionSessionManagerOptions(
   runtimeStack: LocalRuntimeStack,
   telemetry: Telemetry,
 ): SessionManagerOptions {
+  if (runtimeStack.sessions.storageSemantics !== "transactional-primary") {
+    throw new TypeError(
+      `Production runtime requires a session store declaring transactional-primary semantics; received ${runtimeStack.sessions.storageSemantics ?? "unclassified"}`,
+    );
+  }
   const config = input.config ?? {};
   const env = input.env ?? process.env;
   // Runtime stacks from older/untyped embedders do not carry a capability declaration. Unknown
@@ -178,7 +369,13 @@ export function productionSessionManagerOptions(
           ...(input.disabledSkills ? { disabled: input.disabledSkills } : {}),
         }
       : true;
-  const tools = configuredTools(input, executionMode);
+  const transactionalDelegate = transactionalExecutionDelegate(runtimeStack.isolatedRuntime);
+  const containerBoundaryAttested =
+    executionMode === "container" &&
+    transactionalDelegate instanceof ContainerIsolatedRuntime &&
+    transactionalDelegate.toolModuleEnvironment === "container";
+  const isolatedModulesSupported = containerBoundaryAttested;
+  const tools = configuredTools(input, executionMode, isolatedModulesSupported);
 
   return {
     store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(input.sessionsDir)),
@@ -204,7 +401,12 @@ export function productionSessionManagerOptions(
     // policy to route foreground writes through PatchSet and reject persistent direct writers.
     sandbox: "workspace-write",
     workspaceScope: input.cwd,
-    resolveProvider: input.resolveProvider ?? runtimeStack.resolveProvider,
+    resolveProvider: input.resolveProvider ?? runtimeStack.resolveProviderAsync,
+    ...(input.inspectProvider
+      ? { inspectProvider: input.inspectProvider }
+      : input.resolveProvider === undefined
+        ? { inspectProvider: runtimeStack.providers.inspectProvider }
+        : {}),
     ...(input.runBudget ? { runBudget: input.runBudget } : {}),
     ...(input.shutdownTimeoutMs !== undefined
       ? { shutdownTimeoutMs: input.shutdownTimeoutMs }
@@ -242,7 +444,7 @@ export function productionSessionManagerOptions(
     ...(tools ? { tools } : {}),
     smallModel: config.smallModel ?? true,
     ...(config.fallbackModels?.length ? { fallbackModels: config.fallbackModels } : {}),
-    ...(supportsPersistentProcesses && config.hooks?.length
+    ...(containerBoundaryAttested && config.hooks?.length
       ? {
           hooks: commandHooksFromConfig(config.hooks, {
             executionRuntime: runtimeStack.isolatedRuntime,
@@ -308,7 +510,11 @@ export function createProductionSessionManager(
   try {
     runtimeStack =
       input.runtimeStack ??
-      createLocalRuntimeStack(path.dirname(input.sessionsDir), input.env ?? process.env);
+      createLocalRuntimeStack(
+        path.dirname(input.sessionsDir),
+        input.env ?? process.env,
+        input.localRuntimeOptions,
+      );
     telemetry = input.telemetry ?? telemetryForLocalStack(runtimeStack, input.env ?? process.env);
     manager = new SessionManager(
       productionSessionManagerOptions({ ...input, browserRegistry }, runtimeStack, telemetry),

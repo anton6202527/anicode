@@ -16,9 +16,15 @@ import {
   probeLocalProviders,
   t,
   type AnicodeConfig,
+  type BoundProviderRegistry,
   type ProductionSessionManagerComposition,
   type WorkspaceTrustSource,
 } from "@anicode/core";
+
+/** Exact loader installed by the VSIX build; resolving this path performs no credential access. */
+export function packagedKeyringModulePath(extensionPath: string): string {
+  return path.join(extensionPath, "out", "keyring", "index.js");
+}
 
 /** debug/本地 provider 免 key；云端缺 key 给出清晰错误。 */
 export function resolveConfiguredProvider(model: string) {
@@ -39,8 +45,15 @@ export function buildManager(
   workspaceTrust?: WorkspaceTrustSource,
   workspaceScope?: string,
   config?: AnicodeConfig,
+  keyringModulePath?: string,
 ): SessionManager {
-  return buildManagerComposition(sessionsDir, workspaceTrust, workspaceScope, config).manager;
+  return buildManagerComposition(
+    sessionsDir,
+    workspaceTrust,
+    workspaceScope,
+    config,
+    keyringModulePath,
+  ).manager;
 }
 
 /** Shared production composition; the extension keeps the result so owned SQLite/proxy resources close. */
@@ -49,6 +62,7 @@ export function buildManagerComposition(
   workspaceTrust?: WorkspaceTrustSource,
   workspaceScope?: string,
   config?: AnicodeConfig,
+  keyringModulePath?: string,
 ): ProductionSessionManagerComposition {
   const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
   return createProductionSessionManager({
@@ -56,6 +70,9 @@ export function buildManagerComposition(
     sessionsDir: dir,
     config: config ?? {},
     ...(workspaceTrust ? { workspaceTrust } : {}),
+    ...(keyringModulePath
+      ? { localRuntimeOptions: { osKeychain: { modulePath: keyringModulePath } } }
+      : {}),
   });
 }
 
@@ -65,6 +82,7 @@ export async function buildManagerCompositionAsync(
   workspaceTrust?: WorkspaceTrustSource,
   workspaceScope?: string,
   config?: AnicodeConfig,
+  keyringModulePath?: string,
 ): Promise<ProductionSessionManagerComposition> {
   const dir = sessionsDir ?? path.join(os.homedir(), ".anicode", "sessions");
   return createProductionSessionManagerAsync({
@@ -72,6 +90,9 @@ export async function buildManagerCompositionAsync(
     sessionsDir: dir,
     config: config ?? {},
     ...(workspaceTrust ? { workspaceTrust } : {}),
+    ...(keyringModulePath
+      ? { localRuntimeOptions: { osKeychain: { modulePath: keyringModulePath } } }
+      : {}),
   });
 }
 
@@ -83,7 +104,9 @@ export interface ModelChoice {
 }
 
 /** 目录 + 就绪状态；主机能读 env 并探测本地服务存活，据此排序与标注。 */
-export async function modelChoices(): Promise<ModelChoice[]> {
+export async function modelChoices(
+  providers: Pick<BoundProviderRegistry, "diagnoseProvider">,
+): Promise<ModelChoice[]> {
   const details = listProviderDetails();
   const probed = new Set(
     details.filter((d) => d.local && (d.baseURL || d.baseURLEnv)).map((d) => d.id),
@@ -91,7 +114,7 @@ export async function modelChoices(): Promise<ModelChoice[]> {
   const live = await probeLocalProviders(details);
   return listModelCatalog()
     .map((entry) => {
-      const d = diagnoseProvider(entry.spec);
+      const d = providers.diagnoseProvider(entry.spec);
       let ready: boolean;
       let cred: string;
       if (probed.has(entry.providerId)) {
@@ -106,10 +129,15 @@ export async function modelChoices(): Promise<ModelChoice[]> {
       } else {
         ready = d.hasCredentials;
         cred = ready
-          ? t(
-              `${d.credentialEnv ?? t("credential", "凭证")} configured`,
-              `${d.credentialEnv ?? "凭证"} 已配置`,
-            )
+          ? d.credentialAvailability === "configured"
+            ? t(
+                `${d.credentialEnv ?? t("credential", "凭证")} configured (not verified)`,
+                `${d.credentialEnv ?? "凭证"} 已配置（未验证）`,
+              )
+            : t(
+                `${d.credentialEnv ?? t("credential", "凭证")} available`,
+                `${d.credentialEnv ?? "凭证"} 可用`,
+              )
           : t(
               `Missing ${d.apiKeyEnv.join(" / ") || "API key"}`,
               `缺 ${d.apiKeyEnv.join(" / ") || "API key"}`,

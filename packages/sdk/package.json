@@ -10,7 +10,7 @@
   "scripts": {
     "codegen": "node --import tsx scripts/generate.ts",
     "codegen:check": "node --import tsx scripts/generate.ts --check",
-    "test": "cross-env ANICODE_LANG=zh node --import tsx --test 'src/**/*.test.ts'",
+    "test": "cross-env ANICODE_LANG=zh ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

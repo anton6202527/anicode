@@ -1,6 +1,8 @@
 // 构建两个 bundle：扩展主机（Node/CJS，external vscode）与 webview（浏览器/IIFE）。
 // @anicode/core 及其 SDK 依赖一并打进主机 bundle，因此 .vsix 自包含。
 import * as esbuild from "esbuild";
+import { rm } from "node:fs/promises";
+import { packageKeyringRuntime } from "./scripts/package-keyring-runtime.mjs";
 
 const production = process.argv.includes("--production");
 const watch = process.argv.includes("--watch");
@@ -36,11 +38,17 @@ const webview = {
   target: "es2020",
 };
 
+// `outfile` builds do not clean stale file-loader artifacts. Keep the generated native directory
+// deterministic, then install the isolated helper's exact loader/binding beside the extension.
+await rm("out/native", { recursive: true, force: true });
+
 if (watch) {
+  await packageKeyringRuntime();
   const ctxHost = await esbuild.context(host);
   const ctxView = await esbuild.context(webview);
   await Promise.all([ctxHost.watch(), ctxView.watch()]);
   console.log("watching…");
 } else {
   await Promise.all([esbuild.build(host), esbuild.build(webview)]);
+  await packageKeyringRuntime();
 }

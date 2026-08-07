@@ -1035,6 +1035,7 @@ function sessionMetaFromRow(row: Row): SessionMeta {
 
 /** 共享控制面的会话存储；所有复合写入均为 SERIALIZABLE，并锁定 session row。 */
 export class PostgresSessionStore implements ISessionStore {
+  readonly storageSemantics = "transactional-primary" as const;
   constructor(readonly database: PostgresRuntimeDatabase) {}
 
   create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
@@ -1125,18 +1126,20 @@ export class PostgresSessionStore implements ISessionStore {
 
   async load(id: string): Promise<SessionData> {
     assertIdentifier(id, "session id");
-    const [session, messages] = await Promise.all([
-      this.database.pool.query("SELECT * FROM anicode_sessions WHERE id = $1", [id]),
-      this.database.pool.query(
+    // Metadata and transcript form one logical document. Keep both reads on the same
+    // SERIALIZABLE connection so a concurrent rewrite/delete can never produce a mixed version.
+    return this.database.transaction(async (client) => {
+      const session = await client.query("SELECT * FROM anicode_sessions WHERE id = $1", [id]);
+      if (!session.rows[0]) throw new Error(`Session ${id} not found`);
+      const messages = await client.query(
         "SELECT data FROM anicode_session_messages WHERE session_id = $1 ORDER BY idx",
         [id],
-      ),
-    ]);
-    if (!session.rows[0]) throw new Error(`Session ${id} not found`);
-    return {
-      ...sessionMetaFromRow(session.rows[0] as Row),
-      messages: messages.rows.map((row) => clone((row as Row).data as ChatMessage)),
-    };
+      );
+      return {
+        ...sessionMetaFromRow(session.rows[0] as Row),
+        messages: messages.rows.map((row) => clone((row as Row).data as ChatMessage)),
+      };
+    });
   }
 
   async list(): Promise<SessionMeta[]> {

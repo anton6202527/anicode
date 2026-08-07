@@ -15,7 +15,15 @@
 
 import type { ImagePart, ToolResultPart, Usage } from "./types.js";
 import type { AgentEvent } from "./agent.js";
-import { ToolError, type Tool, type ToolRegistry } from "./tools/tool.js";
+import {
+  ToolError,
+  isIsolatedModuleTool,
+  isManagedExternalTool,
+  normalizeIsolatedToolInput,
+  type Tool,
+  type ToolContext,
+  type ToolRegistry,
+} from "./tools/tool.js";
 import type { PermissionDecision, PermissionEngine } from "./permission.js";
 import type { HookRunner } from "./hooks.js";
 import { Chan } from "./chan.js";
@@ -24,8 +32,19 @@ import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 import type { NetworkProxy } from "./runtime/network-proxy.js";
 import { noTelemetry, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
 import type { SecurityPolicyEngine } from "./security/policy.js";
+import { hasUnparsedToolArguments } from "./tool-arguments.js";
+import { IsolatedToolRunner } from "./tools/isolated-tool-runner.js";
 
 export type ToolCall = { id: string; name: string; args: Record<string, unknown> };
+
+const DEFAULT_MAX_PROGRESS_EVENTS = 1_000;
+const DEFAULT_MAX_PROGRESS_BYTES = 1 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHED_IMAGES = 4;
+// One built-in screenshot may contain up to 5 MiB of decoded data (~6.7 MiB base64).
+const DEFAULT_MAX_ATTACHED_IMAGE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_ISOLATED_INPUT_BYTES = 512 * 1024;
+const DEFAULT_MAX_ISOLATED_OUTPUT_BYTES = 32 * 1024;
+const HARD_MAX_CONCURRENT_TOOLS = 32;
 
 export interface ToolExecutionFenceRequest {
   toolCallId: string;
@@ -48,6 +67,18 @@ export interface ToolExecutorOptions {
   maxConcurrentTools?: number;
   /** 单个工具统一执行超时（毫秒），默认 10 分钟。 */
   toolTimeoutMs?: number;
+  /** Declarative isolated-module JSON input ceiling, at most 512 KiB. */
+  maxIsolatedInputBytes?: number;
+  /** Declarative isolated-module UTF-8 result ceiling, at most 32 KiB. */
+  maxIsolatedOutputBytes?: number;
+  /** 单次工具执行最多接受的 progress payload 数量，默认 1000。 */
+  maxProgressEvents?: number;
+  /** 单次工具执行最多接受的 progress payload JSON 字节数，默认 1 MiB。 */
+  maxProgressBytes?: number;
+  /** 单次工具执行最多附带的图片数量，默认 4。 */
+  maxAttachedImages?: number;
+  /** 单次工具执行最多保留的 base64 图片数据字节数，默认 8 MiB。 */
+  maxAttachedImageBytes?: number;
   /**
    * 并发分组发生在执行前。只要 PreToolUse 或只读 ask-confirm 可能改写入参，
    * 就必须保守串行，避免按旧参数判成安全、最终却执行写操作。
@@ -72,14 +103,75 @@ export interface ToolExecutorOptions {
 
 export class ToolExecutor {
   private readonly rawExecutions = new Set<Promise<unknown>>();
+  private readonly isolatedRunner: IsolatedToolRunner;
+  private readonly maxConcurrentTools: number;
+  private readonly isolatedInputBytes: number;
+  private readonly isolatedOutputBytes: number;
+  private closed = false;
+  private closeTask?: Promise<void>;
+  private readonly outputQuotas: {
+    progressEvents: number;
+    progressBytes: number;
+    attachedImages: number;
+    attachedImageBytes: number;
+  };
 
-  constructor(private readonly o: ToolExecutorOptions) {}
+  constructor(private readonly o: ToolExecutorOptions) {
+    this.maxConcurrentTools = boundedPositiveQuota(
+      "maxConcurrentTools",
+      o.maxConcurrentTools,
+      8,
+      HARD_MAX_CONCURRENT_TOOLS,
+    );
+    this.isolatedInputBytes = boundedPositiveQuota(
+      "maxIsolatedInputBytes",
+      o.maxIsolatedInputBytes,
+      DEFAULT_MAX_ISOLATED_INPUT_BYTES,
+      DEFAULT_MAX_ISOLATED_INPUT_BYTES,
+    );
+    this.isolatedOutputBytes = boundedPositiveQuota(
+      "maxIsolatedOutputBytes",
+      o.maxIsolatedOutputBytes,
+      DEFAULT_MAX_ISOLATED_OUTPUT_BYTES,
+      DEFAULT_MAX_ISOLATED_OUTPUT_BYTES,
+    );
+    this.isolatedRunner = new IsolatedToolRunner(o.isolatedRuntime, {
+      maxConcurrent: this.maxConcurrentTools,
+    });
+    this.outputQuotas = {
+      progressEvents: quota("maxProgressEvents", o.maxProgressEvents, DEFAULT_MAX_PROGRESS_EVENTS),
+      progressBytes: quota("maxProgressBytes", o.maxProgressBytes, DEFAULT_MAX_PROGRESS_BYTES),
+      attachedImages: quota("maxAttachedImages", o.maxAttachedImages, DEFAULT_MAX_ATTACHED_IMAGES),
+      attachedImageBytes: quota(
+        "maxAttachedImageBytes",
+        o.maxAttachedImageBytes,
+        DEFAULT_MAX_ATTACHED_IMAGE_BYTES,
+      ),
+    };
+  }
 
   /** Keep durable command ownership until aborted/timed-out tool code has actually settled. */
   async awaitIdle(): Promise<void> {
     while (this.rawExecutions.size > 0) {
       await Promise.allSettled([...this.rawExecutions]);
     }
+  }
+
+  /** Abort killable extension processes and await their close proof. Stable and idempotent. */
+  close(): Promise<void> {
+    if (this.closeTask) return this.closeTask;
+    this.closed = true;
+    this.closeTask = (async () => {
+      const results = await Promise.allSettled([this.isolatedRunner.close(), this.awaitIdle()]);
+      const failures = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "Tool executor cleanup failed");
+      }
+    })();
+    return this.closeTask;
   }
 
   /**
@@ -106,7 +198,7 @@ export class ToolExecutor {
         batch.push(calls[i + batch.length]!);
       }
       i += batch.length;
-      const concurrency = Math.max(1, Math.floor(this.o.maxConcurrentTools ?? 8));
+      const concurrency = this.maxConcurrentTools;
       for (let offset = 0; offset < batch.length; offset += concurrency) {
         const chunk = batch.slice(offset, offset + concurrency);
         if (chunk.length === 1) yield* this.runToolSafe(chunk[0]!, signal, results, images);
@@ -122,8 +214,21 @@ export class ToolExecutor {
    * 从而让多个只读调研子 agent 并行 fan-out）；否则回落到静态 readOnly 契约。
    */
   private isParallelSafe(call: ToolCall): boolean {
+    // Provider 参数解析失败时会保留一个仅供内部诊断的 __unparsed 哨兵。
+    // 不要让这类调用进入并发判定，因为自定义 isConcurrencySafe 也可能读取或执行入参。
+    if (hasUnparsedToolArguments(call.args)) return false;
     const tool = this.o.tools.get(call.name);
     if (!tool || !this.o.parallelInputsStable) return false;
+    if (tool.execution?.kind === "isolated-module") {
+      if (!isIsolatedModuleTool(tool)) return false;
+      try {
+        normalizeIsolatedToolInput(call.args, this.isolatedInputBytes);
+      } catch {
+        return false;
+      }
+      return tool.readOnly;
+    }
+    if (tool.execution?.kind === "managed-external" && !isManagedExternalTool(tool)) return false;
     if (tool.isConcurrencySafe) {
       try {
         return tool.isConcurrencySafe(call.args);
@@ -207,8 +312,23 @@ export class ToolExecutor {
     results: ToolResultPart[],
     images: ImagePart[],
   ): AsyncGenerator<AgentEvent> {
+    if (this.closed) {
+      const msg = "工具执行器已关闭，工具未执行";
+      results.push(errResult(call.id, call.name, msg));
+      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
+      return;
+    }
     if (signal.aborted) {
       const msg = "会话已中断，工具未执行";
+      results.push(errResult(call.id, call.name, msg));
+      yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
+      return;
+    }
+    // Provider 返回的 tool arguments 不是合法 JSON。原文可能含敏感信息或提示注入，
+    // 因此既不回显，也不让它进入 hook、ruleKey、权限判断或工具实现。
+    if (hasUnparsedToolArguments(call.args)) {
+      const msg =
+        "工具参数无效（INVALID_TOOL_ARGUMENTS）：参数不是合法 JSON，请严格按照该工具的参数 schema 重新发起调用。";
       results.push(errResult(call.id, call.name, msg));
       yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
       return;
@@ -222,9 +342,20 @@ export class ToolExecutor {
       yield { type: "tool_result", id: call.id, name: call.name, content: msg, isError: true };
       return;
     }
+    if (tool.execution?.kind === "isolated-module" && !isIsolatedModuleTool(tool)) {
+      throw new ToolError("Untrusted isolated tool registration was rejected");
+    }
+    if (tool.execution?.kind === "managed-external" && !isManagedExternalTool(tool)) {
+      throw new ToolError("Untrusted managed tool registration was rejected");
+    }
+    const isolated = tool.execution?.kind === "isolated-module";
 
     // PreToolUse hook：可拦截 / 改写入参 / 显式放行（跳过权限门）
-    let args = call.args;
+    // Declarative extension input is normalized before it can reach even a core-owned rule-key or
+    // permission callback. This rejects accessors, cycles, special prototypes and oversized JSON.
+    let args = isolated
+      ? normalizeIsolatedToolInput(call.args, this.isolatedInputBytes)
+      : call.args;
     let hookAllowed = false;
     let blockedReason: string | null = null;
     let preContext: string | undefined;
@@ -242,7 +373,11 @@ export class ToolExecutor {
       throwIfAborted(signal);
       if (h.mutatedWorkspace) this.o.onFilesChanged?.([this.o.cwd]);
       if (h.blocked) blockedReason = h.reason ?? "被 PreToolUse hook 拦截";
-      if (h.updatedInput) args = h.updatedInput;
+      if (h.updatedInput) {
+        args = isolated
+          ? normalizeIsolatedToolInput(h.updatedInput, this.isolatedInputBytes)
+          : h.updatedInput;
+      }
       hookAllowed = h.allowed;
       preContext = h.additionalContext;
     }
@@ -298,7 +433,9 @@ export class ToolExecutor {
     // confirm 可以收窄/改写参数，但确认针对的是原动作。最终动作必须重新经过
     // deny/ask 不可绕过层，不能借 updatedInput 把安全请求换成被禁请求。
     if (decision.behavior === "allow" && decision.updatedInput) {
-      const updated = decision.updatedInput;
+      const updated = isolated
+        ? normalizeIsolatedToolInput(decision.updatedInput, this.isolatedInputBytes)
+        : decision.updatedInput;
       const updatedRuleKey = tool.ruleKey(updated);
       decision = this.o.perm.validateUpdatedInput({
         toolName: call.name,
@@ -349,7 +486,9 @@ export class ToolExecutor {
     }
 
     // 执行：进度经 Chan 实时回流（子 agent 事件、长任务心跳）
-    const input = decision.updatedInput ?? args;
+    const input = isolated
+      ? normalizeIsolatedToolInput(decision.updatedInput ?? args, this.isolatedInputBytes)
+      : (decision.updatedInput ?? args);
     const chan = new Chan<AgentEvent>();
     // 工具经 attachImage 附带的图片先收在本地；只有工具成功时才并入历史。
     const localImages: ImagePart[] = [];
@@ -367,6 +506,27 @@ export class ToolExecutor {
     const execution = new AbortController();
     let active = true;
     let timedOut = false;
+    let progressEvents = 0;
+    let progressBytes = 0;
+    let attachedImageBytes = 0;
+    const quotaWarnings = new Set<"progress" | "images">();
+    const warnQuotaOnce = (kind: "progress" | "images"): void => {
+      if (!active || quotaWarnings.has(kind)) return;
+      quotaWarnings.add(kind);
+      const progress = kind === "progress";
+      chan.push({
+        type: "tool_progress",
+        id: call.id,
+        name: call.name,
+        event: {
+          type: "warning",
+          code: progress ? "TOOL_PROGRESS_QUOTA_EXCEEDED" : "TOOL_IMAGE_QUOTA_EXCEEDED",
+          message: progress
+            ? `工具进度输出超过配额（最多 ${this.outputQuotas.progressEvents} 条 / ${this.outputQuotas.progressBytes} 字节），后续进度已丢弃`
+            : `工具附图超过配额（最多 ${this.outputQuotas.attachedImages} 张 / ${this.outputQuotas.attachedImageBytes} 字节 base64 数据），后续附图已丢弃`,
+        },
+      });
+    };
     const timeoutMs = Math.max(1_000, this.o.toolTimeoutMs ?? 10 * 60_000);
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -404,7 +564,7 @@ export class ToolExecutor {
           if (tool.mutatesFiles || tool.capabilities?.includes("filesystem-write")) {
             this.o.onFilesChanged?.(changedPaths(input, this.o.cwd));
           }
-          return await tool.run(input, {
+          const context: ToolContext = {
             cwd: this.o.cwd,
             signal: execution.signal,
             ...(this.o.sandbox ? { sandbox: this.o.sandbox } : {}),
@@ -413,16 +573,55 @@ export class ToolExecutor {
             ...(toolContext ? { traceContext: toolContext } : {}),
             modelSupportsImages: this.o.supportsImages(),
             attachImage: (img) => {
-              if (active) localImages.push(img);
+              if (!active || quotaWarnings.has("images")) return;
+              if (
+                img?.type !== "image" ||
+                typeof img.mediaType !== "string" ||
+                typeof img.data !== "string" ||
+                localImages.length >= this.outputQuotas.attachedImages
+              ) {
+                warnQuotaOnce("images");
+                return;
+              }
+              const remaining = this.outputQuotas.attachedImageBytes - attachedImageBytes;
+              const bytes = utf8BytesUpTo(img.data, remaining);
+              if (bytes > remaining) {
+                warnQuotaOnce("images");
+                return;
+              }
+              attachedImageBytes += bytes;
+              localImages.push(img);
             },
             emit: (progress) => {
-              if (active)
-                chan.push({ type: "tool_progress", id: call.id, name: call.name, event: progress });
+              if (!active || quotaWarnings.has("progress")) return;
+              if (progressEvents >= this.outputQuotas.progressEvents) {
+                warnQuotaOnce("progress");
+                return;
+              }
+              const remaining = this.outputQuotas.progressBytes - progressBytes;
+              const bytes = progressPayloadBytes(progress, remaining);
+              if (bytes > remaining) {
+                warnQuotaOnce("progress");
+                return;
+              }
+              progressEvents++;
+              progressBytes += bytes;
+              chan.push({ type: "tool_progress", id: call.id, name: call.name, event: progress });
             },
             addUsage: (usage) => {
               if (active) this.o.addUsage(usage);
             },
-          });
+          };
+          if (tool.execution?.kind === "isolated-module") {
+            return await this.isolatedRunner.run(tool, input, context, {
+              timeoutMs,
+              maxInputBytes: this.isolatedInputBytes,
+              maxOutputBytes: this.isolatedOutputBytes,
+              maxProgressEvents: this.outputQuotas.progressEvents,
+              maxProgressBytes: this.outputQuotas.progressBytes,
+            });
+          }
+          return await tool.run(input, context);
         } finally {
           releaseTreeSlot();
         }
@@ -452,7 +651,15 @@ export class ToolExecutor {
       if (execution.signal.aborted) onExecutionAbort();
       else execution.signal.addEventListener("abort", onExecutionAbort, { once: true });
     });
-    const settled = Promise.race([raw, aborted]).finally(() => {
+    const closeConfirmed =
+      tool.execution?.kind === "isolated-module" ||
+      (tool.execution?.kind === "managed-external" &&
+        tool.execution.cancellation === "close-confirmed");
+    // Kill-confirmed adapters must not produce a model-visible terminal result until their child
+    // process/transport has proved closed. Legacy trusted closures retain the compatibility race;
+    // their raw Promise remains fenced by awaitIdle().
+    const visible = closeConfirmed ? raw : Promise.race([raw, aborted]);
+    const settled = visible.finally(() => {
       active = false;
       clearTimeout(timeout);
       signal.removeEventListener("abort", onParentAbort);
@@ -461,6 +668,26 @@ export class ToolExecutor {
     });
     for await (const ev of chan) yield ev;
     const r = await settled;
+
+    const isolatedTerminationProofFailed =
+      !r.ok &&
+      tool.execution?.kind === "isolated-module" &&
+      r.err instanceof ToolError &&
+      /termination proof failed/i.test(r.err.message);
+    if (
+      !r.ok &&
+      execution.signal.aborted &&
+      tool.execution?.kind === "managed-external" &&
+      tool.execution.cancellation === "outcome-indeterminate"
+    ) {
+      r.err = new ToolError(
+        timedOut
+          ? `工具 ${call.name} 执行超时（${timeoutMs}ms）；远端操作结果未知`
+          : `工具 ${call.name} 已中断；远端操作结果未知`,
+      );
+    } else if (!r.ok && timedOut && !isolatedTerminationProofFailed) {
+      r.err = new ToolError(`工具 ${call.name} 执行超时（${timeoutMs}ms）`);
+    }
 
     if (r.ok) toolSpan.setStatus({ code: "ok" });
     else toolSpan.recordException(r.err).setStatus({ code: "error" });
@@ -471,7 +698,7 @@ export class ToolExecutor {
       r.ok ? r.content : r.err instanceof ToolError ? r.err.message : errText(r.err),
       this.o.maxToolResultChars,
     );
-    if (preContext) content += reminder(preContext);
+    if (preContext) content = appendBoundedReminder(content, preContext, this.o.maxToolResultChars);
     // PostToolUse 对成功和失败都执行；反馈（含 block reason）回传给模型。
     if (this.o.hooks.has("PostToolUse")) {
       const h = await raceWithSignal(
@@ -488,8 +715,11 @@ export class ToolExecutor {
       );
       if (h.mutatedWorkspace) this.o.onFilesChanged?.([this.o.cwd]);
       const feedback = h.blocked ? h.reason : h.additionalContext;
-      if (feedback) content += reminder(feedback);
+      if (feedback) content = appendBoundedReminder(content, feedback, this.o.maxToolResultChars);
     }
+    // Hook context is an untrusted output boundary too. Keep the persisted/model-visible payload
+    // within the same hard limit even after Pre/PostToolUse additions.
+    content = truncateToolResult(content, this.o.maxToolResultChars);
     const result: ToolResultPart = {
       type: "tool_result",
       toolCallId: call.id,
@@ -524,6 +754,84 @@ function errText(err: unknown): string {
   return String((err as { message?: unknown })?.message ?? err);
 }
 
+function quota(name: string, value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} 必须是非负安全整数`);
+  }
+  return value;
+}
+
+function boundedPositiveQuota(
+  name: string,
+  value: number | undefined,
+  fallback: number,
+  hardMaximum: number,
+): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 1) {
+    throw new TypeError(`${name} 必须是正安全整数`);
+  }
+  return Math.min(resolved, hardMaximum);
+}
+
+/** UTF-8 byte length with an early exit, avoiding a second large buffer allocation. */
+function utf8BytesUpTo(value: string, limit: number): number {
+  if (limit < 0) return 0;
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+    if (bytes > limit) return limit + 1;
+  }
+  return bytes;
+}
+
+/**
+ * Measure the serialized progress payload without letting one giant string be copied in full.
+ * The replacer provides an early lower-bound guard; the final scan supplies the exact UTF-8 size.
+ * Unserializable payloads are rejected at this boundary because downstream transports could not
+ * safely encode them either.
+ */
+function progressPayloadBytes(progress: unknown, limit: number): number {
+  if (limit < 0) return 0;
+  const tooLarge = Symbol("progress-too-large");
+  let inspected = 0;
+  try {
+    const json = JSON.stringify(progress, (key, value: unknown) => {
+      inspected += 4;
+      inspected += utf8BytesUpTo(key, Math.max(0, limit - inspected));
+      if (typeof value === "string") {
+        inspected += utf8BytesUpTo(value, Math.max(0, limit - inspected));
+      }
+      if (inspected > limit) throw tooLarge;
+      return value;
+    });
+    if (json === undefined) return 0;
+    return utf8BytesUpTo(json, limit);
+  } catch {
+    return limit + 1;
+  }
+}
+
+function appendBoundedReminder(content: string, context: string, max: number): string {
+  // Bound the hook-controlled string before interpolation so concatenation itself stays O(max).
+  const boundedContext = truncateToolResult(context, max);
+  return truncateToolResult(content + reminder(boundedContext), max);
+}
+
 function changedPaths(input: Record<string, unknown>, cwd: string): string[] {
   const paths = ["path", "file", "file_path"]
     .map((key) => input[key])
@@ -551,11 +859,10 @@ function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T>
 /** 超长工具结果截中段（保头 80% + 尾 20%，头尾往往比中段信息密度高） */
 export function truncateToolResult(content: string, max: number): string {
   if (content.length <= max) return content;
-  const head = Math.floor(max * 0.8);
-  const tail = max - head;
-  return (
-    content.slice(0, head) +
-    `\n\n…（工具输出共 ${content.length} 字符，超过 ${max} 上限，中段已截断）…\n\n` +
-    content.slice(content.length - tail)
-  );
+  const marker = `\n\n…（工具输出共 ${content.length} 字符，超过 ${max} 上限，中段已截断）…\n\n`;
+  if (marker.length >= max) return marker.slice(0, Math.max(0, max));
+  const payload = max - marker.length;
+  const head = Math.floor(payload * 0.8);
+  const tail = payload - head;
+  return content.slice(0, head) + marker + content.slice(content.length - tail);
 }

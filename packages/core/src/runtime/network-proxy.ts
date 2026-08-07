@@ -10,12 +10,7 @@ import { Agent as UndiciAgent } from "undici";
 import type { CredentialBroker } from "../security/credentials.js";
 
 const PROXY_CREDENTIAL_CONTROL_PATH = "/.well-known/anicode/proxy-credentials";
-
-interface PinnedLookupCallback {
-  (error: Error): void;
-  (error: null, address: string, family: number): void;
-  (error: null, addresses: { address: string; family: number }[]): void;
-}
+const HAPPY_EYEBALLS_ATTEMPT_TIMEOUT_MS = 250;
 
 export interface NetworkPolicy {
   allowDomains?: string[];
@@ -38,12 +33,24 @@ export interface NetworkAuditEvent {
 export interface NetworkProxyOptions {
   policy?: NetworkPolicy;
   broker?: CredentialBroker;
-  resolver?: (hostname: string) => Promise<string[]>;
+  resolver?: (hostname: string, signal?: AbortSignal) => Promise<string[]>;
+  /** Maximum time allowed for one DNS refresh. The resolver receives an instance-local signal. */
+  dnsTimeoutMs?: number;
+  /** Successful DNS answers are reused for this short interval. */
+  dnsCacheTtlMs?: number;
+  /** Additional stale-if-error window after dnsCacheTtlMs. */
+  dnsStaleTtlMs?: number;
+  /** Maximum number of hostnames retained by the instance-local DNS LRU. */
+  maxDnsCacheEntries?: number;
   /** Test-runner seam only. Production traffic must use the DNS-pinned Undici dispatcher. */
   fetch?: typeof fetch;
   onAudit?: (event: NetworkAuditEvent) => void | Promise<void>;
   /** DNS-pinned Undici dispatchers retained across origins. Least-recently-used entries retire. */
   maxPinnedAgents?: number;
+  /** Maximum number of pooled upstream connections for one origin. */
+  maxConnectionsPerOrigin?: number;
+  /** Grace period before an upstream dispatcher is force-destroyed. */
+  agentCloseTimeoutMs?: number;
   /** Maximum decoded bytes exposed by one in-process response body. */
   maxResponseBytes?: number;
 }
@@ -128,6 +135,68 @@ function parseIpAddress(address: string): ParsedIpAddress | undefined {
 /** Canonical numeric spelling used for DNS pinning; invalid/zone-scoped input is rejected. */
 export function canonicalizeIpAddress(address: string): string | undefined {
   return parseIpAddress(address)?.canonical;
+}
+
+/** A socket lookup that can only return the addresses authorized for this request. */
+function createPinnedLookup(addresses: readonly string[]): net.LookupFunction {
+  const candidates = [...new Set(addresses)];
+  return (_hostname, options, callback) => {
+    const requested =
+      options.family === "IPv4"
+        ? 4
+        : options.family === "IPv6"
+          ? 6
+          : typeof options.family === "number"
+            ? options.family
+            : 0;
+    const selected = candidates.filter((address) => requested === 0 || isIP(address) === requested);
+    if (selected.length === 0) {
+      callback(
+        Object.assign(new Error("authorized DNS result has no matching address family"), {
+          code: "EAI_ADDRFAMILY",
+        }),
+        "",
+        0,
+      );
+      return;
+    }
+    if (options.all) {
+      callback(
+        null,
+        selected.map((address) => ({ address, family: isIP(address) })),
+      );
+      return;
+    }
+    const address = selected[0]!;
+    callback(null, address, isIP(address));
+  };
+}
+
+function errorFromUnknown(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function waitForPromiseWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(errorFromUnknown(signal.reason ?? "operation aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(errorFromUnknown(signal.reason ?? "operation aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 function inPrefix(value: bigint, prefix: bigint, bits: number, width: 32 | 128): boolean {
@@ -574,15 +643,34 @@ async function receiveTlsClientHello(
   });
 }
 
+interface DnsCacheEntry {
+  readonly addresses: readonly string[];
+  readonly freshUntil: number;
+  readonly staleUntil: number;
+}
+
 export class NetworkProxy {
   private readonly policy: Required<NetworkPolicy>;
-  private readonly resolver: (hostname: string) => Promise<string[]>;
+  private readonly resolver: (hostname: string, signal?: AbortSignal) => Promise<string[]>;
   private readonly doFetch: typeof fetch;
   private readonly customFetch: boolean;
   private readonly pinnedAgents = new Map<string, UndiciAgent>();
   private readonly retiringAgents = new Set<Promise<void>>();
   private readonly maxPinnedAgents: number;
+  private readonly maxConnectionsPerOrigin: number;
+  private readonly agentCloseTimeoutMs: number;
   private readonly maxResponseBytes: number;
+  private readonly dnsTimeoutMs: number;
+  private readonly dnsCacheTtlMs: number;
+  private readonly dnsStaleTtlMs: number;
+  private readonly maxDnsCacheEntries: number;
+  private readonly dnsCache = new Map<string, DnsCacheEntry>();
+  private readonly dnsInFlight = new Map<string, Promise<readonly string[]>>();
+  private readonly dnsControllers = new Set<AbortController>();
+  private readonly activeRequests = new Set<Promise<Response>>();
+  private readonly lifecycleController = new AbortController();
+  private lifecycleState: "open" | "closing" | "closed" = "open";
+  private closePromise: Promise<void> | undefined;
   private readonly broker?: CredentialBroker;
   private readonly onAudit?: NetworkProxyOptions["onAudit"];
 
@@ -607,9 +695,27 @@ export class NetworkProxy {
     this.maxPinnedAgents = Number.isFinite(options.maxPinnedAgents)
       ? Math.max(1, Math.floor(options.maxPinnedAgents!))
       : 128;
+    this.maxConnectionsPerOrigin = Number.isFinite(options.maxConnectionsPerOrigin)
+      ? Math.min(256, Math.max(1, Math.floor(options.maxConnectionsPerOrigin!)))
+      : 8;
+    this.agentCloseTimeoutMs = Number.isFinite(options.agentCloseTimeoutMs)
+      ? Math.min(30_000, Math.max(1, Math.floor(options.agentCloseTimeoutMs!)))
+      : 2_000;
     this.maxResponseBytes = Number.isFinite(options.maxResponseBytes)
       ? Math.max(1, Math.floor(options.maxResponseBytes!))
       : 32 * 1024 * 1024;
+    this.dnsTimeoutMs = Number.isFinite(options.dnsTimeoutMs)
+      ? Math.min(30_000, Math.max(1, Math.floor(options.dnsTimeoutMs!)))
+      : 5_000;
+    this.dnsCacheTtlMs = Number.isFinite(options.dnsCacheTtlMs)
+      ? Math.min(60_000, Math.max(0, Math.floor(options.dnsCacheTtlMs!)))
+      : 5_000;
+    this.dnsStaleTtlMs = Number.isFinite(options.dnsStaleTtlMs)
+      ? Math.min(5 * 60_000, Math.max(0, Math.floor(options.dnsStaleTtlMs!)))
+      : 30_000;
+    this.maxDnsCacheEntries = Number.isFinite(options.maxDnsCacheEntries)
+      ? Math.min(4_096, Math.max(1, Math.floor(options.maxDnsCacheEntries!)))
+      : 256;
     if (options.broker) this.broker = options.broker;
     if (options.onAudit) this.onAudit = options.onAudit;
   }
@@ -618,13 +724,148 @@ export class NetworkProxy {
     await this.onAudit?.({ timestamp: new Date().toISOString(), ...event });
   }
 
-  async authorize(target: string | URL): Promise<{ url: URL; addresses: string[] }> {
+  private assertOpen(): void {
+    if (this.lifecycleState !== "open") {
+      throw new Error(`Network proxy is ${this.lifecycleState}`);
+    }
+  }
+
+  private operationSignal(signal?: AbortSignal): AbortSignal {
+    return signal
+      ? AbortSignal.any([signal, this.lifecycleController.signal])
+      : this.lifecycleController.signal;
+  }
+
+  private validateDnsAnswer(resolved: string[]): string[] {
+    if (!Array.isArray(resolved) || resolved.length === 0) {
+      throw new Error("DNS returned no addresses");
+    }
+    const addresses = resolved.map(canonicalizeIpAddress);
+    if (addresses.some((address) => address === undefined)) {
+      throw new Error("DNS returned an invalid IP address");
+    }
+    const pinned = [...new Set(addresses as string[])];
+    // Only policy-safe answers enter the stale cache. A successful but unsafe DNS response must
+    // fail closed instead of reviving an older public answer.
+    if (!this.policy.allowPrivateAddresses && pinned.some(isPrivateAddress)) {
+      throw new Error("private, loopback, link-local or reserved address");
+    }
+    return pinned;
+  }
+
+  private async invokeResolver(hostname: string): Promise<string[]> {
+    const controller = new AbortController();
+    const timeoutError = new Error(`DNS resolution timed out after ${this.dnsTimeoutMs} ms`);
+    const signal = AbortSignal.any([controller.signal, this.lifecycleController.signal]);
+    this.dnsControllers.add(controller);
+    const timer = setTimeout(() => controller.abort(timeoutError), this.dnsTimeoutMs);
+    const resolution = Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return this.resolver(hostname, signal);
+    });
+    try {
+      return await waitForPromiseWithSignal(resolution, signal);
+    } finally {
+      clearTimeout(timer);
+      this.dnsControllers.delete(controller);
+    }
+  }
+
+  private touchDnsCache(hostname: string, entry: DnsCacheEntry): void {
+    this.assertOpen();
+    this.dnsCache.delete(hostname);
+    this.dnsCache.set(hostname, entry);
+  }
+
+  private rememberDnsAnswer(hostname: string, addresses: string[]): readonly string[] {
+    this.assertOpen();
+    const now = Date.now();
+    const cached = Object.freeze([...addresses]);
+    this.touchDnsCache(hostname, {
+      addresses: cached,
+      freshUntil: now + this.dnsCacheTtlMs,
+      staleUntil: now + this.dnsCacheTtlMs + this.dnsStaleTtlMs,
+    });
+    while (this.dnsCache.size > this.maxDnsCacheEntries) {
+      const oldest = this.dnsCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.dnsCache.delete(oldest);
+    }
+    return cached;
+  }
+
+  private async refreshDnsAnswer(
+    hostname: string,
+    previous: DnsCacheEntry | undefined,
+  ): Promise<readonly string[]> {
+    let resolved: string[];
+    try {
+      resolved = await this.invokeResolver(hostname);
+    } catch (error) {
+      if (this.lifecycleState !== "open") {
+        this.dnsCache.delete(hostname);
+        throw errorFromUnknown(this.lifecycleController.signal.reason ?? error);
+      }
+      if (previous && Date.now() < previous.staleUntil) {
+        this.touchDnsCache(hostname, previous);
+        return previous.addresses;
+      }
+      this.dnsCache.delete(hostname);
+      throw error;
+    }
+    try {
+      this.assertOpen();
+      return this.rememberDnsAnswer(hostname, this.validateDnsAnswer(resolved));
+    } catch (error) {
+      this.dnsCache.delete(hostname);
+      throw error;
+    }
+  }
+
+  private async resolveHostname(hostname: string, signal?: AbortSignal): Promise<string[]> {
+    this.assertOpen();
+    signal?.throwIfAborted();
+    const now = Date.now();
+    const cached = this.dnsCache.get(hostname);
+    if (cached && now < cached.freshUntil) {
+      this.touchDnsCache(hostname, cached);
+      return [...cached.addresses];
+    }
+
+    let pending = this.dnsInFlight.get(hostname);
+    if (!pending) {
+      pending = this.refreshDnsAnswer(hostname, cached);
+      this.dnsInFlight.set(hostname, pending);
+      const cleanup = () => {
+        if (this.dnsInFlight.get(hostname) === pending) this.dnsInFlight.delete(hostname);
+      };
+      void pending.then(cleanup, cleanup);
+    }
+    const addresses = [...(await waitForPromiseWithSignal(pending, signal))];
+    this.assertOpen();
+    return addresses;
+  }
+
+  authorize(
+    target: string | URL,
+    signal?: AbortSignal,
+  ): Promise<{ url: URL; addresses: string[] }> {
+    this.assertOpen();
+    return this.authorizeRequest(target, this.operationSignal(signal));
+  }
+
+  private async authorizeRequest(
+    target: string | URL,
+    signal: AbortSignal,
+  ): Promise<{ url: URL; addresses: string[] }> {
+    signal.throwIfAborted();
     const url = target instanceof URL ? target : new URL(target);
     const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
     const literal = parseIpAddress(host);
     const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
     const deny = async (reason: string): Promise<never> => {
       await this.audit({ url: url.toString(), host, decision: "deny", reason });
+      this.assertOpen();
       throw new Error(`Network policy denied ${url.toString()}: ${reason}`);
     };
     if (!this.policy.protocols.includes(url.protocol as "http:" | "https:")) {
@@ -638,13 +879,14 @@ export class NetworkProxy {
     if (!this.policy.allowDomains.some((pattern) => domainMatches(pattern, host))) {
       return deny("domain is not allowlisted");
     }
-    const resolved = literal ? [literal.canonical] : await this.resolver(host);
-    if (resolved.length === 0) return deny("DNS returned no addresses");
-    const addresses = resolved.map(canonicalizeIpAddress);
-    if (addresses.some((address) => address === undefined)) {
-      return deny("DNS returned an invalid IP address");
+    let pinned: string[];
+    try {
+      pinned = literal ? [literal.canonical] : await this.resolveHostname(host, signal);
+    } catch (error) {
+      if (signal.aborted) throw errorFromUnknown(signal.reason ?? error);
+      return deny(errorFromUnknown(error).message);
     }
-    const pinned: string[] = [...new Set(addresses as string[])];
+    this.assertOpen();
     if (!this.policy.allowPrivateAddresses && pinned.some(isPrivateAddress)) {
       return deny("private, loopback, link-local or reserved address");
     }
@@ -655,22 +897,37 @@ export class NetworkProxy {
       reason: "policy matched",
       addresses: pinned,
     });
+    this.assertOpen();
     return { url, addresses: pinned };
   }
 
-  async fetch(
+  fetch(
     target: string | URL,
     init: RequestInit & { credentialLease?: string } = {},
   ): Promise<Response> {
+    this.assertOpen();
+    const signal = this.operationSignal(init.signal ?? undefined);
+    const request = this.fetchRequest(target, { ...init, signal });
+    this.activeRequests.add(request);
+    const cleanup = () => this.activeRequests.delete(request);
+    void request.then(cleanup, cleanup);
+    return request;
+  }
+
+  private async fetchRequest(
+    target: string | URL,
+    init: RequestInit & { credentialLease?: string },
+  ): Promise<Response> {
     const { credentialLease, body: initialBody, method: initialMethod, ...requestInit } = init;
-    let authorization = await this.authorize(target);
+    const signal = requestInit.signal!;
+    let authorization = await this.authorizeRequest(target, signal);
     let current = authorization.url;
     let method = (initialMethod ?? "GET").toUpperCase();
     let body = initialBody;
     let headers = new Headers(requestInit.headers);
     if (credentialLease) {
       if (!this.broker) throw new Error("No credential broker configured");
-      headers = this.broker.injectHeaders(credentialLease, headers);
+      headers = await this.broker.injectHeadersAsync(credentialLease, headers);
     }
     for (let redirects = 0; ; redirects++) {
       const fetchInit = {
@@ -688,8 +945,17 @@ export class NetworkProxy {
             // 防止检查后再次 DNS 解析产生 rebinding/TOCTOU。
             dispatcher: this.dispatcher(current, authorization.addresses),
           } as RequestInit);
+      if (this.lifecycleState !== "open") {
+        void response.body?.cancel(this.lifecycleController.signal.reason).catch(() => undefined);
+        this.assertOpen();
+      }
       if (![301, 302, 303, 307, 308].includes(response.status)) {
-        return this.boundResponse(response);
+        const bounded = await this.boundResponse(response);
+        if (this.lifecycleState !== "open") {
+          void bounded.body?.cancel(this.lifecycleController.signal.reason).catch(() => undefined);
+        }
+        this.assertOpen();
+        return bounded;
       }
       const location = response.headers.get("location");
       if (!location) return response;
@@ -716,7 +982,7 @@ export class NetworkProxy {
         throw new Error("Cannot follow redirect with a non-replayable request body");
       }
 
-      authorization = await this.authorize(redirectTarget);
+      authorization = await this.authorizeRequest(redirectTarget, signal);
       const next = authorization.url;
       current = next;
     }
@@ -778,15 +1044,90 @@ export class NetworkProxy {
     return bounded;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    const closePromise = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    // Publish the stable close operation before aborting. Abort listeners run synchronously and
+    // may re-enter close(); they must observe this exact same promise.
+    this.closePromise = closePromise;
+    this.lifecycleState = "closing";
+    const closeError = new Error("Network proxy is closing");
+    this.lifecycleController.abort(closeError);
+    for (const controller of this.dnsControllers) controller.abort(closeError);
+
     const agents = [...this.pinnedAgents.values()];
+    const retiring = [...this.retiringAgents];
+    const pending = [...this.activeRequests, ...this.dnsInFlight.values()];
     this.pinnedAgents.clear();
-    await Promise.all([...agents.map((agent) => agent.close()), ...this.retiringAgents]);
+    this.dnsCache.clear();
+    this.dnsInFlight.clear();
+    this.activeRequests.clear();
+    void this.finishClose(agents, retiring, pending).then(resolveClose, rejectClose);
+    return closePromise;
+  }
+
+  private async finishClose(
+    agents: UndiciAgent[],
+    retiring: Promise<void>[],
+    pending: Promise<unknown>[],
+  ): Promise<void> {
+    try {
+      await Promise.all([
+        this.waitForPendingOperations(pending),
+        ...agents.map((agent) => this.closeAgent(agent)),
+        ...retiring,
+      ]);
+    } finally {
+      this.dnsCache.clear();
+      this.dnsInFlight.clear();
+      this.lifecycleState = "closed";
+    }
+  }
+
+  private async waitForPendingOperations(pending: Promise<unknown>[]): Promise<void> {
+    if (pending.length === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(pending).then(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, this.agentCloseTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async closeAgent(agent: UndiciAgent): Promise<void> {
+    const timeoutError = new Error(
+      `Network proxy dispatcher did not close within ${this.agentCloseTimeoutMs} ms`,
+    );
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        agent.close(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(timeoutError), this.agentCloseTimeoutMs);
+        }),
+      ]);
+    } catch (error) {
+      await agent.destroy(errorFromUnknown(error));
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private dispatcher(url: URL, addresses: string[]): UndiciAgent {
-    const candidates = [...new Set(addresses)].sort();
-    const key = `${url.origin}\0${candidates.join(",")}`;
+    this.assertOpen();
+    const candidates = [...new Set(addresses)];
+    const key = `${url.origin}\0${[...candidates].sort().join(",")}`;
     const existing = this.pinnedAgents.get(key);
     if (existing) {
       // Map insertion order is the LRU queue. Refresh hits without allocating another dispatcher.
@@ -795,28 +1136,11 @@ export class NetworkProxy {
       return existing;
     }
     const agent = new UndiciAgent({
+      connections: this.maxConnectionsPerOrigin,
+      autoSelectFamily: true,
+      autoSelectFamilyAttemptTimeout: HAPPY_EYEBALLS_ATTEMPT_TIMEOUT_MS,
       connect: {
-        lookup: (_hostname, options, callback) => {
-          const respond = callback as unknown as PinnedLookupCallback;
-          const requested = typeof options.family === "number" ? options.family : 0;
-          const matches = candidates.filter(
-            (address) => requested === 0 || isIP(address) === requested,
-          );
-          const selected = matches.length > 0 ? matches : candidates;
-          if (options.all) {
-            respond(
-              null,
-              selected.map((address) => ({ address, family: isIP(address) })),
-            );
-            return;
-          }
-          const address = selected[0];
-          if (!address) {
-            respond(new Error("authorized DNS result is empty"));
-            return;
-          }
-          respond(null, address, isIP(address));
-        },
+        lookup: createPinnedLookup(candidates),
       },
     });
     this.pinnedAgents.set(key, agent);
@@ -830,7 +1154,7 @@ export class NetworkProxy {
   }
 
   private retireAgent(agent: UndiciAgent): void {
-    const retiring = agent.close().catch(() => agent.destroy());
+    const retiring = this.closeAgent(agent);
     this.retiringAgents.add(retiring);
     // Observe both outcomes and release the bookkeeping slot even when callers never invoke close().
     void retiring.then(
@@ -1159,7 +1483,7 @@ export class NetworkProxyCredentialClient implements ScopedProxyCredentialIssuer
       ttlMs: Math.min(30_000, Math.max(1_000, this.options.requestTimeoutMs ?? 10_000)),
       maxUses: 1,
     });
-    const headers = this.options.broker.injectHeaders(lease, {
+    const headers = await this.options.broker.injectHeadersAsync(lease, {
       "content-type": "application/json",
       accept: "application/json",
     });
@@ -1513,7 +1837,16 @@ export class NetworkProxyServer {
         throw new Error("CONNECT TLS SNI must exactly match the authorized authority");
       }
 
-      const pendingUpstream = net.connect({ host: authorized.addresses[0]!, port });
+      // Keep hostname/SNI semantics while the custom lookup makes every dial candidate come from
+      // the already-authorized answer. Explicit family auto-selection gives CONNECT the same
+      // IPv6/IPv4 and same-family fallback behavior as the in-process dispatcher.
+      const pendingUpstream = net.connect({
+        host: hostname,
+        port,
+        lookup: createPinnedLookup(authorized.addresses),
+        autoSelectFamily: true,
+        autoSelectFamilyAttemptTimeout: HAPPY_EYEBALLS_ATTEMPT_TIMEOUT_MS,
+      });
       upstream = pendingUpstream;
       await new Promise<void>((resolve, reject) => {
         let settled = false;

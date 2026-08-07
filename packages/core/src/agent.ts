@@ -73,6 +73,7 @@ import { Verifier, renderVerificationReport, type VerificationReport } from "./r
 import { noTelemetry, type SpanContext, type Telemetry } from "./runtime/telemetry.js";
 import type { SecurityPolicyEngine } from "./security/policy.js";
 import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
+import { hasUnparsedToolArguments } from "./tool-arguments.js";
 
 // ---------- 对外事件 ----------
 
@@ -383,6 +384,9 @@ export function defaultSystem(): string {
 
 /** Stop hook 单次 drive 内最多强制续跑的轮数（防 hook 造成死循环） */
 const MAX_STOP_CONTINUATIONS = 3;
+
+/** 无效工具 JSON 最多回灌模型两轮；第三轮补齐 result 后直接熔断。 */
+const MAX_UNPARSED_TOOL_ARGUMENT_RETRIES = 2;
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 500;
@@ -771,15 +775,27 @@ export class Agent {
     await this.conv.whenPersisted(signal);
   }
 
-  /** Wait for raw tool bodies which may have outlived their timeout/abort result. */
+  /**
+   * Wait for raw tool bodies and close-confirmed command hooks which may have outlived an outer
+   * timeout/abort race. Both can mutate the workspace, so the durable command fence must cover
+   * their cleanup proof as well as their model-visible result.
+   */
   async awaitToolExecutionsIdle(): Promise<void> {
-    await this.executor.awaitIdle();
+    const results = await Promise.allSettled([this.executor.awaitIdle(), this.hooks.awaitIdle()]);
+    throwCleanupFailures(results, "Agent execution boundary drain failed");
   }
 
   /** Close resources owned by this Agent's tool instances after all executions are drained. */
   async closeToolResources(): Promise<void> {
-    await this.executor.awaitIdle();
-    await this.tools.closeAll();
+    // close() first aborts killable extension children and waits for process-tree proof. Calling
+    // awaitIdle() first could deadlock shutdown on an isolated module that intentionally ignores
+    // AbortSignal until its OS process is terminated.
+    const results = await Promise.allSettled([
+      this.executor.close(),
+      this.tools.closeAll(),
+      this.hooks.awaitIdle(),
+    ]);
+    throwCleanupFailures(results, "Agent tool resource cleanup failed");
   }
 
   /** Serialize a host-requested full rewrite with every Agent append/compaction rewrite. */
@@ -882,12 +898,19 @@ export class Agent {
         afterTokens: res.afterTokens,
       };
     } finally {
-      this.activeBudget = null;
-      linked.dispose();
-      // Tool-internal usage checkpoints may have been scheduled from a synchronous callback.
-      // Drain them before releasing this drive; a failure has already aborted the ledger.
-      await budget.whenCheckpointed(budget.signal).catch(() => undefined);
-      budget.dispose();
+      try {
+        await this.awaitToolExecutionsIdle();
+      } finally {
+        this.activeBudget = null;
+        linked.dispose();
+        try {
+          // Tool-internal usage checkpoints may have been scheduled from a synchronous callback.
+          // Drain them before releasing this drive; a failure has already aborted the ledger.
+          await budget.whenCheckpointed(budget.signal).catch(() => undefined);
+        } finally {
+          budget.dispose();
+        }
+      }
     }
   }
 
@@ -1030,19 +1053,22 @@ export class Agent {
       }
     } finally {
       // A non-cooperative in-process Tool can outlive the model-visible timeout result. Retain the
-      // run budget and command fence until its raw Promise has settled, so no late side effect can
-      // happen after the durable command is acknowledged terminal.
-      await this.executor.awaitIdle();
-      // per-prompt 覆盖与降级都是 drive 局部的：结束还原主模型。
-      this.runner.restore();
-      this.inbox.clear();
-      this.traceParent = savedTraceParent;
-      this.activeBudget = null;
-      linked.dispose();
-      budget.dispose();
-      this.running = false;
-      // drive 收尾窗口到达、没赶上 turn 边界的任务通知：改走空闲投递（回调或积压）。
-      this.inbox.flushLeftover();
+      // run budget and command fence until raw tools and close-confirmed command hooks have
+      // settled, so no late side effect can happen after the durable command is acknowledged.
+      try {
+        await this.awaitToolExecutionsIdle();
+      } finally {
+        // per-prompt 覆盖与降级都是 drive 局部的：结束还原主模型。
+        this.runner.restore();
+        this.inbox.clear();
+        this.traceParent = savedTraceParent;
+        this.activeBudget = null;
+        linked.dispose();
+        budget.dispose();
+        this.running = false;
+        // drive 收尾窗口到达、没赶上 turn 边界的任务通知：改走空闲投递（回调或积压）。
+        this.inbox.flushLeftover();
+      }
     }
   }
 
@@ -1115,6 +1141,7 @@ export class Agent {
 
     let stopContinuations = 0;
     let verificationAttempts = 0;
+    let consecutiveUnparsedToolRounds = 0;
     for (let turn = 1; turn <= this.maxTurns; turn++) {
       const preTurnBudgetError = budget?.violation();
       if (preTurnBudgetError) {
@@ -1177,11 +1204,11 @@ export class Agent {
         }
         // 已经接受的 steering 不可留到下一次 send 后乱序；先按原顺序入历史，
         // 再结束本轮。它们会在下一次显式 send 时与历史一同交给模型。
+        this.inbox.close();
         while (this.inbox.hasQueued()) {
           yield* this.drainQueued(signal);
           await this.conv.flush(signal);
         }
-        this.inbox.close();
         yield { type: "error", message: budget?.violation() ?? outcome.message };
         return;
       }
@@ -1338,6 +1365,13 @@ export class Agent {
         return;
       }
 
+      // 只有“本轮所有调用都是 provider JSON 解析失败”才计入连续失败。
+      // 任何一个合法调用（即使工具自身返回错误）都重置计数，避免误伤正常工具流。
+      const onlyUnparsedToolArguments = calls.every((call) => hasUnparsedToolArguments(call.args));
+      consecutiveUnparsedToolRounds = onlyUnparsedToolArguments
+        ? consecutiveUnparsedToolRounds + 1
+        : 0;
+
       const toolBudgetError = await budget?.reserveToolCalls(calls.length);
       if (toolBudgetError) {
         const results = calls.map((call) => ({
@@ -1372,6 +1406,20 @@ export class Agent {
         yield { type: "error", message: budget?.violation() ?? "会话已中断" };
         return;
       }
+      if (
+        onlyUnparsedToolArguments &&
+        consecutiveUnparsedToolRounds > MAX_UNPARSED_TOOL_ARGUMENT_RETRIES
+      ) {
+        // 第三轮的 tool_result 已在上面配对落盘，但不再发起第四次模型请求。
+        // 不回显 __unparsed 原文，因其可能含敏感信息或提示注入内容。
+        this.inbox.close();
+        yield {
+          type: "error",
+          message:
+            "模型连续 3 轮返回无法解析的工具参数，已停止无效重试；请重新发起任务或切换模型。",
+        };
+        return;
+      }
       const postToolBudgetError = budget?.violation();
       if (postToolBudgetError) {
         this.inbox.close();
@@ -1389,11 +1437,11 @@ export class Agent {
       }
     }
 
+    this.inbox.close();
     while (this.inbox.hasQueued()) {
       yield* this.drainQueued(signal);
       await this.conv.flush(signal);
     }
-    this.inbox.close();
     yield { type: "error", message: `达到最大轮数 ${this.maxTurns}，已停止` };
   }
 
@@ -1440,7 +1488,10 @@ export class Agent {
 
   private async *drainQueued(signal: AbortSignal): AsyncGenerator<AgentEvent, number> {
     let added = 0;
-    while (this.inbox.hasQueued()) {
+    // Drain the boundary snapshot only. Inputs arriving while a hook/persistence call awaits stay
+    // for the next model boundary instead of turning this loop into a moving, unbounded target.
+    const boundaryCount = this.inbox.queuedCount;
+    for (let processed = 0; processed < boundaryCount && this.inbox.hasQueued(); processed++) {
       const text = this.inbox.shiftQueued()!;
       const prepared = await this.prepareUserInput(text, signal);
       if (prepared.blocked) {
@@ -1578,6 +1629,17 @@ function normalizeUsage(usage: Usage): Usage {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function throwCleanupFailures(
+  results: readonly PromiseSettledResult<unknown>[],
+  message: string,
+): void {
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, message);
 }
 
 function throwIfAborted(signal: AbortSignal): void {

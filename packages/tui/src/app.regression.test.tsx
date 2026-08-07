@@ -814,6 +814,43 @@ const raceCatalog = [
   },
 ];
 
+test("TUI 回归: 显式 /model 后发选择胜出，旧 verify 完全静默", async () => {
+  const first = deferred<readonly string[]>();
+  const second = deferred<readonly string[]>();
+  let discoveryCall = 0;
+  const created: string[] = [];
+  const host = makeHost({ onCreate: (input) => created.push(input.model) });
+  const view = mount(host, {
+    providers: [raceProvider],
+    discoverModels: async () => {
+      discoveryCall++;
+      if (discoveryCall === 1) return first.promise;
+      if (discoveryCall === 2) return second.promise;
+      return ["a", "b"];
+    },
+  });
+  await tick(80);
+  try {
+    view.stdin.write("/model race/a");
+    view.stdin.write("\r");
+    await tick(20);
+    view.stdin.write("/model race/b");
+    view.stdin.write("\r");
+    await tick(20);
+
+    second.resolve(["b"]);
+    await tick(120);
+    assert.deepEqual(created, ["race/b"]);
+
+    first.resolve(["a"]);
+    await tick(120);
+    assert.deepEqual(created, ["race/b"]);
+    assert.doesNotMatch(view.lastFrame() ?? "", /race\/a.*(?:未被模型端点|无法从模型端点)/);
+  } finally {
+    view.unmount();
+  }
+});
+
 test("TUI 回归: /model 后发选择胜出，旧 verify 不得切换或写入错误会话", async () => {
   const first = deferred<readonly string[]>();
   const second = deferred<readonly string[]>();
@@ -825,9 +862,8 @@ test("TUI 回归: /model 后发选择胜出，旧 verify 不得切换或写入�
     catalog: raceCatalog,
     discoverModels: async () => {
       discoveryCall++;
-      if (discoveryCall === 1) return ["a", "b"];
-      if (discoveryCall === 2) return first.promise;
-      if (discoveryCall === 3) return second.promise;
+      if (discoveryCall === 1) return first.promise;
+      if (discoveryCall === 2) return second.promise;
       return ["a", "b"];
     },
   });
@@ -866,9 +902,8 @@ test("TUI 回归: /model Esc 与重开使旧 Tab verify 完全失效", async () 
     catalog: raceCatalog,
     discoverModels: async () => {
       discoveryCall++;
-      if (discoveryCall === 1 || discoveryCall === 3) return ["a", "b"];
-      if (discoveryCall === 2) return stale.promise;
-      if (discoveryCall === 4) return current.promise;
+      if (discoveryCall === 1) return stale.promise;
+      if (discoveryCall === 2) return current.promise;
       return ["a", "b"];
     },
   });

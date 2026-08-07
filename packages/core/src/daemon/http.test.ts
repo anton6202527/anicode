@@ -513,6 +513,43 @@ test("http security: per-address rate limit returns 429 and Retry-After", async 
   }
 });
 
+test("http lifecycle: close is idempotent and force-closes a stalled active handler", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-close-deadline-"));
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+  });
+  let entered!: () => void;
+  const handlerEntered = new Promise<void>((resolve) => (entered = resolve));
+  const server = new HttpDaemonServer({
+    manager,
+    token: TEST_HTTP_TOKEN,
+    shutdownGraceMs: 100,
+    discoverModels: () => {
+      entered();
+      return new Promise<string[] | undefined>(() => {});
+    },
+    onClose: () => manager.shutdown(),
+  });
+  await server.listen(0);
+  const pendingRequest = authenticatedFetch(
+    `http://127.0.0.1:${server.port()}/providers/cliproxy/models`,
+  ).catch(() => undefined);
+  await handlerEntered;
+  const started = Date.now();
+  try {
+    const firstClose = server.close();
+    const secondClose = server.close();
+    assert.equal(firstClose, secondClose, "close callers must share one shutdown fence");
+    await firstClose;
+    assert.ok(Date.now() - started < 1_000, "stalled handlers must not block shutdown forever");
+    await pendingRequest;
+  } finally {
+    await server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("http host: undo 无快照时报错经 HTTP 透传", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-http-"));
   const { server, baseUrl } = await startHttp(dir, scriptedProvider([]));

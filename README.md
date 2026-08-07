@@ -22,8 +22,9 @@ packages/
 Electron IPC、VSCode webview postMessage 只是同一契约的不同「传输」实现，可互换。transcript / Markdown /
 diff 等前端无关的纯逻辑集中在 `@anicode/shared`，三端共用、单独测试。
 
-全仓类型检查与离线测试由 CI 在 Node 22/24、Linux、macOS、Windows 和 PostgreSQL 16
-矩阵中执行。默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，
+全仓类型检查与离线测试由 CI 在最低支持版本 Node 22.15.0、发布用 Node 24 LTS，以及自动跟随官方
+最新稳定版的 Node `current` 上执行；平台矩阵覆盖 Linux、macOS、Windows 和 PostgreSQL 16。
+默认测试不需要真实 API key；280 个真实仓库任务的 catalog/runner 契约离线验证，
 真实模型回归只允许使用已审核、已提交的基线，缺少运行环境或基线会明确失败。
 
 ## 先本地调试 TUI
@@ -37,17 +38,27 @@ npm install
 npm run dev:tui
 ```
 
-`.nvmrc` 固定开发主版本为 Node 24；仓库只把 Node 22.15+ 与 24.x 纳入 CI 和发布门禁。如果当前终端是
-Node 23、25、26 等未验证版本，推荐先执行 `nvm use`；源码调试入口只会告警并继续运行，但这些版本
-不能用于正式发布。日常开发与 CI 支持 npm 10.9.2–11.x；release gate 仍强制要求 Node 22/24 与
-npm 11.5.1+。
+`.nvmrc` 固定 Node 24 LTS，保证日常开发和发布构建可复现。运行时与已发布 CLI 使用仅含最低门槛的
+Node `>=22.15.0` 声明，不会因为新的 Node 主版本产生误报；CI 会持续验证最低版本、发布 LTS 和
+`current` 最新稳定版。已经 EOL 的 Node 主版本不作为正式支持基线。日常开发与 CI 要求 npm
+`>=10.9.2`，不设置未来主版本上限；为保证发布供应链可复现，release gate 仍固定 npm
+`>=11.5.1 <12`。
 
 启动时会先评估 Workspace Trust。已信任工作区会读取项目根目录的 `.env.local` / `.env` 和
 `anicode.json` / `.anicode/anicode.json`；未信任工作区不加载项目环境或可执行配置，只保留模型与
-TUI 偏好。隐式配置的云端模型若没有可用凭证，会给出告警并选择另一个凭证就绪的默认模型；若没有
-任何可用云端凭证，则回退到零网络的 `debug/demo`。显式 `--model` 仍会 fail-fast。
+TUI 偏好。项目或宿主环境中的密钥只进入当前进程 Credential Broker，随后从该进程环境移除；普通
+启动不会把它们持久化到全局 Keychain，因此不同工作区不会通过自动迁移覆盖或复用彼此的 `.env`
+凭据。provider 诊断、默认模型选择以及会话的 create/open/resume 只检查进程内元数据，不读取
+Keychain；其中“已配置”只表示存在精确的懒加载引用，不代表后端值已经验证。没有已配置云端凭证时
+回退到零网络的 `debug/demo`；真正使用云端模型时，会在该会话首次实际 `send/stream` 才解析 provider
+并读取它的精确凭据，失败则 fail closed，不会继续打开其他 fallback Keychain 条目；下一次发送可在
+用户解锁或修复凭据后重试。
 
-CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite，凭证存在本机 OS Keychain，不需要 AniCode 后端服务、PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。使用云端模型时仍需对应 provider 的 API key 或官方支持的企业凭证；这不是 AniCode 自身的后端依赖。
+CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite；当前环境
+凭证只在进程内使用，明确导入的长期凭证才进入本机 OS Keychain。不需要 AniCode 后端服务、
+PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime
+都是显式可选的团队/远程能力。使用云端模型时仍需对应 provider 的 API key 或官方支持的企业凭证；
+这不是 AniCode 自身的后端依赖。
 
 开发数据隔离到：
 
@@ -119,21 +130,67 @@ ANICODE_NETWORK_PROXY_URL=http://127.0.0.1:8787 npm run dev:tui
 
 AniCode 目前只为 macOS 和 Linux 提供原生 OS sandbox。原生 Windows 不会静默回退到裸 PowerShell/
 `cmd.exe`：生产装配会进入 host restricted mode，从模型 schema 移除 `bash` 及后台 shell、LSP 和本地
-browser，并关闭项目命令 hooks、自动 verifier、git checkpoint 与 worktree subagent。stdio MCP/LSP
-收到的是一个无 `prepare()` 的明确拒绝 runtime，不能绕过边界；HTTP MCP 和文件工具仍可用。
+browser，并关闭项目命令 hooks、自动 verifier、git checkpoint 与 worktree subagent。生产本地宿主只连接
+HTTP MCP；LSP 还必须由能兑现 `managedProcessBoundary=close-confirmed` 的 cgroup/sidecar/Job Object
+后端托管，`prepare()` 本身不是清理证明。当前生产 runtime 不声明该能力，HTTP MCP 和文件工具仍可用。
 
 Windows 需要执行命令时，请启用 Docker/Podman OCI 后端并使用固定 digest 的镜像：
 
 ```powershell
 $env:ANICODE_EXECUTION_BACKEND = "container"
 $env:ANICODE_RUNTIME_IMAGE = "ghcr.io/OWNER/anicode-runner@sha256:<digest>"
+$env:ANICODE_CONTAINER_ENGINE_ENDPOINT = "npipe:////./pipe/docker_engine"
+# 仅在 Docker/Podman 不位于受信任的固定安装路径时设置：
+# $env:ANICODE_CONTAINER_ENGINE_BIN = "C:\Program Files\Docker\Docker\resources\bin\docker.exe"
 npm run dev:tui
 ```
 
-OCI 模式当前支持前台 `bash`；因为容器是单次临时执行，后台 shell、命令 hooks、stdio MCP、LSP 和本地
-Chrome 仍保持关闭。详细边界见[本轮 P0/P1 闭环](docs/architecture/2026-08-03-p0-p1-closure.md#windows-与非原生隔离宿主)。
+OCI 模式当前支持前台 `bash`，并可把项目命令 hook 作为单次、按容器 ID 证明清理的 OCI 任务执行；后台
+shell、stdio MCP、LSP 和本地 Chrome 仍保持关闭。详细边界见[本轮 P0/P1 闭环](docs/architecture/2026-08-03-p0-p1-closure.md#windows-与非原生隔离宿主)。
 
-默认长期凭证后端是 OS Keychain；也可设置 `ANICODE_CREDENTIAL_BACKEND=vault|kms`，通过 OIDC/workload identity 读取后端中的 `env:NAME`。完整配置、Remote Runtime 与验收边界见[第三轮生产化归档](docs/architecture/2026-07-29-runtime-hardening-round-3.md)。
+默认长期凭证后端是 OS Keychain，但普通启动不会执行全量枚举或自动写入。环境值优先作为当前进程凭证；
+持久化必须显式执行精确 key 的导入，并通过 `ANICODE_CREDENTIAL_KEYS` 声明允许按需读取的名称：
+
+```bash
+# 单次显式导入；命令不会显示凭证值，也不会枚举 Keychain
+OPENAI_API_KEY='...' anicode credentials import OPENAI_API_KEY
+
+# 运行时只为精确名称注册懒加载引用；首次实际 send/stream 才读取
+ANICODE_CREDENTIAL_KEYS=OPENAI_API_KEY anicode --model openai/gpt-5
+
+anicode credentials list                    # 仅列 allowlist 元数据，不读取后端
+anicode credentials remove OPENAI_API_KEY   # 精确删除；重启已使用它的常驻进程可立即清除内存缓存
+```
+
+既有 Keychain 条目无需重新导入，只需把对应名称加入 `ANICODE_CREDENTIAL_KEYS`。也可设置
+`ANICODE_CREDENTIAL_BACKEND=vault|kms`，通过 OIDC/workload identity 精确读取后端中的 `env:NAME`；
+这些后端同样要求 `ANICODE_CREDENTIAL_KEYS`，不会在启动时自动 list。同步/异步引用的成功读取
+在 Broker 内默认有界缓存 1 小时（最长可配置为 24 小时），后续重新解析会在 TTL 到期后观察外部删除。
+已经物化的 SDK/provider client 可能持有独立副本，不会被 Broker TTL 强制刷新；可靠地应用撤销或轮换需
+回收这些 client，当前应重启已使用该凭据的常驻进程。
+
+仍会打开 OS Keychain 的边界都是精确且有意触发的：首次实际使用某个懒加载 provider、最终选择模型后的
+鉴权目录校验、连接显式启用且需要凭据的 MCP/控制平面，以及 `credentials import/remove`、
+`auth logout/migrate` 或轮换等写删/迁移动作。诊断、默认模型判定、create/open/resume、
+`credentials list`、`auth list` 和仅浏览模型元数据不会打开 Keychain。
+
+原生 Keychain 调用运行在有硬截止的 helper 子进程；CLI/VSIX 使用 bounded stdin/stdout，Electron 在
+保持 `RunAsNode` fuse 关闭时使用一次性 `utilityProcess` 的 bounded `parentPort`。凭据不进入 argv、继承
+环境、临时文件或日志。写入/删除若超时、取消或丢失完成证明会报告 `indeterminate`，不会盲目回滚或
+删除。测试、密闭构建或不允许访问系统凭据库的宿主应同时设置
+`ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1`：前者使用进程内后端，后者让任何
+误触在原生 API 调用前失败。轮换的 single-flight、quarantine 和 pending candidate 仅为进程内状态，
+并非 crash-safe；多副本或跨重启部署必须使用单 active rotator、外部 CAS/分布式 lease 及幂等或持久化
+reconciliation。轮换管理器会快照策略、在发行前后检查 registration generation，并让发行与写入共享
+绝对截止；忽略取消但晚返回的 candidate 会进入显式 reconciliation，不会丢失或覆盖人工恢复。完整配置、轮换与跨进程协调边界见
+[生产运维契约](docs/operations/production-readiness.md)。
+
+自动化浏览器是独立于业务凭据后端的另一条宿主凭据路径：macOS Chrome 即使使用新 profile，也可能初始化
+“Chrome Safe Storage”。AniCode 启动的 Chrome 现在只使用权限为 `0700` 的一次性 profile，macOS 强制
+`--use-mock-keychain`，Linux 强制 `--password-store=basic`，并拒绝附加参数覆盖 profile、密码存储或
+仅回环 CDP 监听。内置 Chrome DevTools MCP 同样固定 `--isolated` 与这两类平台参数；显式连接用户已有
+浏览器仍属于用户主动授权的外部边界。上述参数只约束 AniCode 的子进程，不修改系统钥匙串、代理、DNS、
+路由或证书配置。
 
 TUI 内可用命令：
 
@@ -159,7 +216,11 @@ TUI 内可用命令：
 保留多行且绝不自动提交。授权卡片固定在输入框上方，支持方向键/Enter、`y/a/p/n`，高风险默认选中拒绝，
 永久授权只需一次确认。默认关闭完整鼠标跟踪，可直接拖拽选择和复制文字；备用屏滚轮以及 `PageUp`/`PageDown` 都能回看固定输入框上方的结果。只有需要鼠标点击弹框时才用 `--mouse` 或 `/mouse on` 开启完整跟踪；`/mouse off` 随时恢复原生框选。短会话或输入框已有内容时，`↑`/`↓` 浏览已提交的 prompt 历史；长会话的空输入框中，方向键与滚轮一起回看结果。POSIX 终端中 `Ctrl+Z` 会正确挂起并在 `fg` 后恢复，默认 `Ctrl+Q` 退出；快捷键可在 `anicode.json` 的 `tui.keybindings` 中覆盖。
 
-每次打开 `/model` 都会重新读取各 provider 的鉴权模型目录：本次未返回的旧模型会隐藏，服务端新增模型会立即加入；embedding、图像生成、音频/实时等当前 Agent 适配器无法调用的专用模型不会展示。`/model <provider/model>` 与 `once` 同样必须通过最新目录校验。目录刷新不发送批量推理请求，避免额外费用、配额消耗和限流；临时的 429、5xx 或超时也不会被误判为永久下线。
+打开、搜索、滚动或按 Esc 关闭 `/model` 都只使用静态模型 metadata，不读取凭据。按 Enter/Tab 确认后
+只查询所选 provider 的鉴权目录；目标模型必须在本次返回中，且兼容文本/工具调用。
+`/model <provider/model>` 与 `once` 同样必须通过所选 provider 的最新目录校验，因此可以显式使用服务端
+新增且尚未进入静态目录的模型。目录请求不发送推理 prompt，不产生批量推理费用；临时的 429、5xx 或
+超时也不会被写回静态目录当成永久下线。
 
 安装 workspace 后也可以直接检查 CLI：
 
@@ -195,8 +256,11 @@ anicode mcp remove context7
 对话与流式输出、底部输入框（Enter 发送 / Shift+Enter 换行）、可搜索的模型选择器、插件市场与设置页。
 
 架构上主进程内跑 core 的 `SessionManager`，经 `contextBridge`（`window.anicode`）把 `SessionHost`
-暴露给渲染进程——和 daemon 是同构的传输层。默认模型来自项目配置或已就绪的云端凭证，
-没有可用凭证时回退到零网络的 `debug/demo`。
+暴露给渲染进程——和 daemon 是同构的传输层。默认模型来自项目配置或进程内凭据 metadata；没有已配置
+云端凭据时回退到零网络的 `debug/demo`，懒加载引用仍在首次实际发送时验证。
+原生 Keychain 模块不会加载进 Electron 主进程：应用保持 `RunAsNode` 安全 fuse 关闭，只在一次明确的
+凭据操作时启动一次性 `utilityProcess`，通过有大小/超时限制的 `parentPort` 传输，并在卡死时强制终止
+该精确子进程。凭据不会进入 argv、继承环境、临时文件或日志；启动、会话恢复和浏览模型仍为零读取。
 
 ```bash
 npm run dev:app      # 开发模式（electron-vite，热更新）
@@ -208,15 +272,16 @@ npm run build:app    # 打包 main/preload/renderer 到 packages/app/out
 - **对话与流式渲染**：气泡式界面，助手消息经内置轻量 Markdown 渲染（围栏代码块带复制按钮、
   行内代码 / 粗体 / 链接 / 列表 / 标题），且绝不注入原始 HTML（无 XSS）。
 - **自动标题**：新会话发出首条消息后，用首句自动命名（离线、无需额外模型调用），事务写入会话数据库。
-- **模型选择器**：复用内置免费 / 开源目录，主进程算好凭证就绪状态；可用的排前并标 ✔。
+- **模型选择器**：复用内置免费 / 开源目录，主进程只计算凭据可用/已配置 metadata；标 ✔ 的懒加载引用
+  仍要在首次实际发送时验证。
 - **自定义模型**：设置页可为任意已有 provider 追加模型（持久化到 `userData/models.json`），
   立即出现在选择器里——回答了「模型是否只能写死在代码里」。
 - **会话管理**：侧边栏悬停即可删除会话（删除当前会话会自动切到最近一个或新建）。
 
 **插件市场 → 真实工具链**：插件统一抽象为可挂到 agent 的能力来源——内建工具（文件 / Bash / 任务清单）、
 MCP 服务（Context7 / GitHub / Playwright / Chrome DevTools / Sentry / Firebase）、技能。开关会真正改变 agent 拿到的工具集：停用内建工具组会
-从工具集移除对应工具；启用 MCP 且 Broker 凭证就绪时连接 server 并注入其工具（`<name>__<tool>`），stdio 插件进程由隔离运行时启动，联网插件强制复用策略代理，市场卡片显示连接
-状态。改动对新建会话生效，状态持久化到 `userData/plugins.json`。
+从工具集移除对应工具；启用 HTTP MCP 且 Broker 凭证就绪时连接 server 并注入其工具（`<name>__<tool>`），联网插件强制复用策略代理，市场卡片显示连接
+状态。生产宿主会在启动进程前拒绝 stdio MCP；普通子进程无法对主动脱离进程组的第三方 server 提供强制终止证明。改动对新建会话生效，状态持久化到 `userData/plugins.json`。
 
 **打包分发**（electron-builder，主进程已把 core 与 SDK 依赖打进 bundle，产物自包含）：
 
@@ -224,6 +289,9 @@ MCP 服务（Context7 / GitHub / Playwright / Chrome DevTools / Sentry / Firebas
 npm run --workspace @anicode/app pack   # 快速产出未签名 .app（release/）
 npm run --workspace @anicode/app dist   # 产出安装包（dmg / nsis / AppImage）
 ```
+
+本地 `pack`/`dist` 包装器会清除继承的签名/公证凭据、关闭证书自动发现，并强制使用内存业务凭据后端及
+OS Keychain 禁用哨兵。发布签名只在隔离的 release step 中显式启用，且不会启用 AniCode 业务 Keychain。
 
 ## VSCode 扩展
 
@@ -242,6 +310,9 @@ npm run build:vscode                       # esbuild 打包 out/extension.js 与
 npm run package --workspace anicode-vscode  # 产出可安装的 anicode.vsix
 ```
 
+VSIX 包装器在一次性临时 HOME 中强制使用 `VSCE_STORE=file`，清除 publisher token 与常见密钥环境变量，
+并启用内存凭据后端和 OS Keychain 禁用哨兵；打包结束后删除该临时目录。
+
 Tree-sitter 与 OS Keychain 含原生 N-API 模块，本地 `.vsix` 对应当前 OS/CPU；Release workflow 会分别产出 Linux x64/arm64、macOS arm64/x64 与 Windows x64 安装包。
 
 在 VSCode 里以该目录为「扩展开发宿主」按 F5 即可调试。
@@ -249,7 +320,10 @@ Tree-sitter 与 OS Keychain 含原生 N-API 模块，本地 `.vsix` 对应当前
 ## Provider 与模型
 
 anicode 使用数据驱动 registry，模型字符串格式为 `provider/model`；首个 `/` 后面的模型 id 会完整保留。
-打开 `/model` 时，TUI 会向当前权威 host 请求各 provider 鉴权后的实时 `/models` 目录。只有本次成功返回、且兼容文本/工具调用的模型会进入选择器；探测失败时严格隐藏，不回退到可能过期的静态目录。服务端删除或新增模型会在下次打开选择器时同步反映。
+`/model` 先从当前权威 host 读取不含凭据且已过滤适配器能力的静态 metadata；只有确认一个候选后才请求
+该 provider 的鉴权 `/models` 目录。若目标模型未返回、鉴权失败或超时，本次选择 fail closed；不会为
+浏览选择器而批量解析其他 provider 的凭据。服务端新增模型可通过 `/model <provider/model>` 显式选择并
+实时校验，但仍受当前 provider adapter 的实际能力边界约束。
 
 内置 canonical provider：
 
@@ -347,7 +421,7 @@ registerOpenAICompatibleProvider({
 - 两级 compaction：先清理旧工具输出，再在安全边界生成摘要，保持 tool call/result 配对。
 - SQLite WAL 会话持久化、resume、最近活跃排序、悬空工具调用自愈；旧 JSONL 首次访问时幂等迁移，数据库较新时不回灌。
 - `SessionHost` 抽象与 daemon pub/sub：本地 TUI 和远程客户端使用同一接口，多客户端可观察、接管和裁决权限。
-- MCP：stdio（规范的换行分隔 JSON-RPC）+ Streamable HTTP 客户端；HTTP 强制受控出口，敏感 header/env 只能由 Credential Broker 短租约注入；stdio 可由同一 OS 隔离运行时启动。`anicode mcp serve` 可把自身暴露为 MCP server。
+- MCP：保留 stdio（规范的换行分隔 JSON-RPC）与 Streamable HTTP 客户端；生产工具注册只开放受控出口的 HTTP，敏感 header/env 只能由 Credential Broker 短租约注入。stdio 仅供非生产兼容/测试，直到它由可证明清理的 cgroup、OCI sidecar 或 Windows Job Object 托管。`anicode mcp serve` 可把自身暴露为 MCP server。
 - Notification hook（turn_done / permission_request）+ TUI 授权响铃：配合 anicode.json 命令 hook 可外接桌面通知（对齐 Codex notify）。
 - 插件目录：`~/.anicode/plugins/<name>/` 与项目 `.anicode/plugins/<name>/` 下的 agents/skills/commands 子目录自动并入发现器（Claude Code plugins 的精简形态）。
 - TUI：`/diff`（工作区改动）、`/review`（uncommitted/branch/commit/自定义 四模式审查）、`/tasks`（后台任务一览）、`/status` 显示上下文占用（tokens/窗口/百分比）。
