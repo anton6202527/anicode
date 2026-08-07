@@ -32,6 +32,8 @@ import {
   defaultTools,
   foregroundOnlyBash,
   restrictedWorkspaceDevelopmentTools,
+  selectBrokerWebSearch,
+  webSearchBackendFromBroker,
 } from "./tools/index.js";
 import {
   isIsolatedModuleTool,
@@ -156,7 +158,11 @@ function toolsAllowedByExecutionMode(
             !["bash", "bash_output", "write_stdin", "list_shells", "kill_shell"].includes(name),
         ),
     );
-    if (existingBash) foreground.register(foregroundOnlyBash(existingBash));
+    // A native POSIX process group cannot contain a child that creates a new session (setsid).
+    // Keep shell networking disabled until the runtime can prove whole-workload/cgroup teardown.
+    if (existingBash) {
+      foreground.register(foregroundOnlyBash(existingBash, { allowNetwork: false }));
+    }
     return foreground;
   }
   const filtered = registry.subset(
@@ -178,7 +184,9 @@ function toolsAllowedByExecutionMode(
     existingBash?.capabilities?.includes("process") &&
     !existingBash.capabilities.includes("persistent-process")
   ) {
-    filtered.register(foregroundOnlyBash(existingBash));
+    // A fresh OCI workload provides the cgroup/container lifetime proof required for a one-shot
+    // network grant. Keep this opt-in explicit; the facade defaults to offline.
+    filtered.register(foregroundOnlyBash(existingBash, { allowNetwork: true }));
   }
   return filtered;
 }
@@ -376,6 +384,15 @@ export function productionSessionManagerOptions(
     transactionalDelegate.toolModuleEnvironment === "container";
   const isolatedModulesSupported = containerBoundaryAttested;
   const tools = configuredTools(input, executionMode, isolatedModulesSupported);
+  const webSearchSelection = selectBrokerWebSearch(runtimeStack.broker);
+  const webSearch = webSearchSelection
+    ? webSearchBackendFromBroker({
+        provider: webSearchSelection.provider,
+        credentialId: webSearchSelection.credentialId,
+        broker: runtimeStack.broker,
+        proxy: runtimeStack.networkProxy,
+      })
+    : undefined;
 
   return {
     store: new MigratingSessionStore(runtimeStack.sessions, new SessionStore(input.sessionsDir)),
@@ -439,6 +456,10 @@ export function productionSessionManagerOptions(
     skills,
     ...(supportsPersistentProcesses ? { subagents, checkpoints: true } : {}),
     repoMap: true,
+    ...(webSearch ? { webSearch } : {}),
+    ...(webSearchSelection
+      ? { webSearchProvider: webSearchSelection.provider }
+      : { webSearchDisabledReason: "credential_not_configured" }),
     browser,
     ...(browser !== false ? { browserRegistry } : {}),
     ...(tools ? { tools } : {}),

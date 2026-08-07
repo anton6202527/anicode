@@ -16,9 +16,10 @@ import { DisabledExecutionRuntime } from "./runtime/isolated-runtime.js";
 import type { Tool, ToolCapability } from "./tools/tool.js";
 import { managedExternalTool, ToolRegistry } from "./tools/tool.js";
 import { coreOwnedTool, isCoreOwnedTool } from "./tools/core-owned.js";
-import { defaultTools } from "./tools/index.js";
+import { defaultTools, foregroundOnlyBash } from "./tools/index.js";
 import type { Provider, StreamEvent, StreamRequest } from "./types.js";
 import { BrowserRegistry } from "./browser/cdp.js";
+import { credentialScopesForEnvironment } from "./security/credentials.js";
 
 function fixtureTool(name: string, capabilities?: readonly ToolCapability[]): Tool {
   return coreOwnedTool({
@@ -34,6 +35,45 @@ function fixtureTool(name: string, capabilities?: readonly ToolCapability[]): To
     run: async () => "ok",
   });
 }
+
+test("foreground shell facade is offline by default and only OCI callers opt into network", async () => {
+  let received: Record<string, unknown> | undefined;
+  const source: Tool = {
+    def: {
+      name: "bash",
+      description: "fixture shell",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          network: { type: "boolean" },
+          run_in_background: { type: "boolean" },
+        },
+      },
+    },
+    readOnly: false,
+    ruleKey: (input) => String(input["command"] ?? ""),
+    run: async (input) => {
+      received = { ...input };
+      return "ok";
+    },
+  };
+  const ctx = { cwd: process.cwd(), signal: new AbortController().signal };
+
+  const offline = foregroundOnlyBash(source);
+  const offlineProperties = offline.def.parameters["properties"] as Record<string, unknown>;
+  assert.equal("network" in offlineProperties, false);
+  assert.equal("run_in_background" in offlineProperties, false);
+  await offline.run({ command: "fixture", network: true, run_in_background: true }, ctx);
+  assert.deepEqual(received, { command: "fixture", network: false });
+
+  const contained = foregroundOnlyBash(source, { allowNetwork: true });
+  const containedProperties = contained.def.parameters["properties"] as Record<string, unknown>;
+  assert.equal("network" in containedProperties, true);
+  assert.equal("run_in_background" in containedProperties, false);
+  await contained.run({ command: "fixture", network: true, run_in_background: true }, ctx);
+  assert.deepEqual(received, { command: "fixture", network: true });
+});
 
 test("production tool provenance cannot be forged and built-ins are implementation masks", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-production-tools-"));
@@ -311,6 +351,9 @@ test("production composition keeps every local host on the same capability contr
 
     assert.equal(options.compaction, true);
     assert.equal(options.persistPermissions, true);
+    assert.equal(options.webSearch, undefined);
+    assert.equal(options.webSearchProvider, undefined);
+    assert.equal(options.webSearchDisabledReason, "credential_not_configured");
     assert.equal(options.checkpoints, true);
     assert.equal(options.repoMap, true);
     assert.equal(options.autoTitle, true);
@@ -369,6 +412,16 @@ test("production composition keeps every local host on the same capability contr
     assert.ok(tools?.names().includes("read"));
     assert.ok(tools?.names().includes("extra_fixture"));
     assert.equal(tools?.isDeferred("deferred_fixture"), true);
+    const nativeTools = productionSessionManagerOptions(
+      { cwd, sessionsDir: path.join(root, "native-sessions") },
+      { ...stack, executionMode: "native-isolated" },
+      noTelemetry,
+    ).tools?.();
+    const nativeBashProperties = nativeTools?.get("bash")?.def.parameters["properties"] as
+      Record<string, unknown> | undefined;
+    assert.ok(nativeBashProperties);
+    assert.equal("run_in_background" in nativeBashProperties, false);
+    assert.equal("network" in nativeBashProperties, false);
 
     let capturedWindowsRequest: StreamRequest | undefined;
     const windowsProvider: Provider = {
@@ -492,6 +545,7 @@ test("production composition keeps every local host on the same capability contr
       unknown
     >;
     assert.equal("run_in_background" in containerBashProperties, false);
+    assert.equal("network" in containerBashProperties, true);
     assert.equal(containerTools?.names().includes("bash_output"), false);
     assert.equal(containerTools?.names().includes("kill_shell"), false);
     const untrustedContainerBash = container.restrictedDevelopmentTools?.().get("bash");
@@ -502,6 +556,104 @@ test("production composition keeps every local host on the same capability contr
     assert.equal("run_in_background" in untrustedContainerProperties, false);
     assert.equal("network" in untrustedContainerProperties, false);
   } finally {
+    await stack.artifacts.close?.();
+    await stack.networkProxy.close();
+    await stack.database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("production composition advertises broker-backed web_search only to trusted workspaces", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-production-web-search-"));
+  const cwd = path.join(root, "workspace");
+  await fs.mkdir(cwd);
+  const stack = createLocalRuntimeStack(root, {
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    ANICODE_DISABLE_OS_KEYCHAIN: "1",
+    ANICODE_NETWORK_PROXY_URL: "http://127.0.0.1:9317",
+  });
+  let credentialReads = 0;
+  stack.broker.registerAsyncReference({
+    id: "env:TAVILY_API_KEY",
+    backend: {
+      kind: "fake-lazy-search-backend",
+      async get() {
+        credentialReads++;
+        return "must-not-read-while-advertising-tools";
+      },
+      async put() {},
+      async delete() {
+        return true;
+      },
+    },
+    backendKey: "env:TAVILY_API_KEY",
+    scopes: credentialScopesForEnvironment("TAVILY_API_KEY"),
+  });
+
+  const toolNamesByTrust: Record<"trusted" | "restricted", string[]> = {
+    trusted: [],
+    restricted: [],
+  };
+  const providerFor = (trust: keyof typeof toolNamesByTrust): Provider => ({
+    name: `capture-${trust}`,
+    async *stream(request): AsyncIterable<StreamEvent> {
+      toolNamesByTrust[trust] = (request.tools ?? []).map((tool) => tool.name);
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  });
+
+  const trustedOptions = productionSessionManagerOptions(
+    {
+      cwd,
+      sessionsDir: path.join(root, "trusted-sessions"),
+      resolveProvider: () => ({ provider: providerFor("trusted"), model: "demo" }),
+    },
+    stack,
+    noTelemetry,
+  );
+  assert.equal(trustedOptions.webSearchProvider, "tavily");
+  assert.equal(trustedOptions.webSearchDisabledReason, undefined);
+  const trusted = new SessionManager(trustedOptions);
+  const restricted = new SessionManager(
+    productionSessionManagerOptions(
+      {
+        cwd,
+        sessionsDir: path.join(root, "restricted-sessions"),
+        resolveProvider: () => ({ provider: providerFor("restricted"), model: "demo" }),
+        workspaceTrust: async () => ({
+          trusted: false,
+          reason: "not-trusted",
+          executionSources: [],
+          storeFile: path.join(root, "trust.json"),
+          assessedAt: new Date().toISOString(),
+        }),
+      },
+      stack,
+      noTelemetry,
+    ),
+  );
+
+  try {
+    assert.equal(credentialReads, 0, "production option assembly must be metadata-only");
+    const trustedSession = await trusted.createSession({ cwd, model: "demo" });
+    await trusted.send(trustedSession.id, "inspect trusted tools");
+    assert.equal(toolNamesByTrust.trusted.includes("web_search"), true);
+
+    const restrictedSession = await restricted.createSession({ cwd, model: "demo" });
+    await restricted.send(restrictedSession.id, "inspect restricted tools");
+    assert.equal(toolNamesByTrust.restricted.includes("web_search"), false);
+    assert.equal(
+      credentialReads,
+      0,
+      "advertising tool schemas must not read the search credential",
+    );
+  } finally {
+    await Promise.allSettled([trusted.shutdown(), restricted.shutdown()]);
     await stack.artifacts.close?.();
     await stack.networkProxy.close();
     await stack.database.close();
