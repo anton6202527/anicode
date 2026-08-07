@@ -158,6 +158,21 @@ test("overlay: 会话列表与授权弹框定宽且含关键信息", () => {
   assert.match(pt, /允许并记住/);
   assert.match(pt, /Shift\+Tab/);
 
+  const networkPerm = buildPermissionOverlay(
+    [{ toolName: "bash", ruleKey: "curl https://example.test", network: true }],
+    30,
+    80,
+  );
+  const networkPermissionText = networkPerm.lines.map(strip).join("\n");
+  assert.match(networkPermissionText, /本次允许联网/);
+  assert.match(networkPermissionText, /网络|联网/);
+  assert.match(networkPermissionText, /拒绝/);
+  assert.doesNotMatch(networkPermissionText, /允许并记住|永久允许/);
+  assert.deepEqual(
+    [...new Set((networkPerm.hitRows ?? []).filter((value) => value !== null))],
+    [0, 1],
+  );
+
   const fixedPermission = buildPermissionOverlay(
     [{ toolName: "bash", ruleKey: "npm test" }],
     30,

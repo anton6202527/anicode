@@ -733,14 +733,27 @@ export function buildPermissionOverlay(
     );
   }
   if (!compact) L.push(blank());
+  const rememberable = !(p.toolName.toLowerCase() === "bash" && p.network === true);
   const options = [
-    { key: "y", label: t("Allow once", "允许一次"), color: DLG.ok },
-    { key: "a", label: t("Allow for this session", "本会话允许并记住"), color: DLG.accent },
     {
-      key: "p",
-      label: t("Always allow in this project", "永久允许（写入项目）"),
-      color: DLG.section,
+      key: "y",
+      label: rememberable ? t("Allow once", "允许一次") : t("Allow network once", "本次允许联网"),
+      color: DLG.ok,
     },
+    ...(rememberable
+      ? [
+          {
+            key: "a",
+            label: t("Allow for this session", "本会话允许并记住"),
+            color: DLG.accent,
+          },
+          {
+            key: "p",
+            label: t("Always allow in this project", "永久允许（写入项目）"),
+            color: DLG.section,
+          },
+        ]
+      : []),
     { key: "n", label: t("Deny", "拒绝"), color: DLG.err },
   ];
   const index = Math.max(0, Math.min(selected, options.length - 1));
