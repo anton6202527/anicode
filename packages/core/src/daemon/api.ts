@@ -548,7 +548,7 @@ export const EVENTS: Record<string, string> = {
   "session.updated": "标题等元数据变化：{ sessionId, title }",
   "session.reverted":
     "撤销完成：{ sessionId, checkpointId, restored, deleted, mode?, removedMessages? }",
-  "permission.asked": "权限请求：{ sessionId, permId, toolName, ruleKey }",
+  "permission.asked": "权限请求：{ sessionId, permId, toolName, ruleKey, network?, risk? }",
   "permission.replied": "权限裁决：{ sessionId, permId, decision }",
   "message.updated": "消息元数据创建/完成：{ info: MessageInfo }",
   "message.part.updated": "part 创建或到达终态：{ part: MessagePart }",
@@ -598,6 +598,32 @@ const COMPONENT_SCHEMAS: Record<string, Record<string, unknown>> = {
         enum: ["default", "acceptEdits", "auto", "bypass", "plan"],
       },
       pendingPermissions: { type: "array", items: { type: "object" } },
+      networkTools: {
+        type: "object",
+        required: ["webSearch", "webFetch"],
+        properties: {
+          webSearch: { $ref: "#/components/schemas/NetworkToolStatus" },
+          webFetch: { $ref: "#/components/schemas/NetworkToolStatus" },
+        },
+      },
+    },
+  },
+  NetworkToolStatus: {
+    type: "object",
+    required: ["state"],
+    properties: {
+      state: { type: "string", enum: ["ready", "disabled"] },
+      provider: { type: "string", enum: ["tavily", "brave", "custom"] },
+      reason: {
+        type: "string",
+        enum: [
+          "workspace_restricted",
+          "credential_not_configured",
+          "host_disabled",
+          "network_policy",
+          "network_proxy_unavailable",
+        ],
+      },
     },
   },
   Checkpoint: {

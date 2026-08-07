@@ -58,6 +58,21 @@ test("OpenAPI 3.1.1 conformance: operationId/path params/responses 完整且唯�
     false,
     "permissionMode must remain optional for compatibility with older snapshot producers",
   );
+  assert.equal(
+    (sessionSnapshot?.required as string[]).includes("networkTools"),
+    false,
+    "networkTools must remain optional for compatibility with older snapshot producers",
+  );
+  const networkTools = (sessionSnapshot?.properties as Record<string, Record<string, unknown>>)
+    .networkTools;
+  assert.deepEqual(networkTools?.required, ["webSearch", "webFetch"]);
+  const networkToolStatus = (components.schemas as Record<string, Record<string, unknown>>)
+    .NetworkToolStatus;
+  assert.ok(networkToolStatus);
+  assert.deepEqual(
+    (networkToolStatus.properties as Record<string, Record<string, unknown>>).state!.enum,
+    ["ready", "disabled"],
+  );
   const operations = Object.values(full.paths as Record<string, Record<string, unknown>>).flatMap(
     (path) => Object.values(path),
   ) as Array<Record<string, unknown>>;

@@ -384,6 +384,8 @@ function deriveNamedEvents(
           permId: event.permId,
           toolName: event.toolName,
           ruleKey: event.ruleKey,
+          ...(event.network !== undefined ? { network: event.network } : {}),
+          ...(event.risk ? { risk: event.risk } : {}),
         }),
       ];
     case "permission_resolved":
