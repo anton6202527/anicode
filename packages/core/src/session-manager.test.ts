@@ -221,6 +221,40 @@ test("SessionManager: snapshot 权限模式反映初始配置与运行时切换"
   }
 });
 
+test("SessionManager: snapshot reports actual network tool readiness without probing credentials", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-network-tools-"));
+  const ready = new SessionManager({
+    store: new SessionStore(path.join(dir, "ready")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    webSearch: async () => [],
+    webSearchProvider: "tavily",
+    webSearchDisabledReason: "credential_not_configured",
+  });
+  const disabled = new SessionManager({
+    store: new SessionStore(path.join(dir, "disabled")),
+    resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
+    tools: () => new ToolRegistry(),
+    webSearchDisabledReason: "credential_not_configured",
+  });
+  try {
+    const readySession = await ready.createSession({ cwd: dir, model: "scripted" });
+    assert.deepEqual(ready.peek(readySession.id)?.networkTools, {
+      webSearch: { state: "ready", provider: "tavily" },
+      webFetch: { state: "ready" },
+    });
+
+    const disabledSession = await disabled.createSession({ cwd: dir, model: "scripted" });
+    assert.deepEqual(disabled.peek(disabledSession.id)?.networkTools, {
+      webSearch: { state: "disabled", reason: "credential_not_configured" },
+      webFetch: { state: "disabled", reason: "host_disabled" },
+    });
+  } finally {
+    ready.dispose();
+    disabled.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager: workspace scope 以 canonical cwd 隔离 list/create/load/fork", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-scope-"));
   const workspaceA = path.join(dir, "workspace-a");
@@ -742,6 +776,10 @@ test("SessionManager: 未信任 cwd 的 default 模式启用受审计开发工�
     const session = await manager.createSession({ cwd: workspace, model: "capture" });
     assert.equal(assessments, 1, "createSession 必须按 cwd 评估 trust");
     assert.equal(manager.peek(session.id)?.workspaceTrust?.reason, "not-trusted");
+    assert.deepEqual(manager.peek(session.id)?.networkTools, {
+      webSearch: { state: "disabled", reason: "workspace_restricted" },
+      webFetch: { state: "disabled", reason: "workspace_restricted" },
+    });
     await manager.send(session.id, "inspect only");
     assert.ok(captured);
     assert.deepEqual(
@@ -1627,6 +1665,163 @@ test("SessionManager: 权限广播，任一订阅者可裁决", async () => {
   );
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("SessionManager: shell 联网的 stale allow_always 被规范为一次性 allow", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-network-permission-"));
+  const provider = scriptedProvider([
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "network-shell",
+            name: "bash",
+            args: { command: "fetch example", network: true },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+  ]);
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "scripted" }),
+    permission: { mode: "bypass" },
+    tools: () =>
+      new ToolRegistry().register({
+        readOnly: false,
+        capabilities: ["process"],
+        def: {
+          name: "bash",
+          description: "fake network shell",
+          parameters: {
+            type: "object",
+            properties: {
+              command: { type: "string" },
+              network: { type: "boolean" },
+            },
+            required: ["command"],
+            additionalProperties: false,
+          },
+        },
+        ruleKey: (input) => String(input["command"] ?? ""),
+        run: async () => "executed",
+      }),
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    const events: SessionEvent[] = [];
+    await manager.open(session.id, (event) => {
+      events.push(event);
+      if (event.type === "permission_request") {
+        void manager.answerPermission(session.id, event.permId, "allow_always");
+      }
+    });
+    await manager.send(session.id, "request network");
+
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "permission_resolved" &&
+          event.permId === "network-shell" &&
+          event.decision === "allow",
+      ),
+      "one-shot network consent must never be reported as persistent",
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: 非法权限答复 fail closed 且不消费待裁决请求", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-invalid-permission-"));
+  let executions = 0;
+  const provider = scriptedProvider([
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "network-shell-invalid-answer",
+            name: "bash",
+            args: { command: "fetch example", network: true },
+          },
+        ],
+      },
+    ],
+    [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+  ]);
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    resolveProvider: () => ({ provider, model: "scripted" }),
+    permission: { mode: "bypass" },
+    tools: () =>
+      new ToolRegistry().register({
+        readOnly: false,
+        capabilities: ["process"],
+        def: {
+          name: "bash",
+          description: "fake network shell",
+          parameters: {
+            type: "object",
+            properties: {
+              command: { type: "string" },
+              network: { type: "boolean" },
+            },
+            required: ["command"],
+            additionalProperties: false,
+          },
+        },
+        ruleKey: (input) => String(input["command"] ?? ""),
+        run: async () => {
+          executions++;
+          return "executed";
+        },
+      }),
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "scripted" });
+    const events: SessionEvent[] = [];
+    let signalPermission!: (permId: string) => void;
+    const permissionRequested = new Promise<string>((resolve) => {
+      signalPermission = resolve;
+    });
+    await manager.open(session.id, (event) => {
+      events.push(event);
+      if (event.type === "permission_request") signalPermission(event.permId);
+    });
+
+    const send = manager.send(session.id, "request network");
+    const permId = await permissionRequested;
+    assert.equal(
+      await manager.answerPermission(session.id, permId, "bogus" as never),
+      false,
+      "unknown runtime values must not approve or consume the prompt",
+    );
+    assert.equal(
+      events.some((event) => event.type === "permission_resolved" && event.permId === permId),
+      false,
+    );
+    assert.equal(await manager.answerPermission(session.id, permId, "deny"), true);
+    await send;
+
+    assert.equal(executions, 0);
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "permission_resolved" &&
+          event.permId === permId &&
+          event.decision === "deny",
+      ),
+    );
+  } finally {
+    manager.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("SessionManager: create 只做纯 provider 检查，首次 send 才解析一次", async () => {

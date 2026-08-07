@@ -42,12 +42,13 @@ import { newSessionId, type ISessionStore, type SessionMeta } from "./session.js
 import { defaultSmallModel } from "./provider/registry.js";
 import type { BrowserRegistry } from "./browser/cdp.js";
 import { appendLocalAllowRules } from "./permission-store.js";
-import type {
-  PermissionConfig,
-  PermissionDecision,
-  PermissionRequest,
-  PermissionMode,
-  PermissionProfile,
+import {
+  requiresExplicitNetworkApproval,
+  type PermissionConfig,
+  type PermissionDecision,
+  type PermissionRequest,
+  type PermissionMode,
+  type PermissionProfile,
 } from "./permission.js";
 import {
   MemoryArtifactStore,
@@ -150,6 +151,12 @@ export type RewindMode = "files" | "conversation" | "both";
 /** allow_remember=本会话记住；allow_always=写入项目本地设置，跨会话生效。 */
 export type PermissionAnswer = "allow" | "allow_remember" | "allow_always" | "deny";
 
+function isPermissionAnswer(value: unknown): value is PermissionAnswer {
+  return (
+    value === "allow" || value === "allow_remember" || value === "allow_always" || value === "deny"
+  );
+}
+
 /** 后台子 agent 任务的可序列化摘要（晚订阅者/daemon 客户端观测用）。 */
 export interface BackgroundTaskSummary {
   id: string;
@@ -158,6 +165,29 @@ export interface BackgroundTaskSummary {
   status: "running" | "done" | "error" | "stopped";
   background: boolean;
   worktree?: string;
+}
+
+/** Stable, secret-free reasons why a host did not expose one of the built-in network tools. */
+export type NetworkToolDisabledReason =
+  | "workspace_restricted"
+  | "credential_not_configured"
+  | "host_disabled"
+  | "network_policy"
+  | "network_proxy_unavailable";
+
+export type WebSearchProvider = "tavily" | "brave" | "custom";
+
+/**
+ * Composition readiness, not a live connectivity probe. A ready tool can still report a scoped
+ * policy, DNS, timeout or upstream HTTP error when it is actually called.
+ */
+export type NetworkToolStatus =
+  | { state: "ready"; provider?: WebSearchProvider }
+  | { state: "disabled"; reason: NetworkToolDisabledReason };
+
+export interface NetworkToolStatuses {
+  webSearch: NetworkToolStatus;
+  webFetch: NetworkToolStatus;
 }
 
 export interface SessionSnapshot {
@@ -177,6 +207,8 @@ export interface SessionSnapshot {
   contextUsage?: { tokens: number; window?: number };
   /** Present when the host configured per-workspace trust enforcement. */
   workspaceTrust?: WorkspaceTrustAssessment;
+  /** Host-authoritative, secret-free readiness of the built-in web discovery/read tools. */
+  networkTools?: NetworkToolStatuses;
 }
 
 export interface SessionSummary extends SessionMeta {
@@ -302,6 +334,10 @@ export interface SessionManagerOptions {
    * 自定义，或 webSearchBackendFromEnv() 的返回值）。省略则不启用。
    */
   webSearch?: WebSearchBackend;
+  /** Safe display metadata for a configured search backend; never contains a credential id/value. */
+  webSearchProvider?: WebSearchProvider;
+  /** Why a trusted session has no web_search tool. Ignored whenever the tool is actually present. */
+  webSearchDisabledReason?: NetworkToolDisabledReason;
   /**
    * 启用 diagnostics 工具：给出语言服务器配置，SessionManager 会为每个会话按其 cwd 惰性
    * 建一个 LspPool 并在 dispose 时统一关闭。空数组/省略则不启用。
@@ -518,6 +554,10 @@ class ManagedSession {
     private readonly onEvent?: (event: SessionEvent) => void,
     private readonly workspaceTrust?: WorkspaceTrustAssessment,
     private readonly restrictedWorkspaceDevelopment = false,
+    private readonly networkToolHints: {
+      webSearchProvider?: WebSearchProvider;
+      webSearchDisabledReason?: NetworkToolDisabledReason;
+    } = {},
     initialCheckpoints: readonly Checkpoint[] = [],
     private readonly listeners: Set<SessionListener> = new Set<SessionListener>(),
   ) {
@@ -561,6 +601,7 @@ class ManagedSession {
       })),
       ...(this.agent.contextUsage ? { contextUsage: this.agent.contextUsage } : {}),
       ...(this.workspaceTrust ? { workspaceTrust: this.workspaceTrust } : {}),
+      networkTools: this.networkToolStatuses(),
       ...(this.agent.backgroundTasks.length > 0
         ? {
             backgroundTasks: this.agent.backgroundTasks.map((r) => ({
@@ -574,6 +615,30 @@ class ManagedSession {
           }
         : {}),
     };
+  }
+
+  private networkToolStatuses(): NetworkToolStatuses {
+    const restricted = this.workspaceTrust?.trusted === false;
+    const disabledReason: NetworkToolDisabledReason = restricted
+      ? "workspace_restricted"
+      : "host_disabled";
+    const webSearch: NetworkToolStatus = this.agent.hasTool("web_search")
+      ? {
+          state: "ready",
+          ...(this.networkToolHints.webSearchProvider
+            ? { provider: this.networkToolHints.webSearchProvider }
+            : {}),
+        }
+      : {
+          state: "disabled",
+          reason: restricted
+            ? "workspace_restricted"
+            : (this.networkToolHints.webSearchDisabledReason ?? disabledReason),
+        };
+    const webFetch: NetworkToolStatus = this.agent.hasTool("webfetch")
+      ? { state: "ready" }
+      : { state: "disabled", reason: disabledReason };
+    return { webSearch, webFetch };
   }
 
   subscribe(listener: SessionListener): () => void {
@@ -641,25 +706,33 @@ class ManagedSession {
   }
 
   answerPermission(permId: string, decision: PermissionAnswer): boolean {
+    // Transport types disappear at runtime. Reject malformed/stale custom-client values at the
+    // authoritative boundary before consuming the pending prompt; unknown values must never fall
+    // through the non-deny branch and become an approval.
+    if (!isPermissionAnswer(decision)) return false;
     const p = this.pending.get(permId);
     if (!p) return false;
     this.pending.delete(permId);
+    // Even a stale or custom client may submit allow_always. Normalize the observable and
+    // executable decision so one-shot shell-network consent is never represented as persistent.
+    const effectiveDecision: PermissionAnswer =
+      decision !== "deny" && requiresExplicitNetworkApproval(p) ? "allow" : decision;
     p.resolve(
-      decision === "deny"
+      effectiveDecision === "deny"
         ? { behavior: "deny", message: "已拒绝该操作" }
         : {
             behavior: "allow",
             remember:
-              decision === "allow_always"
+              effectiveDecision === "allow_always"
                 ? "always"
-                : decision === "allow_remember"
+                : effectiveDecision === "allow_remember"
                   ? "session"
                   : false,
           },
     );
     // 所有观察者都必须清掉同一个授权提示；仅给请求发起者返回 boolean
     // 无法处理多 TUI/重连观察者的陈旧 UI。
-    this.emit({ type: "permission_resolved", permId, decision });
+    this.emit({ type: "permission_resolved", permId, decision: effectiveDecision });
     return true;
   }
 
@@ -3703,6 +3776,12 @@ export class SessionManager {
       },
       workspaceTrust,
       restrictedDevelopment,
+      {
+        ...(this.opts.webSearchProvider ? { webSearchProvider: this.opts.webSearchProvider } : {}),
+        ...(this.opts.webSearchDisabledReason
+          ? { webSearchDisabledReason: this.opts.webSearchDisabledReason }
+          : {}),
+      },
       recovered.checkpoints,
       listeners,
     );
