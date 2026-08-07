@@ -19,6 +19,7 @@ import {
   type StreamEvent,
   type ChatMessage,
   type ModelCatalogEntry,
+  type NetworkToolStatuses,
   type ProviderDescriptor,
   type SessionEvent,
   type SessionHost,
@@ -34,6 +35,8 @@ import {
   inputView,
   InputPanel,
   matchesKeybinding,
+  networkToolsText,
+  permissionAnswersFor,
   promptHistoryFromMessages,
   subagentActivityLine,
   Welcome,
@@ -85,6 +88,7 @@ function offlineHost(
     running?: boolean;
     eventsBeforeSnapshot?: SessionEvent[];
     pendingPermissions?: PendingPermission[];
+    networkTools?: NetworkToolStatuses;
     onInterrupt?: () => void;
     onSend?: (text: string) => void;
     onCreate?: (input: { cwd: string; model: string; title?: string }) => void;
@@ -143,6 +147,7 @@ function offlineHost(
           usage: zeroUsage,
           running: options.running ?? false,
           pendingPermissions: options.pendingPermissions ?? [],
+          ...(options.networkTools ? { networkTools: options.networkTools } : {}),
         },
         close() {},
       };
@@ -852,6 +857,33 @@ test("TUI: 权限层贴在输入框上方，永久允许只需一次 Enter 确�
   view.unmount();
 });
 
+test("TUI: shell 联网授权明确标注联网且只提供一次性允许", async () => {
+  const decisions: string[] = [];
+  const host = offlineHost({
+    pendingPermissions: [
+      {
+        permId: "p-network",
+        toolName: "bash",
+        ruleKey: "curl https://example.com",
+        network: true,
+        risk: "high",
+      },
+    ],
+    onPermission: (decision) => decisions.push(decision),
+  });
+  const view = render(<App host={host} cwd="/fallback" model="fallback" sessionId="s_offline" />);
+  await waitFor(() => /授权请求/.test(view.lastFrame() ?? ""));
+  const frame = view.lastFrame() ?? "";
+  assert.match(frame, /联网/);
+  assert.match(frame, /本次允许联网/);
+  assert.doesNotMatch(frame, /本会话允许并记住|永久允许/);
+
+  view.stdin.write("y");
+  await waitFor(() => decisions.length === 1);
+  assert.deepEqual(decisions, ["allow"]);
+  view.unmount();
+});
+
 test("TUI: 极矮终端的授权面板仍显示拒绝入口并保持输入框固定", async () => {
   const host = offlineHost({
     pendingPermissions: [{ permId: "p-small", toolName: "bash", ruleKey: "dangerous command" }],
@@ -926,7 +958,16 @@ test("TUI: 会话列表高亮超过前十项时会滚动窗口并清洗元数据
 });
 
 test("TUI: /help 与 /status 显示快捷帮助和 snapshot 实际元数据", async () => {
-  const host = offlineHost({ id: "s_status", cwd: "/status/cwd", model: "status/model" });
+  const networkTools: NetworkToolStatuses = {
+    webSearch: { state: "disabled", reason: "credential_not_configured" },
+    webFetch: { state: "ready" },
+  };
+  const host = offlineHost({
+    id: "s_status",
+    cwd: "/status/cwd",
+    model: "status/model",
+    networkTools,
+  });
   const view = render(<App host={host} cwd="/wrong" model="wrong" sessionId="s_status" />);
   await tick(80);
 
@@ -944,7 +985,31 @@ test("TUI: /help 与 /status 显示快捷帮助和 snapshot 实际元数据", as
   assert.match(frame, /\/providers/);
   assert.match(frame, /\/model <provider\/model>/);
   assert.match(frame, /会话 s_status · status\/model · \/status\/cwd · 空闲/);
+  assert.match(frame, /web_search: 已禁用 · 未配置搜索凭据/);
+  assert.match(frame, /webfetch: 可用/);
+
+  for (const ch of "/tools") view.stdin.write(ch);
+  view.stdin.write("\r");
+  await tick(80);
+  assert.match(view.lastFrame() ?? "", /联网工具[\s\S]*web_search[\s\S]*webfetch/);
   view.unmount();
+});
+
+test("TUI: network tool diagnostics are explicit and bash network approval is one-shot", () => {
+  assert.match(
+    networkToolsText({
+      webSearch: { state: "ready", provider: "brave" },
+      webFetch: { state: "disabled", reason: "workspace_restricted" },
+    }),
+    /web_search: 可用 \(brave\)[\s\S]*webfetch: 已禁用 · 工作区未授信/,
+  );
+  assert.deepEqual(permissionAnswersFor({ toolName: "bash", network: true }), ["allow", "deny"]);
+  assert.deepEqual(permissionAnswersFor({ toolName: "bash", network: false }), [
+    "allow",
+    "allow_remember",
+    "allow_always",
+    "deny",
+  ]);
 });
 
 test("TUI: /mouse 可切换跟踪，off 明确恢复原生框选/复制", async () => {

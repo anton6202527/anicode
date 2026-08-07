@@ -76,7 +76,7 @@ import {
 import { App, type TuiKeybindingAction } from "./app.js";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
 import { TuiErrorBoundary } from "./error-boundary.js";
-import { createTerminalCaretOutput } from "./terminal-caret.js";
+import { createTerminalCaretOutput, RESET_FULLSCREEN_VIEWPORT } from "./terminal-caret.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
 // 版本号由 build.mjs 经 esbuild define 注入（发布包 package.json 单一事实源）；
@@ -145,7 +145,8 @@ export function colorlessTerminalOutput(output: NodeJS.WriteStream): NodeJS.Writ
 }
 
 const ENTER_ALTERNATE_SCREEN = "\x1b[?1049h";
-const RESET_FULLSCREEN_VIEWPORT = "\x1b[r\x1b[2J\x1b[3J\x1b[H";
+/** Fixed-height TUI frames must remain complete so a resize can atomically replace old cells. */
+export const TUI_INCREMENTAL_RENDERING = false;
 
 /**
  * 每次 Ink 进入/恢复备用屏时重置滚动区域并清掉备用屏自己的历史。
@@ -2556,6 +2557,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const fullscreenOutput = fullscreenViewportOutput(baseTerminalOutput, alternateScreen);
     const terminalCaret = createTerminalCaretOutput(fullscreenOutput, {
       enabled: !screenReader && !experimentalOverlay,
+      resetOnResize: alternateScreen,
     });
     const terminalOutput = terminalCaret.output;
     const restoreTerminalScreen = enterTerminalScreen(terminalOutput, process.stdin, {
@@ -2625,7 +2627,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         {
           stdout: terminalOutput,
           alternateScreen,
-          incrementalRendering: !screenReader,
+          // Ink 7 only invalidates its incremental line cache when terminal width shrinks.
+          // Growing either dimension can therefore diff against stale physical coordinates and
+          // leave old logos/composers behind. Complete frames make resize reset + repaint atomic.
+          incrementalRendering: TUI_INCREMENTAL_RENDERING,
           isScreenReaderEnabled: screenReader,
           // Ink otherwise disables input whenever CI=1, even for a real PTY.
           interactive: process.stdin.isTTY === true,

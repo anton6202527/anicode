@@ -42,6 +42,8 @@ import type {
   ChatMessage,
   CustomCommand,
   ModelCatalogEntry,
+  NetworkToolDisabledReason,
+  NetworkToolStatuses,
   PermissionAnswer,
   PermissionMode,
   PendingPermission,
@@ -528,7 +530,17 @@ function builtinCommands(): CommandMenuRow[] {
     { name: "help", description: t("Show command help", "显示命令帮助") },
     {
       name: "status",
-      description: t("Show current session, model and directory", "显示当前会话、模型与目录"),
+      description: t(
+        "Show current session, model, directory and network tools",
+        "显示当前会话、模型、目录与联网工具",
+      ),
+    },
+    {
+      name: "tools",
+      description: t(
+        "Show web_search/webfetch availability and disabled reasons",
+        "显示 web_search/webfetch 可用状态与禁用原因",
+      ),
     },
     { name: "usage", description: t("Show token and cache usage", "显示 token 与缓存用量") },
     {
@@ -846,6 +858,15 @@ export function terminalMouseModeSequence(fullTracking: boolean): string {
 
 type PendingPerm = PendingPermission;
 
+/** Shell network access is intentionally one-shot; the core re-confirms every invocation. */
+export function permissionAnswersFor(
+  pending: Pick<PendingPermission, "toolName" | "network">,
+): readonly PermissionAnswer[] {
+  return pending.toolName.toLowerCase() === "bash" && pending.network === true
+    ? ["allow", "deny"]
+    : ["allow", "allow_remember", "allow_always", "deny"];
+}
+
 interface SessionPickerState {
   rows: SessionSummary[];
   index: number;
@@ -1053,8 +1074,9 @@ export function App({
   pendingsRef.current = pendings;
   const [permissionIndex, setPermissionIndex] = useState(0);
   const permissionIndexRef = useRef(0);
-  const setPermissionSelection = useCallback((index: number) => {
-    const value = ((index % 4) + 4) % 4;
+  const setPermissionSelection = useCallback((index: number, optionCount = 4) => {
+    const count = Math.max(1, optionCount);
+    const value = ((index % count) + count) % count;
     permissionIndexRef.current = value;
     setPermissionIndex(value);
   }, []);
@@ -1062,8 +1084,13 @@ export function App({
   const activePermissionId = pendings[0]?.permId;
   const activePermissionRisk = pendings[0]?.risk;
   useLayoutEffect(() => {
-    setPermissionSelection(activePermissionRisk === "high" ? 3 : 0);
-  }, [activePermissionId, activePermissionRisk, setPermissionSelection]);
+    const active = pendings[0];
+    const options = active ? permissionAnswersFor(active) : [];
+    setPermissionSelection(
+      activePermissionRisk === "high" ? options.length - 1 : 0,
+      options.length,
+    );
+  }, [activePermissionId, activePermissionRisk, pendings, setPermissionSelection]);
   useEffect(() => {
     if (activePermissionId && terminalControl && stdout.isTTY) stdout.write("\x07");
   }, [activePermissionId, stdout, terminalControl]);
@@ -1802,9 +1829,11 @@ export function App({
       if (cmd === "status") {
         // 上下文占用取自新鲜 snapshot（最近一轮真实输入 token / 模型窗口，对齐 Codex /status）。
         let ctx = "";
+        let networkTools: NetworkToolStatuses | undefined;
         try {
           const handle = await host.open(state.meta.id, () => {});
           handle.close();
+          networkTools = handle.snapshot.networkTools;
           const usage = handle.snapshot.contextUsage;
           if (usage) {
             const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
@@ -1829,8 +1858,18 @@ export function App({
               ) +
               ` · ${state.running ? t("running", "运行中") : t("idle", "空闲")}` +
               ctx +
-              (state.meta.title ? ` · ${state.meta.title}` : ""),
+              (state.meta.title ? ` · ${state.meta.title}` : "") +
+              (networkTools ? `\n${networkToolsText(networkTools)}` : ""),
           },
+        });
+        return true;
+      }
+      if (cmd === "tools") {
+        const handle = await host.open(state.meta.id, () => {});
+        handle.close();
+        dispatch({
+          t: "push",
+          item: { kind: "info", text: networkToolsText(handle.snapshot.networkTools) },
         });
         return true;
       }
@@ -2889,11 +2928,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         });
         return;
       }
-      const options: PermissionAnswer[] = ["allow", "allow_remember", "allow_always", "deny"];
+      const options = permissionAnswersFor(pending);
       let selectedByMouse: PermissionAnswer | null = null;
       if (mouse !== null) {
         if (mouse.wheelDelta !== 0) {
-          setPermissionSelection(permissionIndexRef.current + mouse.wheelDelta);
+          setPermissionSelection(permissionIndexRef.current + mouse.wheelDelta, options.length);
         } else if (mouse.leftClick) {
           const anchor = panelRef.current ? absoluteTop(panelRef.current) : termRows;
           const sprite = buildPermissionOverlay(
@@ -2913,11 +2952,11 @@ Requirements: read the actual diff and surrounding code before judging; verify e
         if (!selectedByMouse) return;
       }
       if (key.upArrow || key.leftArrow) {
-        setPermissionSelection(permissionIndexRef.current - 1);
+        setPermissionSelection(permissionIndexRef.current - 1, options.length);
         return;
       }
       if (key.downArrow || key.rightArrow) {
-        setPermissionSelection(permissionIndexRef.current + 1);
+        setPermissionSelection(permissionIndexRef.current + 1, options.length);
         return;
       }
       const kind: PermissionAnswer | null = selectedByMouse
@@ -2926,9 +2965,9 @@ Requirements: read the actual diff and surrounding code before judging; verify e
           ? options[permissionIndexRef.current]!
           : ch === "y" || ch === "Y"
             ? "allow"
-            : ch === "a" || ch === "A"
+            : options.includes("allow_remember") && (ch === "a" || ch === "A")
               ? "allow_remember"
-              : ch === "p" || ch === "P"
+              : options.includes("allow_always") && (ch === "p" || ch === "P")
                 ? "allow_always"
                 : ch === "n" || ch === "N"
                   ? "deny"
@@ -3774,12 +3813,50 @@ function sessionBoundary(meta: SessionMeta): Item {
   };
 }
 
+function networkToolDisabledReason(reason: NetworkToolDisabledReason): string {
+  switch (reason) {
+    case "workspace_restricted":
+      return t("workspace is restricted", "工作区未授信");
+    case "credential_not_configured":
+      return t("search credential is not configured", "未配置搜索凭据");
+    case "network_policy":
+      return t("blocked by network policy", "被网络策略阻止");
+    case "network_proxy_unavailable":
+      return t("controlled network proxy is unavailable", "受控网络代理不可用");
+    case "host_disabled":
+      return t("disabled by the host", "宿主已禁用");
+  }
+}
+
+/** Shared formatter for /status and /tools; it never probes the network or a credential backend. */
+export function networkToolsText(status: NetworkToolStatuses | undefined): string {
+  if (!status) {
+    return t("Network tools: status unavailable from this host", "联网工具：当前宿主未提供状态");
+  }
+  const line = (
+    name: "web_search" | "webfetch",
+    tool: NetworkToolStatuses[keyof NetworkToolStatuses],
+  ) =>
+    tool.state === "ready"
+      ? `✓ ${name}: ${t("ready", "可用")}${tool.provider ? ` (${tool.provider})` : ""}`
+      : `✗ ${name}: ${t("disabled", "已禁用")} · ${networkToolDisabledReason(tool.reason)}`;
+  return [
+    t("Network tools", "联网工具"),
+    line("web_search", status.webSearch),
+    line("webfetch", status.webFetch),
+  ].join("\n");
+}
+
 function helpText(): string {
   return [
     t("/help                 Show command help", "/help                 显示命令帮助"),
     t(
-      "/status               Show current session, model and directory",
-      "/status               显示当前会话、模型与目录",
+      "/status               Show session, model, directory and network tools",
+      "/status               显示会话、模型、目录与联网工具",
+    ),
+    t(
+      "/tools                Show web_search/webfetch readiness",
+      "/tools                显示 web_search/webfetch 状态",
     ),
     t(
       "/usage                Show token/cache/cost totals",
@@ -4580,25 +4657,38 @@ function PermissionPanel({
   termCols: number;
   showPermissionControls: boolean;
 }) {
+  const rememberable = permissionAnswersFor(pending).includes("allow_remember");
+  const networkApproval = pending.toolName.toLowerCase() === "bash" && pending.network === true;
   const options = [
-    { keyName: "y", label: t("Allow once", "允许一次"), short: t("Once", "一次"), color: "green" },
     {
-      keyName: "a",
-      label: t("Allow for this session", "本会话允许并记住"),
-      short: t("Session", "会话"),
-      color: "cyan",
+      keyName: "y",
+      label: networkApproval
+        ? t("Allow network once", "本次允许联网")
+        : t("Allow once", "允许一次"),
+      short: networkApproval ? t("Network once", "联网一次") : t("Once", "一次"),
+      color: "green",
     },
-    {
-      keyName: "p",
-      label: t("Always allow in this project", "永久允许（写入项目）"),
-      short: t("Project", "项目"),
-      color: "magenta",
-    },
+    ...(rememberable
+      ? [
+          {
+            keyName: "a",
+            label: t("Allow for this session", "本会话允许并记住"),
+            short: t("Session", "会话"),
+            color: "cyan",
+          },
+          {
+            keyName: "p",
+            label: t("Always allow in this project", "永久允许（写入项目）"),
+            short: t("Project", "项目"),
+            color: "magenta",
+          },
+        ]
+      : []),
     { keyName: "n", label: t("Deny", "拒绝"), short: t("Deny", "拒绝"), color: "red" },
-  ] as const;
+  ];
   const title = `${t("⚠ Permission request: ", "⚠ 授权请求: ")}${terminalInlineText(
     pending.toolName,
-  )} · ${(pending.risk ?? "medium").toUpperCase()}${
+  )} · ${(pending.risk ?? "medium").toUpperCase()}${networkApproval ? t(" · NETWORK", " · 联网") : ""}${
     pendingCount > 1
       ? t(` (${pendingCount - 1} more pending)`, `（还有 ${pendingCount - 1} 个待裁决）`)
       : ""
@@ -4615,21 +4705,24 @@ function PermissionPanel({
         aria-role="radiogroup"
       >
         <Text color="yellow" bold wrap="truncate">
-          {truncWidth(`⚠ ${terminalInlineText(pending.toolName)}`, Math.max(1, termCols - 2))}
+          {truncWidth(
+            `⚠ ${terminalInlineText(pending.toolName)}${networkApproval ? t(" · NETWORK", " · 联网") : ""}`,
+            Math.max(1, termCols - 2),
+          )}
         </Text>
         <Text wrap="truncate">
           [<Text color="red">n</Text>] {t("Deny", "拒绝")} · [<Text color="green">y</Text>]{" "}
-          {t("Once", "一次")}
+          {networkApproval ? t("Network once", "联网一次") : t("Once", "一次")}
         </Text>
       </Box>
     );
   }
 
   if (compact) {
-    const selected = options[index] ?? options[0];
+    const selected = options[index] ?? options[0]!;
     // Deny is deliberately first so it remains visible even in the narrowest
     // supported terminal; arrows still reach every option and Enter confirms.
-    const compactKeys = [options[3], options[0], options[1], options[2]];
+    const compactKeys = [options[options.length - 1]!, ...options.slice(0, -1)];
     return (
       <Box
         flexDirection="column"
