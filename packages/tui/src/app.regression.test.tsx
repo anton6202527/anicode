@@ -23,6 +23,13 @@ import { App, parseMouseInput, terminalMouseModeSequence } from "./app.js";
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
+/** Wait on observable TUI/host state instead of assuming filesystem work finishes within a sleep. */
+async function waitFor(cond: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond() && Date.now() < deadline) await tick(25);
+  if (!cond()) throw new Error(`Timed out after ${timeoutMs}ms waiting for TUI state`);
+}
+
 const zeroUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
 test("TUI 回归: SGR 左键点击解析坐标，释放事件不重复触发", () => {
@@ -66,11 +73,11 @@ test("TUI 安全边界: 仅本地且受信任工作区展开 @文件，远端与
         canInspectWorkspace: scenario.canInspectWorkspace,
         requireWorkspaceTrust: true,
       });
-      await tick(80);
       try {
+        await waitFor(() => (view.lastFrame() ?? "").includes("s_reg"));
         view.stdin.write("inspect @secret.txt");
         view.stdin.write("\r");
-        await tick(100);
+        await waitFor(() => sent.length >= 1);
         assert.equal(sent.length, 1, scenario.name);
         assert.equal(sent[0]!.includes("CLIENT_ONLY_SECRET"), scenario.expands, scenario.name);
         if (!scenario.expands) assert.equal(sent[0], "inspect @secret.txt", scenario.name);
