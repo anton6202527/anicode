@@ -169,7 +169,8 @@ export class FileCommandInboxStore implements CommandInboxStore {
             mode: 0o600,
             flag: "wx",
           });
-          const handle = await fs.open(temporary, "r");
+          // Windows requires write access on a handle passed to FlushFileBuffers/FileHandle.sync.
+          const handle = await fs.open(temporary, "r+");
           try {
             await handle.sync();
           } finally {
@@ -454,7 +455,8 @@ export class FileOutboxStore implements OutboxStore {
         mode: 0o600,
         flag: "wx",
       });
-      const handle = await fs.open(temporary, "r");
+      // Windows requires write access on a handle passed to FlushFileBuffers/FileHandle.sync.
+      const handle = await fs.open(temporary, "r+");
       try {
         await handle.sync();
       } finally {

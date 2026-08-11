@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   createDaemonManagerComposition,
   daemonHelpText,
@@ -16,6 +17,13 @@ import { createLocalRuntimeStack } from "../runtime/local-stack.js";
 import { DisabledExecutionRuntime } from "../runtime/isolated-runtime.js";
 import { noTelemetry } from "../runtime/telemetry.js";
 import type { Provider, StreamEvent, StreamRequest } from "../types.js";
+
+/** Windows local IPC accepts named pipes, not filesystem-shaped Unix socket paths. */
+function testSocketPath(directory: string, name = "daemon.sock"): string {
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\anicode-test-${process.pid}-${randomUUID()}`
+    : path.join(directory, name);
+}
 
 test("daemon socket: default endpoint is isolated per user and portable", () => {
   assert.equal(
@@ -101,8 +109,8 @@ test("daemon CLI: 严格解析路径、权限与帮助参数", () => {
     "./workspace",
     "--accept-edits",
   ]);
-  assert.match(args.socketPath, /tmp\/anicode\.sock$/);
-  assert.match(args.sessionsDir, /tmp\/sessions$/);
+  assert.equal(args.socketPath, path.resolve("./tmp/anicode.sock"));
+  assert.equal(args.sessionsDir, path.resolve("./tmp/sessions"));
   assert.equal(args.cwd, path.resolve("./workspace"));
   assert.equal(args.permissionMode, "acceptEdits");
   assert.match(daemonHelpText(), /anicode-daemon 0\.0\.1/);
@@ -174,7 +182,7 @@ test("daemon composition: Windows restricted runtime does not expose process too
 
 test("daemon CLI: 不会把正在监听的 socket 当作陈旧文件删除", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-launch-"));
-  const socketPath = path.join(dir, "active.sock");
+  const socketPath = testSocketPath(dir, "active.sock");
   const server = net.createServer((socket) => socket.on("error", () => {}));
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -182,7 +190,7 @@ test("daemon CLI: 不会把正在监听的 socket 当作陈旧文件删除", asy
   });
 
   await assert.rejects(removeStaleSocket(socketPath), /daemon 已在监听/);
-  assert.equal((await fs.lstat(socketPath)).isSocket(), true);
+  if (process.platform !== "win32") assert.equal((await fs.lstat(socketPath)).isSocket(), true);
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await fs.rm(dir, { recursive: true, force: true });

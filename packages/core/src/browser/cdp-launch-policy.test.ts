@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { promises as fs, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { test } from "node:test";
 import {
   buildBrowserLaunchArguments,
@@ -11,6 +11,15 @@ import {
 } from "./cdp.js";
 
 const syntheticProfile = resolve(tmpdir(), "anicode-browser-policy-test");
+
+function assertPathContained(root: string, candidate: string | undefined, label: string): void {
+  assert.ok(candidate, `${label} must be configured`);
+  const child = relative(root, candidate);
+  assert.ok(
+    child === "" || (child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child)),
+    `${label} must stay inside the disposable profile`,
+  );
+}
 
 test("browser launch policy: macOS uses only the disposable mock Keychain", () => {
   const args = buildBrowserLaunchArguments({
@@ -60,7 +69,7 @@ test("browser launch policy: Linux HOME and XDG state stay inside the disposable
     "XDG_RUNTIME_DIR",
   ]) {
     const value = env[name];
-    assert.ok(value === syntheticProfile || value?.startsWith(`${syntheticProfile}/`), name);
+    assertPathContained(syntheticProfile, value, name);
   }
   assert.equal(env["DBUS_SESSION_BUS_ADDRESS"], undefined);
   assert.equal(env["CHROME_CONFIG_HOME"], undefined);
@@ -80,8 +89,8 @@ test("browser launch policy: Windows app-data roots stay inside the disposable p
 
   assert.equal(env["HOME"], syntheticProfile);
   assert.equal(env["USERPROFILE"], syntheticProfile);
-  assert.ok(env["APPDATA"]?.startsWith(`${syntheticProfile}/`));
-  assert.ok(env["LOCALAPPDATA"]?.startsWith(`${syntheticProfile}/`));
+  assertPathContained(syntheticProfile, env["APPDATA"], "APPDATA");
+  assertPathContained(syntheticProfile, env["LOCALAPPDATA"], "LOCALAPPDATA");
 });
 
 test("browser launch policy: Windows does not receive unsupported POSIX keyring switches", () => {

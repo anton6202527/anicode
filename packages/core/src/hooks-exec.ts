@@ -16,6 +16,7 @@
  */
 
 import { spawn } from "node:child_process";
+import * as path from "node:path";
 import {
   HookExecutionBoundaryError,
   type HookEventName,
@@ -34,7 +35,7 @@ export interface CommandHookConfig {
   event: HookEventName;
   /** 工具名/子 agent 类型匹配（* glob）；缺省匹配全部。 */
   matcher?: string;
-  /** 经 /bin/sh -c 执行的命令行。 */
+  /** 经平台命令解释器（POSIX sh / Windows cmd）执行的命令行。 */
   command: string;
   /** 超时毫秒；默认 60000。 */
   timeoutMs?: number;
@@ -143,7 +144,8 @@ async function runCommandHook(
   return new Promise<HookResult | void>((resolve, reject) => {
     let child;
     try {
-      child = spawn("/bin/sh", ["-c", cfg.command], {
+      const shell = hostCommandShell(cfg.command);
+      child = spawn(shell.file, shell.args, {
         cwd: payload.cwd,
         env: sanitizedShellEnv(),
         stdio: ["pipe", "pipe", "pipe"],
@@ -227,6 +229,34 @@ async function runCommandHook(
       /* 进程可能已退出 */
     }
   });
+}
+
+function hostCommandShell(command: string): { file: string; args: string[] } {
+  if (process.platform === "win32") {
+    // /d disables registry AutoRun commands, keeping the configured hook as the only command body.
+    return {
+      file: windowsCommandInterpreter(process.env),
+      args: ["/d", "/s", "/c", command],
+    };
+  }
+  return { file: "/bin/sh", args: ["-c", command] };
+}
+
+function windowsCommandInterpreter(env: NodeJS.ProcessEnv): string {
+  const configured = env["ComSpec"]?.trim();
+  if (
+    configured &&
+    path.win32.isAbsolute(configured) &&
+    path.win32.basename(configured).toLowerCase() === "cmd.exe"
+  ) {
+    return configured;
+  }
+  const systemRoot = env["SystemRoot"]?.trim() || env["windir"]?.trim();
+  if (systemRoot && path.win32.isAbsolute(systemRoot)) {
+    return path.win32.join(systemRoot, "System32", "cmd.exe");
+  }
+  // Avoid a PATH lookup even in a malformed inherited environment.
+  return "C:\\Windows\\System32\\cmd.exe";
 }
 
 /** 把一条配置转成 HookRegistration。 */

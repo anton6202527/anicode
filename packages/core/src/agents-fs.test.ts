@@ -88,7 +88,9 @@ test("discoverSubagents: includeProject=false 排除两种项目 agent，保留�
   const home = path.join(root, "home");
   const project = path.join(root, "project");
   const oldHome = process.env["HOME"];
+  const oldUserProfile = process.env["USERPROFILE"];
   process.env["HOME"] = home;
+  process.env["USERPROFILE"] = home;
   try {
     const globalDir = path.join(home, ".claude", "agents");
     const projectDir = path.join(project, ".claude", "agents");
@@ -117,6 +119,8 @@ test("discoverSubagents: includeProject=false 排除两种项目 agent，保留�
   } finally {
     if (oldHome === undefined) delete process.env["HOME"];
     else process.env["HOME"] = oldHome;
+    if (oldUserProfile === undefined) delete process.env["USERPROFILE"];
+    else process.env["USERPROFILE"] = oldUserProfile;
     await fs.rm(root, { recursive: true, force: true });
   }
 });

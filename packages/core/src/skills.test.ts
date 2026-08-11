@@ -13,13 +13,25 @@ async function writeSkill(root: string, dir: string, text: string): Promise<stri
   return file;
 }
 
+function setTestHome(home: string): () => void {
+  const oldHome = process.env["HOME"];
+  const oldUserProfile = process.env["USERPROFILE"];
+  process.env["HOME"] = home;
+  process.env["USERPROFILE"] = home;
+  return () => {
+    if (oldHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = oldHome;
+    if (oldUserProfile === undefined) delete process.env["USERPROFILE"];
+    else process.env["USERPROFILE"] = oldUserProfile;
+  };
+}
+
 test("skills: 项目级同名 skill 覆盖用户级，并发现额外目录", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-skills-"));
   const home = path.join(root, "home");
   const project = path.join(root, "project");
   const extra = path.join(root, "extra");
-  const oldHome = process.env["HOME"];
-  process.env["HOME"] = home;
+  const restoreHome = setTestHome(home);
 
   try {
     await writeSkill(
@@ -52,8 +64,7 @@ test("skills: 项目级同名 skill 覆盖用户级，并发现额外目录", as
     assert.equal(found.find((skill) => skill.name === "extra")?.description, "extra version");
     assert.equal(found.filter((skill) => skill.name === "shared").length, 1);
   } finally {
-    if (oldHome === undefined) delete process.env["HOME"];
-    else process.env["HOME"] = oldHome;
+    restoreHome();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -62,8 +73,7 @@ test("skills: 自动检测 metadata.requires.bins，缺依赖标 available=false
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-skill-req-"));
   const home = path.join(root, "home");
   const project = path.join(root, "project");
-  const oldHome = process.env["HOME"];
-  process.env["HOME"] = home;
+  const restoreHome = setTestHome(home);
   try {
     // node 一定在 PATH 上 → 可用；一个不存在的二进制 → 不可用；无 requires → 可用。
     await writeSkill(
@@ -89,8 +99,7 @@ test("skills: 自动检测 metadata.requires.bins，缺依赖标 available=false
     assert.equal(found.find((s) => s.name === "plain")?.available, true);
     assert.equal(found.find((s) => s.name === "plain")?.requiresBins, undefined);
   } finally {
-    if (oldHome === undefined) delete process.env["HOME"];
-    else process.env["HOME"] = oldHome;
+    restoreHome();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -100,8 +109,7 @@ test("skills: includeProject=false 排除项目 skill，保留用户级与显式
   const home = path.join(root, "home");
   const project = path.join(root, "project");
   const extra = path.join(root, "extra");
-  const oldHome = process.env["HOME"];
-  process.env["HOME"] = home;
+  const restoreHome = setTestHome(home);
   try {
     await writeSkill(
       path.join(home, ".claude", "skills"),
@@ -122,8 +130,7 @@ test("skills: includeProject=false 排除项目 skill，保留用户级与显式
       false,
     );
   } finally {
-    if (oldHome === undefined) delete process.env["HOME"];
-    else process.env["HOME"] = oldHome;
+    restoreHome();
     await fs.rm(root, { recursive: true, force: true });
   }
 });

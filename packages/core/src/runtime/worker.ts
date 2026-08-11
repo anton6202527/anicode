@@ -237,7 +237,8 @@ export class FileWorkerQueueStore implements WorkerQueueStore {
         mode: 0o600,
         flag: "wx",
       });
-      const handle = await fs.open(temporary, "r");
+      // Windows requires write access on a handle passed to FlushFileBuffers/FileHandle.sync.
+      const handle = await fs.open(temporary, "r+");
       try {
         await handle.sync();
       } finally {

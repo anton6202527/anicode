@@ -13,14 +13,26 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as net from "node:net";
+import { randomUUID } from "node:crypto";
 import { DaemonServer } from "./server.js";
 import { DaemonClient } from "./client.js";
 import { MAX_FRAME_BYTES } from "./protocol.js";
-import { generateDaemonAuthToken, provisionDaemonAuthToken } from "./auth-token.js";
+import {
+  defaultDaemonAuthTokenPath,
+  generateDaemonAuthToken,
+  provisionDaemonAuthToken,
+} from "./auth-token.js";
 import { SessionManager, type SessionEvent } from "../session-manager.js";
 import { SessionStore } from "../session.js";
 import type { SessionHost } from "../host.js";
 import type { Provider, StreamEvent, ChatMessage } from "../index.js";
+
+/** Windows local IPC accepts named pipes, not filesystem-shaped Unix socket paths. */
+function testSocketPath(directory: string, name = "daemon.sock"): string {
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\anicode-test-${process.pid}-${randomUUID()}`
+    : path.join(directory, name);
+}
 
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
   let turn = 0;
@@ -46,7 +58,7 @@ async function startDaemon(
   provider: Provider,
   discoverModels?: (providerId: string) => Promise<string[] | undefined>,
 ) {
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
     resolveProvider: () => ({ provider, model: "scripted" }),
@@ -65,7 +77,8 @@ async function startDaemon(
 
 test("daemon socket: bearer auth is required and client discovers the private token file", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-auth-"));
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
+  const tokenFile = defaultDaemonAuthTokenPath(sockPath);
   const token = generateDaemonAuthToken();
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
@@ -90,13 +103,14 @@ test("daemon socket: bearer auth is required and client discovers the private to
     wrong.dispose();
   } finally {
     await server.close();
+    await fs.rm(tokenFile, { force: true });
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
 
 test("daemon socket: idle clients must send an initial request before the deadline", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-idle-client-"));
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
   const token = generateDaemonAuthToken();
   const manager = new SessionManager({
     store: new SessionStore(path.join(dir, "sessions")),
@@ -134,7 +148,7 @@ test("daemon socket: idle clients must send an initial request before the deadli
 
 test("daemon socket: one client cannot dispatch unbounded concurrent requests", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-in-flight-"));
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
   let releaseDiscovery!: () => void;
   const discoveryGate = new Promise<void>((resolve) => (releaseDiscovery = resolve));
   let enteredDiscovery!: () => void;
@@ -304,7 +318,7 @@ test("daemon: 两个客户端共享同一会话，一个 send 两个都收事件
 
 test("daemon client: open 先交付 snapshot，再回放响应飞行期事件", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-race-"));
-  const sockPath = path.join(dir, "fake.sock");
+  const sockPath = testSocketPath(dir, "fake.sock");
   const fake = net.createServer((sock) => {
     let buffer = "";
     sock.on("data", (chunk) => {
@@ -376,7 +390,7 @@ test("daemon client: open 先交付 snapshot，再回放响应飞行期事件", 
 
 test("daemon client: dispose 立即拒绝 pending 并销毁半开 socket", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-dispose-"));
-  const sockPath = path.join(dir, "half-open.sock");
+  const sockPath = testSocketPath(dir, "half-open.sock");
   let accepted!: net.Socket;
   const fake = net.createServer({ allowHalfOpen: true }, (socket) => {
     accepted = socket;
@@ -407,7 +421,7 @@ test("daemon client: dispose 立即拒绝 pending 并销毁半开 socket", async
 
 test("daemon client: request timeout bounds a connected peer that never responds", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-timeout-"));
-  const sockPath = path.join(dir, "stalled.sock");
+  const sockPath = testSocketPath(dir, "stalled.sock");
   const sockets = new Set<net.Socket>();
   const fake = net.createServer((socket) => {
     sockets.add(socket);
@@ -444,7 +458,7 @@ test("daemon: 同一客户端并发 open 同一冷会话不会重复订阅事件
     }),
   });
   const server = new DaemonServer({ manager, unsafeAllowUnauthenticatedForTests: true });
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
   await server.listen(sockPath);
   const client = await DaemonClient.connect(sockPath);
   const first: SessionEvent[] = [];
@@ -532,7 +546,7 @@ test("daemon: open 返回 snapshot；resume 已有会话", async () => {
     }),
   });
   const server = new DaemonServer({ manager, unsafeAllowUnauthenticatedForTests: true });
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
   await server.listen(sockPath);
 
   const client = await DaemonClient.connect(sockPath);
@@ -680,7 +694,7 @@ test("daemon: 超过单帧上限的长会话 snapshot 可分块恢复", async ()
     resolveProvider: () => ({ provider: scriptedProvider([]), model: "scripted" }),
   });
   const server = new DaemonServer({ manager, unsafeAllowUnauthenticatedForTests: true });
-  const sockPath = path.join(dir, "d.sock");
+  const sockPath = testSocketPath(dir);
   await server.listen(sockPath);
   const client = await DaemonClient.connect(sockPath);
 

@@ -497,7 +497,9 @@ test("Bridge: 自动发现的文件系统技能进入市场、默认启用、可
   // 隔离 HOME，避免机器上真实的全局技能干扰断言。
   const home = path.join(dir, "home");
   const oldHome = process.env["HOME"];
+  const oldUserProfile = process.env["USERPROFILE"];
   process.env["HOME"] = home;
+  process.env["USERPROFILE"] = home;
   const { ipcMain, invoke } = fakeIpc();
   bridge.register(ipcMain);
   const sender = new FakeSender();
@@ -549,6 +551,8 @@ test("Bridge: 自动发现的文件系统技能进入市场、默认启用、可
   } finally {
     if (oldHome === undefined) delete process.env["HOME"];
     else process.env["HOME"] = oldHome;
+    if (oldUserProfile === undefined) delete process.env["USERPROFILE"];
+    else process.env["USERPROFILE"] = oldUserProfile;
     await bridge.dispose();
   }
 });

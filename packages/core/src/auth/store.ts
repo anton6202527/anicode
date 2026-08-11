@@ -511,7 +511,8 @@ export class AuthStore {
         mode: 0o600,
         flag: "wx",
       });
-      const handle = await fs.open(tmp, "r");
+      // FileHandle.sync() maps to FlushFileBuffers on Windows, which rejects read-only handles.
+      const handle = await fs.open(tmp, "r+");
       try {
         await handle.sync();
       } finally {

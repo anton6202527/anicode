@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { commandHook, commandHooksFromConfig, isHookEventName } from "./hooks-exec.js";
 import { HookExecutionBoundaryError, HookRunner } from "./hooks.js";
 import {
@@ -16,20 +17,21 @@ import {
 import { TransactionalExecutionRuntime } from "./runtime/transactional-runtime.js";
 
 const payload = { event: "PreToolUse" as const, cwd: process.cwd(), toolName: "bash" };
+const hookFixture = fileURLToPath(new URL("./testutil/fake-command-hook.mjs", import.meta.url));
+
+function fixtureCommand(mode: string): string {
+  return [process.execPath, hookFixture, mode].map(shellArg).join(" ");
+}
+
+function shellArg(value: string): string {
+  if (process.platform === "win32") return `"${value.replaceAll('"', '""')}"`;
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
 
 test("命令 hook: stdout JSON 解析为 HookResult；stdin 收到 payload", async () => {
   const reg = commandHook({
     event: "PreToolUse",
-    // 从 stdin 读 payload，校验字段后输出 JSON 决策
-    command: `node -e '
-      let s = "";
-      process.stdin.on("data", (d) => (s += d));
-      process.stdin.on("end", () => {
-        const p = JSON.parse(s);
-        if (p.hook_event_name !== "PreToolUse" || p.toolName !== "bash") process.exit(1);
-        console.log(JSON.stringify({ decision: "allow", additionalContext: "来自命令hook" }));
-      });
-    '`,
+    command: fixtureCommand("allow"),
   });
   const outcome = await new HookRunner([reg]).run(payload);
   assert.equal(outcome.allowed, true);
@@ -39,7 +41,7 @@ test("命令 hook: stdout JSON 解析为 HookResult；stdin 收到 payload", asy
 test("命令 hook: exit 2 = block，stderr 为理由", async () => {
   const reg = commandHook({
     event: "PreToolUse",
-    command: `echo '危险命令，拒绝' 1>&2; exit 2`,
+    command: fixtureCommand("block"),
   });
   const outcome = await new HookRunner([reg]).run(payload);
   assert.equal(outcome.blocked, true);
@@ -47,18 +49,21 @@ test("命令 hook: exit 2 = block，stderr 为理由", async () => {
 });
 
 test("命令 hook: 非 JSON stdout 作为 additionalContext；其他退出码为无操作", async () => {
-  const ctxReg = commandHook({ event: "UserPromptSubmit", command: `echo '当前分支: main'` });
+  const ctxReg = commandHook({
+    event: "UserPromptSubmit",
+    command: fixtureCommand("context"),
+  });
   const out1 = await new HookRunner([ctxReg]).run({ event: "UserPromptSubmit", cwd: "." });
   assert.equal(out1.additionalContext, "当前分支: main");
 
-  const failReg = commandHook({ event: "UserPromptSubmit", command: `echo oops; exit 3` });
+  const failReg = commandHook({ event: "UserPromptSubmit", command: fixtureCommand("noop") });
   const out2 = await new HookRunner([failReg]).run({ event: "UserPromptSubmit", cwd: "." });
   assert.equal(out2.blocked, false);
   assert.equal(out2.additionalContext, undefined);
 });
 
 test("命令 hook: 超时按无操作处理（不挂死 loop）", async () => {
-  const reg = commandHook({ event: "Stop", command: "sleep 30", timeoutMs: 200 });
+  const reg = commandHook({ event: "Stop", command: fixtureCommand("hang"), timeoutMs: 200 });
   const start = Date.now();
   const outcome = await new HookRunner([reg]).run({ event: "Stop", cwd: "." });
   assert.ok(Date.now() - start < 5_000, "应在超时后立即返回");

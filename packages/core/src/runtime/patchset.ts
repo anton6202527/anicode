@@ -204,7 +204,9 @@ async function atomicWrite(
   );
   try {
     await fs.writeFile(temporary, content, { flag: "wx", mode });
-    const handle = await fs.open(temporary, "r");
+    // Windows FlushFileBuffers requires a handle opened with write access. Reopening the fully
+    // written temporary read-only makes FileHandle.sync() fail with EPERM on Windows.
+    const handle = await fs.open(temporary, "r+");
     try {
       await handle.sync();
     } finally {

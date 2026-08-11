@@ -110,10 +110,14 @@ test("browserUsageProvider: 未注册 browser 工具时无贡献，注册后注�
 /** 隔离用户级 ~/.claude/skills：把 HOME 指到干净目录（与 skills.test.ts 同法）。 */
 function isolateHome(t: { after: (fn: () => void) => void }, home: string): void {
   const oldHome = process.env["HOME"];
+  const oldUserProfile = process.env["USERPROFILE"];
   process.env["HOME"] = home;
+  process.env["USERPROFILE"] = home;
   t.after(() => {
     if (oldHome === undefined) delete process.env["HOME"];
     else process.env["HOME"] = oldHome;
+    if (oldUserProfile === undefined) delete process.env["USERPROFILE"];
+    else process.env["USERPROFILE"] = oldUserProfile;
   });
 }
 
