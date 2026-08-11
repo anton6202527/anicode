@@ -532,7 +532,8 @@ export class ToolExecutor {
       timedOut = true;
       execution.abort(new ToolError(`工具 ${call.name} 执行超时（${timeoutMs}ms）`));
     }, timeoutMs);
-    timeout.unref?.();
+    // Keep the hard timeout referenced: an uncooperative tool may otherwise leave no active
+    // handles, allowing Node 22 (and a short-lived CLI) to exit before the timeout is enforced.
     const onParentAbort = () =>
       execution.abort(signal.reason ?? new ToolError(`工具 ${call.name} 已中断`));
     if (signal.aborted) onParentAbort();

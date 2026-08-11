@@ -640,11 +640,28 @@ export class S3ArtifactStore implements ArtifactStore {
       : { ServerSideEncryption: "AES256" };
   }
 
-  private send(command: unknown, signal?: AbortSignal): Promise<unknown> {
-    const timeout = AbortSignal.timeout(this.requestTimeoutMs);
-    return this.client.send(command, {
-      abortSignal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-    });
+  private async send(command: unknown, signal?: AbortSignal): Promise<unknown> {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(signal?.reason ?? new Error("S3 request cancelled"));
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(
+      () =>
+        controller.abort(
+          new Error(`S3 artifact request timed out after ${this.requestTimeoutMs}ms`),
+        ),
+      this.requestTimeoutMs,
+    );
+    try {
+      controller.signal.throwIfAborted();
+      return await abortable(
+        this.client.send(command, { abortSignal: controller.signal }),
+        controller.signal,
+      );
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   private async sessionIsDeleted(sessionId: string, signal?: AbortSignal): Promise<boolean> {

@@ -107,7 +107,9 @@ export async function withCredentialDeadline<T>(
     timedOut = true;
     controller.abort(safeCredentialError(`${label} timed out after ${timeoutMs}ms`));
   }, timeoutMs);
-  timer.unref();
+  // This timer is the only progress source when an injected fetch/SDK call ignores abort and
+  // returns a promise with no active handles. Keep it referenced until the race settles so the
+  // advertised hard deadline also holds on Node 22 and in short-lived CLI processes.
   const aborted = new Promise<never>((_resolve, reject) => {
     const fail = () =>
       reject(

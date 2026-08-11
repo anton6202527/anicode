@@ -1132,7 +1132,7 @@ class StdioTransport implements McpTransport {
           ),
         requestTimeoutMs,
       );
-      timer.unref?.();
+      // The deadline is authoritative even if the server has no live handles of its own.
       this.pending.set(id, {
         resolve: (v) => {
           cleanup();
@@ -1445,7 +1445,8 @@ class HttpTransport implements McpTransport {
       timedOut = true;
       cancel(new Error(`MCP request timed out (${method})`));
     }, requestTimeoutMs);
-    timer.unref?.();
+    // A custom transport may return a non-cooperative promise with no active handles. Keep this
+    // referenced so the caller-visible hard boundary remains enforceable in short-lived clients.
     // `inFlight` counts the physical operation, not only the caller-visible boundary. A custom
     // NetworkProxy/fetch implementation may ignore AbortSignal forever; releasing the slot when
     // the deadline wins would let repeated timeouts create unbounded live requests underneath.
@@ -1503,7 +1504,7 @@ class HttpTransport implements McpTransport {
         void response?.body?.cancel().catch(() => undefined);
         resolve();
       }, closeTimeoutMs);
-      timer.unref?.();
+      // Session cleanup is a hard close fence and must make progress on its own.
     });
     const cleanup = Promise.resolve()
       .then(() =>

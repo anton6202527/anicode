@@ -20,10 +20,32 @@ class MutableOutput extends EventEmitter {
     encodingOrCallback?: BufferEncoding | (() => void),
     callback?: () => void,
   ): boolean {
-    this.chunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    this.chunks.push(text);
+    this.emit("chunk", text);
     const done = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
     done?.();
     return true;
+  }
+
+  waitForChunk(predicate: (chunk: string) => boolean): Promise<void> {
+    if (this.chunks.some(predicate)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const onChunk = (chunk: string) => {
+        if (!predicate(chunk)) return;
+        cleanup();
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("timed out waiting for terminal output"));
+      }, 1_000);
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.off("chunk", onChunk);
+      };
+      this.on("chunk", onChunk);
+    });
   }
 
   resize(columns: number, rows: number): void {
@@ -108,7 +130,11 @@ test("terminal resize: growing the alternate viewport resets and writes one comp
       [110, 32],
     ] as const) {
       const start = raw.chunks.length;
+      const frameReady = raw.waitForChunk((chunk) => chunk.includes(`ANICODE ${columns}x${rows}`));
       raw.resize(columns, rows);
+      // Ink may observe no pending React work if waitUntilRenderFlush() races useWindowSize's
+      // scheduled update. Synchronize on the actual resized frame before asking it to drain.
+      await frameReady;
       await instance.waitUntilRenderFlush();
       const resizeChunks = raw.chunks.slice(start);
       assert.ok(

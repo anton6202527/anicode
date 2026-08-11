@@ -1815,6 +1815,9 @@ export class RunBudgetLedger {
     this.timer = setTimeout(() => {
       this.fail(`任务达到最大执行时间 ${this.limits.maxWallTimeMs}ms，已停止`);
     }, remaining);
+    // An unowned ledger must not keep a process alive. acquireReference() refs the timer for the
+    // lifetime of a real root/detached scope, where it may be the only progress source left by a
+    // non-cooperative provider or checkpoint.
     this.timer.unref?.();
     if (this.reason) {
       clearTimeout(this.timer);
@@ -1846,6 +1849,7 @@ export class RunBudgetLedger {
 
   private acquireReference(): void {
     if (this.closed) throw new Error("任务预算作用域已结束，不能重新派生后台工作");
+    if (this.references === 0) this.timer.ref?.();
     this.references++;
   }
 

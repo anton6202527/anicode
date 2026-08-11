@@ -1010,7 +1010,8 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
       timedOut = true;
       controller.abort(new Error(`${label} timed out after ${this.requestTimeoutMs}ms`));
     }, this.requestTimeoutMs);
-    timer.unref();
+    // A non-cooperative control-plane transport may leave this as the only active handle. The
+    // hard request deadline must remain enforceable until the caller-visible race settles.
     const aborted = new Promise<never>((_resolve, reject) => {
       const fail = () =>
         reject(
@@ -1044,7 +1045,7 @@ export class KubernetesJobRuntime implements ExecutionRuntime {
         closing.then(() => true),
         new Promise<false>((resolve) => {
           timer = setTimeout(() => resolve(false), this.shutdownGraceMs);
-          timer.unref();
+          // Dispatcher shutdown is bounded even when close() itself exposes no active handles.
         }),
       ]);
       if (!graceful) await this.dispatcher.destroy();
