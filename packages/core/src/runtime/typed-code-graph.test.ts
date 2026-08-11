@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TypedCodeGraph, extractTreeSitterSymbols } from "./typed-code-graph.js";
@@ -83,7 +83,7 @@ test("typed graph: LSP definition 精确覆盖同名启发式引用边", async (
   const caller = path.join(root, "caller.ts");
   await fs.writeFile(target, "export function resolveUser() { return 1; }\n");
   await fs.writeFile(caller, "export const value = resolveUser();\n");
-  const canonicalTarget = await fs.realpath(target);
+  const canonicalTarget = realpathSync(target);
   const client = {
     documentSymbols: async () => [],
     definition: async () => [{ path: canonicalTarget, line: 1, column: 17 }],
@@ -116,8 +116,8 @@ test("typed graph: target 迁移会失效并重建复用 caller 的 LSP 边", as
   const caller = path.join(root, "caller.ts");
   await fs.writeFile(firstTarget, "export function resolveUser() { return 1; }\n");
   await fs.writeFile(caller, "export const value = resolveUser();\n");
-  const canonicalCaller = await fs.realpath(caller);
-  let definitionTarget = await fs.realpath(firstTarget);
+  const canonicalCaller = realpathSync(caller);
+  let definitionTarget = realpathSync(firstTarget);
   let callerDefinitions = 0;
   const client = {
     documentSymbols: async () => [],
@@ -135,7 +135,7 @@ test("typed graph: target 迁移会失效并重建复用 caller 的 LSP 边", as
     assert.ok(callerDefinitions > 0);
     callerDefinitions = 0;
     await fs.rename(firstTarget, secondTarget);
-    definitionTarget = await fs.realpath(secondTarget);
+    definitionTarget = realpathSync(secondTarget);
     const snapshot = await graph.refresh();
     const target = snapshot.files["target-new.ts"]?.symbols.find(
       (symbol) => symbol.name === "resolveUser",

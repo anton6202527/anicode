@@ -17,6 +17,7 @@ import {
   OsKeychainSecretBackend,
   type SyncSecretBackend,
 } from "../security/secret-backends.js";
+import { openExclusiveLockFile } from "../security/exclusive-lock-file.js";
 
 export interface OAuthCredential {
   type: "oauth";
@@ -572,7 +573,7 @@ export class AuthStore {
     let handle: import("node:fs/promises").FileHandle;
     for (;;) {
       try {
-        handle = await fs.open(lock, "wx", 0o600);
+        handle = await openExclusiveLockFile(lock, 0o600);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         if (Date.now() >= deadline) {

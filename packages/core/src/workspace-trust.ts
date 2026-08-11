@@ -11,6 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type BigIntStats } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { openExclusiveLockFile } from "./security/exclusive-lock-file.js";
 
 const TRUST_DOCUMENT_VERSION = 1;
 const FINGERPRINT_VERSION = 1;
@@ -438,7 +439,7 @@ export class WorkspaceTrustStore {
     let handle: import("node:fs/promises").FileHandle | undefined;
     for (;;) {
       try {
-        handle = await fs.open(lock, "wx", 0o600);
+        handle = await openExclusiveLockFile(lock, 0o600);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const current = await readTrustLockOwner(lock);
