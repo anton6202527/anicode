@@ -42,6 +42,10 @@ export interface IncrementalCodeIndexOptions {
   indexFile?: string;
   maxFiles?: number;
   maxFileBytes?: number;
+  /** Maximum aggregate source bytes considered by one refresh. Undefined preserves legacy limits. */
+  maxTotalSourceBytes?: number;
+  /** Disable disk persistence for process-owned ephemeral indexes. Defaults to true. */
+  persist?: boolean;
   embed?: CodeEmbedding;
   extractSymbols?: (file: string, content: string) => { name: string; sig: string }[];
 }
@@ -73,6 +77,7 @@ const SKIP = new Set([
   "__pycache__",
 ]);
 const IDENT = /[A-Za-z_$][\w$]*/g;
+const INDEX_IO_CONCURRENCY = 32;
 
 function hash(content: string): string {
   return createHash("sha256").update(content).digest("hex");
@@ -150,34 +155,65 @@ export class IncrementalCodeIndex {
     await walk(this.root, this.root, paths, this.options.maxFiles ?? 3_000);
     const files: Record<string, IndexedCodeFile> = {};
     const embeddings: { file: IndexedCodeFile; text: string }[] = [];
-    for (const absolute of paths) {
-      const stat = await fs.stat(absolute);
-      if (stat.size > (this.options.maxFileBytes ?? 256 * 1024)) continue;
-      const relative = path.relative(this.root, absolute);
+    const maxFileBytes = this.options.maxFileBytes ?? 256 * 1024;
+    const maxTotalSourceBytes = this.options.maxTotalSourceBytes ?? Number.POSITIVE_INFINITY;
+    const metadata = await mapConcurrent(paths, INDEX_IO_CONCURRENCY, async (absolute) => {
+      try {
+        const stat = await fs.stat(absolute);
+        return { absolute, stat };
+      } catch {
+        // A file may disappear between readdir and stat; the next refresh will see the new tree.
+        return null;
+      }
+    });
+    const changed: Array<{ absolute: string; relative: string; size: number; mtimeMs: number }> =
+      [];
+    let totalSourceBytes = 0;
+    for (const item of metadata) {
+      if (!item || !item.stat.isFile() || item.stat.size > maxFileBytes) continue;
+      if (totalSourceBytes + item.stat.size > maxTotalSourceBytes) break;
+      totalSourceBytes += item.stat.size;
+      const relative = path.relative(this.root, item.absolute);
       const cached = previous?.files[relative];
-      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+      if (cached && cached.size === item.stat.size && cached.mtimeMs === item.stat.mtimeMs) {
         files[relative] = cached;
         this.stats.reused++;
         continue;
       }
-      const content = await fs.readFile(absolute, "utf8");
-      const symbols = this.extract(relative, content).map((symbol) => ({
-        name: symbol.name,
-        signature: symbol.sig,
-      }));
-      const indexed: IndexedCodeFile = {
-        path: relative,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-        hash: hash(content),
-        symbols,
-        identifiers: frequencies(content),
-      };
-      files[relative] = indexed;
-      embeddings.push({
-        file: indexed,
-        text: `${relative}\n${symbols.map((symbol) => symbol.signature).join("\n")}`,
+      changed.push({
+        absolute: item.absolute,
+        relative,
+        size: item.stat.size,
+        mtimeMs: item.stat.mtimeMs,
       });
+    }
+    const parsed = await mapConcurrent(changed, INDEX_IO_CONCURRENCY, async (candidate) => {
+      try {
+        const content = await fs.readFile(candidate.absolute, "utf8");
+        const symbols = this.extract(candidate.relative, content).map((symbol) => ({
+          name: symbol.name,
+          signature: symbol.sig,
+        }));
+        const file: IndexedCodeFile = {
+          path: candidate.relative,
+          size: candidate.size,
+          mtimeMs: candidate.mtimeMs,
+          hash: hash(content),
+          symbols,
+          identifiers: frequencies(content),
+        };
+        return {
+          file,
+          text: `${candidate.relative}\n${symbols.map((symbol) => symbol.signature).join("\n")}`,
+        };
+      } catch {
+        return null;
+      }
+    });
+    for (const item of parsed) {
+      if (!item) continue;
+      files[item.file.path] = item.file;
+      embeddings.push(item);
       this.stats.parsed++;
     }
     this.stats.removed = Object.keys(previous?.files ?? {}).filter((file) => !files[file]).length;
@@ -187,6 +223,10 @@ export class IncrementalCodeIndex {
         const vector = vectors[i];
         if (vector) embeddings[i]!.file.embedding = vector;
       }
+    }
+    if (previous && embeddings.length === 0 && this.stats.removed === 0) {
+      this.snapshot = previous;
+      return previous;
     }
     this.snapshot = {
       version: 2,
@@ -203,67 +243,81 @@ export class IncrementalCodeIndex {
     const queryTerms = [...new Set(terms(query))];
     const queryVector = this.options.embed ? (await this.options.embed([query]))[0] : undefined;
     const definitions = new Map<string, string[]>();
+    const identifierTotals = new Map<string, number>();
     for (const file of Object.values(snapshot.files)) {
       for (const symbol of file.symbols) {
         const key = symbol.name.toLowerCase();
         definitions.set(key, [...(definitions.get(key) ?? []), file.path]);
       }
+      for (const [identifier, count] of Object.entries(file.identifiers)) {
+        identifierTotals.set(identifier, (identifierTotals.get(identifier) ?? 0) + count);
+      }
     }
     const queriedSymbols = [...definitions.keys()].filter((name) =>
       queryTerms.some((term) => name.includes(term)),
     );
-    return Object.values(snapshot.files)
-      .map((file) => {
-        const pathTerms = new Set(terms(file.path));
-        const symbolTerms = new Set(file.symbols.flatMap((symbol) => terms(symbol.name)));
-        let lexical = 0;
-        let graph = 0;
-        const references = new Set<string>();
-        for (const term of queryTerms) {
-          if (pathTerms.has(term)) lexical += 3;
-          if (symbolTerms.has(term)) lexical += 5;
-          lexical += Math.min(3, file.identifiers[term] ?? 0) * 0.6;
-          if ((file.identifiers[term] ?? 0) > 0) {
-            for (const target of definitions.get(term) ?? []) {
-              if (target !== file.path) references.add(target);
-            }
-            if ((definitions.get(term)?.length ?? 0) > 0) graph += 2;
-          }
-        }
-        for (const symbolName of queriedSymbols) {
-          if ((file.identifiers[symbolName] ?? 0) === 0) continue;
-          graph += 2;
-          for (const target of definitions.get(symbolName) ?? []) {
+    const ranked = Object.values(snapshot.files).map((file) => {
+      const pathTerms = new Set(terms(file.path));
+      const symbolTerms = new Set(file.symbols.flatMap((symbol) => terms(symbol.name)));
+      let lexical = 0;
+      let graph = 0;
+      const references = new Set<string>();
+      for (const term of queryTerms) {
+        if (pathTerms.has(term)) lexical += 3;
+        if (symbolTerms.has(term)) lexical += 5;
+        lexical += Math.min(3, file.identifiers[term] ?? 0) * 0.6;
+        if ((file.identifiers[term] ?? 0) > 0) {
+          for (const target of definitions.get(term) ?? []) {
             if (target !== file.path) references.add(target);
           }
+          if ((definitions.get(term)?.length ?? 0) > 0) graph += 2;
         }
-        // 命中定义文件时，把引用该符号的文件边反向计分。
-        for (const symbol of file.symbols) {
-          if (!queriedSymbols.includes(symbol.name.toLowerCase())) continue;
-          for (const other of Object.values(snapshot.files)) {
-            if (
-              other.path !== file.path &&
-              (other.identifiers[symbol.name.toLowerCase()] ?? 0) > 0
-            ) {
-              graph += 0.5;
-              references.add(other.path);
-            }
+      }
+      for (const symbolName of queriedSymbols) {
+        if ((file.identifiers[symbolName] ?? 0) === 0) continue;
+        graph += 2;
+        for (const target of definitions.get(symbolName) ?? []) {
+          if (target !== file.path) references.add(target);
+        }
+      }
+      // 命中定义文件时，把引用该符号的文件边反向计分。
+      for (const symbol of file.symbols) {
+        if (!queriedSymbols.includes(symbol.name.toLowerCase())) continue;
+        for (const other of Object.values(snapshot.files)) {
+          if (other.path !== file.path && (other.identifiers[symbol.name.toLowerCase()] ?? 0) > 0) {
+            graph += 0.5;
+            references.add(other.path);
           }
         }
-        const semantic = Math.max(0, cosine(queryVector, file.embedding));
-        return {
-          path: file.path,
-          score: lexical + graph + semantic * 4,
-          lexical,
-          semantic,
-          graph,
-          symbols: file.symbols,
-          references: [...references].slice(0, 8),
-        };
-      })
-      .filter((hit) => hit.score > 0 || queryTerms.length === 0)
-      .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
-      .slice(0, Math.max(1, limit));
+      }
+      const semantic = Math.max(0, cosine(queryVector, file.embedding));
+      return {
+        path: file.path,
+        score: lexical + graph + semantic * 4,
+        lexical,
+        semantic,
+        graph,
+        symbols: file.symbols,
+        references: [...references].slice(0, 8),
+        // Query-independent fallback used when a natural-language query has no lexical/vector
+        // hit. It approximates the old repo-map's global reference ranking while keeping the
+        // normal relevant-query score untouched.
+        fallbackScore: file.symbols.reduce(
+          (sum, symbol) => sum + (identifierTotals.get(symbol.name.toLowerCase()) ?? 0),
+          0,
+        ),
+      };
+    });
+    const matched = ranked.filter((hit) => hit.score > 0);
+    const selected = matched.length > 0 ? matched : ranked;
+    return selected
+      .sort((a, b) =>
+        matched.length > 0
+          ? b.score - a.score || a.path.localeCompare(b.path)
+          : b.fallbackScore - a.fallbackScore || a.path.localeCompare(b.path),
+      )
+      .slice(0, Math.max(1, limit))
+      .map(({ fallbackScore: _fallbackScore, ...hit }) => hit);
   }
 
   async render(query: string, tokenBudget = 1_500): Promise<string> {
@@ -291,6 +345,7 @@ export class IncrementalCodeIndex {
 
   private async load(): Promise<CodeIndexSnapshot | undefined> {
     if (this.snapshot) return this.snapshot;
+    if (this.options.persist === false) return undefined;
     try {
       const parsed = JSON.parse(await fs.readFile(this.indexFile, "utf8")) as CodeIndexSnapshot;
       if (parsed.version === 2 && parsed.root === this.root) return parsed;
@@ -301,6 +356,7 @@ export class IncrementalCodeIndex {
   }
 
   private async save(snapshot: CodeIndexSnapshot): Promise<void> {
+    if (this.options.persist === false) return;
     await fs.mkdir(path.dirname(this.indexFile), { recursive: true, mode: 0o700 });
     const temporary = `${this.indexFile}.${process.pid}.${randomUUID()}.tmp`;
     try {
@@ -311,4 +367,25 @@ export class IncrementalCodeIndex {
       await fs.rm(temporary, { force: true });
     }
   }
+}
+
+async function mapConcurrent<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async (): Promise<void> => {
+      while (true) {
+        const index = cursor++;
+        if (index >= values.length) return;
+        results[index] = await mapper(values[index]!);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
 }

@@ -8,9 +8,9 @@ import { t } from "@anicode/core/i18n";
 import { parseMarkdown, type MdBlock, type Span } from "@anicode/shared";
 import { trustedExternalUrl } from "../../shared/security.js";
 
-export function Markdown({ text }: { text: string }) {
+export const Markdown = React.memo(function Markdown({ text }: { text: string }) {
   return <>{parseMarkdown(text).map((block, i) => renderBlock(block, i))}</>;
-}
+});
 
 function renderBlock(block: MdBlock, key: number): React.ReactNode {
   switch (block.kind) {

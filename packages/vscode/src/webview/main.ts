@@ -7,9 +7,10 @@
 // 走零依赖子路径，避免把 core 的 Node-only 依赖（Anthropic/OpenAI SDK）打进浏览器 bundle。
 import { t } from "@anicode/core/i18n";
 import type { SessionEvent, TodoItem, Usage } from "@anicode/core";
+import { coalesceSessionEvents } from "../event-batch.js";
 import type { FileChange, HostToWebview, PendingPerm, SessionInfo } from "../protocol.js";
 import { messagesToItems, todosFromMessages, firstLine, type Item } from "../transcript.js";
-import { renderMarkdown } from "./markdown.js";
+import { renderMarkdown, StreamingMarkdownRenderer } from "./markdown.js";
 
 interface VsCodeApi {
   postMessage(msg: unknown): void;
@@ -32,6 +33,60 @@ const state = {
   pendings: [] as PendingPerm[],
   fileChanges: new Map<string, FileChange>(),
 };
+
+// Durable history stays in SessionManager; these limits only bound browser layout/DOM work.
+const MAX_TRANSCRIPT_ITEMS = 1_000;
+const MAX_ITEM_CHARS = 256 * 1024;
+const MAX_TOOL_DETAIL_CHARS = 64 * 1024;
+const MAX_LIVE_CHARS = 256 * 1024;
+const MAX_ACTIVE_TOOLS = 200;
+const MAX_TODOS = 200;
+const MAX_PENDING_PERMISSIONS = 100;
+
+function boundedText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const marker = t("… older display content omitted …", "… 较早的显示内容已省略 …");
+  const keep = Math.max(0, max - marker.length - 1);
+  return keep > 0 ? `${marker}\n${text.slice(-keep)}` : marker.slice(0, max);
+}
+
+function boundedItem(item: Item): Item {
+  if (item.kind === "tool") {
+    return {
+      ...item,
+      name: boundedText(item.name, 4 * 1024),
+      ruleKey: boundedText(item.ruleKey, 16 * 1024),
+      ...(item.detail ? { detail: boundedText(item.detail, MAX_TOOL_DETAIL_CHARS) } : {}),
+    };
+  }
+  return { ...item, text: boundedText(item.text, MAX_ITEM_CHARS) };
+}
+
+function pushItem(item: Item): void {
+  state.items.push(boundedItem(item));
+  if (state.items.length <= MAX_TRANSCRIPT_ITEMS) return;
+  state.items = state.items.slice(-MAX_TRANSCRIPT_ITEMS);
+}
+
+function setActiveTool(id: string, tool: ToolItem): void {
+  if (!state.activeTools.has(id) && state.activeTools.size >= MAX_ACTIVE_TOOLS) {
+    const oldest = state.activeTools.keys().next().value;
+    if (oldest !== undefined) state.activeTools.delete(oldest);
+  }
+  state.activeTools.set(id, boundedItem(tool) as ToolItem);
+}
+
+function appendLiveText(delta: string): void {
+  if (delta.length >= MAX_LIVE_CHARS) {
+    state.liveText = boundedText(delta, MAX_LIVE_CHARS);
+    return;
+  }
+  if (state.liveText.length + delta.length <= MAX_LIVE_CHARS) {
+    state.liveText += delta;
+    return;
+  }
+  state.liveText = boundedText(state.liveText + delta, MAX_LIVE_CHARS);
+}
 
 // ---------- DOM 骨架 ----------
 const root = document.getElementById("root")!;
@@ -72,42 +127,77 @@ textarea.addEventListener("keydown", (e) => {
 });
 
 // ---------- 消息处理 ----------
+type RenderIntent = 0 | 1 | 2;
+const NO_RENDER: RenderIntent = 0;
+const LIVE_RENDER: RenderIntent = 1;
+const FULL_RENDER: RenderIntent = 2;
+const eventQueue: SessionEvent[] = [];
+let eventFrame: number | undefined;
+
 window.addEventListener("message", (e: MessageEvent<HostToWebview>) => {
   const msg = e.data;
-  if (msg.type === "reset") applyReset(msg);
-  else if (msg.type === "event") applyEvent(msg.event);
-  else if (msg.type === "fileChange") {
+  if (msg.type === "reset") {
+    cancelQueuedEvents();
+    applyReset(msg);
+  } else if (msg.type === "event") {
+    eventQueue.push(msg.event);
+    if (eventFrame === undefined) eventFrame = requestAnimationFrame(() => flushQueuedEvents());
+  } else if (msg.type === "fileChange") {
+    flushQueuedEvents(false);
     state.fileChanges.set(msg.change.toolId, msg.change);
     render();
   } else if (msg.type === "error") {
-    state.items.push({ kind: "error", text: msg.message });
+    flushQueuedEvents(false);
+    pushItem({ kind: "error", text: msg.message });
     render();
   }
 });
 
+function cancelQueuedEvents(): void {
+  if (eventFrame !== undefined) cancelAnimationFrame(eventFrame);
+  eventFrame = undefined;
+  eventQueue.length = 0;
+}
+
+function flushQueuedEvents(renderResult = true): RenderIntent {
+  if (eventFrame !== undefined) cancelAnimationFrame(eventFrame);
+  eventFrame = undefined;
+  let intent: RenderIntent = NO_RENDER;
+  const queued = coalesceSessionEvents(eventQueue);
+  eventQueue.length = 0;
+  for (const event of queued) {
+    intent = Math.max(intent, applyEvent(event)) as RenderIntent;
+  }
+  if (renderResult) {
+    if (intent === FULL_RENDER) render();
+    else if (intent === LIVE_RENDER) renderLive();
+  }
+  return intent;
+}
+
 function applyReset(msg: Extract<HostToWebview, { type: "reset" }>): void {
   state.info = msg.info;
   state.activeTools = new Map();
-  state.items = [];
+  const restoredItems: Item[] = [];
   for (const item of messagesToItems(msg.messages)) {
-    if (item.kind === "tool" && item.status === "run") state.activeTools.set(item.id, item);
-    else state.items.push(item);
+    if (item.kind === "tool" && item.status === "run") setActiveTool(item.id, item);
+    else restoredItems.push(boundedItem(item));
   }
-  state.todos = todosFromMessages(msg.messages);
+  state.items = restoredItems.slice(-MAX_TRANSCRIPT_ITEMS);
+  state.todos = todosFromMessages(msg.messages).slice(0, MAX_TODOS);
   state.usage = msg.usage;
   state.running = msg.running;
-  state.pendings = msg.pendings;
+  state.pendings = msg.pendings.slice(0, MAX_PENDING_PERMISSIONS);
   state.liveText = "";
   state.fileChanges = new Map();
   render();
 }
 
-function applyEvent(se: SessionEvent): void {
+function applyEvent(se: SessionEvent): RenderIntent {
   if (se.type === "state") {
     state.running = se.running;
     if (!se.running) flushLive();
-    render();
-    return;
+    return FULL_RENDER;
   }
   if (se.type === "permission_request") {
     if (!state.pendings.some((p) => p.permId === se.permId))
@@ -117,31 +207,31 @@ function applyEvent(se: SessionEvent): void {
         ruleKey: se.ruleKey,
         ...(se.network !== undefined ? { network: se.network } : {}),
       });
-    render();
-    return;
+    if (state.pendings.length > MAX_PENDING_PERMISSIONS) {
+      state.pendings.length = MAX_PENDING_PERMISSIONS;
+    }
+    return FULL_RENDER;
   }
   if (se.type === "permission_resolved") {
     state.pendings = state.pendings.filter((p) => p.permId !== se.permId);
-    render();
-    return;
+    return FULL_RENDER;
   }
   if (se.type === "reverted") {
-    state.items.push({
+    pushItem({
       kind: "info",
       text: t(
         `↩ Workspace reverted: restored ${se.restored} files, removed ${se.deleted} newly added files`,
         `↩ 工作区已回滚：恢复 ${se.restored} 个文件，删除 ${se.deleted} 个新增文件`,
       ),
     });
-    render();
-    return;
+    return FULL_RENDER;
   }
   if (se.type === "title") {
     // 标题变化：webview 暂不展示标题，忽略。
-    return;
+    return NO_RENDER;
   }
   if (se.type === "workspace_trust") {
-    state.items.push({
+    pushItem({
       kind: "info",
       text: se.assessment.trusted
         ? t("Workspace trust granted", "工作区已授信")
@@ -150,8 +240,7 @@ function applyEvent(se: SessionEvent): void {
             "工作区信任已撤销，受限模式已生效",
           ),
     });
-    render();
-    return;
+    return FULL_RENDER;
   }
   const ev = se.event;
   switch (ev.type) {
@@ -159,119 +248,133 @@ function applyEvent(se: SessionEvent): void {
       flushLive();
       // 后台任务完成通知（自动 drive 的 user 消息）：收敛成一行 info（与 TUI/restore 一致）。
       if (ev.text.startsWith("<task-notification")) {
-        state.items.push({ kind: "info", text: `◆ ${noticeHead(ev.text)}` });
-        render();
-        break;
+        pushItem({ kind: "info", text: `◆ ${noticeHead(ev.text)}` });
+        return FULL_RENDER;
       }
-      state.items.push({ kind: "user", text: ev.text });
-      render();
-      break;
+      pushItem({ kind: "user", text: ev.text });
+      return FULL_RENDER;
     case "task_notice":
       // 运行中注入的后台任务完成通知：一行 info 摘要（全文只给模型看）。
       flushLive();
-      state.items.push({ kind: "info", text: `◆ ${noticeHead(ev.text)}` });
-      render();
-      break;
+      pushItem({ kind: "info", text: `◆ ${noticeHead(ev.text)}` });
+      return FULL_RENDER;
     case "text":
-      state.liveText += ev.text;
-      renderLive();
-      break;
+      appendLiveText(ev.text);
+      return LIVE_RENDER;
     case "tool_progress":
       if (isTodo(ev.event)) {
-        state.todos = ev.event.todos;
-        render();
+        state.todos = ev.event.todos.slice(0, MAX_TODOS);
+        return FULL_RENDER;
       }
-      break;
+      return NO_RENDER;
     case "turn_reset":
       state.liveText = "";
-      renderLive();
-      break;
+      return FULL_RENDER;
     case "tool_start":
       flushLive();
-      state.activeTools.set(ev.id, {
+      setActiveTool(ev.id, {
         kind: "tool",
         id: ev.id,
         name: ev.name,
         ruleKey: ev.ruleKey,
         status: "run",
       });
-      render();
-      break;
+      return FULL_RENDER;
     case "tool_permission":
       if (ev.decision === "deny") {
         const t = state.activeTools.get(ev.id);
         if (t) t.status = "deny";
-        render();
+        return FULL_RENDER;
       }
-      break;
+      return NO_RENDER;
     case "tool_result": {
       const t = state.activeTools.get(ev.id);
       state.activeTools.delete(ev.id);
       if (t) {
-        state.items.push({
+        pushItem({
           ...t,
           status: t.status === "deny" ? "deny" : ev.isError ? "err" : "ok",
           ...(ev.isError ? { detail: firstLine(ev.content) } : {}),
         });
       }
-      render();
-      break;
+      return FULL_RENDER;
     }
     case "turn_end":
       state.usage = ev.usage;
-      break;
+      return NO_RENDER;
     case "compacted":
-      state.items.push({
+      pushItem({
         kind: "info",
         text: t(
           `Context compacted ${ev.beforeTokens}→${ev.afterTokens} tokens`,
           `上下文已压缩 ${ev.beforeTokens}→${ev.afterTokens} tokens`,
         ),
       });
-      render();
-      break;
+      return FULL_RENDER;
     case "done":
       flushLive();
       state.usage = ev.usage;
-      render();
-      break;
+      return FULL_RENDER;
     case "error":
       flushLive();
-      state.items.push({ kind: "error", text: ev.message });
-      render();
-      break;
+      pushItem({ kind: "error", text: ev.message });
+      return FULL_RENDER;
+    default:
+      return NO_RENDER;
   }
 }
 
 function flushLive(): void {
   if (state.liveText) {
-    state.items.push({ kind: "assistant", text: state.liveText });
+    pushItem({ kind: "assistant", text: state.liveText });
     state.liveText = "";
   }
 }
 
 // ---------- 渲染 ----------
 let liveEl: HTMLElement | null = null;
+let liveMarkdown: StreamingMarkdownRenderer | null = null;
+const itemElementCache = new WeakMap<object, HTMLElement>();
+const fileChangeElementCache = new WeakMap<object, HTMLElement>();
 
 function render(): void {
-  messages.innerHTML = "";
+  const fragment = document.createDocumentFragment();
   liveEl = null;
+  liveMarkdown = null;
   for (const item of state.items) {
-    messages.append(renderItem(item));
+    let element = itemElementCache.get(item);
+    if (!element) {
+      element = renderItem(item);
+      itemElementCache.set(item, element);
+    }
+    fragment.append(element);
     if (item.kind === "tool") {
       const fc = state.fileChanges.get(item.id);
-      if (fc) messages.append(renderFileChange(fc));
+      if (fc) {
+        let changeElement = fileChangeElementCache.get(fc);
+        if (!changeElement) {
+          changeElement = renderFileChange(fc);
+          fileChangeElementCache.set(fc, changeElement);
+        }
+        fragment.append(changeElement);
+      }
     }
   }
   if (state.liveText) {
-    const bubble = assistantBubble(state.liveText, true);
+    const bubble = assistantBubble("", true);
     liveEl = bubble.querySelector(".md");
-    messages.append(bubble);
+    if (liveEl) {
+      liveMarkdown = new StreamingMarkdownRenderer(liveEl);
+      liveMarkdown.render(state.liveText);
+    }
+    fragment.append(bubble);
   }
-  for (const t of state.activeTools.values()) messages.append(renderItem(t));
-  if (state.todos.length) messages.append(renderTodos(state.todos));
+  for (const t of state.activeTools.values()) fragment.append(renderItem(t));
+  if (state.todos.length) fragment.append(renderTodos(state.todos));
   if (state.pendings[0])
-    messages.append(renderPermission(state.pendings[0], state.pendings.length - 1));
+    fragment.append(renderPermission(state.pendings[0], state.pendings.length - 1));
+
+  messages.replaceChildren(fragment);
 
   modelChip.textContent = `${state.info?.model ?? "—"} ▾`;
   sendBtn.textContent = state.running ? "■" : "↑";
@@ -280,12 +383,11 @@ function render(): void {
 
 function renderLive(): void {
   if (!state.liveText) return;
-  if (!liveEl) {
+  if (!liveEl || !liveMarkdown) {
     render();
     return;
   }
-  liveEl.innerHTML = "";
-  renderMarkdown(liveEl, state.liveText);
+  liveMarkdown.render(state.liveText);
   scrollToEnd();
 }
 

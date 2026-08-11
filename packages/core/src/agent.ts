@@ -255,7 +255,8 @@ export interface AgentOptions {
   injectEnv?: boolean;
   /**
    * 是否在会话开始时注入 repo map（代码骨架：关键文件及其顶层符号签名），
-   * 让模型少盲 grep、首次定位更准。true=默认预算；对象可调预算/限量。默认关。
+   * 让模型少盲 grep、首次定位更准。true=有界轻量增量索引；对象可调预算/限量，
+   * 仅显式 incremental:true 才启用 Tree-sitter/LSP/vector 重型图。默认关。
    */
   repoMap?: boolean | RepoMapOptions;
   /** 子 agent worktree 的跨 worker 独占租约。 */
@@ -444,6 +445,16 @@ export class Agent {
 
   private system: string;
   private memoryLoaded = false;
+  /** Reuse expensive first-turn filesystem discovery when a caller aborts while it is in flight. */
+  private memoryPreparation: {
+    query: string;
+    settled: boolean;
+    promise: Promise<{
+      contributions: Awaited<ReturnType<ContextAssembler["collectContributions"]>>;
+      discovered: SubagentDefinition[];
+    }>;
+  } | null = null;
+  private subagentToolsRegistered = false;
   /** 会话历史 + 持久化 + 记账（架构 v2：唯一能改写历史的对象）。 */
   private readonly conv: Conversation;
   private running = false; // 并发护栏：send 不可重入
@@ -1566,24 +1577,51 @@ export class Agent {
       markReadOnly: (names: string[]) => this.perm.addReadOnlyTools(names),
     };
     try {
-      const contributions = await raceWithSignal(this.assembler.collectContributions(ctx), signal);
+      if (
+        !this.memoryPreparation ||
+        (this.memoryPreparation.settled && this.memoryPreparation.query !== query)
+      ) {
+        const discover = async (): Promise<SubagentDefinition[]> => {
+          if (!this.subagentsOpt?.discover) return [];
+          try {
+            return await discoverSubagents(this.cwd, this.subagentsOpt.dirs, {
+              includeProject: this.subagentsOpt.includeProject,
+            });
+          } catch {
+            // 文件 agents 属可选能力；发现失败仍注册内置/程序化类型。
+            return [];
+          }
+        };
+        const promise = Promise.all([this.assembler.collectContributions(ctx), discover()]).then(
+          ([contributions, discovered]) => ({ contributions, discovered }),
+        );
+        const preparation = { query, settled: false, promise };
+        this.memoryPreparation = preparation;
+        const clearFailed = () => {
+          if (this.memoryPreparation === preparation) this.memoryPreparation = null;
+        };
+        // Successful work remains cached until memory is committed. Only a real collector failure
+        // is retried; a caller AbortSignal merely stops waiting for this reusable preparation.
+        void promise.then(() => {
+          preparation.settled = true;
+        }, clearFailed);
+      }
+      const activePreparation = this.memoryPreparation;
+      const prepared = await raceWithSignal(activePreparation.promise, signal);
+      throwIfAborted(signal);
+      if (activePreparation.query !== query) {
+        // A replacement prompt arrived after aborting the prompt that started discovery. Do not
+        // run two scans concurrently; reuse the completed index, then cheaply rerender for the
+        // actual first accepted query.
+        if (this.memoryPreparation === activePreparation) this.memoryPreparation = null;
+        return this.ensureMemory(query, signal);
+      }
+      const contributions = [...prepared.contributions];
       // 文件系统 agents：发现是异步的，task 工具在此（首次 send 前）注册。
       // 文件定义排在程序化定义之前 —— createTaskTool 按序覆盖，程序化同名优先。
-      if (this.subagentsOpt?.discover) {
-        let discovered: SubagentDefinition[] = [];
-        try {
-          discovered = await raceWithSignal(
-            discoverSubagents(this.cwd, this.subagentsOpt.dirs, {
-              includeProject: this.subagentsOpt.includeProject,
-            }),
-            signal,
-          );
-        } catch (error) {
-          if (signal.aborted) throw error;
-          /* 发现失败不影响主流程；仍注册内置类型 */
-        }
-        throwIfAborted(signal);
-        this.registerTaskTool([...discovered, ...this.subagentsOpt.definitions]);
+      if (this.subagentsOpt?.discover && !this.subagentToolsRegistered) {
+        this.registerTaskTool([...prepared.discovered, ...this.subagentsOpt.definitions]);
+        this.subagentToolsRegistered = true;
       }
       // SessionStart hook：会话装配的最后一步，additionalContext 注入 system。
       contributions.push(
@@ -1613,6 +1651,7 @@ export class Agent {
           .setAttribute("anicode.context.digest", compiled.digest);
       }
       this.memoryLoaded = true;
+      this.memoryPreparation = null;
       span.setStatus({ code: "ok" });
     } catch (error) {
       span.recordException(error).setStatus({ code: "error" });

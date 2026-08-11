@@ -6,14 +6,9 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import {
-  loadConfig,
-  loadProjectEnv,
-  t,
-  type BoundProviderRegistry,
-  WorkspaceTrustStore,
-} from "@anicode/core";
+import type { BoundProviderRegistry } from "@anicode/core";
 import { ChatBridge } from "./bridge.js";
+import { loadConfig, loadProjectEnv, t, WorkspaceTrustStore } from "./core-runtime.js";
 import { buildManagerCompositionAsync, modelChoices, packagedKeyringModulePath } from "./host.js";
 import type { HostToWebview, WebviewToHost } from "./protocol.js";
 
@@ -89,6 +84,7 @@ export function deactivate(): void {}
 class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewId = "anicode.chat";
   private view: vscode.WebviewView | undefined;
+  private viewDisposables: vscode.Disposable[] = [];
   private bridge: ChatBridge;
 
   constructor(
@@ -109,6 +105,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
+    this.disposeViewListeners();
     this.view = view;
     view.webview.options = {
       enableScripts: true,
@@ -119,12 +116,19 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     this.bridge.setPost((msg: HostToWebview) => void view.webview.postMessage(msg));
     view.webview.html = this.html(view.webview);
-    view.webview.onDidReceiveMessage((msg: WebviewToHost) => {
-      if (msg.type === "pickModel") return void this.pickModel();
-      if (msg.type === "resume") return void this.resume();
-      if (msg.type === "openFile") return void this.openFile(msg.path);
-      void this.bridge.handle(msg).then(() => this.onModelChange());
-    });
+    this.viewDisposables.push(
+      view.webview.onDidReceiveMessage((msg: WebviewToHost) => {
+        if (msg.type === "pickModel") return void this.pickModel();
+        if (msg.type === "resume") return void this.resume();
+        if (msg.type === "openFile") return void this.openFile(msg.path);
+        void this.bridge.handle(msg).then(() => this.onModelChange());
+      }),
+      view.onDidDispose(() => {
+        if (this.view === view) this.view = undefined;
+        this.bridge.setPost(() => {});
+        this.disposeViewListeners();
+      }),
+    );
   }
 
   async newSession(): Promise<void> {
@@ -219,10 +223,16 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.disposeViewListeners();
+    this.view = undefined;
     this.bridge.dispose();
     void this.disposeManager().catch((error) =>
       console.error("anicode vscode: resource shutdown failed", error),
     );
+  }
+
+  private disposeViewListeners(): void {
+    for (const disposable of this.viewDisposables.splice(0)) disposable.dispose();
   }
 
   private html(webview: vscode.Webview): string {

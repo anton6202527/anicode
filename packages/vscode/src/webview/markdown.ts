@@ -8,7 +8,73 @@ import { t } from "@anicode/core/i18n";
 import { parseMarkdown, type MdBlock, type Span } from "@anicode/shared";
 
 export function renderMarkdown(container: HTMLElement, text: string): void {
-  for (const block of parseMarkdown(text)) container.append(renderBlock(block));
+  container.append(markdownFragment(text));
+}
+
+function markdownFragment(text: string): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  for (const block of parseMarkdown(text)) fragment.append(renderBlock(block));
+  return fragment;
+}
+
+/**
+ * Append-only renderer used while tokens stream. Completed paragraphs/code fences are committed
+ * once; only the unfinished tail is parsed and replaced on the next animation frame.
+ */
+export class StreamingMarkdownRenderer {
+  private value = "";
+  private scanOffset = 0;
+  private committedEnd = 0;
+  private inCode = false;
+  private tailNodes: Node[] = [];
+
+  constructor(private readonly container: HTMLElement) {}
+
+  render(text: string): void {
+    if (text === this.value) return;
+    if (!text.startsWith(this.value)) this.reset();
+    this.value = text;
+
+    let stableEnd = this.committedEnd;
+    while (this.scanOffset < text.length) {
+      const newline = text.indexOf("\n", this.scanOffset);
+      if (newline < 0) break;
+      const lineStart = this.scanOffset;
+      const line = text.slice(lineStart, newline);
+      this.scanOffset = newline + 1;
+      if (/^```/.test(line)) {
+        if (this.inCode) {
+          this.inCode = false;
+          stableEnd = this.scanOffset;
+        } else {
+          // The block before an opening fence cannot be affected by later fence contents.
+          stableEnd = Math.max(stableEnd, lineStart);
+          this.inCode = true;
+        }
+      } else if (!this.inCode && line.trim() === "") {
+        stableEnd = this.scanOffset;
+      }
+    }
+
+    for (const node of this.tailNodes) node.parentNode?.removeChild(node);
+    this.tailNodes = [];
+    if (stableEnd > this.committedEnd) {
+      this.container.append(markdownFragment(text.slice(this.committedEnd, stableEnd)));
+      this.committedEnd = stableEnd;
+    }
+    const tail = markdownFragment(text.slice(this.committedEnd));
+    this.tailNodes = Array.from(tail.childNodes);
+    this.container.append(tail);
+  }
+
+  private reset(): void {
+    this.container.replaceChildren();
+    this.value = "";
+    this.scanOffset = 0;
+    this.committedEnd = 0;
+    this.inCode = false;
+    this.tailNodes = [];
+  }
 }
 
 function renderBlock(block: MdBlock): Node {

@@ -34,3 +34,24 @@ test("CodeIndex: 增量复用、引用图与混合排序", async () => {
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("CodeIndex: 内存模式复用未变化文件且不写索引", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-index-memory-"));
+  try {
+    await fs.writeFile(path.join(root, "main.ts"), "export function main() {}\n");
+    const indexFile = path.join(root, ".cache", "must-not-exist.json");
+    const index = new IncrementalCodeIndex(root, {
+      extractSymbols,
+      indexFile,
+      persist: false,
+    });
+    await index.refresh();
+    assert.equal(index.stats.parsed, 1);
+    await index.refresh();
+    assert.equal(index.stats.parsed, 0);
+    assert.equal(index.stats.reused, 1);
+    await assert.rejects(() => fs.access(indexFile));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

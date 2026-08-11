@@ -177,6 +177,17 @@ button {
   flex-shrink: 0;
 }
 
+.cloud-auth-form,
+.cloud-account-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cloud-account-row {
+  justify-content: space-between;
+}
+
 /* ---------- Main ---------- */
 .main {
   flex: 1;
@@ -219,6 +230,12 @@ button {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+/* Chromium can skip layout/paint for old off-screen transcript rows. The remembered intrinsic
+   size keeps scrolling stable after a row has been measured. */
+.chat-history-item {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 72px;
 }
 .empty {
   text-align: center;

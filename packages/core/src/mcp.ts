@@ -1809,6 +1809,8 @@ function extractText(res: any): string {
 /** 便捷函数：启动多个 MCP server，收集全部工具。
  * handlers.onToolsChanged 在任一 server 广播工具变更时触发（带 server 名），
  * 调用方可对该 client 重新 listTools() 并更新自己的注册表。 */
+const MCP_CONNECT_CONCURRENCY = 8;
+
 export async function connectMcpServers(
   configs: McpServerConfig[],
   handlers?: {
@@ -1822,37 +1824,73 @@ export async function connectMcpServers(
   tools: Tool[];
   clients: McpClient[];
 }> {
-  const clients: McpClient[] = [];
-  const tools: Tool[] = [];
-  try {
-    for (const cfg of configs) {
-      let client: McpClient | undefined;
-      const perServer: McpClientHandlers = {
-        onToolsChanged: () => {
-          if (client) handlers?.onToolsChanged?.(cfg.name, client);
-        },
-        ...(handlers?.telemetry ? { telemetry: handlers.telemetry } : {}),
-        ...(handlers?.networkProxy ? { networkProxy: handlers.networkProxy } : {}),
-        ...(handlers?.credentialBroker ? { credentialBroker: handlers.credentialBroker } : {}),
-        ...(handlers?.executionRuntime ? { executionRuntime: handlers.executionRuntime } : {}),
-      };
-      client = await McpClient.start(cfg, perServer);
-      clients.push(client);
-      tools.push(...(await client.listTools()));
-    }
-  } catch (error) {
-    const cleanup = await Promise.allSettled(
-      [...clients].reverse().map((client) => client.close()),
+  const connected: PromiseSettledResult<{ client: McpClient; tools: Tool[] }>[] = [];
+  for (let offset = 0; offset < configs.length; offset += MCP_CONNECT_CONCURRENCY) {
+    const batch = await Promise.allSettled(
+      configs
+        .slice(offset, offset + MCP_CONNECT_CONCURRENCY)
+        .map(async (cfg): Promise<{ client: McpClient; tools: Tool[] }> => {
+          let client: McpClient | undefined;
+          const perServer: McpClientHandlers = {
+            onToolsChanged: () => {
+              if (client) handlers?.onToolsChanged?.(cfg.name, client);
+            },
+            ...(handlers?.telemetry ? { telemetry: handlers.telemetry } : {}),
+            ...(handlers?.networkProxy ? { networkProxy: handlers.networkProxy } : {}),
+            ...(handlers?.credentialBroker ? { credentialBroker: handlers.credentialBroker } : {}),
+            ...(handlers?.executionRuntime ? { executionRuntime: handlers.executionRuntime } : {}),
+          };
+          client = await McpClient.start(cfg, perServer);
+          try {
+            return { client, tools: await client.listTools() };
+          } catch (error) {
+            // A client whose handshake succeeded is owned here until it is returned. Close it locally
+            // if tools/list fails so the aggregate cleanup below cannot miss this partial connection.
+            const cleanup = await Promise.allSettled([client.close()]);
+            const cleanupError = cleanup[0];
+            if (cleanupError?.status === "rejected") {
+              throw new AggregateError(
+                [error, cleanupError.reason],
+                `Failed to initialize MCP ${cfg.name}`,
+                {
+                  cause: error,
+                },
+              );
+            }
+            throw error;
+          }
+        }),
     );
-    const failures = cleanup
+    connected.push(...batch);
+    // Preserve the old fail-fast boundary for later configurations. Peers already started in this
+    // bounded batch settle and are cleaned below, but a known failure must not launch more servers.
+    if (batch.some((result) => result.status === "rejected")) break;
+  }
+  const successes = connected.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : [],
+  );
+  const failures = connected.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length > 0) {
+    const cleanup = await Promise.allSettled(
+      [...successes].reverse().map(({ client }) => client.close()),
+    );
+    const cleanupFailures = cleanup
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
-    if (failures.length > 0) {
-      throw new AggregateError([error, ...failures], "Failed to connect and clean up MCP servers", {
-        cause: error,
-      });
-    }
-    throw error;
+    if (failures.length === 1 && cleanupFailures.length === 0) throw failures[0];
+    const cause = failures[0];
+    throw new AggregateError(
+      [...failures, ...cleanupFailures],
+      "Failed to connect and clean up MCP servers",
+      { ...(cause !== undefined ? { cause } : {}) },
+    );
   }
-  return { tools, clients };
+  return {
+    // Promise.allSettled preserves input order, keeping tool schema order byte-stable for provider
+    // prompt caching even though independent handshakes run concurrently.
+    clients: successes.map(({ client }) => client),
+    tools: successes.flatMap(({ tools }) => tools),
+  };
 }

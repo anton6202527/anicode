@@ -10,11 +10,9 @@
  * 异步 gatherRepoMap(cwd, opts) 负责走盘采集（跳过 node_modules/.git/产物目录，限量限大小）。
  */
 
-import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { LspPool } from "./lsp.js";
-import { type CodeEmbedding } from "./runtime/code-index.js";
-import { TypedCodeGraph } from "./runtime/typed-code-graph.js";
+import { IncrementalCodeIndex, type CodeEmbedding } from "./runtime/code-index.js";
 import type { VectorStore } from "./runtime/vector-store.js";
 
 export interface RepoMapOptions {
@@ -26,7 +24,10 @@ export interface RepoMapOptions {
   maxFileBytes?: number;
   /** 首轮用户请求，用于 lexical + symbol graph + embedding 混合排序。 */
   query?: string;
-  /** 默认 true；关闭时使用旧的一次性扫描排序。 */
+  /**
+   * 显式 true 时启用 Tree-sitter/LSP/vector 重型代码图。默认使用有界的轻量增量索引，
+   * 避免把全引用图构建放进首次响应关键路径。
+   */
   incremental?: boolean;
   /** Trusted host-owned cache directory outside cwd. */
   cacheDirectory?: string;
@@ -34,6 +35,10 @@ export interface RepoMapOptions {
   embed?: CodeEmbedding;
   lspPool?: LspPool;
   vectorStore?: VectorStore;
+  /** 重型代码图的序列化缓存上限；主要用于宿主调优与故障降级测试。 */
+  maxCacheBytes?: number;
+  /** 一次刷新最多处理的源文件总字节数；轻量 prompt 索引默认 16 MiB。 */
+  maxTotalSourceBytes?: number;
 }
 
 export interface SourceFile {
@@ -45,33 +50,6 @@ interface Symbol {
   name: string;
   sig: string;
 }
-
-const SOURCE_EXT = new Set([
-  ".ts",
-  ".tsx",
-  ".js",
-  ".jsx",
-  ".mjs",
-  ".cjs",
-  ".py",
-  ".go",
-  ".rs",
-  ".java",
-]);
-
-const SKIP_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "out",
-  "build",
-  "release",
-  "coverage",
-  ".next",
-  ".turbo",
-  "vendor",
-  "__pycache__",
-]);
 
 /** 各语言顶层定义的正则：捕获组 1 = 符号名；整行（trim）作为签名。 */
 const PATTERNS: { ext: Set<string>; res: RegExp[] }[] = [
@@ -193,29 +171,12 @@ export function buildRepoMap(files: SourceFile[], opts: RepoMapOptions = {}): st
   return lines.join("\n");
 }
 
-async function walk(dir: string, root: string, out: string[], maxFiles: number): Promise<void> {
-  if (out.length >= maxFiles) return;
-  let entries: import("node:fs").Dirent[];
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const ent of entries) {
-    if (out.length >= maxFiles) return;
-    const full = path.join(dir, ent.name);
-    if (ent.isDirectory()) {
-      if (SKIP_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
-      await walk(full, root, out, maxFiles);
-    } else if (ent.isFile() && SOURCE_EXT.has(path.extname(ent.name))) {
-      out.push(full);
-    }
-  }
-}
-
 /** 采集工作区源文件并渲染 repo map。任何一步失败静默降级为空串。 */
 export async function gatherRepoMap(cwd: string, opts: RepoMapOptions = {}): Promise<string> {
-  if (opts.incremental !== false) {
+  if (opts.incremental === true) {
+    // Keep the native Tree-sitter languages out of CLI/core startup. They are only needed when a
+    // caller explicitly opts into the heavyweight typed graph.
+    const { TypedCodeGraph } = await import("./runtime/typed-code-graph.js");
     const index = new TypedCodeGraph(cwd, {
       ...(opts.cacheDirectory ? { cacheDirectory: opts.cacheDirectory } : {}),
       ...(opts.indexFile ? { indexFile: opts.indexFile } : {}),
@@ -224,29 +185,73 @@ export async function gatherRepoMap(cwd: string, opts: RepoMapOptions = {}): Pro
       ...(opts.embed ? { embedding: opts.embed } : {}),
       ...(opts.lspPool ? { lspPool: opts.lspPool } : {}),
       ...(opts.vectorStore ? { vectorStore: opts.vectorStore } : {}),
+      ...(opts.maxCacheBytes ? { maxCacheBytes: opts.maxCacheBytes } : {}),
+      ...(opts.maxTotalSourceBytes ? { maxTotalSourceBytes: opts.maxTotalSourceBytes } : {}),
     });
     try {
       await index.refresh();
       return await index.render(opts.query ?? "", opts.tokenBudget ?? 1500);
+    } catch {
+      // A repo map is optional context. Oversized/corrupt typed caches or unavailable native
+      // parsers must degrade to the bounded lightweight index instead of adding seconds and then
+      // contributing nothing to the first request.
     } finally {
       await index.close();
     }
   }
+  return gatherLightweightRepoMap(cwd, opts);
+}
+
+interface LightweightRepoMapEntry {
+  readonly index: IncrementalCodeIndex;
+  refreshing?: Promise<void>;
+  lastUsed: number;
+}
+
+const MAX_LIGHTWEIGHT_INDEXES = 4;
+// The rendered prompt is only ~6 KiB. Capping retained source analysis at 16 MiB keeps the
+// process-wide workspace LRU bounded while still covering this repository (~4.8 MiB).
+const DEFAULT_LIGHTWEIGHT_SOURCE_BYTES = 16 * 1024 * 1024;
+const lightweightIndexes = new Map<string, LightweightRepoMapEntry>();
+
+async function gatherLightweightRepoMap(cwd: string, opts: RepoMapOptions): Promise<string> {
+  const root = path.resolve(cwd);
   const maxFiles = opts.maxFiles ?? 2000;
   const maxBytes = opts.maxFileBytes ?? 256 * 1024;
-  const abs: string[] = [];
-  await walk(path.resolve(cwd), path.resolve(cwd), abs, maxFiles);
-
-  const files: SourceFile[] = [];
-  for (const file of abs) {
-    try {
-      const stat = await fs.stat(file);
-      if (stat.size > maxBytes) continue;
-      const content = await fs.readFile(file, "utf8");
-      files.push({ path: path.relative(cwd, file), content });
-    } catch {
-      /* 跳过读不到的文件 */
-    }
+  const maxTotalSourceBytes = opts.maxTotalSourceBytes ?? DEFAULT_LIGHTWEIGHT_SOURCE_BYTES;
+  const key = `${root}\0${maxFiles}\0${maxBytes}\0${maxTotalSourceBytes}`;
+  let entry = lightweightIndexes.get(key);
+  if (!entry) {
+    entry = {
+      index: new IncrementalCodeIndex(root, {
+        maxFiles,
+        maxFileBytes: maxBytes,
+        maxTotalSourceBytes,
+        persist: false,
+        extractSymbols,
+      }),
+      lastUsed: Date.now(),
+    };
+    lightweightIndexes.set(key, entry);
+    evictLightweightIndexes();
   }
-  return buildRepoMap(files, opts);
+  entry.lastUsed = Date.now();
+  if (!entry.refreshing) {
+    entry.refreshing = entry.index.refresh().then(() => undefined);
+    const refresh = entry.refreshing;
+    const clear = () => {
+      if (entry?.refreshing === refresh) delete entry.refreshing;
+    };
+    void refresh.then(clear, clear);
+  }
+  await entry.refreshing;
+  return entry.index.render(opts.query ?? "", opts.tokenBudget ?? 1500);
+}
+
+function evictLightweightIndexes(): void {
+  if (lightweightIndexes.size <= MAX_LIGHTWEIGHT_INDEXES) return;
+  const oldest = [...lightweightIndexes.entries()].sort(
+    ([, left], [, right]) => left.lastUsed - right.lastUsed,
+  )[0];
+  if (oldest) lightweightIndexes.delete(oldest[0]);
 }

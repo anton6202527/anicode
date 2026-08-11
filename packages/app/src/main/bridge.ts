@@ -20,16 +20,19 @@ import {
   closeAllBrowsers,
   telemetryForLocalStack,
   t,
+  type AgentEvent,
   type LocalRuntimeStack,
   type OpenHandle,
   type PermissionDecisionKind,
+  type SessionEvent,
   type SecretBackend,
+  type CredentialBroker,
   type Telemetry,
   type AnicodeConfig,
   type WorkspaceTrustSource,
 } from "@anicode/core";
 import { applyPluginToggle, PLUGIN_CATALOG, type PluginEntry } from "../shared/plugins.js";
-import type { AppInfo, ModelRow, UserModel } from "../shared/api.js";
+import type { AppInfo, CloudAuthStatus, ModelRow, UserModel } from "../shared/api.js";
 import { PluginRuntime, type McpConnector } from "./plugin-runtime.js";
 
 export interface BridgeOptions {
@@ -52,6 +55,15 @@ export interface BridgeOptions {
    * references through the configured runtime and owns closing this backend.
    */
   credentialBackend?: SecretBackend & { close?(): void | Promise<void> };
+  /** Main-process-only cloud auth. No access or refresh token is exposed through this contract. */
+  cloudAuth?: {
+    attachBroker(broker: CredentialBroker): void;
+    status(): CloudAuthStatus;
+    signIn(email: string, password: string): Promise<CloudAuthStatus>;
+    signOut(): Promise<CloudAuthStatus>;
+    close(): void | Promise<void>;
+  };
+  cloudDefaultModel?: string;
   /** Enforces restricted sessions until this cwd has an explicit Workspace Trust grant. */
   workspaceTrust?: WorkspaceTrustSource;
   /** Initial assessment used to avoid starting plugin processes before the first session. */
@@ -89,6 +101,46 @@ function sessionId(value: unknown): string {
   return id;
 }
 
+function safeCloudAuthError(error: unknown, action: "signIn" | "signOut"): Error {
+  const code =
+    error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
+  if (code === "invalid_credentials") {
+    return new Error(t("Incorrect email or password", "邮箱或密码不正确"));
+  }
+  if (code === "storage_unavailable") {
+    return new Error(t("System credential storage is unavailable", "系统凭证存储不可用"));
+  }
+  return new Error(
+    action === "signIn"
+      ? t("AniCode Cloud sign-in failed", "AniCode Cloud 登录失败")
+      : t("AniCode Cloud sign-out failed", "AniCode Cloud 退出失败"),
+  );
+}
+
+/** Runtime projection at the IPC boundary: future auth internals cannot accidentally expose tokens. */
+function publicCloudAuthStatus(value: CloudAuthStatus): CloudAuthStatus {
+  const state = ["signed_out", "configured", "refreshing", "signed_in"].includes(value.state)
+    ? value.state
+    : "signed_out";
+  const signedIn = value.signedIn === true;
+  const userId = value.user?.id;
+  const email = value.user?.email;
+  const expiresAt = value.expiresAt;
+  return {
+    state,
+    signedIn,
+    ...(signedIn && typeof userId === "string" && userId.length <= 256
+      ? {
+          user: {
+            id: userId,
+            ...(typeof email === "string" && email.length <= 320 ? { email } : {}),
+          },
+        }
+      : {}),
+    ...(signedIn && typeof expiresAt === "string" && expiresAt.length <= 64 ? { expiresAt } : {}),
+  };
+}
+
 function parseUserModel(value: unknown): UserModel {
   const input = record(value, "model");
   if (input["free"] !== undefined && typeof input["free"] !== "boolean") {
@@ -112,6 +164,102 @@ function parseUserModel(value: unknown): UserModel {
 }
 
 const EVENT_CHANNEL = "anicode:event";
+const STREAM_EVENT_FLUSH_MS = 16;
+
+/**
+ * Electron IPC has a fixed structured-clone and scheduling cost. Providers commonly emit text
+ * deltas faster than a display can paint, so forwarding every delta immediately can starve the
+ * renderer while providing no visible benefit. Coalesce adjacent text, reasoning and tool-input
+ * deltas to one message per frame; every semantic boundary flushes pending data first and keeps
+ * event ordering.
+ */
+class SessionEventForwarder {
+  private pendingDelta: Extract<
+    AgentEvent,
+    { type: "text" | "thinking" | "tool_input_delta" }
+  > | null = null;
+  private pendingDeltaKey = "";
+  private pendingChunks: string[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private closed = false;
+
+  constructor(
+    private readonly sender: WebContents,
+    private readonly subId: string,
+  ) {}
+
+  enqueue(event: SessionEvent): void {
+    if (this.closed) return;
+    const delta = streamDeltaOf(event);
+    if (delta) {
+      const key = streamDeltaKey(delta);
+      if (this.pendingDelta && this.pendingDeltaKey !== key) this.flushDelta();
+      this.pendingDelta ??= delta;
+      this.pendingDeltaKey = key;
+      this.pendingChunks.push(delta.type === "tool_input_delta" ? delta.delta : delta.text);
+      if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => this.flushDelta(), STREAM_EVENT_FLUSH_MS);
+        this.flushTimer.unref?.();
+      }
+      return;
+    }
+    this.flushDelta();
+    this.send(event);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.pendingDelta = null;
+    this.pendingDeltaKey = "";
+    this.pendingChunks = [];
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+  }
+
+  private flushDelta(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+    const delta = this.pendingDelta;
+    const value = this.pendingChunks.join("");
+    this.pendingDelta = null;
+    this.pendingDeltaKey = "";
+    this.pendingChunks = [];
+    if (!delta || !value || this.closed) return;
+    this.send({
+      type: "agent",
+      event:
+        delta.type === "tool_input_delta" ? { ...delta, delta: value } : { ...delta, text: value },
+    });
+  }
+
+  private send(event: SessionEvent): void {
+    if (this.closed || this.sender.isDestroyed()) return;
+    try {
+      this.sender.send(EVENT_CHANNEL, { subId: this.subId, event });
+    } catch {
+      // The renderer may be destroyed between isDestroyed() and send(). Its lifecycle handler will
+      // close the subscription; one failed observer must not stall the core model stream.
+    }
+  }
+}
+
+function streamDeltaOf(
+  event: SessionEvent,
+): Extract<AgentEvent, { type: "text" | "thinking" | "tool_input_delta" }> | undefined {
+  if (event.type !== "agent") return undefined;
+  const delta = event.event;
+  return delta.type === "text" || delta.type === "thinking" || delta.type === "tool_input_delta"
+    ? delta
+    : undefined;
+}
+
+function streamDeltaKey(
+  event: Extract<AgentEvent, { type: "text" | "thinking" | "tool_input_delta" }>,
+): string {
+  return event.type === "tool_input_delta"
+    ? `${event.type}\0${event.id}\0${event.name}`
+    : event.type;
+}
 
 export class Bridge {
   private readonly manager: SessionManager;
@@ -125,7 +273,10 @@ export class Bridge {
    */
   private readonly disabledSkills: string[] = [];
   /** subId → 订阅句柄与目标 webContents，open 时建立，close/销毁时释放。 */
-  private readonly subscriptions = new Map<string, { handle: OpenHandle; sender: WebContents }>();
+  private readonly subscriptions = new Map<
+    string,
+    { handle: OpenHandle; sender: WebContents; forwarder: SessionEventForwarder }
+  >();
 
   static async create(options: BridgeOptions): Promise<Bridge> {
     let preparedRuntimeStack: LocalRuntimeStack | undefined;
@@ -148,6 +299,7 @@ export class Bridge {
             preparedRuntimeStack.database.close(),
           ]);
         }
+        await options.cloudAuth?.close();
         await options.credentialBackend?.close?.();
         throw error;
       }
@@ -178,6 +330,7 @@ export class Bridge {
       runtimeStack =
         preparedRuntimeStack ??
         createLocalRuntimeStack(path.dirname(options.sessionsDir), options.env ?? process.env);
+      options.cloudAuth?.attachBroker(runtimeStack.broker);
       telemetry = telemetryForLocalStack(runtimeStack, options.env ?? process.env);
       plugins = new PluginRuntime(options.mcpConnector, options.env, runtimeStack.broker, {
         telemetry,
@@ -230,6 +383,7 @@ export class Bridge {
           await attempt(() => runtimeStack!.networkProxy.close());
           await attempt(() => runtimeStack!.database.close());
         }
+        await attempt(async () => options.cloudAuth?.close());
         await attempt(async () => options.credentialBackend?.close?.());
         if (failures.length > 0) throw new AggregateError(failures, "Bridge rollback failed");
       })();
@@ -262,6 +416,33 @@ export class Bridge {
     };
 
     handle("app:info", (): AppInfo => this.appInfo());
+    handle("auth:status", (): CloudAuthStatus =>
+      publicCloudAuthStatus(
+        this.options.cloudAuth?.status() ?? { state: "signed_out", signedIn: false },
+      ),
+    );
+    handle("auth:signIn", async (_event, email, password) => {
+      if (!this.options.cloudAuth)
+        throw new Error(t("AniCode Cloud is unavailable", "AniCode Cloud 不可用"));
+      try {
+        return publicCloudAuthStatus(
+          await this.options.cloudAuth.signIn(
+            stringValue(email, "email", 320),
+            stringValue(password, "password", 1_024),
+          ),
+        );
+      } catch (error) {
+        throw safeCloudAuthError(error, "signIn");
+      }
+    });
+    handle("auth:signOut", async () => {
+      if (!this.options.cloudAuth) return { state: "signed_out", signedIn: false };
+      try {
+        return publicCloudAuthStatus(await this.options.cloudAuth.signOut());
+      } catch (error) {
+        throw safeCloudAuthError(error, "signOut");
+      }
+    });
     handle("host:listSessions", () => this.manager.listSessions());
     handle("host:createSession", (_event, value) => {
       const input = record(value, "session");
@@ -302,11 +483,15 @@ export class Bridge {
     handle("host:open", async (event, id) => {
       const subId = randomUUID();
       const sender = event.sender;
-      const openHandle = await this.manager.open(sessionId(id), (ev) => {
-        if (sender.isDestroyed()) return;
-        sender.send(EVENT_CHANNEL, { subId, event: ev });
-      });
-      this.subscriptions.set(subId, { handle: openHandle, sender });
+      const forwarder = new SessionEventForwarder(sender, subId);
+      let openHandle: OpenHandle;
+      try {
+        openHandle = await this.manager.open(sessionId(id), (ev) => forwarder.enqueue(ev));
+      } catch (error) {
+        forwarder.close();
+        throw error;
+      }
+      this.subscriptions.set(subId, { handle: openHandle, sender, forwarder });
       // 渲染进程窗口销毁时，主动回收其所有订阅，避免向已销毁 sender 推事件。
       sender.once("destroyed", () => this.closeSubscription(subId));
       return { subId, snapshot: openHandle.snapshot };
@@ -374,7 +559,12 @@ export class Bridge {
     const d = this.runtimeStack.providers.diagnoseProvider(entry.spec);
     let ready: boolean | undefined;
     let readyHint: string;
-    if (status.probed.has(entry.providerId)) {
+    if (entry.providerId === "anicode-cloud") {
+      ready = this.options.cloudAuth?.status().signedIn ?? false;
+      readyHint = ready
+        ? t("Signed in · hosted quota", "已登录 · 托管额度")
+        : t("Sign in to AniCode Cloud first", "请先登录 AniCode Cloud");
+    } else if (status.probed.has(entry.providerId)) {
       // 有本地端点的 provider：以存活探测为准，别被「免 key」误导。
       ready = status.live.has(entry.providerId);
       readyHint = ready
@@ -482,12 +672,16 @@ export class Bridge {
   }
 
   private appInfo(): AppInfo {
+    const cloudReady = this.options.cloudAuth?.status().signedIn ?? false;
     return {
       name: this.options.appName,
       version: this.options.appVersion,
       cwd: this.options.cwd,
       sessionsDir: this.options.sessionsDir,
-      defaultModel: this.options.defaultModel ?? this.runtimeStack.providers.resolveDefaultModel(),
+      defaultModel:
+        cloudReady && this.options.cloudDefaultModel
+          ? this.options.cloudDefaultModel
+          : (this.options.defaultModel ?? this.runtimeStack.providers.resolveDefaultModel()),
       inspectProviderCredentials: true,
     };
   }
@@ -496,6 +690,7 @@ export class Bridge {
     const sub = this.subscriptions.get(subId);
     if (!sub) return;
     this.subscriptions.delete(subId);
+    sub.forwarder.close();
     sub.handle.close();
   }
 
@@ -588,6 +783,7 @@ export class Bridge {
       await attempt(async () => this.runtimeStack.isolatedRuntime.shutdown?.());
       await attempt(() => this.runtimeStack.networkProxy.close());
       await attempt(() => this.runtimeStack.database.close());
+      await attempt(async () => this.options.cloudAuth?.close());
       await attempt(async () => this.options.credentialBackend?.close?.());
 
       if (failures.length > 0) {

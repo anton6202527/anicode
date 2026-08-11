@@ -68,6 +68,39 @@ test("repomap: gatherRepoMap 跳过 node_modules 等目录，只收源文件", a
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("repomap: 自然语言 query 无标识符命中时仍返回稳定代码骨架", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-repomap-query-"));
+  try {
+    await fs.writeFile(path.join(dir, "core.ts"), "export function dispatchRequest() {}\n");
+    await fs.writeFile(
+      path.join(dir, "caller.ts"),
+      "export function run() { return dispatchRequest(); }\n",
+    );
+
+    const map = await gatherRepoMap(dir, { query: "优化响应速度" });
+    assert.match(map, /core\.ts:/);
+    assert.match(map, /dispatchRequest/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("repomap: 重型图缓存超限时快速降级为轻量代码骨架", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-repomap-fallback-"));
+  try {
+    await fs.writeFile(path.join(dir, "keep.ts"), "export function keepWorking() {}\n");
+    const map = await gatherRepoMap(dir, {
+      incremental: true,
+      maxCacheBytes: 1,
+      query: "keep",
+    });
+    assert.match(map, /keep\.ts:/);
+    assert.match(map, /keepWorking/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("repomap: .anicode symlink 不得把派生索引写入宿主目标", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-repomap-boundary-"));
   const host = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-repomap-host-"));

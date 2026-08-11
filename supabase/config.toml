@@ -1,0 +1,10 @@
+project_id = "anicode"
+
+[functions.anicode-chat]
+# Modern Supabase signing keys are verified inside the function with auth.getUser(). The legacy
+# gateway verifier can reject those keys before the function gets a chance to validate them.
+verify_jwt = false
+
+# Keep local streaming pipes/background quota settlement alive after the Response is returned.
+[edge_runtime]
+policy = "per_worker"

@@ -209,6 +209,10 @@ interface RegisteredProvider {
   factory: Factory;
   /** Resolve the exact registration-time credential without exposing it through diagnostics. */
   runtime?: (bindings: ProviderRuntimeBindings) => { baseURL?: string; apiKey: string };
+  /** Trusted host-owned request transport shared by chat completions and model discovery. */
+  fetchFactory?: (bindings: ProviderRuntimeBindings) => typeof fetch;
+  /** Reject configured endpoints that are not valid HTTPS URLs before reading credentials. */
+  requireHttps?: boolean;
   /** Non-secret headers required by this provider's model-directory endpoint. */
   discoveryHeaders?: Readonly<Record<string, string>>;
   /** 程序化注册的直接凭证是否存在；仅用于诊断布尔值，绝不保存/返回 key。 */
@@ -230,6 +234,14 @@ export interface OpenAICompatibleProviderRegistration {
   limits?: ProviderLimits;
   models?: readonly ProviderModelProfile[];
   catalog?: readonly ProviderCatalogEntry[];
+  /**
+   * Trusted host hook for request-scoped authentication or another controlled transport. The
+   * returned fetch is used by both Chat Completions and `/models`; never populate this from
+   * workspace or other untrusted configuration.
+   */
+  fetchFactory?: (bindings: ProviderRuntimeBindings) => typeof fetch;
+  /** Require the default or environment-overridden base URL to be a valid HTTPS URL. */
+  requireHttps?: boolean;
   defaultHeaders?: Record<string, string>;
   streamUsage?: boolean;
   maxTokensField?: MaxTokensField;
@@ -472,6 +484,14 @@ function requestHeaders(entry: RegisteredProvider, apiKey: string): { headers: H
   return { headers };
 }
 
+function networkProxyFetch(proxy: NetworkProxy): typeof fetch {
+  return ((input: string | URL | Request, init?: RequestInit) =>
+    proxy.fetch(
+      typeof input === "string" || input instanceof URL ? input : input.url,
+      init,
+    )) as typeof fetch;
+}
+
 /** 宿主把环境/Keychain/Vault 密钥导入 Broker 后调用；provider adapter 优先从 Broker 取。 */
 export function configureProviderCredentialBroker(
   broker: CredentialBroker | undefined,
@@ -503,6 +523,7 @@ function openAI(
 const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
   openAI("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", {
     baseURLEnv: "DEEPSEEK_BASE_URL",
+    requireHttps: true,
     streamUsage: true,
     maxTokensField: "max_tokens",
     reasoningEffort: false,
@@ -787,34 +808,35 @@ export function registerOpenAICompatibleProvider(
     ...(input.models ? { models: input.models } : {}),
     ...(input.catalog ? { catalog: input.catalog } : {}),
   });
+  const fetchFactory = input.fetchFactory;
+  const requireHttps = input.requireHttps === true;
   const resolveRuntime = (bindings: ProviderRuntimeBindings) =>
-    runtimeConfig(d, input.apiKey, bindings);
+    runtimeConfig(d, input.apiKey, bindings, requireHttps);
 
   install({
     descriptor: d,
     directCredential: Boolean(input.apiKey),
     runtime: resolveRuntime,
+    ...(fetchFactory ? { fetchFactory } : {}),
+    ...(requireHttps ? { requireHttps: true } : {}),
     ...(input.defaultHeaders ? { discoveryHeaders: { ...input.defaultHeaders } } : {}),
     factory: (bindings = legacyRuntimeBindings()) => {
       const runtime = resolveRuntime(bindings);
       const directLoopback = Boolean(
         d.local && runtime.baseURL && isLoopbackProviderURL(runtime.baseURL),
       );
+      const request = fetchFactory
+        ? fetchFactory(bindings)
+        : !directLoopback && bindings.networkProxy
+          ? networkProxyFetch(bindings.networkProxy)
+          : undefined;
       return new OpenAICompatProvider({
         name: d.id,
         ...(runtime.baseURL ? { baseURL: runtime.baseURL } : {}),
         // 始终显式传入（包括空串），禁止 SDK 回退到 OPENAI_API_KEY。
         apiKey: runtime.apiKey,
         maxRetries: 0,
-        ...(!directLoopback && bindings.networkProxy
-          ? {
-              fetch: ((input: string | URL | Request, init?: RequestInit) =>
-                bindings.networkProxy!.fetch(
-                  typeof input === "string" || input instanceof URL ? input : input.url,
-                  init,
-                )) as typeof fetch,
-            }
-          : {}),
+        ...(request ? { fetch: request } : {}),
         ...(input.defaultHeaders ? { defaultHeaders: input.defaultHeaders } : {}),
         ...(input.streamUsage !== undefined ? { streamUsage: input.streamUsage } : {}),
         ...(input.maxTokensField !== undefined ? { maxTokensField: input.maxTokensField } : {}),
@@ -913,27 +935,32 @@ export async function discoverProviderModels(
   const configuredBaseURL =
     (d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv, activeBindings.environment) : undefined) ?? d.baseURL;
   if (!configuredBaseURL) return undefined;
-  // Reject an unusable egress route before opening a lazy credential reference.
-  if (d.local && !isLoopbackProviderURL(configuredBaseURL)) return undefined;
-  const directLoopback = d.local && isLoopbackProviderURL(configuredBaseURL);
-  if (!directLoopback && !activeBindings.networkProxy) return undefined;
+  if (providerBaseURLSecurityWarning(d.id, configuredBaseURL, entry.requireHttps === true)) {
+    return undefined;
+  }
   const modelsURL = providerModelsURL(configuredBaseURL);
   if (!modelsURL) return undefined;
+  const hasRegisteredFetch = entry.fetchFactory !== undefined;
+  // Reject an unusable egress route before opening a lazy credential reference.
+  if (!hasRegisteredFetch && d.local && !isLoopbackProviderURL(configuredBaseURL)) return undefined;
+  const directLoopback = d.local && isLoopbackProviderURL(configuredBaseURL);
+  if (!hasRegisteredFetch && !directLoopback && !activeBindings.networkProxy) return undefined;
 
   await prepareRuntimeCredential(entry, activeBindings);
   const runtime = entry.runtime?.(activeBindings) ?? runtimeConfig(d, undefined, activeBindings);
   if (!runtime.baseURL || (d.requiresApiKey && !runtime.apiKey)) return undefined;
-  // Cloud discovery carries credentials and must never silently bypass the production egress
-  // boundary. Loopback discovery is the only direct-fetch exception.
-  const request = directLoopback
-    ? fetchImpl
-    : activeBindings.networkProxy!.fetch.bind(activeBindings.networkProxy);
   const boundedTimeoutMs = normalizeDiscoveryTimeout(timeoutMs);
   const cache = modelDiscoveryCacheFor(bindings);
   const cacheKey = modelsURL.toString();
 
   return cachedModelDiscovery(cache, entry, cacheKey, () =>
     withHardTimeout(boundedTimeoutMs, async (signal) => {
+      // A trusted registration-owned transport may replace NetworkProxy (for example to attach a
+      // short-lived host credential). Without it, cloud discovery remains fail-closed and only a
+      // local loopback endpoint may use the caller's direct fixture fetch.
+      const request =
+        entry.fetchFactory?.(activeBindings) ??
+        (directLoopback ? fetchImpl : networkProxyFetch(activeBindings.networkProxy!));
       const response = await request(modelsURL, {
         signal,
         redirect: "error",
@@ -1118,16 +1145,44 @@ function runtimeConfig(
   d: ProviderDescriptor,
   directApiKey?: string,
   bindings: ProviderRuntimeBindings = legacyRuntimeBindings(),
+  requireHttps = false,
 ): { baseURL?: string; apiKey: string } {
   const envBase = d.baseURLEnv ? nonEmptyEnv(d.baseURLEnv, bindings.environment) : undefined;
+  const baseURL = envBase ?? d.baseURL;
+  assertProviderBaseURLSecurity(d.id, baseURL, requireHttps);
   const credential =
-    directApiKey ??
-    findCredential(d.apiKeyEnv, `provider:${d.id}`, envBase ?? d.baseURL, bindings)?.value;
+    directApiKey ?? findCredential(d.apiKeyEnv, `provider:${d.id}`, baseURL, bindings)?.value;
   return {
-    ...((envBase ?? d.baseURL) ? { baseURL: envBase ?? d.baseURL } : {}),
+    ...(baseURL ? { baseURL } : {}),
     // 本地匿名服务仍给 SDK 一个无敏感性的占位 key；云端缺 key 用空串尽早失败。
     apiKey: credential ?? (d.requiresApiKey ? "" : "anicode-local"),
   };
+}
+
+function providerBaseURLSecurityWarning(
+  providerId: string,
+  baseURL: string | undefined,
+  requireHttps: boolean,
+): string | undefined {
+  if (!requireHttps || !baseURL) return undefined;
+  try {
+    if (new URL(baseURL).protocol === "https:") return undefined;
+  } catch {
+    // A malformed URL cannot satisfy an HTTPS-only provider policy.
+  }
+  return t(
+    `Security policy rejected ${providerId} baseURL: a valid HTTPS URL is required`,
+    `安全策略拒绝 ${providerId} baseURL：必须使用有效的 HTTPS URL`,
+  );
+}
+
+function assertProviderBaseURLSecurity(
+  providerId: string,
+  baseURL: string | undefined,
+  requireHttps: boolean,
+): void {
+  const warning = providerBaseURLSecurityWarning(providerId, baseURL, requireHttps);
+  if (warning) throw new Error(warning);
 }
 
 function diagnosticsFor(
@@ -1155,6 +1210,12 @@ function diagnosticsFor(
   }
   if (!baseURL && d.kind !== "debug")
     warnings.push(t("provider baseURL is not configured", "未配置 provider baseURL"));
+  const baseURLSecurityWarning = providerBaseURLSecurityWarning(
+    d.id,
+    baseURL,
+    entry.requireHttps === true,
+  );
+  if (baseURLSecurityWarning) warnings.push(baseURLSecurityWarning);
   if (d.local && baseURL && !isLoopbackProviderURL(baseURL)) {
     warnings.push(
       t(
@@ -1247,6 +1308,7 @@ async function prepareRuntimeCredential(
     ? nonEmptyEnv(descriptor.baseURLEnv, bindings.environment)
     : undefined;
   const baseURL = envBase ?? descriptor.baseURL;
+  assertProviderBaseURLSecurity(descriptor.id, baseURL, entry.requireHttps === true);
   for (const name of descriptor.apiKeyEnv) {
     const brokerId = `env:${name}`;
     if (bindings.broker?.has(brokerId)) {

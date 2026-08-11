@@ -3,7 +3,7 @@
  * 逻辑对齐 TUI 的 App reducer/handleEvent，但面向 DOM 渲染。
  */
 
-import { useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import type { SessionEvent, SessionMeta, TodoItem, Usage } from "@anicode/core";
 import { t } from "@anicode/core/i18n";
 import { messagesToItems, todosFromMessages, type Item } from "./transcript.js";
@@ -72,12 +72,15 @@ function reducer(s: ChatState, a: Action): ChatState {
     case "reset":
       return { ...initialState, activeTools: new Map(), ...a.state, opening: false };
     case "opening":
+      if (s.opening === a.v) return s;
       return { ...s, opening: a.v };
     case "push":
       return { ...s, items: [...s.items, a.item] };
     case "live":
+      if (!a.delta) return s;
       return { ...s, liveText: s.liveText + a.delta };
     case "resetLive":
+      if (!s.liveText) return s;
       return { ...s, liveText: "" };
     case "flushLive":
       if (!s.liveText) return s;
@@ -114,8 +117,10 @@ function reducer(s: ChatState, a: Action): ChatState {
       };
     }
     case "running":
+      if (s.running === a.v) return s;
       return { ...s, running: a.v };
     case "usage":
+      if (sameUsage(s.usage, a.u)) return s;
       return { ...s, usage: a.u };
     case "todos":
       return { ...s, todos: a.todos };
@@ -127,8 +132,18 @@ function reducer(s: ChatState, a: Action): ChatState {
     case "permSet":
       return { ...s, pendings: a.perms };
     case "workspaceTrust":
+      if (s.workspaceTrusted === a.trusted) return s;
       return { ...s, workspaceTrusted: a.trusted };
   }
+}
+
+function sameUsage(a: Usage, b: Usage): boolean {
+  return (
+    a.inputTokens === b.inputTokens &&
+    a.outputTokens === b.outputTokens &&
+    a.cacheReadTokens === b.cacheReadTokens &&
+    a.cacheWriteTokens === b.cacheWriteTokens
+  );
 }
 
 function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
@@ -255,6 +270,73 @@ function applyEvent(dispatch: React.Dispatch<Action>, se: SessionEvent): void {
   }
 }
 
+interface SessionEventBatcher {
+  push(event: SessionEvent): void;
+  close(): void;
+}
+
+/**
+ * IPC can deliver one event per model token. Folding every token into React state immediately makes
+ * rendering frequency depend on provider/network chunking and repeatedly copies an ever-growing
+ * string. Coalesce adjacent text deltas to at most one update per animation frame. A non-text
+ * event always flushes first so tool/message boundaries retain their exact ordering.
+ *
+ * The scheduler is injectable to keep ordering and cleanup covered by fast Node tests.
+ */
+export function createSessionEventBatcher(
+  dispatch: React.Dispatch<Action>,
+  scheduleFrame: (callback: () => void) => number = (callback) =>
+    window.requestAnimationFrame(callback),
+  cancelFrame: (id: number) => void = (id) => window.cancelAnimationFrame(id),
+): SessionEventBatcher {
+  let pendingText = "";
+  let frameId: number | null = null;
+  let closed = false;
+
+  const flushText = () => {
+    if (!pendingText || closed) return;
+    const delta = pendingText;
+    pendingText = "";
+    dispatch({ t: "live", delta });
+  };
+
+  const cancelPendingFrame = () => {
+    if (frameId === null) return;
+    cancelFrame(frameId);
+    frameId = null;
+  };
+
+  return {
+    push(event) {
+      if (closed) return;
+      const delta = textDeltaOf(event);
+      if (delta !== null) {
+        pendingText += delta;
+        if (pendingText && frameId === null) {
+          frameId = scheduleFrame(() => {
+            frameId = null;
+            flushText();
+          });
+        }
+        return;
+      }
+
+      cancelPendingFrame();
+      flushText();
+      applyEvent(dispatch, event);
+    },
+    close() {
+      closed = true;
+      cancelPendingFrame();
+      pendingText = "";
+    },
+  };
+}
+
+function textDeltaOf(event: SessionEvent): string | null {
+  return event.type === "agent" && event.event.type === "text" ? event.event.text : null;
+}
+
 export interface SessionController {
   state: ChatState;
   answerPermission: (
@@ -274,6 +356,7 @@ export function useSession(sessionId: string | null): SessionController {
     let ready = false;
     let subId: string | null = null;
     const buffered: SessionEvent[] = [];
+    const eventBatcher = createSessionEventBatcher(dispatch);
     dispatch({ t: "opening", v: true });
 
     const off = window.anicode.onEvent((envelope) => {
@@ -282,7 +365,7 @@ export function useSession(sessionId: string | null): SessionController {
         buffered.push(envelope.event);
         return;
       }
-      applyEvent(dispatch, envelope.event);
+      eventBatcher.push(envelope.event);
     });
 
     window.anicode
@@ -315,7 +398,7 @@ export function useSession(sessionId: string | null): SessionController {
           },
         });
         ready = true;
-        for (const ev of buffered) applyEvent(dispatch, ev);
+        for (const ev of buffered) eventBatcher.push(ev);
       })
       .catch((err: unknown) => {
         if (closed) return;
@@ -325,31 +408,32 @@ export function useSession(sessionId: string | null): SessionController {
 
     return () => {
       closed = true;
+      eventBatcher.close();
       off();
       if (subId) void window.anicode.close(subId);
     };
   }, [sessionId]);
 
-  const answerPermission = (
-    permId: string,
-    decision: "allow" | "allow_remember" | "allow_always" | "deny",
-  ) => {
-    const id = sessionRef.current;
-    if (!id) return;
-    dispatch({ t: "permRemove", permId });
-    void window.anicode.answerPermission(id, permId, decision).catch((err: unknown) => {
-      dispatch({
-        t: "push",
-        item: {
-          kind: "error",
-          text: t(
-            `Failed to reply to permission: ${errorMessage(err)}`,
-            `授权答复失败: ${errorMessage(err)}`,
-          ),
-        },
+  const answerPermission = useCallback(
+    (permId: string, decision: "allow" | "allow_remember" | "allow_always" | "deny") => {
+      const id = sessionRef.current;
+      if (!id) return;
+      dispatch({ t: "permRemove", permId });
+      void window.anicode.answerPermission(id, permId, decision).catch((err: unknown) => {
+        dispatch({
+          t: "push",
+          item: {
+            kind: "error",
+            text: t(
+              `Failed to reply to permission: ${errorMessage(err)}`,
+              `授权答复失败: ${errorMessage(err)}`,
+            ),
+          },
+        });
       });
-    });
-  };
+    },
+    [],
+  );
 
   return { state, answerPermission };
 }

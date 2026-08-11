@@ -12,6 +12,7 @@
 
 export class Chan<T> implements AsyncIterable<T> {
   private buf: T[] = [];
+  private head = 0;
   private closed = false;
   private wake: (() => void) | null = null;
 
@@ -28,7 +29,13 @@ export class Chan<T> implements AsyncIterable<T> {
 
   async *[Symbol.asyncIterator](): AsyncIterator<T> {
     while (true) {
-      while (this.buf.length > 0) yield this.buf.shift()!;
+      // Advancing an index keeps a burst of progress/streaming events O(n). Array.shift() moves
+      // every remaining element and turns a large buffered burst into O(n²) work.
+      while (this.head < this.buf.length) yield this.buf[this.head++]!;
+      if (this.head > 0) {
+        this.buf = [];
+        this.head = 0;
+      }
       if (this.closed) return;
       await new Promise<void>((resolve) => {
         this.wake = () => {

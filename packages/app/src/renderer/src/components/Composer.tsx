@@ -10,7 +10,7 @@ interface Props {
   onOpenModelPicker: () => void;
 }
 
-export function Composer({
+export const Composer = React.memo(function Composer({
   running,
   modelLabel,
   disabled,
@@ -92,4 +92,4 @@ export function Composer({
       </div>
     </div>
   );
-}
+});

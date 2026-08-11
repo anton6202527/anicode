@@ -5,8 +5,14 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import {
+import type {
   SessionManager,
+  AnicodeConfig,
+  BoundProviderRegistry,
+  ProductionSessionManagerComposition,
+  WorkspaceTrustSource,
+} from "@anicode/core";
+import {
   createProductionSessionManager,
   createProductionSessionManagerAsync,
   createProvider,
@@ -15,11 +21,7 @@ import {
   listProviderDetails,
   probeLocalProviders,
   t,
-  type AnicodeConfig,
-  type BoundProviderRegistry,
-  type ProductionSessionManagerComposition,
-  type WorkspaceTrustSource,
-} from "@anicode/core";
+} from "./core-runtime.js";
 
 /** Exact loader installed by the VSIX build; resolving this path performs no credential access. */
 export function packagedKeyringModulePath(extensionPath: string): string {

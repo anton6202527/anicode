@@ -52,6 +52,13 @@ export interface AppInfo {
   inspectProviderCredentials: boolean;
 }
 
+export interface CloudAuthStatus {
+  state: "signed_out" | "configured" | "refreshing" | "signed_in";
+  signedIn: boolean;
+  user?: { id: string; email?: string };
+  expiresAt?: string;
+}
+
 /** open 订阅的载荷：一次拿到 snapshot + 订阅 id，事件随后经 onEvent 回流。 */
 export interface OpenResult {
   subId: string;
@@ -67,6 +74,11 @@ export interface EventEnvelope {
 /** contextBridge 暴露的完整 API。所有返回值必须是结构化可克隆的。 */
 export interface AgentxApi {
   appInfo(): Promise<AppInfo>;
+
+  // —— AniCode Cloud 登录；Token 永远不跨越 preload 边界 ——
+  authStatus(): Promise<CloudAuthStatus>;
+  authSignIn(email: string, password: string): Promise<CloudAuthStatus>;
+  authSignOut(): Promise<CloudAuthStatus>;
 
   // —— SessionHost 面 ——
   listSessions(): Promise<SessionSummary[]>;

@@ -14,7 +14,7 @@ interface Props {
   onNavigate: (view: View) => void;
 }
 
-export function Sidebar({
+export const Sidebar = React.memo(function Sidebar({
   sessions,
   currentId,
   view,
@@ -83,4 +83,4 @@ export function Sidebar({
       </div>
     </aside>
   );
-}
+});

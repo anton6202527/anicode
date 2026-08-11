@@ -9,7 +9,12 @@ interface Props {
   onClose: () => void;
 }
 
-export function ModelPicker({ rows, currentSpec, onPick, onClose }: Props) {
+export const ModelPicker = React.memo(function ModelPicker({
+  rows,
+  currentSpec,
+  onPick,
+  onClose,
+}: Props) {
   const [query, setQuery] = useState("");
 
   useEffect(() => {
@@ -94,4 +99,4 @@ export function ModelPicker({ rows, currentSpec, onPick, onClose }: Props) {
       </div>
     </div>
   );
-}
+});

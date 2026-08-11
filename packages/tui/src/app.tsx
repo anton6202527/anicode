@@ -1470,7 +1470,8 @@ export function App({
     const flush = () => {
       flushTimer = null;
       if (queue.length === 0) return;
-      const batch = queue.splice(0, queue.length);
+      const batch = coalesceSessionEventsForRender(queue);
+      queue.length = 0;
       for (const ev of batch) handleEvent(ev, dispatch, setPendings);
     };
     flushRef.current = flush;
@@ -1595,7 +1596,7 @@ export function App({
           setPendings(snap.pendingPermissions);
           resetTranscriptScroll();
           ready = true;
-          for (const ev of buffered) {
+          for (const ev of coalesceSessionEventsForRender(buffered)) {
             const trustUpdate = workspaceTrustUpdateFromEvent(ev);
             if (trustUpdate) {
               workspaceTrustedRef.current = trustUpdate.trusted;
@@ -3614,6 +3615,68 @@ function workspaceTrustUpdateFromEvent(
   if (typeof nested["trusted"] !== "boolean") return undefined;
   const reason = typeof nested["reason"] === "string" ? nested["reason"] : undefined;
   return { trusted: nested["trusted"], ...(reason ? { reason } : {}) };
+}
+
+/**
+ * React batches dispatches from one timer, but reducers still run once per token. Collapse adjacent
+ * text/reasoning/tool-input chunks first so a frame performs one append per logical stream.
+ */
+export function coalesceSessionEventsForRender(events: readonly SessionEvent[]): SessionEvent[] {
+  const output: SessionEvent[] = [];
+  let pending:
+    | {
+        key: string;
+        first: Extract<SessionEvent, { type: "agent" }>;
+        chunks: string[];
+      }
+    | undefined;
+
+  const flush = (): void => {
+    if (!pending) return;
+    if (pending.chunks.length === 1) {
+      output.push(pending.first);
+    } else {
+      const event = pending.first.event;
+      const value = pending.chunks.join("");
+      output.push({
+        type: "agent",
+        event:
+          event.type === "tool_input_delta"
+            ? { ...event, delta: value }
+            : event.type === "text" || event.type === "thinking"
+              ? { ...event, text: value }
+              : event,
+      });
+    }
+    pending = undefined;
+  };
+
+  for (const event of events) {
+    if (event.type === "agent") {
+      const agent = event.event;
+      let key: string | undefined;
+      let chunk: string | undefined;
+      if (agent.type === "text" || agent.type === "thinking") {
+        key = agent.type;
+        chunk = agent.text;
+      } else if (agent.type === "tool_input_delta") {
+        key = `${agent.type}\0${agent.id}\0${agent.name}`;
+        chunk = agent.delta;
+      }
+      if (key !== undefined && chunk !== undefined) {
+        if (pending?.key === key) pending.chunks.push(chunk);
+        else {
+          flush();
+          pending = { key, first: event, chunks: [chunk] };
+        }
+        continue;
+      }
+    }
+    flush();
+    output.push(event);
+  }
+  flush();
+  return output;
 }
 
 function handleEvent(

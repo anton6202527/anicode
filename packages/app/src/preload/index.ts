@@ -10,6 +10,9 @@ const EVENT_CHANNEL = "anicode:event";
 
 const api: AgentxApi = {
   appInfo: () => ipcRenderer.invoke("app:info"),
+  authStatus: () => ipcRenderer.invoke("auth:status"),
+  authSignIn: (email, password) => ipcRenderer.invoke("auth:signIn", email, password),
+  authSignOut: () => ipcRenderer.invoke("auth:signOut"),
 
   listSessions: () => ipcRenderer.invoke("host:listSessions"),
   createSession: (input) => ipcRenderer.invoke("host:createSession", input),

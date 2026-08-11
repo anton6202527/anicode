@@ -82,6 +82,49 @@ test("ChatBridge: ready 建默认会话并回发 reset 快照", async () => {
   }
 });
 
+test("ChatBridge: open 期间的流式事件在 reset 后合并并按序发布", async () => {
+  const posted: HostToWebview[] = [];
+  const manager = {
+    async open(_sessionId: string, listener: (event: SessionEvent) => void) {
+      listener({ type: "agent", event: { type: "text", text: "一" } });
+      listener({ type: "agent", event: { type: "text", text: "二" } });
+      listener({ type: "state", running: true });
+      return {
+        snapshot: {
+          meta: {
+            id: "buffered",
+            createdAt: "2026-08-11T00:00:00.000Z",
+            updatedAt: "2026-08-11T00:00:00.000Z",
+            cwd: "/work",
+            model: "debug/demo",
+          },
+          messages: [],
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          },
+          running: true,
+          pendingPermissions: [],
+        },
+        close() {},
+      };
+    },
+  } as unknown as SessionManager;
+  const bridge = new ChatBridge(manager, "/work", "debug/demo", (message) => posted.push(message));
+  try {
+    await bridge.resume("buffered");
+    assert.equal(posted[0]?.type, "reset");
+    assert.deepEqual(posted.slice(1), [
+      { type: "event", event: { type: "agent", event: { type: "text", text: "一二" } } },
+      { type: "event", event: { type: "state", running: true } },
+    ]);
+  } finally {
+    bridge.dispose();
+  }
+});
+
 test("ChatBridge: send 驱动回合，事件回流并按首句自动命名", async () => {
   const { manager, posted, bridge } = await setup();
   try {

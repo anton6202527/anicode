@@ -25,6 +25,9 @@ import {
   type ElectronKeychainUtilityProcess,
 } from "./electron-keychain-backend.js";
 import { trustedExternalUrl, trustedRendererDevUrl } from "../shared/security.js";
+import { CloudAuthService } from "./cloud-auth.js";
+import { ANICODE_CLOUD_CONFIG, ANICODE_CLOUD_DEFAULT_MODEL } from "./cloud-config.js";
+import { registerAnicodeCloudProvider } from "./cloud-provider.js";
 
 // electron-vite 会注入渲染层入口：dev 下是 devServer URL，prod 下是打包 HTML。
 const rendererDevUrlInput = process.env["ELECTRON_RENDERER_URL"];
@@ -95,28 +98,52 @@ async function createBridge(): Promise<Bridge> {
   const credentialKind = process.env["ANICODE_CREDENTIAL_BACKEND"]?.trim() || "keychain";
   const credentialBackend =
     credentialKind === "keychain"
-      ? new ElectronUtilityKeychainBackend({
-          service: process.env["ANICODE_KEYCHAIN_SERVICE"] ?? "dev.anicode.credentials",
-          helperPath: path.join(__dirname, "keychain-utility-helper.js"),
-          modulePath: createRequire(__filename).resolve("@napi-rs/keyring"),
-          utilityFactory: electronKeychainUtilityFactory,
-          workingDirectory: path.dirname(process.execPath),
-          environment: process.env,
+      ? createElectronKeychainBackend(
+          process.env["ANICODE_KEYCHAIN_SERVICE"] ?? "dev.anicode.credentials",
+        )
+      : undefined;
+  const cloudAuth =
+    credentialKind === "keychain"
+      ? new CloudAuthService({
+          backend: createElectronKeychainBackend("dev.anicode.cloud-auth"),
+          projectUrl: ANICODE_CLOUD_CONFIG.projectUrl,
+          publishableKey: ANICODE_CLOUD_CONFIG.publishableKey,
         })
       : undefined;
-  return Bridge.create({
-    cwd,
-    sessionsDir: path.join(userData, "sessions"),
-    pluginsFile: path.join(userData, "plugins.json"),
-    modelsFile: path.join(userData, "models.json"),
-    appName: app.getName(),
-    appVersion: app.getVersion(),
-    ...(config.model ? { defaultModel: config.model } : {}),
-    config,
-    workspaceTrust: workspaceTrustStore,
-    workspaceTrusted: workspaceTrust.trusted,
-    isTrustedSender: trustedIpcSender,
-    ...(credentialBackend ? { credentialBackend } : {}),
+  if (cloudAuth) {
+    await cloudAuth.restore().catch(() => undefined);
+    registerAnicodeCloudProvider(cloudAuth);
+  }
+  try {
+    return await Bridge.create({
+      cwd,
+      sessionsDir: path.join(userData, "sessions"),
+      pluginsFile: path.join(userData, "plugins.json"),
+      modelsFile: path.join(userData, "models.json"),
+      appName: app.getName(),
+      appVersion: app.getVersion(),
+      ...(config.model ? { defaultModel: config.model } : {}),
+      config,
+      workspaceTrust: workspaceTrustStore,
+      workspaceTrusted: workspaceTrust.trusted,
+      isTrustedSender: trustedIpcSender,
+      ...(credentialBackend ? { credentialBackend } : {}),
+      ...(cloudAuth ? { cloudAuth, cloudDefaultModel: ANICODE_CLOUD_DEFAULT_MODEL } : {}),
+    });
+  } catch (error) {
+    await cloudAuth?.close();
+    throw error;
+  }
+}
+
+function createElectronKeychainBackend(service: string): ElectronUtilityKeychainBackend {
+  return new ElectronUtilityKeychainBackend({
+    service,
+    helperPath: path.join(__dirname, "keychain-utility-helper.js"),
+    modulePath: createRequire(__filename).resolve("@napi-rs/keyring"),
+    utilityFactory: electronKeychainUtilityFactory,
+    workingDirectory: path.dirname(process.execPath),
+    environment: process.env,
   });
 }
 
@@ -177,18 +204,31 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(async () => {
-  bridge = await createBridge();
-  bridge.register(ipcMain);
-  // 连接已启用的 MCP 插件后再建窗；连接失败不阻塞启动（状态在市场里展示）。
-  await bridge.init().catch(() => {});
-  createWindow();
-  startAutoUpdates();
-
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
   });
-});
+
+  app.whenReady().then(async () => {
+    bridge = await createBridge();
+    bridge.register(ipcMain);
+    // 连接已启用的 MCP 插件后再建窗；连接失败不阻塞启动（状态在市场里展示）。
+    await bridge.init().catch(() => {});
+    createWindow();
+    startAutoUpdates();
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

@@ -25,6 +25,72 @@ test("ContextAssembler: 按注册顺序收集贡献段，null 被跳过", async 
   assert.deepEqual(await asm.collect(ctx()), ["A", "C"]);
 });
 
+test("ContextAssembler: 并发采集纯 provider，同时保序返回", async () => {
+  let releaseSlow!: () => void;
+  const slow = new Promise<void>((resolve) => {
+    releaseSlow = resolve;
+  });
+  let fastStarted = false;
+  const asm = new ContextAssembler([
+    {
+      id: "slow",
+      async contribute() {
+        await slow;
+        return "SLOW";
+      },
+    },
+    {
+      id: "fast",
+      async contribute() {
+        fastStarted = true;
+        return "FAST";
+      },
+    },
+  ]);
+
+  const pending = asm.collectContributions(ctx());
+  await Promise.resolve();
+  assert.equal(fastStarted, true, "后续纯 provider 不应被前一个 I/O 阻塞");
+  releaseSlow();
+  assert.deepEqual(await pending, [
+    { id: "slow", content: "SLOW" },
+    { id: "fast", content: "FAST" },
+  ]);
+});
+
+test("ContextAssembler: serial provider 形成副作用顺序栅栏", async () => {
+  const order: string[] = [];
+  const provider = (
+    id: string,
+    options: { serial?: boolean; wait?: Promise<void> } = {},
+  ): ContextProvider => ({
+    id,
+    ...(options.serial ? { serial: true } : {}),
+    async contribute() {
+      order.push(`${id}:start`);
+      await options.wait;
+      order.push(`${id}:end`);
+      return id;
+    },
+  });
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const asm = new ContextAssembler([
+    provider("a", { wait }),
+    provider("b", { serial: true }),
+    provider("c"),
+  ]);
+
+  const pending = asm.collect(ctx());
+  await Promise.resolve();
+  assert.deepEqual(order, ["a:start"]);
+  release();
+  assert.deepEqual(await pending, ["a", "b", "c"]);
+  assert.deepEqual(order, ["a:start", "a:end", "b:start", "b:end", "c:start", "c:end"]);
+});
+
 test("browserUsageProvider: 未注册 browser 工具时无贡献，注册后注入用法指引", async () => {
   const p = browserUsageProvider();
   assert.equal(await p.contribute(ctx()), null);

@@ -3,8 +3,9 @@
  * 维护「当前活动会话」：VSCode 侧边栏是单一活动对话，切模型/新建/恢复都换这个活动会话。
  */
 
-import { t } from "@anicode/core";
 import type { SessionEvent, SessionManager } from "@anicode/core";
+import { t } from "./core-runtime.js";
+import { coalesceSessionEvents, isStreamDeltaEvent } from "./event-batch.js";
 import type { HostToWebview, PendingPerm, PermissionDecision, WebviewToHost } from "./protocol.js";
 import { fileChangeFor } from "./filechange.js";
 
@@ -20,6 +21,9 @@ export class ChatBridge {
   private currentId: string | null = null;
   private currentModel: string;
   private close: (() => void) | null = null;
+  private openGeneration = 0;
+  private eventQueue: SessionEvent[] = [];
+  private eventTimer: ReturnType<typeof setTimeout> | undefined;
   /** 当前活动会话是否还没有标题且没有用户消息（用于首条消息自动命名）。 */
   private needsTitle = false;
 
@@ -33,6 +37,7 @@ export class ChatBridge {
   }
 
   setPost(post: Poster): void {
+    this.clearEventQueue();
     this.post = post;
   }
 
@@ -98,12 +103,24 @@ export class ChatBridge {
   }
 
   private async open(sessionId: string, model?: string): Promise<void> {
+    const generation = ++this.openGeneration;
     this.close?.();
     this.close = null;
+    this.clearEventQueue();
+    let ready = false;
+    const buffered: SessionEvent[] = [];
     const handle = await this.manager.open(sessionId, (event) => {
-      this.post({ type: "event", event });
-      this.maybeFileChange(sessionId, event);
+      if (generation !== this.openGeneration) return;
+      if (!ready) {
+        buffered.push(event);
+        return;
+      }
+      this.forwardEvent(sessionId, event);
     });
+    if (generation !== this.openGeneration) {
+      handle.close();
+      return;
+    }
     this.close = handle.close;
     this.currentId = sessionId;
     const snap = handle.snapshot;
@@ -124,6 +141,42 @@ export class ChatBridge {
       running: snap.running,
       pendings: snap.pendingPermissions as PendingPerm[],
     });
+    ready = true;
+    for (const event of buffered) this.forwardEvent(sessionId, event);
+  }
+
+  /** Keep high-frequency provider deltas below one extension→webview message per frame. */
+  private forwardEvent(sessionId: string, event: SessionEvent): void {
+    if (isStreamDeltaEvent(event)) {
+      this.eventQueue.push(event);
+      if (!this.eventTimer) {
+        this.eventTimer = setTimeout(() => {
+          this.eventTimer = undefined;
+          this.flushEventQueue();
+        }, 16);
+        this.eventTimer.unref?.();
+      }
+    } else {
+      // A control event is an ordering barrier: publish all earlier deltas before it.
+      this.flushEventQueue();
+      this.post({ type: "event", event });
+    }
+    this.maybeFileChange(sessionId, event);
+  }
+
+  private flushEventQueue(): void {
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = undefined;
+    if (this.eventQueue.length === 0) return;
+    const queued = this.eventQueue;
+    this.eventQueue = [];
+    for (const event of coalesceSessionEvents(queued)) this.post({ type: "event", event });
+  }
+
+  private clearEventQueue(): void {
+    if (this.eventTimer) clearTimeout(this.eventTimer);
+    this.eventTimer = undefined;
+    this.eventQueue = [];
   }
 
   /** write/edit 工具成功后，从快照里取参数算出 diff 预览发给 webview。 */
@@ -152,6 +205,8 @@ export class ChatBridge {
   }
 
   dispose(): void {
+    this.openGeneration++;
+    this.clearEventQueue();
     this.close?.();
     this.close = null;
   }

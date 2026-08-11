@@ -10,8 +10,20 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { IpcMain } from "electron";
-import { registerOpenAICompatibleProvider, type SecretBackend } from "@anicode/core";
-import type { EventEnvelope, ModelRow, PluginEntry, UserModel } from "../shared/api.js";
+import {
+  registerOpenAICompatibleProvider,
+  registerProvider,
+  type CredentialBroker,
+  type Provider,
+  type SecretBackend,
+} from "@anicode/core";
+import type {
+  CloudAuthStatus,
+  EventEnvelope,
+  ModelRow,
+  PluginEntry,
+  UserModel,
+} from "../shared/api.js";
 import { Bridge, type BridgeOptions } from "./bridge.js";
 
 type Handler = (event: { sender: FakeSender }, ...args: unknown[]) => unknown;
@@ -163,6 +175,56 @@ test("Bridge: 创建会话 → 订阅 → 发送，事件经 sender 回流（走
   }
 });
 
+test("Bridge: 高频文本增量按帧合并，且在 done 前保持顺序", async () => {
+  const providerId = "bridge-burst-stream";
+  registerProvider(providerId, (): Provider => ({
+    name: providerId,
+    async *stream(request) {
+      const text = "x".repeat(200);
+      for (const char of text) yield { type: "text_delta", text: char };
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+        usage: {
+          inputTokens: request.messages.length,
+          outputTokens: text.length,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      };
+    },
+  }));
+  const { bridge, dir } = await tempBridge();
+  const { ipcMain, invoke } = fakeIpc();
+  bridge.register(ipcMain);
+  const sender = new FakeSender();
+
+  try {
+    const meta = (await invoke("host:createSession", sender, {
+      cwd: dir,
+      model: `${providerId}/test`,
+    })) as { id: string };
+    await invoke("host:open", sender, meta.id);
+    await invoke("host:send", sender, meta.id, "burst");
+
+    const agentEvents = sender.received.flatMap((envelope) =>
+      envelope.event.type === "agent" ? [envelope.event.event] : [],
+    );
+    const textEvents = agentEvents.filter((event) => event.type === "text");
+    assert.equal(textEvents.length, 1, "200 个同步 delta 应合并成一个 IPC 文本事件");
+    assert.equal(textEvents[0]?.type === "text" ? textEvents[0].text : "", "x".repeat(200));
+    assert.ok(
+      agentEvents.findIndex((event) => event.type === "text") <
+        agentEvents.findIndex((event) => event.type === "done"),
+      "合并文本必须在 done 边界前送达",
+    );
+  } finally {
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bridge: 模型目录标注凭证就绪状态，debug/demo 免 key 可用", async () => {
   registerOpenAICompatibleProvider({
     id: "bridge-test-cloud",
@@ -259,6 +321,86 @@ test("Bridge: 未显式指定默认模型时使用自身 runtimeStack provider �
     if (previous === undefined) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = previous;
   }
+});
+
+test("Bridge: 登录后云端模型优先，auth IPC 只返回脱敏状态", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-cloud-auth-"));
+  let status: CloudAuthStatus = {
+    state: "signed_in",
+    signedIn: true,
+    user: { id: "user-1", email: "user@example.com" },
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    accessToken: "must-never-cross-ipc",
+    refreshToken: "must-never-cross-ipc",
+  } as CloudAuthStatus;
+  let failSignIn = false;
+  let closed = 0;
+  const cloudAuth: NonNullable<BridgeOptions["cloudAuth"]> = {
+    attachBroker(_broker: CredentialBroker) {},
+    status: () => status,
+    async signIn() {
+      if (failSignIn) {
+        throw Object.assign(new Error("upstream leaked super-secret-token"), {
+          code: "temporarily_unavailable",
+        });
+      }
+      return status;
+    },
+    async signOut() {
+      status = { state: "signed_out", signedIn: false };
+      return status;
+    },
+    close() {
+      closed++;
+    },
+  };
+  const bridge = new Bridge({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile: path.join(dir, "plugins.json"),
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    env: memoryCredentialEnv(),
+    isTrustedSender: () => true,
+    defaultModel: "custom/local-model",
+    cloudDefaultModel: "anicode-cloud/deepseek-v4-flash",
+    cloudAuth,
+  });
+  const { ipcMain, invoke } = fakeIpc();
+  bridge.register(ipcMain);
+  const sender = new FakeSender();
+  try {
+    const info = (await invoke("app:info", sender)) as { defaultModel: string };
+    assert.equal(info.defaultModel, "anicode-cloud/deepseek-v4-flash");
+
+    const auth = (await invoke("auth:status", sender)) as CloudAuthStatus;
+    assert.deepEqual(auth, {
+      state: "signed_in",
+      signedIn: true,
+      user: { id: "user-1", email: "user@example.com" },
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    assert.doesNotMatch(JSON.stringify(auth), /access|refresh|token|secret/iu);
+
+    failSignIn = true;
+    await assert.rejects(
+      () => invoke("auth:signIn", sender, "user@example.com", "correct-password"),
+      (error: Error) => {
+        assert.match(error.message, /AniCode Cloud/iu);
+        assert.doesNotMatch(error.message, /super-secret-token/iu);
+        return true;
+      },
+    );
+
+    await invoke("auth:signOut", sender);
+    const signedOutInfo = (await invoke("app:info", sender)) as { defaultModel: string };
+    assert.equal(signedOutInfo.defaultModel, "custom/local-model");
+  } finally {
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+  assert.equal(closed, 1);
 });
 
 test("Bridge: deleteSession 从列表移除会话", async () => {

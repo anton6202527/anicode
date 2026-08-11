@@ -27,3 +27,16 @@ test("Chan: 等待中的 reader 会被 push 和 close 唤醒", async () => {
   queueMicrotask(() => chan.close());
   assert.deepEqual(await end, { value: undefined, done: true });
 });
+
+test("Chan: 大批缓冲事件保持顺序且全部 drain", async () => {
+  const chan = new Chan<number>();
+  const count = 20_000;
+  for (let index = 0; index < count; index++) chan.push(index);
+  chan.close();
+
+  const received: number[] = [];
+  for await (const value of chan) received.push(value);
+  assert.equal(received.length, count);
+  assert.equal(received[0], 0);
+  assert.equal(received[count - 1], count - 1);
+});

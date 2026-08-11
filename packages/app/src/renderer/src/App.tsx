@@ -1,7 +1,13 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import type { ProviderDescriptor, SessionSummary } from "@anicode/core";
 import { t } from "@anicode/core/i18n";
-import type { AppInfo, ModelRow, PluginEntry, UserModel } from "../../shared/api.js";
+import type {
+  AppInfo,
+  CloudAuthStatus,
+  ModelRow,
+  PluginEntry,
+  UserModel,
+} from "../../shared/api.js";
 import { Sidebar, type View } from "./components/Sidebar.js";
 import { ChatView } from "./components/ChatView.js";
 import { Composer } from "./components/Composer.js";
@@ -30,6 +36,7 @@ export function App() {
   const [view, setView] = useState<View>("chat");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
+  const [cloudAuth, setCloudAuth] = useState<CloudAuthStatus | null>(null);
 
   const { state, answerPermission } = useSession(currentId);
 
@@ -64,12 +71,13 @@ export function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [info, cat, provs, plugs, ums] = await Promise.all([
+        const [info, cat, provs, plugs, ums, auth] = await Promise.all([
           window.anicode.appInfo(),
           window.anicode.listModelCatalog(),
           window.anicode.listProviders(),
           window.anicode.listPlugins(),
           window.anicode.listUserModels(),
+          window.anicode.authStatus(),
         ]);
         if (cancelled) return;
         setAppInfo(info);
@@ -77,6 +85,7 @@ export function App() {
         setProviders(provs);
         setPlugins(plugs);
         setUserModels(ums);
+        setCloudAuth(auth);
         setCurrentModel(info.defaultModel);
         const meta = await window.anicode.createSession({
           cwd: info.cwd,
@@ -93,6 +102,24 @@ export function App() {
       cancelled = true;
     };
   }, [refreshSessions]);
+
+  // Refresh the server-owned auth state whenever settings is opened. This lets an expired or
+  // remotely revoked refresh session surface as signed out without exposing any token to React.
+  useEffect(() => {
+    if (view !== "settings") return;
+    let cancelled = false;
+    void window.anicode
+      .authStatus()
+      .then((status) => {
+        if (!cancelled) setCloudAuth(status);
+      })
+      .catch((err) => {
+        if (!cancelled) setBanner(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [view]);
 
   const sendAndMaybeTitle = useCallback(
     (id: string, text: string, isFirst: boolean) => {
@@ -173,7 +200,66 @@ export function App() {
     setUserModels(await window.anicode.listUserModels());
   }, []);
 
-  const modelLabel = catalog.find((r) => r.spec === currentModel)?.label ?? currentModel;
+  const onCloudSignIn = useCallback(
+    async (email: string, password: string): Promise<void> => {
+      const auth = await window.anicode.authSignIn(email, password);
+      const [info, rows] = await Promise.all([
+        window.anicode.appInfo(),
+        window.anicode.listModelCatalog(),
+      ]);
+      setCloudAuth(auth);
+      setAppInfo(info);
+      setCatalog(rows);
+      setCurrentModel(info.defaultModel);
+      const meta = await window.anicode.createSession({ cwd: info.cwd, model: info.defaultModel });
+      setCurrentId(meta.id);
+      setView("chat");
+      void refreshSessions();
+    },
+    [refreshSessions],
+  );
+
+  const onCloudSignOut = useCallback(async (): Promise<void> => {
+    const auth = await window.anicode.authSignOut();
+    const [info, rows] = await Promise.all([
+      window.anicode.appInfo(),
+      window.anicode.listModelCatalog(),
+    ]);
+    setCloudAuth(auth);
+    setAppInfo(info);
+    setCatalog(rows);
+    if (currentModel.startsWith("anicode-cloud/")) void startSession(info.defaultModel);
+  }, [currentModel, startSession]);
+
+  const modelLabel = useMemo(
+    () => catalog.find((r) => r.spec === currentModel)?.label ?? currentModel,
+    [catalog, currentModel],
+  );
+  const onNewSession = useCallback(() => {
+    void startSession(currentModel);
+  }, [currentModel, startSession]);
+  const onSelectSessionId = useCallback(
+    (id: string) => {
+      const session = sessions.find((candidate) => candidate.id === id);
+      if (session) onSelectSession(session);
+    },
+    [onSelectSession, sessions],
+  );
+  const onDeleteSessionId = useCallback(
+    (id: string) => {
+      void onDeleteSession(id);
+    },
+    [onDeleteSession],
+  );
+  const openModelPicker = useCallback(() => setPickerOpen(true), []);
+  const closeModelPicker = useCallback(() => setPickerOpen(false), []);
+  const pickModel = useCallback(
+    (spec: string) => {
+      setPickerOpen(false);
+      void startSession(spec);
+    },
+    [startSession],
+  );
 
   return (
     <div className="app">
@@ -181,12 +267,9 @@ export function App() {
         sessions={sessions}
         currentId={currentId}
         view={view}
-        onNew={() => void startSession(currentModel)}
-        onSelect={(id) => {
-          const s = sessions.find((x) => x.id === id);
-          if (s) onSelectSession(s);
-        }}
-        onDelete={(id) => void onDeleteSession(id)}
+        onNew={onNewSession}
+        onSelect={onSelectSessionId}
+        onDelete={onDeleteSessionId}
         onNavigate={setView}
       />
 
@@ -206,7 +289,7 @@ export function App() {
               disabled={!appInfo}
               onSend={onSend}
               onInterrupt={onInterrupt}
-              onOpenModelPicker={() => setPickerOpen(true)}
+              onOpenModelPicker={openModelPicker}
             />
           </>
         ) : null}
@@ -221,6 +304,9 @@ export function App() {
             providers={providers}
             model={currentModel}
             userModels={userModels}
+            cloudAuth={cloudAuth}
+            onCloudSignIn={onCloudSignIn}
+            onCloudSignOut={onCloudSignOut}
             onAddUserModel={onAddUserModel}
             onRemoveUserModel={onRemoveUserModel}
           />
@@ -231,22 +317,22 @@ export function App() {
         <ModelPicker
           rows={catalog}
           currentSpec={currentModel}
-          onPick={(spec) => {
-            setPickerOpen(false);
-            void startSession(spec);
-          }}
-          onClose={() => setPickerOpen(false)}
+          onPick={pickModel}
+          onClose={closeModelPicker}
         />
       ) : null}
     </div>
   );
 }
 
-function SettingsView({
+const SettingsView = React.memo(function SettingsView({
   info,
   providers,
   model,
   userModels,
+  cloudAuth,
+  onCloudSignIn,
+  onCloudSignOut,
   onAddUserModel,
   onRemoveUserModel,
 }: {
@@ -254,6 +340,9 @@ function SettingsView({
   providers: ProviderDescriptor[];
   model: string;
   userModels: UserModel[];
+  cloudAuth: CloudAuthStatus | null;
+  onCloudSignIn: (email: string, password: string) => Promise<void>;
+  onCloudSignOut: () => Promise<void>;
   onAddUserModel: (model: UserModel) => Promise<void>;
   onRemoveUserModel: (spec: string) => Promise<void>;
 }) {
@@ -266,6 +355,7 @@ function SettingsView({
         onAdd={onAddUserModel}
         onRemove={onRemoveUserModel}
       />
+      <CloudAccount status={cloudAuth} onSignIn={onCloudSignIn} onSignOut={onCloudSignOut} />
       <section className="settings-card">
         <h2>{t("Application", "应用")}</h2>
         <dl>
@@ -283,8 +373,8 @@ function SettingsView({
         <h2>{t("Provider credentials", "Provider 凭证")}</h2>
         <p className="settings-note">
           {t(
-            "Credentials are injected via environment variables and not stored in the app. Providers missing credentials are marked unavailable in the model picker.",
-            "凭证通过环境变量注入，不在应用内保存。缺少凭证的 provider 在模型选择器里会标为不可用。",
+            "AniCode Cloud uses your signed-in Supabase session; the shared DeepSeek key stays on the server. Personal provider keys use environment variables or the OS credential store.",
+            "AniCode Cloud 使用 Supabase 登录会话，共享 DeepSeek Key 始终留在服务端；个人 Provider Key 通过环境变量或系统凭证库存放。",
           )}
         </p>
         <table className="prov-table">
@@ -301,9 +391,11 @@ function SettingsView({
                 <td>{p.name}</td>
                 <td>{p.local ? t("Local", "本地") : t("Cloud", "云端")}</td>
                 <td>
-                  {p.requiresApiKey
-                    ? p.apiKeyEnv.join(" / ") || "—"
-                    : t("No key needed", "无需 key")}
+                  {p.id === "anicode-cloud"
+                    ? t("Supabase account", "Supabase 登录")
+                    : p.requiresApiKey
+                      ? p.apiKeyEnv.join(" / ") || "—"
+                      : t("No key needed", "无需 key")}
                 </td>
               </tr>
             ))}
@@ -312,7 +404,109 @@ function SettingsView({
       </section>
     </div>
   );
-}
+});
+
+const CloudAccount = React.memo(function CloudAccount({
+  status,
+  onSignIn,
+  onSignOut,
+}: {
+  status: CloudAuthStatus | null;
+  onSignIn: (email: string, password: string) => Promise<void>;
+  onSignOut: () => Promise<void>;
+}) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onSignIn(email, password);
+      setPassword("");
+    } catch (err) {
+      setError(errorMessage(err));
+      setPassword("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const logout = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onSignOut();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="settings-card">
+      <h2>{t("AniCode Cloud", "AniCode Cloud")}</h2>
+      <p className="settings-note">
+        {t(
+          "Sign in to use the shared DeepSeek quota on any device. Only the refresh session is kept in the OS credential store; the DeepSeek key never reaches this app.",
+          "登录后可在任意设备使用共享 DeepSeek 额度。系统凭证库只保存刷新会话，DeepSeek Key 不会下发到本应用。",
+        )}
+      </p>
+      {status?.signedIn ? (
+        <div className="cloud-account-row">
+          <div>
+            <strong>{status.user?.email ?? t("Signed in", "已登录")}</strong>
+            <div className="settings-note">{t("Hosted quota enabled", "已启用托管额度")}</div>
+          </div>
+          <button className="btn" disabled={busy} onClick={() => void logout()}>
+            {busy ? t("Signing out…", "正在退出…") : t("Sign out", "退出登录")}
+          </button>
+        </div>
+      ) : (
+        <div className="cloud-auth-form">
+          <input
+            className="mf-input grow"
+            type="email"
+            autoComplete="email"
+            placeholder={t("Supabase account email", "Supabase 账号邮箱")}
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+          />
+          <input
+            className="mf-input grow"
+            type="password"
+            autoComplete="current-password"
+            placeholder={t("Password", "密码")}
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !busy) void submit();
+            }}
+          />
+          <button
+            className="btn allow"
+            disabled={busy || !email || !password}
+            onClick={() => void submit()}
+          >
+            {busy ? t("Signing in…", "正在登录…") : t("Sign in", "登录")}
+          </button>
+        </div>
+      )}
+      {status?.state === "configured" ? (
+        <div className="settings-note">
+          {t(
+            "A saved session exists but could not be refreshed. Check the network and sign in again if needed.",
+            "检测到已保存会话，但暂时无法刷新；请检查网络，必要时重新登录。",
+          )}
+        </div>
+      ) : null}
+      {error ? <div className="mf-error">{error}</div> : null}
+    </section>
+  );
+});
 
 function CustomModels({
   providers,

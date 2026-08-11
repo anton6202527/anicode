@@ -12,3 +12,5 @@ coverage/
 .anicode-dev/
 .anicode/
 *.vsix
+supabase/.branches/
+supabase/.temp/

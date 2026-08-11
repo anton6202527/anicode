@@ -31,6 +31,7 @@ import {
   boundTranscriptRows,
   composerCaretPosition,
   composerLayout,
+  coalesceSessionEventsForRender,
   dispWidth,
   inputView,
   InputPanel,
@@ -78,6 +79,36 @@ const zeroUsage = {
   cacheReadTokens: 0,
   cacheWriteTokens: 0,
 };
+
+test("TUI stream batching: adjacent token deltas merge without crossing event boundaries", () => {
+  const stateEvent: SessionEvent = { type: "state", running: true };
+  assert.deepEqual(
+    coalesceSessionEventsForRender([
+      { type: "agent", event: { type: "thinking", text: "先" } },
+      { type: "agent", event: { type: "thinking", text: "想" } },
+      stateEvent,
+      { type: "agent", event: { type: "text", text: "答" } },
+      { type: "agent", event: { type: "text", text: "案" } },
+      {
+        type: "agent",
+        event: { type: "tool_input_delta", id: "tool", name: "read", delta: '{"path":' },
+      },
+      {
+        type: "agent",
+        event: { type: "tool_input_delta", id: "tool", name: "read", delta: '"x"}' },
+      },
+    ]),
+    [
+      { type: "agent", event: { type: "thinking", text: "先想" } },
+      stateEvent,
+      { type: "agent", event: { type: "text", text: "答案" } },
+      {
+        type: "agent",
+        event: { type: "tool_input_delta", id: "tool", name: "read", delta: '{"path":"x"}' },
+      },
+    ],
+  );
+});
 
 function offlineHost(
   options: {
@@ -346,7 +377,7 @@ test("TUI: 键入 → 授权 → 文件落盘 → 渲染（走 SessionHost）", 
   assert.doesNotMatch(frame, /⚙\s+write/);
   assert.match(frame, /\d+\/\d+ tokens/);
 
-  host.dispose();
+  await host.dispose();
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -392,7 +423,7 @@ test("TUI: 工具被拒绝后以最终状态追加，不被错误结果覆盖", 
   await assert.rejects(fs.access(path.join(dir, "blocked.txt")));
 
   view.unmount();
-  host.dispose();
+  await host.dispose();
   await fs.rm(dir, { recursive: true, force: true });
 });
 

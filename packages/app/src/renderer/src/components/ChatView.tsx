@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useMemo, useRef } from "react";
 import { t } from "@anicode/core/i18n";
 import type { ChatState, PendingPerm } from "../useSession.js";
 import type { Item } from "../transcript.js";
@@ -12,24 +12,55 @@ interface Props {
   ) => void;
 }
 
-export function ChatView({ state, onAnswerPermission }: Props) {
-  const endRef = useRef<HTMLDivElement>(null);
-  const activeTools = [...state.activeTools.values()];
+export const ChatView = React.memo(function ChatView({ state, onAnswerPermission }: Props) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const activeTools = useMemo(() => [...state.activeTools.values()], [state.activeTools]);
 
+  // A newly opened transcript should start at its latest message, regardless of where the user
+  // had scrolled in the previous session.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [state.items.length, state.liveText, activeTools.length, state.pendings.length]);
+    stickToBottomRef.current = true;
+  }, [state.meta?.id]);
+
+  // Coalesce scrolling with paint and never enqueue overlapping smooth-scroll animations while
+  // tokens stream. If the user scrolls up, preserve their reading position until they return near
+  // the bottom.
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const element = scrollRef.current;
+    if (!element) return;
+    const frameId = window.requestAnimationFrame(() => {
+      if (stickToBottomRef.current && scrollRef.current === element) {
+        element.scrollTop = element.scrollHeight;
+      }
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    state.items.length,
+    state.liveText.length,
+    activeTools.length,
+    state.todos,
+    state.pendings.length,
+    state.running,
+    state.meta?.id,
+  ]);
+
+  const onScroll = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+    stickToBottomRef.current = distanceFromBottom <= 96;
+  }, []);
 
   const empty =
     state.items.length === 0 && !state.liveText && activeTools.length === 0 && !state.opening;
 
   return (
-    <div className="chat-scroll">
+    <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
       <div className="chat-inner">
         {empty ? <EmptyState /> : null}
-        {state.items.map((item, i) => (
-          <ItemRow key={i} item={item} />
-        ))}
+        <TranscriptItems items={state.items} />
         {state.liveText ? <Bubble role="assistant" text={state.liveText} streaming /> : null}
         {activeTools.map((tool) => (
           <ToolRow key={tool.id} item={tool} />
@@ -45,13 +76,24 @@ export function ChatView({ state, onAnswerPermission }: Props) {
         {state.running && !state.liveText && activeTools.length === 0 ? (
           <div className="thinking">● {t("Thinking…", "思考中…")}</div>
         ) : null}
-        <div ref={endRef} />
       </div>
     </div>
   );
-}
+});
 
-function EmptyState() {
+/** The items array is append-only between semantic events, so streaming frames can skip walking
+ * and reconciling the entire transcript rather than only skipping each individual row render. */
+const TranscriptItems = React.memo(function TranscriptItems({ items }: { items: Item[] }) {
+  return (
+    <>
+      {items.map((item, index) => (
+        <ItemRow key={index} item={item} />
+      ))}
+    </>
+  );
+});
+
+const EmptyState = React.memo(function EmptyState() {
   return (
     <div className="empty">
       <div className="empty-logo">◆</div>
@@ -64,9 +106,9 @@ function EmptyState() {
       </p>
     </div>
   );
-}
+});
 
-function ItemRow({ item }: { item: Item }) {
+const ItemRow = React.memo(function ItemRow({ item }: { item: Item }) {
   switch (item.kind) {
     case "user":
       return <Bubble role="user" text={item.text} />;
@@ -75,13 +117,13 @@ function ItemRow({ item }: { item: Item }) {
     case "tool":
       return <ToolRow item={item} />;
     case "info":
-      return <div className="notice">{item.text}</div>;
+      return <div className="notice chat-history-item">{item.text}</div>;
     case "error":
-      return <div className="notice error">✖ {item.text}</div>;
+      return <div className="notice error chat-history-item">✖ {item.text}</div>;
   }
-}
+});
 
-function Bubble({
+const Bubble = React.memo(function Bubble({
   role,
   text,
   streaming,
@@ -91,30 +133,32 @@ function Bubble({
   streaming?: boolean;
 }) {
   return (
-    <div className={`row ${role}`}>
+    <div className={`row ${role}${streaming ? " streaming" : " chat-history-item"}`}>
       <div className="avatar">{role === "user" ? t("You", "你") : "◆"}</div>
       <div className="bubble">
-        {role === "assistant" ? <Markdown text={text} /> : text}
+        {role === "assistant" && !streaming ? <Markdown text={text} /> : text}
         {streaming ? <span className="caret" /> : null}
       </div>
     </div>
   );
-}
+});
 
-function ToolRow({ item }: { item: Extract<Item, { kind: "tool" }> }) {
+const ToolRow = React.memo(function ToolRow({ item }: { item: Extract<Item, { kind: "tool" }> }) {
   const mark =
     item.status === "run" ? "⚙" : item.status === "ok" ? "✔" : item.status === "deny" ? "⊘" : "✖";
   return (
-    <div className={`tool status-${item.status}`}>
+    <div
+      className={`tool status-${item.status}${item.status === "run" ? "" : " chat-history-item"}`}
+    >
       <span className="tool-mark">{mark}</span>
       <span className="tool-name">{item.name}</span>
       <span className="tool-key">{item.ruleKey}</span>
       {item.detail ? <span className="tool-detail">— {item.detail}</span> : null}
     </div>
   );
-}
+});
 
-function TodoCard({ todos }: { todos: ChatState["todos"] }) {
+const TodoCard = React.memo(function TodoCard({ todos }: { todos: ChatState["todos"] }) {
   return (
     <div className="todo-card">
       <div className="todo-title">{t("Task list", "任务清单")}</div>
@@ -129,9 +173,9 @@ function TodoCard({ todos }: { todos: ChatState["todos"] }) {
       })}
     </div>
   );
-}
+});
 
-function PermissionCard({
+const PermissionCard = React.memo(function PermissionCard({
   pending,
   onAnswer,
   extra,
@@ -186,4 +230,4 @@ function PermissionCard({
       </div>
     </div>
   );
-}
+});

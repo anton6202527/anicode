@@ -239,11 +239,11 @@ test("registry: model profile 解析 capabilities/limits，未列出的模型继
   assert.equal(unlisted.modelInfo.limits.contextWindow, 1_000_000);
 });
 
-test("registry: details/diagnostics 只暴露安全元数据，支持 env 端点诊断", () => {
+test("registry: details/diagnostics 只暴露安全元数据，支持 HTTPS env 端点诊断", () => {
   const oldKey = process.env["DEEPSEEK_API_KEY"];
   const oldBase = process.env["DEEPSEEK_BASE_URL"];
   process.env["DEEPSEEK_API_KEY"] = "never-appear-in-details";
-  process.env["DEEPSEEK_BASE_URL"] = "http://127.0.0.1:43210/v1";
+  process.env["DEEPSEEK_BASE_URL"] = "https://deepseek-proxy.example.test/v1";
   try {
     const details = listProviderDetails();
     const deepseek = details.find((item) => item.id === "deepseek");
@@ -252,11 +252,12 @@ test("registry: details/diagnostics 只暴露安全元数据，支持 env 端点
     assert.equal(JSON.stringify(details).includes("never-appear-in-details"), false);
 
     const diagnosis = diagnoseProvider("deepseek/deepseek-chat");
-    assert.equal(diagnosis.baseURL, "http://127.0.0.1:43210/v1");
+    assert.equal(diagnosis.baseURL, "https://deepseek-proxy.example.test/v1");
     assert.equal(diagnosis.baseURLSource, "environment");
     assert.equal(diagnosis.credentialEnv, "DEEPSEEK_API_KEY");
     assert.equal(diagnosis.hasCredentials, true);
     assert.equal(JSON.stringify(diagnosis).includes("never-appear-in-details"), false);
+    assert.deepEqual(diagnosis.warnings, []);
 
     const debug = diagnoseProvider("debug/demo");
     assert.deepEqual(debug.warnings, []);
@@ -266,6 +267,33 @@ test("registry: details/diagnostics 只暴露安全元数据，支持 env 端点
     if (oldBase === undefined) delete process.env["DEEPSEEK_BASE_URL"];
     else process.env["DEEPSEEK_BASE_URL"] = oldBase;
   }
+});
+
+test("registry: DeepSeek HTTPS policy rejects before opening a configured credential", async () => {
+  const backend = new CountingProviderSecretBackend();
+  const broker = new CredentialBroker();
+  broker.registerReference({
+    id: "env:DEEPSEEK_API_KEY",
+    backend,
+    scopes: credentialScopesForEnvironment("DEEPSEEK_API_KEY"),
+  });
+  const registry = bindProviderRegistry({
+    broker,
+    environment: { DEEPSEEK_BASE_URL: "http://api.deepseek.com/v1" },
+    allowEnvironmentFallback: false,
+  });
+
+  const diagnostics = registry.diagnoseProvider("deepseek/deepseek-chat");
+  assert.equal(diagnostics.baseURL, "http://api.deepseek.com/v1");
+  assert.equal(diagnostics.baseURLSource, "environment");
+  assert.match(diagnostics.warnings.join("\n"), /HTTPS/u);
+  assert.equal(backend.reads, 0);
+  assert.throws(() => registry.resolveProvider("deepseek/deepseek-chat"), /HTTPS/u);
+  assert.equal(backend.reads, 0);
+  await assert.rejects(registry.resolveProviderAsync("deepseek/deepseek-chat"), /HTTPS/u);
+  assert.equal(backend.reads, 0);
+  assert.equal(await registry.discoverModels("deepseek"), undefined);
+  assert.equal(backend.reads, 0);
 });
 
 test("registry: diagnostics/default model 不读取 configured reference，createProvider 才读取一次", () => {
@@ -395,6 +423,176 @@ test("registry: 可注册 OpenAI-compatible profile 与 alias", () => {
   assert.equal(resolved.modelInfo.limits.maxOutputTokens, 512);
   assert.equal(resolved.diagnostics?.hasCredentials, true);
   assert.deepEqual(resolved.diagnostics?.warnings, []);
+});
+
+test("registry: host fetchFactory 同时承载 chat completions 与 /models discovery", async () => {
+  const requests: Array<{ marker: string; url: string; authorization: string | null }> = [];
+  let proxyRequests = 0;
+  let fallbackRequests = 0;
+  const proxy = new NetworkProxy({
+    policy: { allowDomains: ["host-fetch.example.test"], allowPorts: [443] },
+    resolver: async () => ["93.184.216.34"],
+    fetch: (async () => {
+      proxyRequests++;
+      throw new Error("NetworkProxy must not run when fetchFactory is registered");
+    }) as typeof fetch,
+  });
+  const fallbackFetch = (async () => {
+    fallbackRequests++;
+    throw new Error("discovery fallback fetch must not run for a non-loopback factory endpoint");
+  }) as typeof fetch;
+  registerOpenAICompatibleProvider({
+    id: "host-fetch-factory-fixture",
+    baseURL: "https://host-fetch.example.test/v1",
+    apiKey: "factory-static-key",
+    fetchFactory: (bindings) => {
+      const marker = bindings.environment?.["ANICODE_HOST_FETCH_MARKER"] ?? "";
+      assert.ok(marker === "without-proxy" || marker === "with-proxy");
+      if (marker === "with-proxy") assert.equal(bindings.networkProxy, proxy);
+      else assert.equal(bindings.networkProxy, undefined);
+      return (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+        const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+        requests.push({ marker, url, authorization: headers.get("authorization") });
+        if (url.endsWith("/models")) {
+          return Response.json({ data: [{ id: "factory-live-model" }] });
+        }
+        assert.ok(url.endsWith("/chat/completions"));
+        return new Response(
+          `data: ${JSON.stringify({
+            choices: [{ index: 0, delta: { content: "factory-ok" }, finish_reason: null }],
+          })}\n\ndata: ${JSON.stringify({
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          })}\n\ndata: [DONE]\n\n`,
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }) as typeof fetch;
+    },
+  });
+  const withoutProxy = bindProviderRegistry({
+    environment: { ANICODE_HOST_FETCH_MARKER: "without-proxy" },
+  });
+  const withProxy = bindProviderRegistry({
+    environment: { ANICODE_HOST_FETCH_MARKER: "with-proxy" },
+    networkProxy: proxy,
+  });
+
+  try {
+    assert.deepEqual(
+      await withoutProxy.discoverModels("host-fetch-factory-fixture", 2_000, fallbackFetch),
+      ["factory-live-model"],
+    );
+    assert.deepEqual(
+      await withProxy.discoverModels("host-fetch-factory-fixture", 2_000, fallbackFetch),
+      ["factory-live-model"],
+    );
+    const resolved = withProxy.resolveProvider("host-fetch-factory-fixture/model");
+    let sawText = false;
+    for await (const event of resolved.provider.stream({ model: resolved.model, messages: [] })) {
+      if (event.type === "text_delta" && event.text === "factory-ok") sawText = true;
+    }
+    assert.equal(sawText, true);
+    assert.deepEqual(requests, [
+      {
+        marker: "without-proxy",
+        url: "https://host-fetch.example.test/v1/models",
+        authorization: "Bearer factory-static-key",
+      },
+      {
+        marker: "with-proxy",
+        url: "https://host-fetch.example.test/v1/models",
+        authorization: "Bearer factory-static-key",
+      },
+      {
+        marker: "with-proxy",
+        url: "https://host-fetch.example.test/v1/chat/completions",
+        authorization: "Bearer factory-static-key",
+      },
+    ]);
+    assert.equal(proxyRequests, 0);
+    assert.equal(fallbackRequests, 0);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("registry: requireHttps blocks default endpoint before credential and fetch factories", async () => {
+  let credentialReads = 0;
+  const readCredential = (key: string): string | undefined => {
+    credentialReads++;
+    return key === "env:CUSTOM_OPENAI_API_KEY" ? "insecure-endpoint-secret" : undefined;
+  };
+  const backend: SyncSecretBackend = {
+    kind: "https-required-counting-backend",
+    getSync: readCredential,
+    putSync: () => undefined,
+    deleteSync: () => false,
+    get: async (key) => readCredential(key),
+    put: async () => undefined,
+    delete: async () => false,
+  };
+  const broker = new CredentialBroker();
+  broker.registerReference({
+    id: "env:CUSTOM_OPENAI_API_KEY",
+    backend,
+    scopes: credentialScopesForEnvironment("CUSTOM_OPENAI_API_KEY"),
+  });
+  let fetchFactoryCalls = 0;
+  let factoryRequests = 0;
+  let proxyRequests = 0;
+  let fallbackRequests = 0;
+  const proxy = new NetworkProxy({
+    policy: { allowDomains: ["insecure.example.test"], allowPorts: [80] },
+    resolver: async () => ["93.184.216.34"],
+    fetch: (async () => {
+      proxyRequests++;
+      throw new Error("insecure endpoint must not reach NetworkProxy");
+    }) as typeof fetch,
+  });
+  const fallbackFetch = (async () => {
+    fallbackRequests++;
+    throw new Error("insecure endpoint must not reach fallback fetch");
+  }) as typeof fetch;
+  registerOpenAICompatibleProvider({
+    id: "https-required-fixture",
+    baseURL: "http://insecure.example.test/v1",
+    apiKeyEnv: "CUSTOM_OPENAI_API_KEY",
+    requireHttps: true,
+    fetchFactory: () => {
+      fetchFactoryCalls++;
+      return (async () => {
+        factoryRequests++;
+        throw new Error("insecure endpoint must not issue a request");
+      }) as typeof fetch;
+    },
+  });
+  const registry = bindProviderRegistry({
+    broker,
+    networkProxy: proxy,
+    environment: {},
+    allowEnvironmentFallback: false,
+  });
+
+  try {
+    const diagnostics = registry.diagnoseProvider("https-required-fixture/model");
+    assert.equal(diagnostics.baseURL, "http://insecure.example.test/v1");
+    assert.equal(diagnostics.baseURLSource, "default");
+    assert.match(diagnostics.warnings.join("\n"), /HTTPS/u);
+    assert.throws(() => registry.resolveProvider("https-required-fixture/model"), /HTTPS/u);
+    await assert.rejects(registry.resolveProviderAsync("https-required-fixture/model"), /HTTPS/u);
+    assert.equal(
+      await registry.discoverModels("https-required-fixture", 2_000, fallbackFetch),
+      undefined,
+    );
+    assert.equal(credentialReads, 0);
+    assert.equal(fetchFactoryCalls, 0);
+    assert.equal(factoryRequests, 0);
+    assert.equal(proxyRequests, 0);
+    assert.equal(fallbackRequests, 0);
+  } finally {
+    await proxy.close();
+  }
 });
 
 test("registry: local 标记被改到公网端点时仍强制经过统一网络策略", async () => {

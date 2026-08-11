@@ -140,6 +140,72 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
+test("connectMcpServers: independent handshakes start concurrently and preserve config order", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-parallel-"));
+  const marker = path.join(directory, "started.txt");
+  const barrierServer = String.raw`
+const { appendFileSync, readFileSync } = require("node:fs");
+const marker = process.argv[1];
+const name = process.argv[2];
+appendFileSync(marker, name + "\n", { mode: 0o600 });
+let buffer = "";
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+const bothStarted = () => {
+  try { return readFileSync(marker, "utf8").trim().split(/\n/).length >= 2; }
+  catch { return false; }
+};
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf8");
+  let newline;
+  while ((newline = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, newline).trim();
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "server/discover") {
+      const wait = () => {
+        if (!bothStarted()) return setTimeout(wait, 5);
+        send({ jsonrpc: "2.0", id: message.id, result: {
+          resultType: "complete",
+          supportedVersions: ["2026-07-28"],
+          capabilities: { tools: {} }
+        }});
+      };
+      wait();
+    } else if (message.method === "tools/list") {
+      send({ jsonrpc: "2.0", id: message.id, result: {
+        resultType: "complete",
+        tools: [{ name: "ping", description: name, inputSchema: { type: "object" } }]
+      }});
+    }
+  }
+});
+`;
+  let clients: Awaited<ReturnType<typeof connectMcpServers>>["clients"] = [];
+  try {
+    const connected = await connectMcpServers(
+      ["first", "second"].map((name) => ({
+        name,
+        command: process.execPath,
+        args: ["-e", barrierServer, marker, name],
+        timeoutMs: 2_000,
+      })),
+    );
+    clients = connected.clients;
+    assert.deepEqual(
+      connected.clients.map((client) => client.name),
+      ["first", "second"],
+    );
+    assert.deepEqual(
+      connected.tools.map((tool) => tool.def.name),
+      ["first__ping", "second__ping"],
+    );
+  } finally {
+    await Promise.allSettled(clients.map((client) => client.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("MCP(HTTP legacy): discover 失败后回退握手并维持 session", async () => {
   const seenSession: string[] = [];
   const seenAuthorization: string[] = [];

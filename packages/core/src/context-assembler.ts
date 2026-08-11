@@ -4,7 +4,8 @@
  *
  * 把「拼进 system 的各段上下文」从命令式串行代码变成有序的 provider 管线：
  * 新增上下文源 = 新增一个 ContextProvider + 一行注册，不再编辑 ensureMemory。
- * provider 顺序即注入顺序 —— 与 v1 的 sections.push 顺序逐字节一致（缓存友好）。
+ * 纯采集 provider 并发执行，显式 serial provider 充当副作用栅栏；结果仍按注册顺序注入，
+ * 与 v1 的 sections.push 顺序逐字节一致（缓存友好）。
  *
  * 错误语义与 v1 对齐：env / repo map 采集失败静默跳过（provider 内部吞掉），
  * 其余 provider 的异常照常向上抛 —— assembler 本身不兜错，避免掩盖真实故障。
@@ -47,6 +48,13 @@ export interface ContextContribution {
 
 export interface ContextProvider {
   readonly id: string;
+  /**
+   * A serial provider is an ordering fence: all earlier providers finish before it starts, and
+   * later providers wait for it. Use this only for providers with observable side effects or
+   * lifecycle ordering requirements. Pure filesystem/context collectors run concurrently while
+   * their contributions are still returned in registration order.
+   */
+  readonly serial?: boolean;
   /** 返回要拼进 system 的一段；null 表示本次无贡献。 */
   contribute(ctx: ContextProviderCtx): Promise<string | null>;
 }
@@ -56,12 +64,34 @@ export class ContextAssembler {
 
   /** 保留 provider 身份，供 Context Compiler 做来源追踪、预算与去重。 */
   async collectContributions(ctx: ContextProviderCtx): Promise<ContextContribution[]> {
-    const contributions: ContextContribution[] = [];
-    for (const p of this.providers) {
-      const content = await p.contribute(ctx);
-      if (content) contributions.push({ id: p.id, content });
+    const slots: Array<ContextContribution | null> = new Array(this.providers.length).fill(null);
+    let parallel: Promise<void>[] = [];
+    const flushParallel = async (): Promise<void> => {
+      if (parallel.length === 0) return;
+      const pending = parallel;
+      parallel = [];
+      const settled = await Promise.allSettled(pending);
+      const failure = settled.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failure) throw failure.reason;
+    };
+
+    for (let index = 0; index < this.providers.length; index++) {
+      const provider = this.providers[index]!;
+      const collect = async (): Promise<void> => {
+        const content = await provider.contribute(ctx);
+        if (content) slots[index] = { id: provider.id, content };
+      };
+      if (provider.serial) {
+        await flushParallel();
+        await collect();
+      } else {
+        parallel.push(collect());
+      }
     }
-    return contributions;
+    await flushParallel();
+    return slots.filter((item): item is ContextContribution => item !== null);
   }
 
   /** 按注册顺序执行全部 provider，收集非空贡献段。 */
@@ -120,6 +150,8 @@ export function repoMapProvider(opt: boolean | RepoMapOptions): ContextProvider 
 export function skillsProvider(opt: SkillsOption): ContextProvider {
   return {
     id: "skills",
+    // Registers a tool and mutates the permission engine's read-only set.
+    serial: true,
     async contribute({ cwd, tools, markReadOnly }) {
       const o = typeof opt === "object" ? opt : {};
       const extraDirs = o.dirs ?? [];
@@ -158,6 +190,8 @@ export function browserUsageProvider(): ContextProvider {
 export function sessionStartHookProvider(hooks: HookRunner): ContextProvider {
   return {
     id: "session-start-hook",
+    // SessionStart is a lifecycle boundary and may execute user-provided hook code.
+    serial: true,
     async contribute({ cwd }) {
       if (!hooks.has("SessionStart")) return null;
       const h = await hooks.run({ event: "SessionStart", cwd });

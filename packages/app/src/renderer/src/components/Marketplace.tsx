@@ -14,7 +14,7 @@ const CATEGORY_LABEL: Record<PluginCategory | "all", string> = {
   skill: t("Skills", "技能"),
 };
 
-export function Marketplace({ plugins, onToggle }: Props) {
+export const Marketplace = React.memo(function Marketplace({ plugins, onToggle }: Props) {
   const [filter, setFilter] = useState<PluginCategory | "all">("all");
 
   const shown = useMemo(
@@ -127,4 +127,4 @@ export function Marketplace({ plugins, onToggle }: Props) {
       </div>
     </div>
   );
-}
+});
