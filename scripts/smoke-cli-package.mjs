@@ -43,12 +43,13 @@ async function runInteractivePty(entry, project, options = {}) {
   const cliArgs = [
     process.execPath,
     entry,
-    "--demo",
+    ...(options.demo === false ? [] : ["--demo"]),
     "--no-color",
     "--cwd",
     project,
     "--sessions",
-    path.join(project, ".sessions"),
+    options.sessionsDir ?? path.join(project, ".sessions"),
+    ...(options.debugLog ? ["--debug-log", options.debugLog] : []),
   ];
   const driver = path.join(root, "scripts", "run-cli-pty.py");
   const child = spawn("python3", [driver, ...cliArgs], {
@@ -62,6 +63,7 @@ async function runInteractivePty(entry, project, options = {}) {
       ...(options.screenReader ? { INK_SCREEN_READER: "true" } : {}),
       ...(options.suspend ? { ANICODE_PTY_TEST_SUSPEND: "1" } : {}),
       TERM: process.env.TERM || "xterm-256color",
+      ...(options.env ?? {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -97,6 +99,24 @@ async function runInteractivePty(entry, project, options = {}) {
       );
     }
   }
+  return output;
+}
+
+async function startedModel(debugLog) {
+  const records = (await fs.readFile(debugLog, "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  return records.find(
+    (record) => record.kind === "host.start" && record.operation === "createSession",
+  )?.model;
+}
+
+function expectNoUnknownCustom(output) {
+  expect(
+    !/unknown provider\s+["']?custom|\u672a\u77e5 provider\s+["']?custom/iu.test(output),
+    `installed CLI rejected the built-in custom provider\n${output}`,
+  );
 }
 
 function expect(condition, message) {
@@ -162,6 +182,54 @@ try {
   expect(/Usage:|用法:/.test(help), "installed CLI --help did not render");
   const models = run(process.execPath, [entry, "--list-models"], { cwd: project });
   expect(models.includes("debug/demo"), "installed CLI model catalog is incomplete");
+  const providers = run(process.execPath, [entry, "--list-providers"], { cwd: project });
+  expect(providers.includes("custom"), "installed CLI omitted the built-in custom provider");
+
+  if (process.platform !== "win32") {
+    const defaultWorkspace = path.join(temporary, "default-model-workspace");
+    const defaultHome = path.join(temporary, "default-model-home");
+    const defaultDebugLog = path.join(temporary, "default-model.jsonl");
+    await fs.mkdir(defaultWorkspace);
+    await fs.mkdir(defaultHome);
+    const defaultOutput = await runInteractivePty(entry, defaultWorkspace, {
+      demo: false,
+      debugLog: defaultDebugLog,
+      sessionsDir: path.join(temporary, "default-model-sessions"),
+      env: {
+        HOME: defaultHome,
+        DEEPSEEK_API_KEY: "anicode-package-smoke-deepseek-key",
+      },
+    });
+    expectNoUnknownCustom(defaultOutput);
+    expect(
+      (await startedModel(defaultDebugLog)) === "deepseek/deepseek-v4-flash",
+      "installed CLI without --model/--demo did not start with the DeepSeek default",
+    );
+
+    const customWorkspace = path.join(temporary, "configured-custom-workspace");
+    const customHome = path.join(temporary, "configured-custom-home");
+    const customDebugLog = path.join(temporary, "configured-custom.jsonl");
+    await fs.mkdir(customWorkspace);
+    await fs.mkdir(customHome);
+    await fs.writeFile(
+      path.join(customWorkspace, "anicode.json"),
+      `${JSON.stringify({ model: "custom/legacy-default" }, null, 2)}\n`,
+    );
+    const customOutput = await runInteractivePty(entry, customWorkspace, {
+      demo: false,
+      debugLog: customDebugLog,
+      sessionsDir: path.join(temporary, "configured-custom-sessions"),
+      env: {
+        HOME: customHome,
+      },
+    });
+    expectNoUnknownCustom(customOutput);
+    expect(
+      (await startedModel(customDebugLog)) === "custom/legacy-default",
+      "installed CLI did not preserve a configured custom provider model",
+    );
+  }
+
   await runInteractivePty(entry, project, { suspend: true });
   await runInteractivePty(entry, project, { screenReader: true });
 

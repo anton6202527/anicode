@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
+import { Writable } from "node:stream";
 import React from "react";
 import { render } from "ink";
 import {
@@ -49,11 +50,17 @@ import {
   createDiagnosticsTool,
   LspPool,
   AuthStore,
+  CloudAuthService,
+  ANICODE_CLOUD_CONFIG,
+  ANICODE_CLOUD_DEFAULT_MODEL,
+  ANICODE_CLOUD_PROVIDER_ID,
+  registerAnicodeCloudProvider,
   configuredSecretBackendFromEnv,
   createConfiguredLocalRuntimeStack,
   credentialEnvironmentAllowlist,
   isCredentialEnvironmentName,
   OS_KEYCHAIN_DISABLED_ENV,
+  OsKeychainSecretBackend,
   OsKeychainDisabledError,
   telemetryFromEnv,
   telemetryForLocalStack,
@@ -68,6 +75,8 @@ import {
   type LocalRuntimeStack,
   type Telemetry,
   type AuthStoreOptions,
+  type CloudAuthServiceOptions,
+  type CloudAuthStatus,
   type SecretBackend,
   type McpServerConfig,
   type WorkspaceTrustAssessment,
@@ -84,9 +93,11 @@ import { sanitizeTerminalText } from "./terminal-text.js";
 declare const __ANICODE_VERSION__: string | undefined;
 const CLI_VERSION = typeof __ANICODE_VERSION__ !== "undefined" ? __ANICODE_VERSION__ : "0.2.0";
 const DISPLAY_NAME = "AniCode Zen";
-// 默认走 DeepSeek 开放模型；真正生效值由 resolveDefaultModel 在运行时按凭证/本地服务挑选
-// （无 DeepSeek key 时优雅回退，见 resolveDefaultModel）。
+// 默认稳定使用 DeepSeek 开放模型；--demo 是显式的零网络调试入口。
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const CLI_CLOUD_RESTORE_TIMEOUT_MS = 1_500;
+/** Existing discovery transport doubles as a backwards-compatible host capability handshake. */
+export const CLI_HOST_DEFAULT_MODEL_CAPABILITY = "anicode-host-default";
 
 export function terminalSafe(text: unknown): string {
   return sanitizeTerminalText(String(text));
@@ -330,7 +341,7 @@ export function startRawModeWatchdog(
 
 export interface CliArgs {
   model: string;
-  /** 用户是否显式传了 --model；否则运行时按已配置凭证挑默认模型。 */
+  /** 用户是否显式传了 --model；否则使用配置值或稳定的 DeepSeek 默认模型。 */
   modelExplicit: boolean;
   cwd: string;
   resume?: string;
@@ -664,8 +675,8 @@ export function helpText(): string {
       `  --demo                    使用零 Key 的确定性调试模型\n`,
     ) +
     t(
-      `  --model <provider/model>  Select model (auto-picks a provider with configured credentials, else the zero-key debug/demo)\n`,
-      `  --model <provider/model>  选择模型（不指定则自动挑已配置凭证的 provider，都没有则用零 Key 的 debug/demo）\n`,
+      `  --model <provider/model>  Select model (default: deepseek/deepseek-v4-flash)\n`,
+      `  --model <provider/model>  选择模型（默认：deepseek/deepseek-v4-flash）\n`,
     ) +
     t(
       `  --cwd <dir>               Agent working directory\n`,
@@ -751,12 +762,16 @@ export function helpText(): string {
       `  exec --prompt <text>      无头执行一条提示词（默认 JSONL）\n`,
     ) +
     t(
-      `  auth login [provider]     Disabled pending provider authorization; configure an API key\n`,
-      `  auth login [provider]     等待提供商授权，当前已禁用；请配置 API key\n`,
+      `  auth login                Sign in to AniCode Cloud (password input is hidden)\n`,
+      `  auth login                登录 AniCode Cloud（密码隐藏输入）\n`,
     ) +
     t(
-      `  auth logout [provider]    Log out and delete local credentials\n`,
-      `  auth logout [provider]    登出并删除本地凭证\n`,
+      `  auth status               Show the safe AniCode Cloud login status\n`,
+      `  auth status               查看 AniCode Cloud 安全登录状态\n`,
+    ) +
+    t(
+      `  auth logout               Log out and delete the local Cloud refresh credential\n`,
+      `  auth logout               登出并删除本机 Cloud refresh 凭证\n`,
     ) +
     t(
       `  auth list                 View logged-in credentials\n`,
@@ -877,65 +892,303 @@ interface StartupProviderRegistry {
   resolveDefaultModel(): string;
 }
 
+const CLI_CLOUD_KEYCHAIN_SERVICE = "dev.anicode.cloud-auth";
+
+export interface CliCloudAuthRuntime {
+  service: CloudAuthService;
+  status: CloudAuthStatus;
+  /** Restore errors are intentionally reduced to a boolean so secret-bearing causes are not logged. */
+  restoreFailed: boolean;
+}
+
+/** Production always uses a dedicated OS Keychain namespace; backend injection is test-only. */
+export function createCliCloudAuthService(
+  options: {
+    /** @internal deterministic test seam */
+    backend?: CloudAuthServiceOptions["backend"];
+    /** @internal deterministic test seam */
+    fetch?: typeof fetch;
+  } = {},
+): CloudAuthService {
+  return new CloudAuthService({
+    backend: options.backend ?? new OsKeychainSecretBackend(CLI_CLOUD_KEYCHAIN_SERVICE),
+    projectUrl: ANICODE_CLOUD_CONFIG.projectUrl,
+    publishableKey: ANICODE_CLOUD_CONFIG.publishableKey,
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+  });
+}
+
+/** Optionally restore, then register a command-scoped Cloud provider and bind it to this Broker. */
+export async function setupCliCloudAuth(
+  runtimeStack: Pick<LocalRuntimeStack, "broker">,
+  options: {
+    auth?: CloudAuthService;
+    env?: NodeJS.ProcessEnv;
+    restore?: boolean;
+    /** Explicit/configured Cloud must fail instead of silently changing the requested model. */
+    requireSignedIn?: boolean;
+    /** @internal deterministic deadline seam */
+    restoreTimeoutMs?: number;
+  } = {},
+): Promise<CliCloudAuthRuntime | undefined> {
+  const env = options.env ?? process.env;
+  if (!options.auth && env[OS_KEYCHAIN_DISABLED_ENV] === "1") {
+    if (options.requireSignedIn) throw cloudRestoreRequiredError();
+    return undefined;
+  }
+  const service = options.auth ?? createCliCloudAuthService();
+  let status: CloudAuthStatus;
+  let restoreFailed = false;
+  try {
+    if (options.restore === false) {
+      status = service.status();
+    } else {
+      const timeoutMs = normalizeCloudRestoreTimeout(
+        options.restoreTimeoutMs,
+        options.requireSignedIn === true,
+      );
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const deadline = timeoutMs === undefined ? undefined : new AbortController();
+      let timedOut = false;
+      if (deadline && timeoutMs !== undefined) {
+        timeout = setTimeout(() => {
+          timedOut = true;
+          deadline.abort();
+        }, timeoutMs);
+      }
+      try {
+        status = await service.restore(deadline ? { signal: deadline.signal } : undefined);
+      } catch {
+        // A transient auth/storage error must not expose its cause or block a separately configured
+        // provider. Core cancellation fences both late Keychain reads and late network responses,
+        // while keeping this service available for an explicit lazy retry later in the command.
+        restoreFailed = true;
+        status = service.status();
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+      if (timedOut) restoreFailed = true;
+      if (options.requireSignedIn && !status.signedIn) {
+        throw cloudRestoreRequiredError(timedOut ? timeoutMs : undefined);
+      }
+    }
+    if (options.requireSignedIn && !status.signedIn) throw cloudRestoreRequiredError();
+    registerAnicodeCloudProvider(service);
+    service.attachBroker(runtimeStack.broker);
+    return { service, status, restoreFailed };
+  } catch (error) {
+    await service.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+function normalizeCloudRestoreTimeout(
+  value: number | undefined,
+  required: boolean,
+): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.min(Math.trunc(value), 30_000);
+  }
+  return required ? undefined : CLI_CLOUD_RESTORE_TIMEOUT_MS;
+}
+
+function cloudRestoreRequiredError(timeoutMs?: number): Error {
+  return new Error(
+    t(
+      `AniCode Cloud login could not be restored${timeoutMs ? ` within ${timeoutMs} ms` : ""}. The explicitly selected Cloud model will not be changed; check the network or run \`anicode auth login\`.`,
+      `${timeoutMs ? `无法在 ${timeoutMs} ms 内` : "无法"}恢复 AniCode Cloud 登录。不会改写显式选择的 Cloud 模型；请检查网络或运行 \`anicode auth login\`。`,
+    ),
+  );
+}
+
+export async function disposeCliCloudAuth(runtime: CliCloudAuthRuntime | undefined): Promise<void> {
+  await runtime?.service.close();
+}
+
+/** Whitelist the public DTO fields instead of serializing an implementation-owned object. */
+export function formatCloudAuthStatus(status: CloudAuthStatus): string {
+  if (status.signedIn) {
+    const identity = status.user?.email ?? status.user?.id ?? t("account", "账户");
+    const expiry = status.expiresAt
+      ? t(`; access expires at ${status.expiresAt}`, `；access 过期于 ${status.expiresAt}`)
+      : "";
+    return t(
+      `AniCode Cloud: signed in as ${identity}${expiry}`,
+      `AniCode Cloud：已登录 ${identity}${expiry}`,
+    );
+  }
+  if (status.state === "configured" || status.state === "refreshing") {
+    return t(
+      "AniCode Cloud: a login is stored, but no active session is available. Run `anicode auth login` to reconnect.",
+      "AniCode Cloud：本机保存了登录信息，但当前会话不可用。请运行 `anicode auth login` 重新连接。",
+    );
+  }
+  return t(
+    "AniCode Cloud: signed out. Run `anicode auth login` in an interactive terminal.",
+    "AniCode Cloud：未登录。请在交互式终端运行 `anicode auth login`。",
+  );
+}
+
+export interface CloudLoginCredentials {
+  email: string;
+  password: string;
+}
+
+/** Interactive password entry is consumed by readline but never forwarded to the real terminal. */
+export async function promptCloudLoginCredentials(
+  input: NodeJS.ReadStream = process.stdin,
+  output: NodeJS.WriteStream = process.stdout,
+): Promise<CloudLoginCredentials> {
+  if (!input.isTTY || !output.isTTY) {
+    throw new Error(
+      t(
+        "AniCode Cloud login requires an interactive terminal; passwords are never accepted in command arguments or piped input.",
+        "AniCode Cloud 登录需要交互式终端；密码不会通过命令行参数或管道输入接收。",
+      ),
+    );
+  }
+  let concealed = false;
+  const readlineOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      if (!concealed) output.write(chunk);
+      callback();
+    },
+  }) as Writable & { isTTY?: boolean; columns?: number };
+  readlineOutput.isTTY = true;
+  readlineOutput.columns = output.columns;
+  const readline = createInterface({ input, output: readlineOutput, terminal: true });
+  try {
+    const email = (
+      await readline.question(terminalSafe(t("AniCode Cloud email: ", "AniCode Cloud 邮箱：")))
+    ).trim();
+    output.write(terminalSafe(t("Password (hidden): ", "密码（隐藏输入）：")));
+    concealed = true;
+    let password = "";
+    try {
+      password = await readline.question("");
+    } finally {
+      concealed = false;
+      output.write("\n");
+    }
+    return { email, password };
+  } finally {
+    readline.close();
+  }
+}
+
 export interface StartupModelSelection {
   model: string;
-  /** Present only when an implicit configured model was unusable and a safe fallback was chosen. */
-  fallbackFrom?: string;
-  fallbackReason?: string;
+}
+
+function isAnicodeCloudModel(model: string | undefined): boolean {
+  const value = model?.trim();
+  return value === ANICODE_CLOUD_PROVIDER_ID || value?.startsWith(`${ANICODE_CLOUD_PROVIDER_ID}/`)
+    ? true
+    : false;
+}
+
+/** A bare provider id means that provider's recommended model, never a DeepSeek model id. */
+export function normalizeCliModelSpec(model: string): string {
+  const value = model.trim();
+  return value === ANICODE_CLOUD_PROVIDER_ID ? ANICODE_CLOUD_DEFAULT_MODEL : value;
+}
+
+function authoritativeStartupModel(
+  args: Pick<CliArgs, "model" | "modelExplicit" | "demo">,
+  configuredModel: string | undefined,
+): string | undefined {
+  if (args.modelExplicit || args.demo) return normalizeCliModelSpec(args.model);
+  const configured = configuredModel?.trim();
+  return configured ? normalizeCliModelSpec(configured) : undefined;
+}
+
+/** Avoid Keychain/network reads when an authoritative non-Cloud model is already known. */
+export function shouldSetupCliCloudAuth(
+  args: Pick<CliArgs, "model" | "modelExplicit" | "demo" | "resume">,
+  configuredModel: string | undefined,
+): boolean {
+  if (args.resume) return true;
+  if (args.demo) return false;
+  const authoritative = authoritativeStartupModel(args, configuredModel);
+  return !authoritative || isAnicodeCloudModel(authoritative);
+}
+
+function requiresSignedInCloudModel(
+  args: Pick<CliArgs, "model" | "modelExplicit" | "demo">,
+  configuredModel: string | undefined,
+): boolean {
+  return isAnicodeCloudModel(authoritativeStartupModel(args, configuredModel));
 }
 
 /**
- * Resolve an implicit startup model against the provider registry bound to this runtime stack.
- * Explicit `--model` and `--demo` choices are never rewritten; their normal validation remains
- * fail-fast. Unknown configured providers also remain errors instead of being silently hidden.
+ * CLI-only default selection. Explicit choices and every non-empty config model are authoritative;
+ * in particular a legitimate custom provider must never be mistaken for stale state. Only the
+ * complete absence of a model source is eligible for the signed-in AniCode Cloud default.
  */
 export function selectStartupModel(
   args: Pick<CliArgs, "model" | "modelExplicit" | "demo">,
   configuredModel: string | undefined,
-  providers: StartupProviderRegistry,
+  _providers: StartupProviderRegistry,
+  cloudStatus?: Pick<CloudAuthStatus, "signedIn">,
 ): StartupModelSelection {
-  if (args.modelExplicit || args.demo) return { model: args.model };
-  const configured = configuredModel?.trim();
-  if (!configured) return { model: providers.resolveDefaultModel() };
-
-  const diagnostics = providers.diagnoseProvider(configured);
-  if (!diagnostics.requiresApiKey || diagnostics.hasCredentials) return { model: configured };
-  return {
-    model: providers.resolveDefaultModel(),
-    fallbackFrom: configured,
-    fallbackReason: diagnostics.warnings.join("; "),
-  };
+  const authoritative = authoritativeStartupModel(args, configuredModel);
+  if (authoritative) return { model: authoritative };
+  return { model: cloudStatus?.signedIn ? ANICODE_CLOUD_DEFAULT_MODEL : DEFAULT_MODEL };
 }
 
-function startupModelFallbackWarning(selection: StartupModelSelection): string | undefined {
-  if (!selection.fallbackFrom) return undefined;
-  const reason = selection.fallbackReason?.trim() || t("credentials unavailable", "凭证不可用");
-  return t(
-    `${DISPLAY_NAME}: configured model ${selection.fallbackFrom} is unavailable (${reason}); using ${selection.model} for this run. Pass --model to require a specific model.`,
-    `${DISPLAY_NAME}: 配置模型 ${selection.fallbackFrom} 当前不可用（${reason}）；本次已回退到 ${selection.model}。如需强制指定模型，请传入 --model。`,
-  );
+/**
+ * A remote client has no authority over host credentials. New CLI hosts advertise their chosen
+ * default through a namespaced discovery capability; older/third-party hosts safely retain the
+ * historical direct-DeepSeek fallback. Explicit flags and client config never consult metadata.
+ */
+export async function selectRemoteStartupModel(
+  args: Pick<CliArgs, "model" | "modelExplicit" | "demo">,
+  configuredModel: string | undefined,
+  host: Pick<SessionHost, "discoverModels">,
+): Promise<StartupModelSelection> {
+  const authoritative = authoritativeStartupModel(args, configuredModel);
+  if (authoritative) return { model: authoritative };
+  try {
+    const advertised = await host.discoverModels?.(CLI_HOST_DEFAULT_MODEL_CAPABILITY);
+    const model = advertised?.length === 1 ? normalizeCliModelSpec(advertised[0]!) : "";
+    if (model && Buffer.byteLength(model, "utf8") <= 512) return { model };
+  } catch {
+    // Capability negotiation is advisory so older or temporarily unavailable hosts still work.
+  }
+  return { model: DEFAULT_MODEL };
 }
 
 /** 本地交互入口要求云端凭证已就绪；core registry 本身仍保持可离线解析。 */
 export function assertProviderConfigured(
   model: string,
   diagnose: (model: string) => StartupProviderDiagnostics = diagnoseProvider,
+  cloudStatus?: Pick<CloudAuthStatus, "signedIn">,
 ): void {
-  const diagnostics = diagnose(model);
+  const normalizedModel = normalizeCliModelSpec(model);
+  if (isAnicodeCloudModel(normalizedModel) && !cloudStatus?.signedIn) {
+    throw new Error(
+      t(
+        "AniCode Cloud is not signed in. Run `anicode auth login` in an interactive terminal.",
+        "尚未登录 AniCode Cloud。请在交互式终端运行 `anicode auth login`。",
+      ),
+    );
+  }
+  const diagnostics = diagnose(normalizedModel);
   if (diagnostics.requiresApiKey && !diagnostics.hasCredentials) {
     throw new Error(
       t(`${diagnostics.warnings.join("；")}.`, `${diagnostics.warnings.join("；")}。`) +
         t(
-          `You can also use --demo (or npm run dev:tui:demo at the repo root) for zero-key debugging.`,
-          `也可以用 --demo（或根目录 npm run dev:tui:demo）进行零 Key 调试。`,
+          `Run \`anicode auth login\` to use AniCode Cloud without receiving a shared provider key, configure your own provider credential, or use --demo for zero-key debugging.`,
+          `可运行 \`anicode auth login\` 使用 AniCode Cloud（客户端不会收到共享 provider key），也可配置自己的 provider 凭证，或用 --demo 进行零 Key 调试。`,
         ),
     );
   }
 }
 
 export function resolveConfiguredProvider(model: string) {
-  assertProviderConfigured(model);
-  return createProvider(model);
+  const normalizedModel = normalizeCliModelSpec(model);
+  assertProviderConfigured(normalizedModel);
+  return createProvider(normalizedModel);
 }
 
 type CliRuntimeResources = Pick<
@@ -1102,7 +1355,13 @@ export function buildManager(
  */
 export async function runServeCommand(
   argv: string[],
-  io: { output?: NodeJS.WritableStream } = {},
+  io: {
+    output?: NodeJS.WritableStream;
+    /** Command-scoped deterministic test seam; the server closes this service. */
+    cloudAuth?: CloudAuthService;
+    /** @internal deterministic startup deadline seam */
+    cloudRestoreTimeoutMs?: number;
+  } = {},
 ): Promise<HttpDaemonServer> {
   const out = io.output ?? process.stderr;
   let port = DEFAULT_HTTP_DAEMON_PORT;
@@ -1159,6 +1418,8 @@ export async function runServeCommand(
   const telemetry = telemetryForLocalStack(runtimeStack);
   let manager: SessionManager | undefined;
   let server: HttpDaemonServer | undefined;
+  let cloudRuntime: CliCloudAuthRuntime | undefined;
+  let hostDefaultModel = DEFAULT_MODEL;
   let resourcesClosed = false;
   const closeResources = async (): Promise<void> => {
     if (resourcesClosed) return;
@@ -1166,10 +1427,29 @@ export async function runServeCommand(
     try {
       await manager?.shutdown();
     } finally {
-      await disposeCliRuntimeResources(runtimeStack, telemetry);
+      try {
+        await disposeCliCloudAuth(cloudRuntime);
+      } finally {
+        await disposeCliRuntimeResources(runtimeStack, telemetry);
+      }
     }
   };
   try {
+    const configuredModel = config.model?.trim();
+    cloudRuntime = await setupCliCloudAuth(runtimeStack, {
+      ...(io.cloudAuth ? { auth: io.cloudAuth } : {}),
+      restore: !configuredModel || isAnicodeCloudModel(configuredModel),
+      requireSignedIn: isAnicodeCloudModel(configuredModel),
+      ...(io.cloudRestoreTimeoutMs !== undefined
+        ? { restoreTimeoutMs: io.cloudRestoreTimeoutMs }
+        : {}),
+    });
+    hostDefaultModel = selectStartupModel(
+      { model: DEFAULT_MODEL, modelExplicit: false, demo: false },
+      configuredModel,
+      runtimeStack.providers,
+      cloudRuntime?.status,
+    ).model;
     manager = buildManager(
       { cwd, sessionsDir, permissionMode: "default" },
       {
@@ -1182,7 +1462,10 @@ export async function runServeCommand(
     server = new HttpDaemonServer({
       manager,
       token: bearerToken,
-      discoverModels: runtimeStack.discoverModels,
+      discoverModels: (providerId) =>
+        providerId === CLI_HOST_DEFAULT_MODEL_CAPABILITY
+          ? Promise.resolve([hostDefaultModel])
+          : runtimeStack.discoverModels(providerId),
       onClose: closeResources,
     });
     // Publish the credential only after the port is successfully bound. Rotating the
@@ -1349,7 +1632,6 @@ export async function runTrustCommand(
   return granted;
 }
 
-/** `anicode auth` —— OAuth 凭证检查、清理和显式旧存储迁移；生产登录入口默认禁用。 */
 /**
  * `anicode mcp` —— 把 anicode 作为 MCP server 暴露（对齐 `codex mcp-server`）。
  * stdio 换行分隔 JSON-RPC；工具 anicode（新会话跑任务）/ anicode_reply（续会话）。
@@ -1358,7 +1640,14 @@ export async function runTrustCommand(
  */
 export async function runMcpCommand(
   argv: string[],
-  io: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {},
+  io: {
+    input?: NodeJS.ReadableStream;
+    output?: NodeJS.WritableStream;
+    /** Command-scoped deterministic test seam; the command closes this service. */
+    cloudAuth?: CloudAuthService;
+    /** @internal deterministic startup deadline seam */
+    cloudRestoreTimeoutMs?: number;
+  } = {},
 ): Promise<{ close(): Promise<void> }> {
   let cwd = process.cwd();
   let model: string | undefined;
@@ -1395,12 +1684,29 @@ export async function runMcpCommand(
   const telemetry = telemetryForLocalStack(runtimeStack);
   let manager: SessionManager | undefined;
   let server: ReturnType<typeof serveMcp> | undefined;
+  let cloudRuntime: CliCloudAuthRuntime | undefined;
   try {
-    // Headless automation must not silently turn a declared cloud model into debug/demo.
-    // With no declared model at all, the registry may still choose its documented zero-config
-    // default; an explicit/configured model remains fail-fast.
-    const selectedModel = model ?? config.model ?? runtimeStack.providers.resolveDefaultModel();
-    assertProviderConfigured(selectedModel, runtimeStack.providers.diagnoseProvider);
+    const declaredModel = model ?? config.model?.trim();
+    cloudRuntime = await setupCliCloudAuth(runtimeStack, {
+      ...(io.cloudAuth ? { auth: io.cloudAuth } : {}),
+      restore: !declaredModel || isAnicodeCloudModel(declaredModel),
+      requireSignedIn: isAnicodeCloudModel(declaredModel),
+      ...(io.cloudRestoreTimeoutMs !== undefined
+        ? { restoreTimeoutMs: io.cloudRestoreTimeoutMs }
+        : {}),
+    });
+    // Explicit and configured models are authoritative. Only a truly absent model source may use
+    // the restored Cloud session; otherwise the CLI's stable direct DeepSeek default is fail-fast.
+    const selectedModel = declaredModel
+      ? normalizeCliModelSpec(declaredModel)
+      : cloudRuntime?.status.signedIn
+        ? ANICODE_CLOUD_DEFAULT_MODEL
+        : DEFAULT_MODEL;
+    assertProviderConfigured(
+      selectedModel,
+      runtimeStack.providers.diagnoseProvider,
+      cloudRuntime?.status,
+    );
     manager = buildManager(
       { cwd, sessionsDir, permissionMode },
       { config, runtimeStack, telemetry, workspaceTrust: workspaceTrustStore },
@@ -1417,7 +1723,11 @@ export async function runMcpCommand(
     try {
       await manager?.shutdown();
     } finally {
-      await disposeCliRuntimeResources(runtimeStack, telemetry).catch(() => undefined);
+      try {
+        await disposeCliCloudAuth(cloudRuntime);
+      } finally {
+        await disposeCliRuntimeResources(runtimeStack, telemetry).catch(() => undefined);
+      }
     }
     throw error;
   }
@@ -1432,7 +1742,11 @@ export async function runMcpCommand(
         try {
           await manager.shutdown();
         } finally {
-          await disposeCliRuntimeResources(runtimeStack, telemetry);
+          try {
+            await disposeCliCloudAuth(cloudRuntime);
+          } finally {
+            await disposeCliRuntimeResources(runtimeStack, telemetry);
+          }
         }
       }
     },
@@ -1596,20 +1910,58 @@ async function mutateMcpSettings(
   }
 }
 
+/** `anicode auth` —— AniCode Cloud 登录/状态/登出，以及旧 OAuth 凭证的显式迁移。 */
 export async function runAuthCommand(
   argv: string[],
   io: {
-    input?: NodeJS.ReadableStream;
+    input?: NodeJS.ReadStream;
     output?: NodeJS.WritableStream;
     store?: AuthStore;
     /** Test/embedding paths and environment; production uses AuthStore defaults. */
     storeOptions?: AuthStoreOptions;
+    /** Command-scoped deterministic test seam; the command always closes this service. */
+    cloudAuth?: CloudAuthService;
+    /** Test/embedding seam. Production always uses hidden interactive terminal input. */
+    readCloudCredentials?: () => Promise<CloudLoginCredentials>;
   } = {},
 ): Promise<void> {
-  const sub = argv[0] ?? "";
-  const provider = argv[1] ?? "anthropic";
+  const sub = argv[0] ?? "status";
+  const provider = argv[1] ?? ANICODE_CLOUD_PROVIDER_ID;
   const out = io.output ?? process.stdout;
   const log = (s: string) => out.write(s + "\n");
+  const cloudProvider = provider === ANICODE_CLOUD_PROVIDER_ID || provider === "cloud";
+
+  if (["login", "status", "logout"].includes(sub) && argv.length > 2) {
+    throw new Error(
+      t(
+        `Usage: anicode auth ${sub} [provider] (credentials are never accepted as arguments)`,
+        `用法: anicode auth ${sub} [provider]（凭证绝不通过参数接收）`,
+      ),
+    );
+  }
+  if (["login", "status", "logout"].includes(sub) && cloudProvider) {
+    const cloudAuth = io.cloudAuth ?? createCliCloudAuthService();
+    try {
+      if (sub === "login") {
+        const credentials = io.readCloudCredentials
+          ? await io.readCloudCredentials()
+          : await promptCloudLoginCredentials(io.input ?? process.stdin, out as NodeJS.WriteStream);
+        try {
+          const status = await cloudAuth.signIn(credentials.email, credentials.password);
+          log(terminalSafe(formatCloudAuthStatus(status)));
+        } finally {
+          // Best effort: drop the only mutable reference immediately after the request returns.
+          credentials.password = "";
+        }
+        return;
+      }
+      const status = sub === "logout" ? await cloudAuth.signOut() : await cloudAuth.restore();
+      log(terminalSafe(formatCloudAuthStatus(status)));
+      return;
+    } finally {
+      await cloudAuth.close();
+    }
+  }
 
   if (sub === "list") {
     const creds = io.store
@@ -1675,8 +2027,8 @@ export async function runAuthCommand(
 
   throw new Error(
     t(
-      `Usage: anicode auth <login|logout|list|migrate> [provider]`,
-      `用法: anicode auth <login|logout|list|migrate> [provider]`,
+      `Usage: anicode auth <login|status|logout|list|migrate> [provider]`,
+      `用法: anicode auth <login|status|logout|list|migrate> [provider]`,
     ),
   );
 }
@@ -1909,6 +2261,10 @@ export async function runExecCommand(
     input?: NodeJS.ReadableStream;
     output?: NodeJS.WritableStream;
     error?: NodeJS.WritableStream;
+    /** Command-scoped deterministic test seam; the command closes this service. */
+    cloudAuth?: CloudAuthService;
+    /** @internal deterministic startup deadline seam */
+    cloudRestoreTimeoutMs?: number;
   } = {},
 ): Promise<void> {
   const parsed = parseExecArgs(argv);
@@ -1924,22 +2280,20 @@ export async function runExecCommand(
     return;
   }
   if (args.listProviders) {
-    output.write(
-      `${listProviderDetails()
-        .map((provider) => provider.id)
-        .join("\n")}\n`,
-    );
+    const ids = listProviderDetails().map((provider) => provider.id);
+    if (!ids.includes(ANICODE_CLOUD_PROVIDER_ID)) ids.push(ANICODE_CLOUD_PROVIDER_ID);
+    output.write(`${ids.join("\n")}\n`);
     return;
   }
   const workspaceTrustStore = new WorkspaceTrustStore();
   const initialWorkspaceTrust = await workspaceTrustStore.assess(args.cwd);
   await loadProjectEnv({ cwd: args.cwd, workspaceTrust: initialWorkspaceTrust });
   if (args.listModels) {
-    output.write(
-      `${listModelCatalog()
-        .map((entry) => entry.spec)
-        .join("\n")}\n`,
-    );
+    const specs = listModelCatalog().map((entry) => entry.spec);
+    if (!specs.includes(ANICODE_CLOUD_DEFAULT_MODEL)) {
+      specs.push(ANICODE_CLOUD_DEFAULT_MODEL, `${ANICODE_CLOUD_PROVIDER_ID}/deepseek-v4-pro`);
+    }
+    output.write(`${specs.join("\n")}\n`);
     return;
   }
   const input = io.input ?? process.stdin;
@@ -2003,20 +2357,36 @@ export async function runExecCommand(
   let host: SessionHost | undefined;
   let debugLogger: DebugLogger | undefined;
   let telemetry: Telemetry | undefined;
+  let cloudRuntime: CliCloudAuthRuntime | undefined;
   try {
+    if (runtimeStack && shouldSetupCliCloudAuth(args, config.model)) {
+      cloudRuntime = await setupCliCloudAuth(runtimeStack, {
+        ...(io.cloudAuth ? { auth: io.cloudAuth } : {}),
+        requireSignedIn: requiresSignedInCloudModel(args, config.model),
+        ...(io.cloudRestoreTimeoutMs !== undefined
+          ? { restoreTimeoutMs: io.cloudRestoreTimeoutMs }
+          : {}),
+      });
+    }
     if (!args.modelExplicit && !args.demo) {
       if (runtimeStack) {
-        // Unlike the interactive TUI, headless exec must never report success after silently
-        // replacing a configured production model with debug/demo.
-        args.model = config.model ?? runtimeStack.providers.resolveDefaultModel();
+        args.model = selectStartupModel(
+          args,
+          config.model,
+          runtimeStack.providers,
+          cloudRuntime?.status,
+        ).model;
       } else {
-        // Remote hosts own their credentials. Preserve the configured/built-in model spec and let
-        // the authoritative host validate it instead of consulting this client's credentials.
-        args.model = config.model ?? args.model;
+        // The final no-source default is negotiated after the remote host is connected.
+        args.model = authoritativeStartupModel(args, config.model) ?? args.model;
       }
     }
     if (runtimeStack && !args.resume) {
-      assertProviderConfigured(args.model, runtimeStack.providers.diagnoseProvider);
+      assertProviderConfigured(
+        args.model,
+        runtimeStack.providers.diagnoseProvider,
+        cloudRuntime?.status,
+      );
     }
     telemetry = runtimeStack ? telemetryForLocalStack(runtimeStack) : telemetryFromEnv();
     let mcpTools: Tool[] = [];
@@ -2080,6 +2450,9 @@ export async function runExecCommand(
         lspPool = undefined;
       },
     });
+    if (!runtimeStack && !args.resume) {
+      args.model = (await selectRemoteStartupModel(args, config.model, host)).model;
+    }
     if (args.debugLog) {
       const logger = new DebugLogger(args.debugLog, args.traceContent);
       debugLogger = logger;
@@ -2158,6 +2531,7 @@ export async function runExecCommand(
         // Cleanup is best-effort; preserve the command's real result.
       }
     }
+    await disposeCliCloudAuth(cloudRuntime).catch(() => undefined);
     await disposeCliRuntimeResources(runtimeStack, telemetry).catch(() => undefined);
   }
 }
@@ -2219,39 +2593,48 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (args.listProviders) {
-    console.log(
-      terminalSafe(
-        listProviderDetails()
-          .map((provider) => {
-            const where = provider.local ? "local" : "cloud";
-            const key = provider.requiresApiKey
-              ? `key: ${provider.apiKeyEnv.join(" | ")}`
-              : "key: not required";
-            return `${provider.id}\t${provider.protocol}\t${where}\t${key}`;
-          })
-          .join("\n"),
-      ),
-    );
+    const providers = listProviderDetails();
+    const rows = providers.map((provider) => {
+      const where = provider.local ? "local" : "cloud";
+      const key = provider.requiresApiKey
+        ? `key: ${provider.apiKeyEnv.join(" | ")}`
+        : "key: not required";
+      return `${provider.id}\t${provider.protocol}\t${where}\t${key}`;
+    });
+    if (!providers.some((provider) => provider.id === ANICODE_CLOUD_PROVIDER_ID)) {
+      rows.push(`${ANICODE_CLOUD_PROVIDER_ID}\topenai-chat\tcloud\tauth: anicode auth login`);
+    }
+    console.log(terminalSafe(rows.join("\n")));
     return;
   }
   if (args.listModels) {
-    console.log(
-      terminalSafe(
-        listModelCatalog()
-          .map((m) => {
-            const tags = [
-              m.free ? "free" : null,
-              m.openWeight ? "open" : null,
-              m.local ? "local" : null,
-              m.recommended ? "recommended" : null,
-            ]
-              .filter(Boolean)
-              .join(",");
-            return `${m.spec}\t${tags || "-"}\t${m.note ?? m.label ?? ""}`;
-          })
-          .join("\n"),
-      ),
-    );
+    const catalog = listModelCatalog();
+    const rows = catalog.map((m) => {
+      const tags = [
+        m.free ? "free" : null,
+        m.openWeight ? "open" : null,
+        m.local ? "local" : null,
+        m.recommended ? "recommended" : null,
+      ]
+        .filter(Boolean)
+        .join(",");
+      return `${m.spec}\t${tags || "-"}\t${m.note ?? m.label ?? ""}`;
+    });
+    if (!catalog.some((model) => model.providerId === ANICODE_CLOUD_PROVIDER_ID)) {
+      rows.push(
+        `${ANICODE_CLOUD_DEFAULT_MODEL}\trecommended\t${t(
+          "Sign in with `anicode auth login`; the shared provider key never reaches the client",
+          "使用 `anicode auth login` 登录；共享 provider key 不会下发到客户端",
+        )}`,
+      );
+      rows.push(
+        `${ANICODE_CLOUD_PROVIDER_ID}/deepseek-v4-pro\t-\t${t(
+          "AniCode Cloud account required",
+          "需要 AniCode Cloud 账户",
+        )}`,
+      );
+    }
+    console.log(terminalSafe(rows.join("\n")));
     return;
   }
 
@@ -2311,29 +2694,42 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   let host: SessionHost | undefined;
   let debugLogger: DebugLogger | undefined;
   let telemetry: Telemetry | undefined;
+  let cloudRuntime: CliCloudAuthRuntime | undefined;
   try {
     telemetry = localRuntimeStack ? telemetryForLocalStack(localRuntimeStack) : telemetryFromEnv();
+    if (localRuntimeStack) {
+      cloudRuntime = await setupCliCloudAuth(localRuntimeStack, {
+        restore: shouldSetupCliCloudAuth(args, config.model),
+        requireSignedIn: requiresSignedInCloudModel(args, config.model),
+      });
+    }
 
     // 本地模式必须通过绑定到当前 Credential Broker 的 registry 选择/诊断模型；
     // 不能在密钥迁出 process.env 后再读取全局 registry，否则会把有效凭证误判为缺失。
     if (!args.modelExplicit && !args.demo) {
       if (localRuntimeStack) {
-        const selection = selectStartupModel(args, config.model, localRuntimeStack.providers);
+        const selection = selectStartupModel(
+          args,
+          config.model,
+          localRuntimeStack.providers,
+          cloudRuntime?.status,
+        );
         args.model = selection.model;
-        const fallbackWarning = startupModelFallbackWarning(selection);
-        if (fallbackWarning) console.error(terminalSafe(fallbackWarning));
       } else {
-        // daemon/HTTP 的凭证属于远端 host；保留配置/内置 spec，由权威 host 校验，
-        // 客户端不能按本机凭证状态改写模型。
-        args.model = config.model ?? args.model;
+        // 最终的无来源默认值在连接远端 host 后协商。
+        args.model = authoritativeStartupModel(args, config.model) ?? args.model;
       }
     }
 
-    // 校验 provider（本地模式下尽早报错）。仅当用户显式选了缺 key 的模型才会抛错。
+    // 校验 provider（本地模式下尽早报错）。默认 DeepSeek 与显式模型都必须有可用凭证。
     if (!args.daemon && !args.http && !args.resume) {
       try {
         // 这里只做无副作用诊断；真正创建 provider 由 createSession 唯一执行。
-        assertProviderConfigured(args.model, localRuntimeStack!.providers.diagnoseProvider);
+        assertProviderConfigured(
+          args.model,
+          localRuntimeStack!.providers.diagnoseProvider,
+          cloudRuntime?.status,
+        );
       } catch (err) {
         throw new Error(
           t(
@@ -2525,6 +2921,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         ),
       );
     });
+    if (!localRuntimeStack && !args.resume) {
+      args.model = (await selectRemoteStartupModel(args, config.model, baseHost)).model;
+    }
     host = baseHost;
     if (args.debugLog) {
       const logger = new DebugLogger(args.debugLog, args.traceContent);
@@ -2670,6 +3069,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         // 关闭 MCP 子进程失败不影响退出
       }
     }
+    await disposeCliCloudAuth(cloudRuntime).catch(() => undefined);
     await disposeCliRuntimeResources(localRuntimeStack, telemetry).catch(() => undefined);
   }
 }

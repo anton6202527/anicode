@@ -1,7 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CredentialBroker, type SecretBackend } from "@anicode/core";
+import {
+  ANICODE_CLOUD_CONFIG,
+  bindProviderRegistry,
+  type CloudAuthExclusiveLock,
+  CredentialBroker,
+  type SecretBackend,
+} from "@anicode/core";
 import { CloudAuthError, CloudAuthService } from "./cloud-auth.js";
+import { registerAnicodeCloudProvider } from "./cloud-provider.js";
 
 const PROJECT_URL = "https://fixture.supabase.co";
 const GATEWAY_URL = `${PROJECT_URL}/functions/v1/anicode-chat/v1/chat/completions`;
@@ -69,13 +76,41 @@ function requestJson(init?: RequestInit): Record<string, unknown> {
   return JSON.parse(body) as Record<string, unknown>;
 }
 
-function createService(backend: MemorySecretBackend, fetchImpl: typeof fetch): CloudAuthService {
+function createService(
+  backend: MemorySecretBackend,
+  fetchImpl: typeof fetch,
+  coordinationLock?: CloudAuthExclusiveLock,
+): CloudAuthService {
   return new CloudAuthService({
     backend,
     projectUrl: PROJECT_URL,
     publishableKey: "sb_publishable_cloud_auth_test",
     fetch: fetchImpl,
+    ...(coordinationLock ? { coordinationLock } : {}),
   });
+}
+
+class SharedTestLock implements CloudAuthExclusiveLock {
+  private tail: Promise<void> = Promise.resolve();
+  active = 0;
+  maximumActive = 0;
+
+  runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.tail.then(async () => {
+      this.active++;
+      this.maximumActive = Math.max(this.maximumActive, this.active);
+      try {
+        return await operation();
+      } finally {
+        this.active--;
+      }
+    });
+    this.tail = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    return task;
+  }
 }
 
 test("cloud auth: persists refresh token only and status DTO never exposes session tokens", async () => {
@@ -121,6 +156,271 @@ test("cloud auth: persists refresh token only and status DTO never exposes sessi
   assert.doesNotMatch(restoredDto, new RegExp(rotated.refresh_token, "u"));
   assert.ok(backend.puts.every(({ value }) => !value.includes(rotated.access_token)));
   await restoredService.close();
+});
+
+test("cloud auth: two services rotate only the latest persisted token under their shared lock", async () => {
+  const backend = new MemorySecretBackend();
+  const lock = new SharedTestLock();
+  const initial = session("process-old");
+  const firstRotation = session("process-first");
+  const secondRotation = session("process-second");
+  backend.values.set(
+    STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: initial.refresh_token }),
+  );
+  const refreshTokens: unknown[] = [];
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = requestUrl(input);
+    assert.equal(url.searchParams.get("grant_type"), "refresh_token");
+    const refreshToken = requestJson(init)["refresh_token"];
+    refreshTokens.push(refreshToken);
+    if (refreshToken === initial.refresh_token) return Response.json(firstRotation);
+    if (refreshToken === firstRotation.refresh_token) return Response.json(secondRotation);
+    throw new Error("a stale or unknown refresh token was used");
+  }) as typeof fetch;
+  const first = createService(backend, fetchImpl, lock);
+  const second = createService(backend, fetchImpl, lock);
+
+  const statuses = await Promise.all([first.restore(), second.restore()]);
+
+  assert.ok(statuses.every(({ signedIn }) => signedIn));
+  assert.equal(lock.maximumActive, 1);
+  assert.deepEqual(refreshTokens, [initial.refresh_token, firstRotation.refresh_token]);
+  assert.deepEqual(JSON.parse(backend.values.get(STORAGE_KEY) ?? "null"), {
+    version: 1,
+    refreshToken: secondRotation.refresh_token,
+  });
+  await Promise.all([first.close(), second.close()]);
+});
+
+test("cloud auth: a second service logout is the durable final writer after an in-flight refresh", async () => {
+  const backend = new MemorySecretBackend();
+  const lock = new SharedTestLock();
+  const initial = session("process-race-old");
+  const rotated = session("process-race-new");
+  backend.values.set(
+    STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: initial.refresh_token }),
+  );
+  const refreshStarted = deferred<void>();
+  const refreshReply = deferred<Response>();
+  let refreshCalls = 0;
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = requestUrl(input);
+    assert.equal(url.searchParams.get("grant_type"), "refresh_token");
+    assert.equal(requestJson(init)["refresh_token"], initial.refresh_token);
+    refreshCalls++;
+    refreshStarted.resolve(undefined);
+    return refreshReply.promise;
+  }) as typeof fetch;
+  const refreshingService = createService(backend, fetchImpl, lock);
+  const logoutService = createService(backend, fetchImpl, lock);
+
+  const restoring = refreshingService.restore();
+  await refreshStarted.promise;
+  const logout = logoutService.signOut();
+  await Promise.resolve();
+  assert.equal(backend.puts.length, 0, "logout must wait behind the locked refresh");
+  refreshReply.resolve(Response.json(rotated));
+
+  assert.equal((await restoring).signedIn, true);
+  assert.deepEqual(await logout, { state: "signed_out", signedIn: false });
+  assert.equal(lock.maximumActive, 1);
+  assert.equal(refreshCalls, 1);
+  assert.equal(backend.values.has(STORAGE_KEY), false);
+  assert.deepEqual(
+    backend.puts.map(({ value }) => JSON.parse(value)),
+    [
+      { version: 1, refreshToken: rotated.refresh_token },
+      { version: 1, revoked: true },
+    ],
+  );
+  await Promise.all([refreshingService.close(), logoutService.close()]);
+});
+
+test("cloud auth: aborting a non-cooperative restore read never triggers a late refresh", async () => {
+  const backend = new MemorySecretBackend();
+  const initial = session("cancelled-read-old");
+  const rotated = session("cancelled-read-new");
+  backend.values.set(
+    STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: initial.refresh_token }),
+  );
+  const readStarted = deferred<void>();
+  const lateRead = deferred<string | undefined>();
+  const ordinaryGet = backend.get.bind(backend);
+  let reads = 0;
+  backend.get = async (key: string) => {
+    reads++;
+    if (reads !== 1) return ordinaryGet(key);
+    readStarted.resolve(undefined);
+    return lateRead.promise;
+  };
+  let refreshCalls = 0;
+  const fetchImpl = (async (input: string | URL | Request) => {
+    const url = requestUrl(input);
+    assert.equal(url.searchParams.get("grant_type"), "refresh_token");
+    refreshCalls++;
+    return Response.json(rotated);
+  }) as typeof fetch;
+  const service = createService(backend, fetchImpl, new SharedTestLock());
+  const controller = new AbortController();
+  const restoring = service.restore({ signal: controller.signal });
+  await readStarted.promise;
+  controller.abort();
+
+  await assert.rejects(
+    restoring,
+    (error) => error instanceof CloudAuthError && error.code === "temporarily_unavailable",
+  );
+  assert.deepEqual(service.status(), { state: "signed_out", signedIn: false });
+  assert.equal(refreshCalls, 0);
+  assert.equal(backend.puts.length, 0);
+  lateRead.resolve(backend.values.get(STORAGE_KEY));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(refreshCalls, 0, "the late read result must be discarded");
+
+  assert.equal((await service.restore()).signedIn, true);
+  assert.equal(refreshCalls, 1);
+  assert.deepEqual(JSON.parse(backend.values.get(STORAGE_KEY) ?? "null"), {
+    version: 1,
+    refreshToken: rotated.refresh_token,
+  });
+  await service.close();
+});
+
+test("cloud auth: bound provider registries never cross-route another runtime's session", async () => {
+  const observed: Array<{ service: string; authorization: string | null }> = [];
+  const createBoundService = async (label: string) => {
+    const backend = new MemorySecretBackend();
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.searchParams.get("grant_type") === "password") {
+        return Response.json(session(label));
+      }
+      if (url.pathname.endsWith("/models")) {
+        observed.push({
+          service: label,
+          authorization: requestHeaders(input, init).get("authorization"),
+        });
+        return Response.json({ data: [{ id: `model-${label}` }] });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as typeof fetch;
+    const service = new CloudAuthService({
+      backend,
+      projectUrl: ANICODE_CLOUD_CONFIG.projectUrl,
+      publishableKey: "sb_publishable_cloud_provider_test",
+      fetch: fetchImpl,
+    });
+    const broker = new CredentialBroker();
+    service.attachBroker(broker);
+    await service.signIn(`${label}@example.test`, "password123");
+    registerAnicodeCloudProvider(service);
+    return {
+      service,
+      registry: bindProviderRegistry({ broker, environment: {}, allowEnvironmentFallback: false }),
+    };
+  };
+
+  const first = await createBoundService("first");
+  const second = await createBoundService("second");
+  try {
+    // The second global descriptor registration must not change the first bound runtime's auth.
+    assert.deepEqual(await first.registry.discoverModels("anicode-cloud"), ["model-first"]);
+    assert.deepEqual(await second.registry.discoverModels("anicode-cloud"), ["model-second"]);
+    assert.deepEqual(
+      observed.map(({ service }) => service),
+      ["first", "second"],
+    );
+    assert.equal(observed[0]?.authorization, `Bearer ${session("first").access_token}`);
+    assert.equal(observed[1]?.authorization, `Bearer ${session("second").access_token}`);
+  } finally {
+    await Promise.all([first.service.close(), second.service.close()]);
+  }
+});
+
+test("cloud auth: password sign-in fences an old-session refresh from replacing the account", async () => {
+  const backend = new MemorySecretBackend();
+  const initial = session("sign-in-fence-old", 1);
+  const replacement = session("sign-in-fence-new");
+  const replacementStarted = deferred<void>();
+  const replacementReply = deferred<Response>();
+  let passwordCalls = 0;
+  let refreshCalls = 0;
+  const fetchImpl = (async (input: string | URL | Request) => {
+    const url = requestUrl(input);
+    if (url.searchParams.get("grant_type") === "password") {
+      passwordCalls++;
+      if (passwordCalls === 1) return Response.json(initial);
+      replacementStarted.resolve(undefined);
+      return replacementReply.promise;
+    }
+    if (url.searchParams.get("grant_type") === "refresh_token") {
+      refreshCalls++;
+      return Response.json(session("sign-in-fence-stale"));
+    }
+    if (url.pathname.startsWith("/functions/v1/anicode-chat/")) {
+      return Response.json({ ok: true });
+    }
+    throw new Error(`unexpected request ${url}`);
+  }) as typeof fetch;
+  const service = createService(backend, fetchImpl);
+  service.attachBroker(new CredentialBroker());
+  await service.signIn("old@example.test", "password123");
+
+  const replacing = service.signIn("new@example.test", "password123");
+  await replacementStarted.promise;
+  await assert.rejects(
+    service.gatewayFetch(GATEWAY_URL, { method: "POST", body: "{}" }),
+    (error) => error instanceof CloudAuthError && error.code === "temporarily_unavailable",
+  );
+  assert.equal(refreshCalls, 0);
+  replacementReply.resolve(Response.json(replacement));
+  const status = await replacing;
+
+  assert.equal(status.user?.id, replacement.user.id);
+  assert.equal(service.status().user?.id, replacement.user.id);
+  assert.deepEqual(JSON.parse(backend.values.get(STORAGE_KEY) ?? "null"), {
+    version: 1,
+    refreshToken: replacement.refresh_token,
+  });
+  await service.close();
+});
+
+test("cloud auth: sign-out awaits bounded remote revocation before command teardown", async () => {
+  const backend = new MemorySecretBackend();
+  const initial = session("awaited-logout");
+  const logoutStarted = deferred<void>();
+  const logoutReply = deferred<Response>();
+  let logoutAuthorization: string | null = null;
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = requestUrl(input);
+    if (url.searchParams.get("grant_type") === "password") return Response.json(initial);
+    if (url.pathname === "/auth/v1/logout") {
+      logoutAuthorization = requestHeaders(input, init).get("authorization");
+      logoutStarted.resolve(undefined);
+      return logoutReply.promise;
+    }
+    throw new Error(`unexpected request ${url}`);
+  }) as typeof fetch;
+  const service = createService(backend, fetchImpl);
+  await service.signIn("logout@example.test", "password123");
+
+  let settled = false;
+  const signingOut = service.signOut().then((status) => {
+    settled = true;
+    return status;
+  });
+  await logoutStarted.promise;
+  await Promise.resolve();
+  assert.equal(settled, false);
+  assert.equal(backend.values.has(STORAGE_KEY), false, "local logout must complete first");
+  assert.equal(logoutAuthorization, `Bearer ${initial.access_token}`);
+  logoutReply.resolve(new Response(null, { status: 204 }));
+
+  assert.deepEqual(await signingOut, { state: "signed_out", signedIn: false });
+  await service.close();
 });
 
 test("cloud auth: concurrent expired-session requests share one refresh", async () => {

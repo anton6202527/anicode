@@ -2,7 +2,7 @@
 
 前端无关的通用型 AI Agent 终端界面（TUI），调研、写作、分析、规划和工具协作都是一等能力，软件工程是重点强化的核心长项。支持多 provider、工具调用、权限门、会话持久化、守护进程与 MCP。
 
-默认以本地单进程模式运行，会话使用内置 SQLite；安装和启动不需要 AniCode 后端、PostgreSQL 或 daemon。远端 host、daemon、Vault/KMS、S3 和 Remote Runtime 均为显式可选项。云端模型本身可能需要对应 provider 的凭证；`debug/demo` 可完全离线启动。
+默认以本地单进程模式运行，会话使用内置 SQLite；PostgreSQL、daemon、Vault/KMS、S3 和 Remote Runtime 均为显式可选项。登录 AniCode Cloud 后，默认模型是 `anicode-cloud/deepseek-v4-flash`；未登录时默认使用 `deepseek/deepseek-v4-flash` 和用户自己的 DeepSeek 凭证，并给出明确登录引导。`--demo` 可完全离线启动。
 
 ## 安装
 
@@ -14,26 +14,43 @@ npm install -g anicode
 
 ```bash
 anicode --version
-anicode --list-providers       # 查看内置 provider 与凭证状态
+anicode --list-providers       # 查看内置 provider 元数据（不读取凭证）
 anicode --list-models          # 查看随版本发布的静态模型目录（不代表在线）
+anicode auth login             # 交互登录；密码隐藏输入，不接受 argv/管道密码
+anicode auth status            # 只显示安全状态 DTO，不输出任何 token
+anicode auth logout            # 删除本机 Cloud refresh token
 OPENAI_API_KEY='...' anicode credentials import OPENAI_API_KEY
 ANICODE_CREDENTIAL_KEYS=OPENAI_API_KEY anicode --model openai/gpt-5
 anicode credentials list       # 只列显式引用名，不读取 Keychain/Vault/KMS
 anicode credentials remove OPENAI_API_KEY
 ```
 
-普通启动不会枚举 OS Keychain，也不会把 `.env` 或 shell 中的密钥自动持久化。环境密钥只在当前进程
+普通启动不会枚举 OS Keychain，也不会把 `.env` 或 shell 中的密钥自动持久化。若启用了系统凭证库，
+本地 TUI、`exec` 和 MCP host 仅在需要判断默认路由、明确选择 Cloud 或恢复未知会话时读取 AniCode Cloud
+专用命名空间中的单个 refresh 记录；动态 HTTP host 启动时也会恢复它。`--demo`、明确的非 Cloud 模型和
+非 Cloud `config.model` 不触碰该记录。Keychain 中只持久化 refresh token，短期 access token 只进入内存 Credential Broker。
+没有显式模型来源时，启动恢复使用短硬截止；Keychain 或登录服务慢/离线会安全取消本次恢复并快速回落到用户自己的
+`deepseek/deepseek-v4-flash`，迟到的读取或响应不能再写回登录态。显式 `--model anicode-cloud[/...]` 或 Cloud
+`config.model` 不会被静默改写，并使用完整认证截止后给出明确错误。裸 `anicode-cloud` 等价于
+`anicode-cloud/deepseek-v4-flash`。
+共享 DeepSeek key 始终留在服务端网关，不会下发、写入配置或出现在 CLI 状态 DTO/日志中。环境密钥只在当前进程
 Broker 中使用；长期保存必须通过 `credentials import` 明确执行，运行时再用
 `ANICODE_CREDENTIAL_KEYS` 指定允许按需读取的精确名称。provider 诊断、默认模型选择和会话
 create/open/resume 都是 metadata-only；懒加载引用直到该会话首次实际 `send/stream` 才读取，失败后可在
 解锁或修复凭据后重试，且失败时不会继续打开其他 fallback Keychain 条目。`credentials list`、
-`auth list` 和只浏览模型元数据不会打开 Keychain。
+`auth list` 和只浏览模型元数据不会打开 Keychain；Cloud 登录态请使用会精确读取上述专用记录的
+`auth status`。
+Cloud refresh token 只保存在当前设备；换新设备时重新执行一次 `anicode auth login`，无需复制任何
+DeepSeek key。
+`anicode serve` 会发布由宿主登录态与宿主 config 决定的默认模型；无 `--model` 且无客户端 config 的
+`anicode --http` 会采用这个宿主默认值。因此已登录的 serve 会话默认走 AniCode Cloud 共享网关，而显式模型和
+客户端 config 仍保持权威；连接不支持该 capability 的旧 host 时兼容回落到 direct DeepSeek。
 已物化的 SDK/provider client 可能继续持有凭据副本；`credentials remove` 或外部轮换后，应重启已使用
 该凭据的常驻 AniCode 进程以可靠应用变更。
 
-仍会访问 Keychain 的动作是精确且显式的：首次实际使用某个懒加载 provider、最终选择模型后的鉴权目录
+仍会访问 Keychain 的动作是精确的：启动时恢复 AniCode Cloud 登录、首次实际使用某个懒加载 provider、最终选择模型后的鉴权目录
 校验、连接显式启用且需要凭据的 MCP/控制平面，以及 `credentials import/remove`、
-`auth logout/migrate` 或轮换等写删/迁移动作。原生调用位于有硬截止的 helper 子进程，凭据请求仅经
+`auth login/status/logout/migrate` 或轮换等读写/迁移动作。原生调用位于有硬截止的 helper 子进程，凭据请求仅经
 bounded stdin 传递；无法证明写入/删除是否完成时会报告 `indeterminate`，不会盲目回滚。测试/密闭
 构建应同时设置 `ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1`，将任何意外系统
 凭据库访问变成原生 API 调用前错误。
@@ -41,8 +58,17 @@ bounded stdin 传递；无法证明写入/删除是否完成时会报告 `indete
 ## 使用
 
 ```bash
+# 推荐：登录后默认通过 AniCode Cloud 使用 DeepSeek（共享 provider key 不下发）
+anicode auth login
+anicode auth status
+anicode
+
+# 或使用自己的 DeepSeek key
+export DEEPSEEK_API_KEY=...
+anicode
+
 # 零网络调试（无需 API key，离线流式 echo + 真实工具链路）
-anicode --model debug/demo
+anicode --demo
 
 # Gemini
 export GEMINI_API_KEY=...

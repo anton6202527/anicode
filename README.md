@@ -48,17 +48,18 @@ Node `>=22.15.0` 声明，不会因为新的 Node 主版本产生误报；CI 会
 `anicode.json` / `.anicode/anicode.json`；未信任工作区不加载项目环境或可执行配置，只保留模型与
 TUI 偏好。项目或宿主环境中的密钥只进入当前进程 Credential Broker，随后从该进程环境移除；普通
 启动不会把它们持久化到全局 Keychain，因此不同工作区不会通过自动迁移覆盖或复用彼此的 `.env`
-凭据。provider 诊断、默认模型选择以及会话的 create/open/resume 只检查进程内元数据，不读取
-Keychain；其中“已配置”只表示存在精确的懒加载引用，不代表后端值已经验证。没有已配置云端凭证时
-回退到零网络的 `debug/demo`；真正使用云端模型时，会在该会话首次实际 `send/stream` 才解析 provider
-并读取它的精确凭据，失败则 fail closed，不会继续打开其他 fallback Keychain 条目；下一次发送可在
-用户解锁或修复凭据后重试。
+凭据。普通 provider 诊断以及会话的 create/open/resume 只检查进程内元数据；其中“已配置”只表示存在
+精确的懒加载引用，不代表后端值已经验证。CLI 会额外读取专用的 AniCode Cloud Keychain 条目来恢复
+Supabase 登录：已登录时默认使用 `anicode-cloud/deepseek-v4-flash`，否则默认直连
+`deepseek/deepseek-v4-flash`；缺少本地 DeepSeek 凭证会明确提示先运行 `anicode auth login`、配置自己的
+Key，或显式使用 `--demo`。真正使用普通云端 provider 时，会在该会话首次实际 `send/stream` 才解析
+精确凭据，失败则 fail closed，不会继续打开其他 fallback Keychain 条目。
 
 CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite；当前环境
-凭证只在进程内使用，明确导入的长期凭证才进入本机 OS Keychain。不需要 AniCode 后端服务、
-PostgreSQL 或单独启动 daemon。`--daemon`、`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime
-都是显式可选的团队/远程能力。使用云端模型时仍需对应 provider 的 API key 或官方支持的企业凭证；
-这不是 AniCode 自身的后端依赖。
+凭证只在进程内使用，明确导入的长期凭证才进入本机 OS Keychain。Supabase 登录的 refresh token 使用
+独立 Keychain 命名空间；共享 DeepSeek Key 始终只存在于服务端 gateway，不会下载到客户端。CLI 的
+SessionManager、工具和 SQLite 仍完全在本机运行，不需要 PostgreSQL 或单独启动 daemon。`--daemon`、
+`--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。
 
 开发数据隔离到：
 
@@ -181,10 +182,12 @@ anicode credentials remove OPENAI_API_KEY   # 精确删除；重启已使用它�
 已经物化的 SDK/provider client 可能持有独立副本，不会被 Broker TTL 强制刷新；可靠地应用撤销或轮换需
 回收这些 client，当前应重启已使用该凭据的常驻进程。
 
-仍会打开 OS Keychain 的边界都是精确且有意触发的：首次实际使用某个懒加载 provider、最终选择模型后的
-鉴权目录校验、连接显式启用且需要凭据的 MCP/控制平面，以及 `credentials import/remove`、
-`auth logout/migrate` 或轮换等写删/迁移动作。诊断、默认模型判定、create/open/resume、
-`credentials list`、`auth list` 和仅浏览模型元数据不会打开 Keychain。
+仍会打开 OS Keychain 的边界都是精确且有意触发的：CLI 在没有权威非 Cloud 模型、明确选择 Cloud、
+恢复未知会话或启动动态 HTTP host 时，只读取 AniCode Cloud 专用命名空间中的单个 refresh 记录；
+`auth login/status/logout` 也只操作这一条记录。普通 provider 则仅在首次实际使用懒加载凭证、最终选择
+模型后的鉴权目录校验、连接显式启用且需要凭据的 MCP/控制平面，以及 `credentials import/remove`、
+`auth migrate` 或轮换时访问后端。普通 provider 诊断、`credentials list`、`auth list` 和仅浏览静态模型
+元数据不会枚举或读取 Keychain。
 
 原生 Keychain 调用运行在有硬截止的 helper 子进程；CLI/VSIX 使用 bounded stdin/stdout，Electron 在
 保持 `RunAsNode` fuse 关闭时使用一次性 `utilityProcess` 的 bounded `parentPort`。凭据不进入 argv、继承
@@ -268,11 +271,12 @@ anicode mcp remove context7
 对话与流式输出、底部输入框（Enter 发送 / Shift+Enter 换行）、可搜索的模型选择器、插件市场与设置页。
 
 架构上主进程内跑 core 的 `SessionManager`，经 `contextBridge`（`window.anicode`）把 `SessionHost`
-暴露给渲染进程——和 daemon 是同构的传输层。默认模型来自项目配置或进程内凭据 metadata；没有已配置
-云端凭据时回退到零网络的 `debug/demo`，懒加载引用仍在首次实际发送时验证。
+暴露给渲染进程——和 daemon 是同构的传输层。已登录 AniCode Cloud 时默认使用云端 DeepSeek gateway；
+否则默认模型来自项目配置或进程内凭据 metadata，没有已配置云端凭据时回退到 `debug/demo`。
 原生 Keychain 模块不会加载进 Electron 主进程：应用保持 `RunAsNode` 安全 fuse 关闭，只在一次明确的
 凭据操作时启动一次性 `utilityProcess`，通过有大小/超时限制的 `parentPort` 传输，并在卡死时强制终止
-该精确子进程。凭据不会进入 argv、继承环境、临时文件或日志；启动、会话恢复和浏览模型仍为零读取。
+该精确子进程。凭据不会进入 argv、继承环境、临时文件或日志；启动时只为恢复 AniCode Cloud 登录读取
+它自己的单一 refresh-token 条目，普通 provider 的会话恢复和模型浏览仍不会枚举或读取 Keychain。
 
 ```bash
 npm run dev:app      # 开发模式（electron-vite，热更新）
@@ -339,13 +343,14 @@ anicode 使用数据驱动 registry，模型字符串格式为 `provider/model`�
 
 内置 canonical provider：
 
-| Provider   | 协议/用途                     | 凭证或端点变量                                          |
-| ---------- | ----------------------------- | ------------------------------------------------------- |
-| `deepseek` | OpenAI-compatible             | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`                 |
-| `gemini`   | Gemini OpenAI compatibility   | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
-| `cliproxy` | 本地 CLI Proxy API            | `CLIPROXY_API_KEY`, `CLIPROXY_BASE_URL`                 |
-| `custom`   | 自定义 OpenAI-compatible 服务 | `CUSTOM_OPENAI_BASE_URL`, `CUSTOM_OPENAI_API_KEY`       |
-| `debug`    | 零网络调试                    | 无；别名 `demo`                                         |
+| Provider        | 协议/用途                     | 凭证或端点变量                                          |
+| --------------- | ----------------------------- | ------------------------------------------------------- |
+| `anicode-cloud` | AniCode 托管 DeepSeek gateway | `anicode auth login`；共享 provider key 始终留在服务端  |
+| `deepseek`      | OpenAI-compatible             | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`                 |
+| `gemini`        | Gemini OpenAI compatibility   | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`, `GEMINI_BASE_URL` |
+| `cliproxy`      | 本地 CLI Proxy API            | `CLIPROXY_API_KEY`, `CLIPROXY_BASE_URL`                 |
+| `custom`        | 自定义 OpenAI-compatible 服务 | `CUSTOM_OPENAI_BASE_URL`, `CUSTOM_OPENAI_API_KEY`       |
+| `debug`         | 零网络调试                    | 无；别名 `demo`                                         |
 
 `debug/demo` 永远可用，适合离线验证 agent loop。`--list-models` 只输出随版本发布的静态诊断目录，不代表模型当前在线；交互选择和直接执行仍以 host 的实时目录校验为准。
 

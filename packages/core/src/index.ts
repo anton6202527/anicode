@@ -20,6 +20,27 @@ export {
 } from "./provider/openai-compat.js";
 export { DebugProvider, type DebugProviderOptions } from "./provider/debug.js";
 export {
+  CloudAuthError,
+  CloudAuthService,
+  type CloudAuthRestoreOptions,
+  type CloudAuthServiceOptions,
+  type CloudAuthStatus,
+} from "./cloud-auth.js";
+export {
+  CloudAuthLockError,
+  FileCloudAuthExclusiveLock,
+  cloudAuthLockFileForNamespace,
+  createCloudAuthExclusiveLock,
+  type CloudAuthExclusiveLock,
+  type CloudAuthLockOptions,
+} from "./security/cloud-auth-lock.js";
+export {
+  ANICODE_CLOUD_CONFIG,
+  ANICODE_CLOUD_DEFAULT_MODEL,
+  ANICODE_CLOUD_PROVIDER_ID,
+} from "./cloud-config.js";
+export { registerAnicodeCloudProvider } from "./cloud-provider.js";
+export {
   createProvider,
   inspectProvider,
   bindProviderRegistry,

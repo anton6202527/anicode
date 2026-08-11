@@ -111,7 +111,9 @@ async function createBridge(): Promise<Bridge> {
         })
       : undefined;
   if (cloudAuth) {
-    await cloudAuth.restore().catch(() => undefined);
+    // Desktop startup must not wait on an unavailable Keychain/network. The service remains
+    // registered after this bounded implicit restore so a later Cloud model selection can retry.
+    await cloudAuth.restore({ signal: AbortSignal.timeout(2_000) }).catch(() => undefined);
     registerAnicodeCloudProvider(cloudAuth);
   }
   try {

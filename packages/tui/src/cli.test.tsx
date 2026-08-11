@@ -6,25 +6,31 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  ANICODE_CLOUD_DEFAULT_MODEL,
   AuthStore,
   createLocalRuntimeStack,
   registerOpenAICompatibleProvider,
   WorkspaceTrustStore,
+  type CloudAuthStatus,
   type SessionHost,
   type SyncSecretBackend,
 } from "@anicode/core";
 import {
   assertProviderConfigured,
   colorlessTerminalOutput,
+  createCliCloudAuthService,
+  CLI_HOST_DEFAULT_MODEL_CAPABILITY,
+  disposeCliCloudAuth,
   disposeCliRuntimeResources,
   enterTerminalScreen,
   fullscreenViewportOutput,
+  formatCloudAuthStatus,
   helpText,
   installTerminalExitGuard,
   parseArgs,
   parseExecArgs,
+  normalizeCliModelSpec,
   resolveConfiguredProvider,
-  resolveDefaultModel,
   resolveInteractivePermissionMode,
   runAuthCommand,
   runMcpCatalogCommand,
@@ -33,7 +39,10 @@ import {
   runTrustCommand,
   runExecCommand,
   selectSessionId,
+  selectRemoteStartupModel,
   selectStartupModel,
+  setupCliCloudAuth,
+  shouldSetupCliCloudAuth,
   startRawModeWatchdog,
   terminalSafe,
   validateArgs,
@@ -45,6 +54,7 @@ class RecordingCredentialBackend implements SyncSecretBackend {
   readonly values = new Map<string, string>();
   getCalls = 0;
   listCalls = 0;
+  closeCalls = 0;
 
   constructor(kind = "recording-test-backend") {
     this.kind = kind;
@@ -76,6 +86,48 @@ class RecordingCredentialBackend implements SyncSecretBackend {
   async list(): Promise<string[]> {
     return this.listSync();
   }
+  close(): void {
+    this.closeCalls++;
+  }
+}
+
+class NonCooperativeReadCredentialBackend extends RecordingCredentialBackend {
+  override async get(_key: string, _signal?: AbortSignal): Promise<string | undefined> {
+    this.getCalls++;
+    return new Promise<string | undefined>(() => {
+      // Intentionally ignores AbortSignal and never settles: the Cloud service must detach safely.
+    });
+  }
+}
+
+const CLOUD_REFRESH_STORAGE_KEY = "auth:supabase-refresh";
+
+function cloudSessionFixture(suffix: string) {
+  return {
+    access_token: `access-token-${suffix}-0123456789`,
+    refresh_token: `refresh-token-${suffix}-0123456789`,
+    expires_in: 3600,
+    user: { id: `user-${suffix}`, email: `${suffix}@example.com` },
+  };
+}
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function cloudChatResponse(text = "cloud-ok"): Response {
+  return new Response(
+    `data: ${JSON.stringify({
+      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+    })}\n\ndata: ${JSON.stringify({
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    })}\n\ndata: [DONE]\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
 }
 
 test("CLI credentials: import/remove 精确 key；list 只读 allowlist 元数据", async () => {
@@ -283,6 +335,313 @@ test("CLI auth metadata commands do not construct a Keychain backend under the s
     );
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI cloud auth: 无 token 的 status 给登录引导且始终清理 service/backend", async () => {
+  const backend = new RecordingCredentialBackend();
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => {
+      assert.fail("empty Keychain must not trigger a network request");
+    },
+  });
+  const chunks: string[] = [];
+
+  await runAuthCommand(["status"], {
+    cloudAuth: service,
+    output: { write: (chunk: string) => (chunks.push(chunk), true) } as NodeJS.WritableStream,
+  });
+
+  assert.match(chunks.join(""), /未登录|signed out/);
+  assert.match(chunks.join(""), /anicode auth login/);
+  assert.equal(backend.closeCalls, 1);
+});
+
+test("CLI cloud auth: 登录密码仅由注入输入进入认证请求，输出与 Keychain 不泄漏", async () => {
+  const backend = new RecordingCredentialBackend();
+  const sentPassword = "password-must-never-be-logged";
+  const accessToken = "access-token-login-0123456789";
+  const refreshToken = "refresh-token-login-0123456789";
+  let authRequestBody = "";
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      authRequestBody = await request.text();
+      return jsonResponse({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_in: 3600,
+        user: { id: "login-user", email: "login@example.com" },
+      });
+    },
+  });
+  const credentials = { email: "login@example.com", password: sentPassword };
+  const chunks: string[] = [];
+
+  await assert.rejects(
+    runAuthCommand(["login", "anicode-cloud", sentPassword], {
+      output: { write: (chunk: string) => (chunks.push(chunk), true) } as NodeJS.WritableStream,
+    }),
+    /凭证绝不通过参数接收|credentials are never accepted as arguments/,
+  );
+
+  await runAuthCommand(["login"], {
+    cloudAuth: service,
+    readCloudCredentials: async () => credentials,
+    output: { write: (chunk: string) => (chunks.push(chunk), true) } as NodeJS.WritableStream,
+  });
+
+  assert.match(authRequestBody, /login@example\.com/);
+  assert.match(authRequestBody, new RegExp(sentPassword));
+  assert.equal(
+    credentials.password,
+    "",
+    "mutable password reference should be cleared immediately",
+  );
+  const output = chunks.join("");
+  assert.match(output, /login@example\.com/);
+  assert.doesNotMatch(output, /password-must-never|access-token|refresh-token/);
+  const persisted = backend.values.get(CLOUD_REFRESH_STORAGE_KEY) ?? "";
+  assert.match(persisted, /refresh-token-login/);
+  assert.doesNotMatch(persisted, /access-token|password-must-never/);
+  assert.equal(backend.closeCalls, 1);
+});
+
+test("CLI cloud auth: restore 后 DTO/状态输出白名单不暴露 access、refresh 或 password", async () => {
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-stored-0123456789" }),
+  );
+  const rotated = cloudSessionFixture("restored");
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => jsonResponse(rotated),
+  });
+  const chunks: string[] = [];
+
+  await runAuthCommand(["status"], {
+    cloudAuth: service,
+    output: { write: (chunk: string) => (chunks.push(chunk), true) } as NodeJS.WritableStream,
+  });
+
+  const output = chunks.join("");
+  assert.match(output, /restored@example\.com/);
+  assert.doesNotMatch(output, /access-token|refresh-token|password/);
+  const adversarialDto = {
+    state: "signed_in",
+    signedIn: true,
+    user: { id: "safe-id", email: "safe@example.com" },
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    accessToken: "must-never-print-access",
+    refreshToken: "must-never-print-refresh",
+    password: "must-never-print-password",
+  } as unknown as CloudAuthStatus;
+  const formatted = formatCloudAuthStatus(adversarialDto);
+  assert.match(formatted, /safe@example\.com/);
+  assert.doesNotMatch(formatted, /must-never-print/);
+  assert.equal(backend.closeCalls, 1);
+});
+
+test("CLI cloud auth: fresh CLI logout 不先 refresh/network，直接以 durable 本地撤销为准", async () => {
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-logout-0123456789" }),
+  );
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => {
+      assert.fail("logout must not refresh solely to obtain a short-lived remote revoke token");
+    },
+  });
+  const chunks: string[] = [];
+
+  await runAuthCommand(["logout"], {
+    cloudAuth: service,
+    output: { write: (chunk: string) => (chunks.push(chunk), true) } as NodeJS.WritableStream,
+  });
+
+  assert.equal(backend.values.has(CLOUD_REFRESH_STORAGE_KEY), false);
+  assert.match(chunks.join(""), /未登录|signed out/);
+  assert.equal(backend.closeCalls, 1);
+});
+
+test("CLI cloud auth: restore、provider 注册、Broker attach 与默认模型形成同一生命周期", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-cloud-runtime-"));
+  const stack = createLocalRuntimeStack(root, { ANICODE_CREDENTIAL_BACKEND: "memory" });
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-runtime-0123456789" }),
+  );
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => jsonResponse(cloudSessionFixture("runtime")),
+  });
+  try {
+    const cloud = await setupCliCloudAuth(stack, { auth: service });
+    assert.equal(cloud?.status.signedIn, true);
+    assert.deepEqual(
+      selectStartupModel(
+        { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+        undefined,
+        stack.providers,
+        cloud?.status,
+      ),
+      { model: ANICODE_CLOUD_DEFAULT_MODEL },
+    );
+    assert.doesNotThrow(() =>
+      assertProviderConfigured(
+        ANICODE_CLOUD_DEFAULT_MODEL,
+        stack.providers.diagnoseProvider,
+        cloud?.status,
+      ),
+    );
+    assert.equal(stack.broker.has("gateway:supabase-access"), true);
+    await disposeCliCloudAuth(cloud);
+    assert.equal(stack.broker.has("gateway:supabase-access"), false);
+    assert.equal(backend.closeCalls, 1);
+  } finally {
+    await Promise.resolve(stack.artifacts.close?.()).catch(() => undefined);
+    await stack.networkProxy.close().catch(() => undefined);
+    await stack.database.close().catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI cloud auth: 非合作网络超过隐式启动预算后取消并禁止迟到响应写入", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-cloud-deadline-"));
+  const stack = createLocalRuntimeStack(root, { ANICODE_CREDENTIAL_BACKEND: "memory" });
+  const backend = new RecordingCredentialBackend();
+  const originalRefreshToken = "refresh-token-deadline-original-0123456789";
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: originalRefreshToken }),
+  );
+  let completeFetch: ((response: Response) => void) | undefined;
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () =>
+      new Promise<Response>((resolve) => {
+        completeFetch = resolve;
+      }),
+  });
+  let cloud: Awaited<ReturnType<typeof setupCliCloudAuth>> = undefined;
+  try {
+    const startedAt = Date.now();
+    cloud = await setupCliCloudAuth(stack, {
+      auth: service,
+      restoreTimeoutMs: 20,
+    });
+    assert.equal(cloud?.status.signedIn, false);
+    assert.equal(cloud?.restoreFailed, true);
+    assert.equal(
+      selectStartupModel(
+        { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+        undefined,
+        stack.providers,
+        cloud?.status,
+      ).model,
+      "deepseek/deepseek-v4-flash",
+    );
+    assert.ok(Date.now() - startedAt < 500, "implicit restore must respect the CLI hard budget");
+    assert.equal(backend.closeCalls, 0, "fallback keeps a lazy command-scoped provider available");
+
+    completeFetch?.(jsonResponse(cloudSessionFixture("too-late")));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(JSON.parse(backend.values.get(CLOUD_REFRESH_STORAGE_KEY) ?? "{}"), {
+      version: 1,
+      refreshToken: originalRefreshToken,
+    });
+    assert.equal(service.status().signedIn, false);
+  } finally {
+    await disposeCliCloudAuth(cloud);
+    assert.equal(backend.closeCalls, 1);
+    await Promise.resolve(stack.artifacts.close?.()).catch(() => undefined);
+    await stack.networkProxy.close().catch(() => undefined);
+    await stack.database.close().catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI cloud auth: 非合作 Keychain get 也受硬 deadline 限制且 service 可立即清理", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-cloud-keychain-deadline-"));
+  const stack = createLocalRuntimeStack(root, { ANICODE_CREDENTIAL_BACKEND: "memory" });
+  const backend = new NonCooperativeReadCredentialBackend();
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => {
+      assert.fail("a Keychain read that never completed must not start auth network I/O");
+    },
+  });
+  let cloud: Awaited<ReturnType<typeof setupCliCloudAuth>> = undefined;
+  try {
+    const startedAt = Date.now();
+    cloud = await setupCliCloudAuth(stack, { auth: service, restoreTimeoutMs: 20 });
+    assert.ok(Date.now() - startedAt < 500, "non-cooperative backend must not defeat the deadline");
+    assert.equal(cloud?.restoreFailed, true);
+    assert.equal(cloud?.status.signedIn, false);
+    let cleanupTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        disposeCliCloudAuth(cloud),
+        new Promise<never>((_resolve, reject) => {
+          cleanupTimeout = setTimeout(
+            () => reject(new Error("cloud cleanup exceeded its hard budget")),
+            500,
+          );
+        }),
+      ]);
+    } finally {
+      if (cleanupTimeout) clearTimeout(cleanupTimeout);
+    }
+    cloud = undefined;
+    assert.equal(backend.closeCalls, 1);
+  } finally {
+    await disposeCliCloudAuth(cloud).catch(() => undefined);
+    await Promise.resolve(stack.artifacts.close?.()).catch(() => undefined);
+    await stack.networkProxy.close().catch(() => undefined);
+    await stack.database.close().catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI cloud auth: 显式 Cloud 超时明确失败且绝不静默改成 direct DeepSeek", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-cli-cloud-required-"));
+  const stack = createLocalRuntimeStack(root, { ANICODE_CREDENTIAL_BACKEND: "memory" });
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-required-0123456789" }),
+  );
+  let completeFetch: ((response: Response) => void) | undefined;
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () =>
+      new Promise<Response>((resolve) => {
+        completeFetch = resolve;
+      }),
+  });
+  try {
+    await assert.rejects(
+      setupCliCloudAuth(stack, {
+        auth: service,
+        requireSignedIn: true,
+        restoreTimeoutMs: 20,
+      }),
+      /^(?=[\s\S]*Cloud)(?=[\s\S]*(?:could not be restored|无法.*恢复))(?=[\s\S]*anicode auth login)/i,
+    );
+    assert.equal(backend.closeCalls, 1);
+  } finally {
+    completeFetch?.(jsonResponse(cloudSessionFixture("required-too-late")));
+    await Promise.resolve(stack.artifacts.close?.()).catch(() => undefined);
+    await stack.networkProxy.close().catch(() => undefined);
+    await stack.database.close().catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 
@@ -660,7 +1019,7 @@ test("CLI: daemon 拒绝本地专属会话目录，trace 必须配日志", () =>
   assert.throws(() => validateArgs(parseArgs(["--trace-content"])), /必须与 --debug-log 一起使用/);
 });
 
-test("CLI: 无 --model 时不硬耦合 ANTHROPIC_API_KEY，无凭证回退 debug/demo", () => {
+test("CLI: 无模型来源时已登录优先 Cloud DeepSeek，否则稳定使用本地 DeepSeek", () => {
   const keys = [
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -675,13 +1034,27 @@ test("CLI: 无 --model 时不硬耦合 ANTHROPIC_API_KEY，无凭证回退 debug
   const saved = new Map(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   try {
-    // 无参数：modelExplicit=false，运行时会挑默认；无任何云端凭证 → debug/demo（直接进 TUI）。
-    assert.equal(parseArgs(["--cwd", "/w"]).modelExplicit, false);
-    assert.equal(resolveDefaultModel(), "debug/demo");
+    // 无参数：modelExplicit=false；无任何本地凭证也不应改写产品默认模型。
+    const args = parseArgs(["--cwd", "/w"]);
+    assert.equal(args.modelExplicit, false);
+    const registry = {
+      diagnoseProvider: () => {
+        throw new Error("无配置时不应诊断 provider");
+      },
+      resolveDefaultModel: () => "debug/demo",
+    };
+    assert.deepEqual(selectStartupModel(args, undefined, registry, { signedIn: false }), {
+      model: "deepseek/deepseek-v4-flash",
+    });
+    assert.deepEqual(selectStartupModel(args, undefined, registry, { signedIn: true }), {
+      model: "anicode-cloud/deepseek-v4-flash",
+    });
 
-    // 配了某个云端 key → 默认挑那个 provider，不再要求 ANTHROPIC_API_KEY。
+    // 选择是稳定产品语义，不直接窥探 process.env。
     process.env["DEEPSEEK_API_KEY"] = "sk-test";
-    assert.equal(resolveDefaultModel(), "deepseek/deepseek-v4-flash");
+    assert.deepEqual(selectStartupModel(args, undefined, registry), {
+      model: "deepseek/deepseek-v4-flash",
+    });
 
     // 显式 --model 仍标记为 explicit（运行时不覆盖）。
     assert.equal(parseArgs(["--model", "openai/gpt-x"]).modelExplicit, true);
@@ -693,35 +1066,43 @@ test("CLI: 无 --model 时不硬耦合 ANTHROPIC_API_KEY，无凭证回退 debug
   }
 });
 
-test("CLI: 隐式配置模型缺凭证时安全回退，显式模型与无效 provider 保持 fail-fast", () => {
+test("CLI: 配置/显式模型保持权威，合法 custom 不会被过宽迁移", () => {
   const missingCredentials = {
     diagnoseProvider(model: string) {
       if (model === "unknown/model") throw new Error("Unknown provider: unknown");
+      if (model === "custom" || model.startsWith("custom/")) {
+        return { requiresApiKey: false, hasCredentials: true, warnings: [] };
+      }
       return {
         requiresApiKey: model !== "debug/demo",
         hasCredentials: model === "debug/demo",
         warnings: model === "debug/demo" ? [] : ["missing DEEPSEEK_API_KEY"],
       };
     },
-    resolveDefaultModel: () => "debug/demo",
+    resolveDefaultModel: () => "deepseek/deepseek-v4-flash",
   };
 
   assert.deepEqual(
     selectStartupModel(
       {
-        model: "deepseek/deepseek-v4-flash",
+        model: "gemini/gemini-3.6-flash",
         modelExplicit: false,
         demo: false,
       },
-      "deepseek/deepseek-v4-flash",
+      "gemini/gemini-3.6-flash",
       missingCredentials,
     ),
-    {
-      model: "debug/demo",
-      fallbackFrom: "deepseek/deepseek-v4-flash",
-      fallbackReason: "missing DEEPSEEK_API_KEY",
-    },
+    { model: "gemini/gemini-3.6-flash" },
   );
+
+  for (const configuredCustom of ["custom", "custom/vendor/model"]) {
+    const selected = selectStartupModel(
+      { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+      configuredCustom,
+      missingCredentials,
+    );
+    assert.equal(selected.model, configuredCustom);
+  }
 
   const explicit = selectStartupModel(
     { model: "deepseek/deepseek-v4-flash", modelExplicit: true, demo: false },
@@ -731,7 +1112,15 @@ test("CLI: 隐式配置模型缺凭证时安全回退，显式模型与无效 pr
   assert.deepEqual(explicit, { model: "deepseek/deepseek-v4-flash" });
   assert.throws(
     () => assertProviderConfigured(explicit.model, missingCredentials.diagnoseProvider),
-    /DEEPSEEK_API_KEY.*--demo/,
+    /DEEPSEEK_API_KEY.*anicode auth login.*--demo/,
+  );
+  assert.deepEqual(
+    selectStartupModel(
+      { model: "custom/vendor/model", modelExplicit: true, demo: false },
+      "custom/legacy-config",
+      missingCredentials,
+    ),
+    { model: "custom/vendor/model" },
   );
   assert.deepEqual(
     selectStartupModel(
@@ -741,15 +1130,116 @@ test("CLI: 隐式配置模型缺凭证时安全回退，显式模型与无效 pr
     ),
     { model: "debug/demo" },
   );
+  const unknown = selectStartupModel(
+    { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+    "unknown/model",
+    missingCredentials,
+  );
+  assert.deepEqual(unknown, { model: "unknown/model" });
   assert.throws(
-    () =>
-      selectStartupModel(
-        { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
-        "unknown/model",
-        missingCredentials,
-      ),
+    () => assertProviderConfigured(unknown.model, missingCredentials.diagnoseProvider),
     /Unknown provider/,
   );
+
+  assert.equal(normalizeCliModelSpec("anicode-cloud"), ANICODE_CLOUD_DEFAULT_MODEL);
+  assert.deepEqual(
+    selectStartupModel(
+      { model: "anicode-cloud", modelExplicit: true, demo: false },
+      undefined,
+      missingCredentials,
+    ),
+    { model: ANICODE_CLOUD_DEFAULT_MODEL },
+  );
+  assert.deepEqual(
+    selectStartupModel(
+      { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+      "anicode-cloud",
+      missingCredentials,
+    ),
+    { model: ANICODE_CLOUD_DEFAULT_MODEL },
+  );
+  assert.throws(
+    () =>
+      assertProviderConfigured(
+        ANICODE_CLOUD_DEFAULT_MODEL,
+        () => ({ requiresApiKey: false, hasCredentials: true, warnings: [] }),
+        { signedIn: false },
+      ),
+    /anicode auth login/,
+    "descriptor availability alone must never mean that Cloud auth is ready",
+  );
+  let diagnosedCloudSpec = "";
+  assert.doesNotThrow(() =>
+    assertProviderConfigured(
+      "anicode-cloud",
+      (model) => {
+        diagnosedCloudSpec = model;
+        return { requiresApiKey: false, hasCredentials: true, warnings: [] };
+      },
+      { signedIn: true },
+    ),
+  );
+  assert.equal(diagnosedCloudSpec, ANICODE_CLOUD_DEFAULT_MODEL);
+});
+
+test("CLI: 远端默认模型由 host capability 决定，显式/config 与旧 host 行为保持稳定", async () => {
+  const probes: string[] = [];
+  const cloudHost: Pick<SessionHost, "discoverModels"> = {
+    async discoverModels(providerId) {
+      probes.push(providerId);
+      return providerId === CLI_HOST_DEFAULT_MODEL_CAPABILITY
+        ? [ANICODE_CLOUD_DEFAULT_MODEL]
+        : undefined;
+    },
+  };
+  const implicit = await selectRemoteStartupModel(
+    { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+    undefined,
+    cloudHost,
+  );
+  assert.deepEqual(implicit, { model: ANICODE_CLOUD_DEFAULT_MODEL });
+  assert.deepEqual(probes, [CLI_HOST_DEFAULT_MODEL_CAPABILITY]);
+
+  const explicit = await selectRemoteStartupModel(
+    { model: "anicode-cloud", modelExplicit: true, demo: false },
+    "custom/config-model",
+    cloudHost,
+  );
+  assert.deepEqual(explicit, { model: ANICODE_CLOUD_DEFAULT_MODEL });
+  const configured = await selectRemoteStartupModel(
+    { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+    "custom/config-model",
+    cloudHost,
+  );
+  assert.deepEqual(configured, { model: "custom/config-model" });
+  assert.equal(probes.length, 1, "authoritative choices must not probe host default metadata");
+
+  const oldHost = {} as Pick<SessionHost, "discoverModels">;
+  assert.deepEqual(
+    await selectRemoteStartupModel(
+      { model: "deepseek/deepseek-v4-flash", modelExplicit: false, demo: false },
+      undefined,
+      oldHost,
+    ),
+    { model: "deepseek/deepseek-v4-flash" },
+  );
+});
+
+test("CLI: Cloud restore 只在默认判定、显式 Cloud 或 resume 时触碰 Keychain", () => {
+  assert.equal(shouldSetupCliCloudAuth(parseArgs([]), undefined), true);
+  assert.equal(
+    shouldSetupCliCloudAuth(parseArgs(["--model", ANICODE_CLOUD_DEFAULT_MODEL]), undefined),
+    true,
+  );
+  assert.equal(shouldSetupCliCloudAuth(parseArgs([]), "anicode-cloud/deepseek-v4-pro"), true);
+  assert.equal(
+    shouldSetupCliCloudAuth(parseArgs(["--resume", "session-id"]), "custom/model"),
+    true,
+  );
+  assert.equal(shouldSetupCliCloudAuth(parseArgs(["--demo"]), undefined), false);
+  assert.equal(shouldSetupCliCloudAuth(parseArgs(["--model", "custom/model"]), undefined), false);
+  assert.equal(shouldSetupCliCloudAuth(parseArgs([]), "custom/model"), false);
+  assert.equal(shouldSetupCliCloudAuth(parseArgs([]), "deepseek/deepseek-v4-flash"), false);
 });
 
 test("CLI: 模型选择读取当前 runtime Broker，而不是密钥清理后的 process.env", async () => {
@@ -859,9 +1349,16 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-serve-"));
   const sink = { write: () => true } as unknown as NodeJS.WritableStream;
   const tokenFile = path.join(dir, "serve.token");
+  const cloudBackend = new RecordingCredentialBackend();
+  const cloudAuth = createCliCloudAuthService({
+    backend: cloudBackend,
+    fetch: async () => {
+      assert.fail("serve with an empty cloud Keychain must not make an auth request");
+    },
+  });
   const server = await runServeCommand(
     ["--port", "0", "--sessions", path.join(dir, "s"), "--cwd", dir, "--token-file", tokenFile],
-    { output: sink },
+    { output: sink, cloudAuth },
   );
   try {
     assert.equal((await fs.readFile(tokenFile, "utf8")).trim(), server.authenticationToken());
@@ -889,6 +1386,9 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
       noAltScreen: false,
       plain: false,
     });
+    assert.deepEqual(await host.discoverModels?.(CLI_HOST_DEFAULT_MODEL_CAPABILITY), [
+      "deepseek/deepseek-v4-flash",
+    ]);
     const meta = await host.createSession({ cwd: dir, model: "debug/demo" });
     const events: unknown[] = [];
     const handle = await host.open(meta.id, (ev) => events.push(ev));
@@ -900,6 +1400,102 @@ test("CLI: serve 起 HTTP 服务 → --http host 连上走通完整会话（demo
     host.dispose();
   } finally {
     await server.close();
+    assert.equal(cloudBackend.closeCalls, 1);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI: 已登录 serve 向无模型来源的 --http 客户端传播 Cloud 默认并真实建会话", async () => {
+  const { runServeCommand, buildHost } = await import("./cli.js");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-serve-cloud-default-"));
+  const tokenFile = path.join(dir, "serve.token");
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-serve-http-0123456789" }),
+  );
+  let gatewayCalls = 0;
+  const cloudAuth = createCliCloudAuthService({
+    backend,
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname.startsWith("/auth/v1/")) {
+        return jsonResponse(cloudSessionFixture("serve-http"));
+      }
+      gatewayCalls++;
+      assert.match(request.headers.get("authorization") ?? "", /^Bearer access-token-serve-http-/);
+      return cloudChatResponse("served-cloud-ok");
+    },
+  });
+  const chunks: string[] = [];
+  const output = {
+    write: (chunk: string) => (chunks.push(chunk), true),
+  } as unknown as NodeJS.WritableStream;
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.XDG_CONFIG_HOME = path.join(dir, "config-home");
+  let server: Awaited<ReturnType<typeof runServeCommand>> | undefined;
+  try {
+    server = await runServeCommand(
+      [
+        "--port",
+        "0",
+        "--sessions",
+        path.join(dir, "sessions"),
+        "--cwd",
+        dir,
+        "--token-file",
+        tokenFile,
+      ],
+      { output: { write: () => true } as unknown as NodeJS.WritableStream, cloudAuth },
+    );
+    const baseUrl = `http://127.0.0.1:${server.port()}`;
+    await runExecCommand(
+      [
+        "--http",
+        baseUrl,
+        "--http-token-file",
+        tokenFile,
+        "--cwd",
+        dir,
+        "--prompt",
+        "use the host default",
+        "--jsonl",
+      ],
+      { output, error: output },
+    );
+    const records = chunks
+      .join("")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; model?: string; event?: unknown });
+    assert.equal(
+      records.find((record) => record.type === "session.started")?.model,
+      ANICODE_CLOUD_DEFAULT_MODEL,
+    );
+    assert.ok(
+      records.some((record) => (JSON.stringify(record.event) ?? "").includes("served-cloud-ok")),
+    );
+
+    const inspectionHost = await buildHost(
+      parseArgs(["--http", baseUrl, "--http-token-file", tokenFile, "--cwd", dir]),
+    );
+    try {
+      const sessions = await inspectionHost.listSessions();
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0]?.model, ANICODE_CLOUD_DEFAULT_MODEL);
+    } finally {
+      await inspectionHost.dispose();
+    }
+    assert.equal(gatewayCalls, 1);
+  } finally {
+    await server?.close();
+    assert.equal(backend.closeCalls, 1);
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
@@ -980,6 +1576,69 @@ test("CLI exec: demo 模型无 TTY 完成一次 JSONL 会话", async () => {
   }
 });
 
+test("CLI exec: 已恢复 Cloud 登录时无 --model 默认走托管 DeepSeek 并清理认证资源", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-exec-cloud-"));
+  const chunks: string[] = [];
+  const output = {
+    write: (chunk: string) => (chunks.push(chunk), true),
+  } as unknown as NodeJS.WritableStream;
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-exec-0123456789" }),
+  );
+  let gatewayCalls = 0;
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname.startsWith("/auth/v1/")) {
+        return jsonResponse(cloudSessionFixture("exec"));
+      }
+      gatewayCalls++;
+      assert.match(request.headers.get("authorization") ?? "", /^Bearer access-token-exec-/);
+      return cloudChatResponse();
+    },
+  });
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.XDG_CONFIG_HOME = path.join(dir, "config-home");
+  try {
+    await runExecCommand(
+      [
+        "--cwd",
+        dir,
+        "--sessions",
+        path.join(dir, "sessions"),
+        "--prompt",
+        "hello cloud",
+        "--jsonl",
+      ],
+      { output, error: output, cloudAuth: service },
+    );
+    const records = chunks
+      .join("")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; model?: string; event?: unknown });
+    assert.equal(
+      records.find((record) => record.type === "session.started")?.model,
+      ANICODE_CLOUD_DEFAULT_MODEL,
+    );
+    assert.ok(records.some((record) => (JSON.stringify(record.event) ?? "").includes("cloud-ok")));
+    assert.equal(records.at(-1)?.type, "session.completed");
+    assert.equal(gatewayCalls, 1);
+    assert.equal(backend.closeCalls, 1);
+  } finally {
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI headless: 配置模型缺凭证时 exec 与 MCP fail-fast，不伪装成 demo 成功", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-headless-model-"));
   const cwd = path.join(root, "workspace");
@@ -1019,6 +1678,74 @@ test("CLI headless: 配置模型缺凭证时 exec 与 MCP fail-fast，不伪装�
     else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
     if (previousDeepSeek === undefined) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = previousDeepSeek;
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI MCP: 无模型来源时恢复 Cloud 默认并清理命令级认证生命周期", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-cloud-lifecycle-"));
+  const backend = new RecordingCredentialBackend();
+  backend.values.set(
+    CLOUD_REFRESH_STORAGE_KEY,
+    JSON.stringify({ version: 1, refreshToken: "refresh-token-mcp-0123456789" }),
+  );
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => jsonResponse(cloudSessionFixture("mcp")),
+  });
+  const input = Readable.from([]);
+  const output = { write: () => true } as unknown as NodeJS.WritableStream;
+  let server: Awaited<ReturnType<typeof runMcpCommand>> | undefined;
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.XDG_CONFIG_HOME = path.join(root, "config-home");
+  try {
+    server = await runMcpCommand(["--cwd", root, "--sessions", path.join(root, "sessions")], {
+      input,
+      output,
+      cloudAuth: service,
+    });
+  } finally {
+    await server?.close();
+    assert.equal(backend.closeCalls, 1);
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
+    if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI MCP: 显式非 Cloud 模型只注册懒 provider，不读取 Cloud Keychain", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-cloud-lazy-"));
+  const backend = new RecordingCredentialBackend();
+  const service = createCliCloudAuthService({
+    backend,
+    fetch: async () => {
+      assert.fail("explicit debug model must not restore Cloud auth");
+    },
+  });
+  const input = Readable.from([]);
+  const output = { write: () => true } as unknown as NodeJS.WritableStream;
+  let server: Awaited<ReturnType<typeof runMcpCommand>> | undefined;
+  const previousBackend = process.env.ANICODE_CREDENTIAL_BACKEND;
+  const previousConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.ANICODE_CREDENTIAL_BACKEND = "memory";
+  process.env.XDG_CONFIG_HOME = path.join(root, "config-home");
+  try {
+    server = await runMcpCommand(
+      ["--cwd", root, "--sessions", path.join(root, "sessions"), "--model", "debug/demo"],
+      { input, output, cloudAuth: service },
+    );
+    assert.equal(backend.getCalls, 0);
+  } finally {
+    await server?.close();
+    assert.equal(backend.closeCalls, 1);
+    if (previousBackend === undefined) delete process.env.ANICODE_CREDENTIAL_BACKEND;
+    else process.env.ANICODE_CREDENTIAL_BACKEND = previousBackend;
     if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = previousConfigHome;
     await fs.rm(root, { recursive: true, force: true });
