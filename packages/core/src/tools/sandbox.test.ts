@@ -14,6 +14,7 @@ import {
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildShellSpawn } from "./shell-spawn.js";
 
 test("sandbox: workspace-write 只放行工作区+临时目录写入并断网", () => {
   const p = buildSeatbeltProfile({ policy: "workspace-write", cwd: "/proj/app" });
@@ -113,6 +114,17 @@ test("sandbox: wrapWithSandbox 按平台选择 seatbelt/bwrap，none 或未知�
   assert.equal(wrapWithSandbox("echo hi", { policy: "none", cwd: "/p" }, "darwin"), null);
 });
 
+test("shell spawn: Windows 不能把限制策略降级为裸 shell", () => {
+  assert.throws(
+    () => buildShellSpawn("echo hi", "workspace-write", process.cwd(), "win32"),
+    /Sandbox policy workspace-write cannot be enforced on win32/,
+  );
+  assert.deepEqual(buildShellSpawn("echo hi", "none", process.cwd(), "win32"), {
+    file: "/bin/bash",
+    args: ["-c", "echo hi"],
+  });
+});
+
 test("sandbox: resolveSandboxPolicy 显式优先，其次环境变量，默认收紧到 workspace-write", () => {
   assert.equal(resolveSandboxPolicy("read-only", {}), "read-only");
   assert.equal(
@@ -132,9 +144,16 @@ test("sandbox: resolveSandboxNetwork 默认拒绝，仅显式 on 放行", () => 
 });
 
 test("sandbox: sandboxBinaryAvailable 命中 PATH 中的可执行文件", () => {
-  // /bin/sh 几乎必然存在且可执行；用自定义 env 避免污染默认缓存。
-  assert.equal(sandboxBinaryAvailable("sh", { PATH: "/bin" }), true);
-  assert.equal(sandboxBinaryAvailable("definitely-not-a-real-binary-xyz", { PATH: "/bin" }), false);
+  // Use the current trusted Node installation so PATH lookup semantics stay covered on every OS.
+  const binaryDirectory = path.dirname(process.execPath);
+  assert.equal(
+    sandboxBinaryAvailable(path.basename(process.execPath), { PATH: binaryDirectory }),
+    true,
+  );
+  assert.equal(
+    sandboxBinaryAvailable("definitely-not-a-real-binary-xyz", { PATH: binaryDirectory }),
+    false,
+  );
 });
 
 test("sandbox: 安全边界二进制不接受 PATH 前置的工作区伪造文件", async () => {

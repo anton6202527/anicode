@@ -15,34 +15,47 @@ const cfg = {
   args: [serverPath], // 纯 JS，任意 cwd 可跑（不依赖 tsx 解析）
   extensions: [".ts", ".tsx"],
 };
+const LSP_TEST_OPTIONS = { timeout: 10_000 };
 
-test("LSP: 握手 → didOpen → 收到 publishDiagnostics", async () => {
+test("LSP: 握手 → didOpen → 收到 publishDiagnostics", LSP_TEST_OPTIONS, async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-"));
+  let client: LspClient | undefined;
+  t.after(async () => {
+    try {
+      await client?.close();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
   const file = path.join(dir, "a.ts");
   await fs.writeFile(file, "const x: number = 1;\nconst y = x;\nbad code here\n");
-  const client = LspClient.start(dir, cfg);
+  client = LspClient.start(dir, cfg);
   const diags = await client.diagnose(file, 3000);
   assert.equal(diags.length, 1);
   assert.equal(diags[0]!.severity, "error");
   assert.equal(diags[0]!.line, 3); // 0-based 2 → 1-based 3
   assert.equal(diags[0]!.column, 5);
   assert.match(diags[0]!.message, /类型不匹配/);
-  await client.close();
-  await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("LSP: diagnostics 工具格式化输出；未配置扩展名给出提示", async () => {
+test("LSP: diagnostics 工具格式化输出；未配置扩展名给出提示", LSP_TEST_OPTIONS, async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-"));
+  let pool: LspPool | undefined;
+  t.after(async () => {
+    try {
+      await pool?.closeAll();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
   await fs.writeFile(path.join(dir, "a.ts"), "x\n");
-  const pool = new LspPool(dir, [cfg]);
+  pool = new LspPool(dir, [cfg]);
   const tool = createDiagnosticsTool(pool);
   const ctx = { cwd: dir, signal: new AbortController().signal } as any;
   const out = await tool.run({ path: "a.ts" }, ctx);
   assert.match(out, /a\.ts:3:5 \[error\] 类型不匹配/);
   const none = await tool.run({ path: "readme.md" }, ctx);
   assert.match(none, /没有为 .md 配置语言服务器/);
-  await pool.closeAll();
-  await fs.rm(dir, { recursive: true, force: true });
 });
 
 test("LSP: pickLspServer 按扩展名匹配（大小写不敏感）", () => {
@@ -51,8 +64,16 @@ test("LSP: pickLspServer 按扩展名匹配（大小写不敏感）", () => {
   assert.equal(pickLspServer([cfg], ".go"), undefined);
 });
 
-test("LSP: production runtime 以只读、断网策略 prepare 持久进程", async () => {
+test("LSP: production runtime 以只读、断网策略 prepare 持久进程", LSP_TEST_OPTIONS, async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-isolated-"));
+  let pool: LspPool | undefined;
+  t.after(async () => {
+    try {
+      await pool?.closeAll();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
   const file = path.join(dir, "a.ts");
   await fs.writeFile(file, "bad code here\n");
   const requests: string[] = [];
@@ -72,74 +93,95 @@ test("LSP: production runtime 以只读、断网策略 prepare 持久进程", as
       };
     },
   };
-  const pool = new LspPool(dir, [cfg], runtime);
+  pool = new LspPool(dir, [cfg], runtime);
   const diagnostics = await pool.clientFor(".ts")!.diagnose(file, 3000);
   assert.equal(diagnostics.length, 1);
   assert.deepEqual(requests, [`read-only:false:${await fs.realpath(dir)}`]);
-  await pool.closeAll();
-  await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("LSP: runtime without close-confirmed containment is rejected before prepare or spawn", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-unmanaged-"));
-  let prepared = false;
-  const runtime: ExecutionRuntime = {
-    managedProcessBoundary: "unsupported",
-    async run() {
-      throw new Error("unused");
-    },
-    prepare() {
-      prepared = true;
-      throw new Error("must not prepare");
-    },
-  };
-  try {
+test(
+  "LSP: runtime without close-confirmed containment is rejected before prepare or spawn",
+  LSP_TEST_OPTIONS,
+  async (t) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-unmanaged-"));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    let prepared = false;
+    const runtime: ExecutionRuntime = {
+      managedProcessBoundary: "unsupported",
+      async run() {
+        throw new Error("unused");
+      },
+      prepare() {
+        prepared = true;
+        throw new Error("must not prepare");
+      },
+    };
     assert.throws(() => LspClient.start(dir, cfg, runtime), /close-confirmed.*process boundary/);
     assert.equal(prepared, false);
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true });
-  }
-});
+  },
+);
 
-test("LSP: 无响应 server 在请求超时后失败，不得挂住 agent", async () => {
+test("LSP: 无响应 server 在请求超时后失败，不得挂住 agent", LSP_TEST_OPTIONS, async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-timeout-"));
+  let client: LspClient | undefined;
+  t.after(async () => {
+    try {
+      await client?.close();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
   const file = path.join(dir, "a.ts");
   await fs.writeFile(file, "const x = 1\n");
-  const client = LspClient.start(dir, {
+  client = LspClient.start(dir, {
     command: process.execPath,
     args: ["-e", "setInterval(()=>{}, 1000)"],
     extensions: [".ts"],
     timeoutMs: 100,
   });
   await assert.rejects(client.diagnose(file), /LSP request timed out: initialize/);
-  await client.close();
-  await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("LSP: 拒绝输入 symlink 逃逸，并过滤 server 返回的 workspace 外 URI", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-boundary-"));
-  const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-host-"));
-  const file = path.join(dir, "a.ts");
-  const outside = path.join(outsideDir, "secret.ts");
-  await fs.writeFile(file, "const x = 1\n");
-  await fs.writeFile(outside, "HOST_CANARY\n");
-  await fs.symlink(outside, path.join(dir, "escape.ts"));
-  const oversized = path.join(dir, "oversized.ts");
-  await fs.writeFile(oversized, "x");
-  await fs.truncate(oversized, 8 * 1024 * 1024 + 1);
-  const client = LspClient.start(dir, cfg);
-  await assert.rejects(() => client.diagnose(path.join(dir, "escape.ts")), /escapes the workspace/);
-  await assert.rejects(() => client.diagnose(oversized), /exceeds the 8 MiB limit/);
-  const definitions = await client.definition(file, { line: 0, character: 0 });
-  assert.deepEqual(definitions, [{ path: await fs.realpath(file), line: 1, column: 1 }]);
-  assert.deepEqual(await client.workspaceSymbols("outside"), []);
-  await client.close();
-  await fs.rm(dir, { recursive: true, force: true });
-  await fs.rm(outsideDir, { recursive: true, force: true });
-});
+test(
+  "LSP: 拒绝输入 symlink 逃逸，并过滤 server 返回的 workspace 外 URI",
+  LSP_TEST_OPTIONS,
+  async (t) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-boundary-"));
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-host-"));
+    let client: LspClient | undefined;
+    t.after(async () => {
+      try {
+        await client?.close();
+      } finally {
+        await Promise.all([
+          fs.rm(dir, { recursive: true, force: true }),
+          fs.rm(outsideDir, { recursive: true, force: true }),
+        ]);
+      }
+    });
+    const file = path.join(dir, "a.ts");
+    const outside = path.join(outsideDir, "secret.ts");
+    await fs.writeFile(file, "const x = 1\n");
+    await fs.writeFile(outside, "HOST_CANARY\n");
+    await fs.symlink(outside, path.join(dir, "escape.ts"));
+    const oversized = path.join(dir, "oversized.ts");
+    await fs.writeFile(oversized, "x");
+    await fs.truncate(oversized, 8 * 1024 * 1024 + 1);
+    client = LspClient.start(dir, cfg);
+    await assert.rejects(
+      () => client.diagnose(path.join(dir, "escape.ts")),
+      /escapes the workspace/,
+    );
+    await assert.rejects(() => client.diagnose(oversized), /exceeds the 8 MiB limit/);
+    const definitions = await client.definition(file, { line: 0, character: 0 });
+    assert.deepEqual(definitions, [{ path: await fs.realpath(file), line: 1, column: 1 }]);
+    assert.deepEqual(await client.workspaceSymbols("outside"), []);
+  },
+);
 
-test("LSP: 工具声明真实的持久进程与文件读取 capabilities", async () => {
+test("LSP: 工具声明真实的持久进程与文件读取 capabilities", LSP_TEST_OPTIONS, async (t) => {
   const pool = new LspPool(process.cwd(), []);
+  t.after(() => pool.closeAll());
   assert.deepEqual(createDiagnosticsTool(pool).capabilities, [
     "filesystem-read",
     "process",

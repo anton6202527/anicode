@@ -70,6 +70,7 @@ export class DaemonServer {
   private readonly initialRequestTimeoutMs: number;
   private readonly maxInFlightRequestsPerConnection: number;
   private conns = new Set<net.Socket>();
+  private isClosing = false;
   private closing: Promise<void> | undefined;
 
   constructor(opts: DaemonServerOptions) {
@@ -124,19 +125,60 @@ export class DaemonServer {
     });
   }
 
-  /** 关闭：先断开所有连接（否则 server.close 会等待它们自然结束），再停监听 */
+  /** 关闭：先停止 accept，再断开已跟踪和延迟交付的连接。 */
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closing = (async () => {
+
+    // A Windows named-pipe client may report `connect` before Node dispatches the server-side
+    // `connection` callback. Fence that callback before closing the listener: sweeping `conns`
+    // first can miss an already-accepted socket and make net.Server.close() wait forever.
+    this.isClosing = true;
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    const closing = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    this.closing = closing;
+
+    const teardownErrors: unknown[] = [];
+    try {
+      this.server.close((error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+          rejectClose(error);
+        } else {
+          resolveClose();
+        }
+      });
+    } catch (error) {
+      teardownErrors.push(error);
+    }
+    for (const sock of this.conns) {
+      try {
+        sock.destroy();
+      } catch (error) {
+        teardownErrors.push(error);
+      }
+    }
+    try {
       this.manager.dispose();
-      for (const sock of this.conns) sock.destroy();
-      this.conns.clear();
-      await new Promise<void>((resolve) => this.server.close(() => resolve()));
-    })();
-    return this.closing;
+    } catch (error) {
+      teardownErrors.push(error);
+    }
+    if (teardownErrors.length === 1) rejectClose(teardownErrors[0]);
+    else if (teardownErrors.length > 1) {
+      rejectClose(new AggregateError(teardownErrors, "Daemon server teardown failed"));
+    }
+    return closing;
   }
 
   private onConnection(sock: net.Socket): void {
+    // `server.close()` stops future accepts but an OS-accepted connection callback may already be
+    // queued. It was not present during the tracked-socket sweep, so close it at the handoff.
+    if (this.isClosing) {
+      sock.destroy();
+      return;
+    }
     this.conns.add(sock);
     // 让 Node 的 StringDecoder 跨 Buffer 边界保留 UTF-8 多字节字符。
     sock.setEncoding("utf8");

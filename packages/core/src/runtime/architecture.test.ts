@@ -40,6 +40,10 @@ const deterministicVerifierRuntime: ExecutionRuntime = {
   },
 };
 
+const POSIX_PROCESS_ONLY = {
+  skip: process.platform === "win32" ? "the restricted Windows host exposes no POSIX shell" : false,
+};
+
 test("runtime: artifact 内容寻址、持久化与 session 隔离", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-artifacts-"));
   try {
@@ -456,7 +460,7 @@ test("network proxy: fetch 固定授权 IP，避免二次 DNS/rebinding", async 
   }
 });
 
-test("isolated runtime: policy none 仍受超时/输出边界管理", async () => {
+test("isolated runtime: policy none 仍受超时/输出边界管理", POSIX_PROCESS_ONLY, async () => {
   const runtime = new IsolatedRuntime({ failClosed: true });
   const result = await runtime.run({
     command: "printf runtime-ok",

@@ -340,25 +340,40 @@ export interface ProcessTreeTerminationOptions {
   platform?: NodeJS.Platform;
 }
 
+/** Resolve the OS-owned Windows tree killer without consulting a workspace-controlled PATH. */
+export function resolveWindowsTaskkillPath(env: NodeJS.ProcessEnv = process.env): string {
+  const systemRoot = env["SystemRoot"]?.trim();
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) {
+    throw new Error("Windows process-tree termination requires an absolute SystemRoot");
+  }
+  return path.win32.join(systemRoot, "System32", "taskkill.exe");
+}
+
 /**
  * Stop a spawned command and all descendants, then prove that the process boundary closed.
  *
  * POSIX children must have been spawned with `detached: true`, which makes their pid the process
  * group id. Windows has no equivalent signal contract, so the supported native implementation is
- * the OS tree primitive `taskkill /T /F`. This helper deliberately never falls back to killing only
- * the direct child: doing so would report cancellation while grandchildren keep mutating state.
+ * the OS tree primitive `taskkill /T /F`. A direct-child kill may release local handles after that
+ * primitive fails, but is never treated as successful tree termination: grandchildren could still
+ * be mutating state, so the caller must receive a rejection.
  */
 export async function terminateProcessTree(
   child: ChildProcess,
   options: ProcessTreeTerminationOptions = {},
 ): Promise<void> {
+  const graceMs = Math.max(50, options.graceMs ?? 750);
+  const killWaitMs = Math.max(250, options.killWaitMs ?? 2_000);
   const pid = child.pid;
   if (!pid) {
     if (isChildClosed(child)) return;
+    // A failed spawn has no process tree, but Node emits `error` before the authoritative `close`.
+    // Drain the locally created pipe handles and wait for that close instead of mistaking the
+    // missing PID for a live process or treating `exitCode` alone as closure.
+    destroyChildStdio(child);
+    if (await waitForChildClose(child, Math.min(killWaitMs, 250))) return;
     throw new Error("Cannot terminate process tree before the child pid is available");
   }
-  const graceMs = Math.max(50, options.graceMs ?? 750);
-  const killWaitMs = Math.max(250, options.killWaitMs ?? 2_000);
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
     await terminateWindowsProcessTree(child, pid, killWaitMs);
@@ -426,37 +441,93 @@ async function terminateWindowsProcessTree(
   pid: number,
   killWaitMs: number,
 ): Promise<void> {
-  const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+  let taskkill: string;
+  try {
+    taskkill = resolveWindowsTaskkillPath();
+  } catch (error) {
+    await bestEffortCloseDirectChild(child, killWaitMs);
+    throw error;
+  }
+  const killer = spawn(taskkill, ["/PID", String(pid), "/T", "/F"], {
     stdio: "ignore",
     windowsHide: true,
   });
   const killerClosed = await waitForChildClose(killer, killWaitMs);
   if (!killerClosed) {
-    // This only stops the stuck taskkill helper; it is never used as a fallback for the target.
     killer.kill("SIGKILL");
+    await bestEffortCloseDirectChild(child, killWaitMs);
     throw new Error(`taskkill did not finish while terminating process tree ${pid}`);
+  }
+  // Direct-child close alone cannot prove that descendants are gone. Only taskkill /T success is
+  // a supported Windows tree-level proof. Still close the direct child and our stdio handles on
+  // failure so callers can reject without leaking a worker; this cleanup is never reported as
+  // successful tree termination.
+  if (killer.exitCode !== 0) {
+    await bestEffortCloseDirectChild(child, killWaitMs);
+    throw new Error(`taskkill failed for process tree ${pid} with exit code ${killer.exitCode}`);
   }
   const targetClosed = await waitForChildClose(child, killWaitMs);
   if (!targetClosed) {
+    await bestEffortCloseDirectChild(child, killWaitMs);
     throw new Error(`taskkill did not close process tree ${pid}`);
   }
-  // Direct-child close alone cannot prove that descendants are gone. Only taskkill /T success is
-  // a supported Windows tree-level proof; never silently downgrade after a non-zero taskkill.
-  if (killer.exitCode !== 0) {
-    throw new Error(`taskkill failed for process tree ${pid} with exit code ${killer.exitCode}`);
+}
+
+async function bestEffortCloseDirectChild(child: ChildProcess, timeoutMs: number): Promise<void> {
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Tree proof is already lost; cleanup remains best-effort and the caller still rejects.
+  }
+  destroyChildStdio(child);
+  await waitForChildClose(child, Math.min(timeoutMs, 250)).catch(() => false);
+}
+
+function destroyChildStdio(child: ChildProcess): void {
+  for (const stream of child.stdio ?? []) {
+    try {
+      stream?.destroy();
+    } catch {
+      // Continue closing every locally owned handle.
+    }
   }
 }
+
+const observedChildCloses = new WeakSet<ChildProcess>();
 
 function childClose(child: ChildProcess): Promise<number | null> {
   if (isChildClosed(child)) return Promise.resolve(child.exitCode);
   return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", resolve);
+    const cleanup = () => {
+      child.removeListener("error", onError);
+      child.removeListener("close", onClose);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = (code: number | null) => {
+      observedChildCloses.add(child);
+      cleanup();
+      resolve(code);
+    };
+    child.once("error", onError);
+    child.once("close", onClose);
+    // Close can race the initial state check and listener installation.
+    if (isChildClosed(child)) {
+      cleanup();
+      resolve(child.exitCode);
+    }
   });
 }
 
 function isChildClosed(child: ChildProcess): boolean {
-  return child.exitCode !== null || child.signalCode !== null;
+  if (observedChildCloses.has(child)) return true;
+  if (child.exitCode === null && child.signalCode === null) return false;
+  // `exit` updates exitCode/signalCode before `close`; inherited stdout/stderr may remain open in
+  // descendants. Only treat an already-observed exit as closed when every local stdio handle is
+  // actually gone.
+  return (child.stdio ?? []).every((stream) => stream == null || stream.destroyed);
 }
 
 async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promise<boolean> {
@@ -468,11 +539,16 @@ async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promis
       child.removeListener("error", onError);
       resolve(closed);
     };
-    const onClose = () => finish(true);
+    const onClose = () => {
+      observedChildCloses.add(child);
+      finish(true);
+    };
     const onError = () => finish(false);
     const timer = setTimeout(() => finish(false), timeoutMs);
     child.once("close", onClose);
     child.once("error", onError);
+    // Close can race the initial state check and listener installation.
+    if (isChildClosed(child)) finish(true);
   });
 }
 

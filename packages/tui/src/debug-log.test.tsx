@@ -6,6 +6,11 @@ import * as path from "node:path";
 import type { SessionHost } from "@anicode/core";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
 
+async function assertPrivatePosixFileMode(file: string): Promise<void> {
+  if (process.platform === "win32") return;
+  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+}
+
 test("debug log: 默认只记内容长度并保持 SessionHost 行为", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-debug-log-"));
   const file = path.join(dir, "trace.jsonl");
@@ -158,7 +163,7 @@ test("debug log: 默认只记内容长度并保持 SessionHost 行为", async ()
   assert.match(log, /"ruleKeyChars":/);
   assert.match(log, /"kind":"session\.event"/);
   assert.match(log, /"kind":"host\.end"/);
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+  await assertPrivatePosixFileMode(file);
 
   await fs.rm(dir, { recursive: true, force: true });
 });
@@ -200,7 +205,7 @@ test("debug log: trace 模式按字段脱敏、截断超长内容并轮转", asy
   }
   assert.ok((await fs.stat(file)).size <= 512);
   assert.ok((await fs.stat(`${file}.1`)).size <= 512);
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+  await assertPrivatePosixFileMode(file);
 
   await fs.rm(dir, { recursive: true, force: true });
 });

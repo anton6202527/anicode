@@ -27,6 +27,7 @@ export function buildShellSpawn(
   command: string,
   sandbox: ToolContext["sandbox"],
   cwd: string,
+  platform: NodeJS.Platform = process.platform,
 ): { file: string; args: string[] } {
   const policy = resolveSandboxPolicy(sandbox);
   // 用真实路径（解 symlink）构 profile：macOS 的 /tmp→/private/tmp、/var→/private/var 等
@@ -46,7 +47,7 @@ export function buildShellSpawn(
         }
       : {}),
   };
-  const wrapped = wrapWithSandbox(command, spec);
+  const wrapped = wrapWithSandbox(command, spec, platform);
   if (wrapped) {
     const trustedBinary = resolveSandboxBinary(wrapped.file);
     if (trustedBinary) return { file: trustedBinary, args: wrapped.args };
@@ -55,7 +56,11 @@ export function buildShellSpawn(
       `Sandbox policy ${policy} cannot be enforced because a trusted ${wrapped.file} is unavailable`,
     );
   }
-  // 只有显式生效的 none 策略才可到达裸 shell。
+  // wrapWithSandbox 对不支持的平台也返回 null；只有显式生效的 none
+  // 策略才能裸跑，不能让 Windows/未知平台把限制策略静默降级。
+  if (policy !== "none") {
+    throw new Error(`Sandbox policy ${policy} cannot be enforced on ${platform}`);
+  }
   return { file: "/bin/bash", args: ["-c", command] };
 }
 

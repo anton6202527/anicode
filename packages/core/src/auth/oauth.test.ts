@@ -85,6 +85,13 @@ async function capturedError(promise: Promise<unknown>): Promise<Error> {
   assert.fail("expected promise to reject");
 }
 
+async function assertPrivatePosixFileMode(file: string): Promise<void> {
+  // Windows does not expose owner/group/other permissions through POSIX mode bits. The
+  // persistence and no-secret behavior remain asserted by the platform-independent checks.
+  if (process.platform === "win32") return;
+  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+}
+
 test("oauth: buildAuthUrl 含 PKCE S256 challenge、client_id、state", () => {
   const { url, verifier, state } = buildAuthUrl({ verifier: "test-verifier", state: "st123" });
   const u = new URL(url);
@@ -367,8 +374,7 @@ test("auth store: set/get/getSync/remove/list，文件 0600", async () => {
     await store.set("anthropic", { type: "oauth", access: "A", refresh: "R", expiresAt: 123 });
     assert.equal((await store.get("anthropic"))?.access, "A");
     assert.equal(store.getSync("anthropic")?.access, "A");
-    const stat = await fs.stat(file);
-    assert.equal(stat.mode & 0o777, 0o600);
+    await assertPrivatePosixFileMode(file);
     const list = await store.list();
     assert.deepEqual(list, [{ providerId: "anthropic", type: "oauth", expiresAt: 123 }]);
     assert.equal(await store.remove("anthropic"), true);
@@ -481,7 +487,7 @@ test("auth store: state 是唯一运行时索引，普通 set/list/get/remove �
     });
     assert.doesNotMatch(serializedState, /"(?:access|refresh)"\s*:/);
     assert.doesNotMatch(serializedState, /highly-sensitive-(?:access|refresh)-value/);
-    assert.equal((await fs.stat(stateFile)).mode & 0o777, 0o600);
+    await assertPrivatePosixFileMode(stateFile);
 
     backend.resetCalls();
     assert.deepEqual(await store.list(), [

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { Agent, type AgentEvent } from "./agent.js";
 import { commandHook } from "./hooks-exec.js";
 import { ToolRegistry, type Tool } from "./tools/tool.js";
+import type { ExecutionRuntime, IsolatedRunRequest } from "./runtime/isolated-runtime.js";
 import type { Verifier } from "./runtime/verifier.js";
 import type { Provider, StreamEvent, Usage } from "./types.js";
 
@@ -73,6 +74,14 @@ async function collect(agent: Agent): Promise<AgentEvent[]> {
 test("Verifier dirty: bash 重定向使用 cwd sentinel 并在 done 前验证", async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-verify-bash-"));
   const observed: string[][] = [];
+  let request: IsolatedRunRequest | undefined;
+  const runtime: ExecutionRuntime = {
+    async run(input) {
+      request = input;
+      await fs.writeFile(path.join(input.cwd, "generated.txt"), "verified");
+      return { exitCode: 0, output: "", timedOut: false, sandboxed: true, durationMs: 1 };
+    },
+  };
   try {
     const agent = new Agent({
       provider: scriptedToolProvider("bash", { command: "printf verified > generated.txt" }),
@@ -88,10 +97,13 @@ test("Verifier dirty: bash 重定向使用 cwd sentinel 并在 done 前验证", 
       projectMemory: false,
       injectEnv: false,
       permission: { mode: "auto" },
+      isolatedRuntime: runtime,
       verifier: passingVerifier(observed),
       retry: false,
     });
     const events = await collect(agent);
+    assert.equal(request?.command, "printf verified > generated.txt");
+    assert.equal(request?.cwd, cwd);
     assert.equal(await fs.readFile(path.join(cwd, "generated.txt"), "utf8"), "verified");
     assert.deepEqual(observed, [[cwd]]);
     assert.ok(events.findIndex((event) => event.type === "verification") >= 0);

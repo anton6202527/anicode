@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { IsolatedRuntime, scopedProxyEnvironment } from "./isolated-runtime.js";
+import {
+  assertBoundedStdin,
+  IsolatedRuntime,
+  resolveWindowsTaskkillPath,
+  scopedProxyEnvironment,
+} from "./isolated-runtime.js";
 
 const POSIX_ONLY = {
   skip: process.platform === "win32" ? "requires a POSIX process group" : false,
@@ -19,6 +24,26 @@ const PROXY_ENVIRONMENT_KEYS = [
   "all_proxy",
   "no_proxy",
 ] as const;
+
+test("Windows process-tree cleanup resolves taskkill from absolute SystemRoot", () => {
+  assert.equal(
+    resolveWindowsTaskkillPath({ SystemRoot: "C:\\Windows" }),
+    "C:\\Windows\\System32\\taskkill.exe",
+  );
+  assert.throws(() => resolveWindowsTaskkillPath({}), /absolute SystemRoot/);
+  assert.throws(
+    () => resolveWindowsTaskkillPath({ SystemRoot: "relative\\windows" }),
+    /absolute SystemRoot/,
+  );
+});
+
+test("IsolatedRuntime: stdin byte limit is platform-independent", () => {
+  assert.doesNotThrow(() => assertBoundedStdin("x".repeat(1024 * 1024)));
+  assert.throws(
+    () => assertBoundedStdin("x".repeat(1024 * 1024 + 1)),
+    /stdin exceeds 1048576 bytes/,
+  );
+});
 
 test("IsolatedRuntime: proxy normalization is child-scoped and parent env stays unchanged", () => {
   const previous = proxyEnvironmentSnapshot(process.env);
@@ -69,31 +94,35 @@ test("IsolatedRuntime: proxy normalization is child-scoped and parent env stays 
   }
 });
 
-test("IsolatedRuntime: delivers bounded stdin without shell argv interpolation", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-stdin-"));
-  const runtime = new IsolatedRuntime({ failClosed: false });
-  try {
-    const result = await runtime.run({
-      command: "cat",
-      cwd: root,
-      policy: "none",
-      stdin: "hook payload '$HOME'\n",
-    });
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.output, "hook payload '$HOME'\n");
-    await assert.rejects(
-      runtime.run({
+test(
+  "IsolatedRuntime: delivers bounded stdin without shell argv interpolation",
+  POSIX_ONLY,
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-stdin-"));
+    const runtime = new IsolatedRuntime({ failClosed: false });
+    try {
+      const result = await runtime.run({
         command: "cat",
         cwd: root,
         policy: "none",
-        stdin: "x".repeat(1024 * 1024 + 1),
-      }),
-      /stdin exceeds 1048576 bytes/,
-    );
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+        stdin: "hook payload '$HOME'\n",
+      });
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.output, "hook payload '$HOME'\n");
+      await assert.rejects(
+        runtime.run({
+          command: "cat",
+          cwd: root,
+          policy: "none",
+          stdin: "x".repeat(1024 * 1024 + 1),
+        }),
+        /stdin exceeds 1048576 bytes/,
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "IsolatedRuntime: timeout kills the entire process group before a grandchild can write",

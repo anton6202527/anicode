@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
@@ -9,6 +9,20 @@ import type { ToolContext } from "./tool.js";
 
 function ctx(cwd: string): ToolContext {
   return { cwd, signal: new AbortController().signal };
+}
+
+const POSIX_SHELL_ONLY = {
+  skip: process.platform === "win32" ? "the restricted Windows host exposes no POSIX shell" : false,
+};
+
+function nodeSpec(script: string): { file: string; args: string[] } {
+  return { file: process.execPath, args: ["-e", script] };
+}
+
+function trackedRegistry(t: TestContext): ShellRegistry {
+  const registry = new ShellRegistry();
+  t.after(() => registry.killAll());
+  return registry;
 }
 
 async function scratch(prefix: string): Promise<string> {
@@ -24,14 +38,13 @@ async function until(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   }
 }
 
-test("ShellRegistry: 启动后台命令并增量读取输出", async () => {
+test("ShellRegistry: 启动后台命令并增量读取输出", async (t) => {
   const dir = await scratch("anicode-shell-start-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "echo hello-bg",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "echo hello-bg"],
+    ...nodeSpec(`process.stdout.write("hello-bg\\n")`),
   });
   assert.match(id, /^bash_\d+$/);
 
@@ -42,17 +55,16 @@ test("ShellRegistry: 启动后台命令并增量读取输出", async () => {
     return seen.includes("hello-bg");
   });
   assert.match(seen, /hello-bg/);
-  reg.killAll();
+  await until(() => reg.read(id)?.status !== "running");
 });
 
-test("ShellRegistry: 读取是增量的——读过的内容不再重复返回", async () => {
+test("ShellRegistry: 读取是增量的——读过的内容不再重复返回", async (t) => {
   const dir = await scratch("anicode-shell-incr-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "echo one",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "echo one"],
+    ...nodeSpec(`process.stdout.write("one\\n")`),
   });
   let first = "";
   await until(() => {
@@ -62,39 +74,35 @@ test("ShellRegistry: 读取是增量的——读过的内容不再重复返回",
   // 再读：同样的内容不该重复出现（这正是上下文被吃光的根因）
   const second = reg.read(id)!;
   assert.equal(second.chunk, "", "已读内容不应重复返回");
-  reg.killAll();
+  await until(() => reg.read(id)?.status !== "running");
 });
 
-test("ShellRegistry: 退出码与状态被正确记录", async () => {
+test("ShellRegistry: 退出码与状态被正确记录", async (t) => {
   const dir = await scratch("anicode-shell-exit-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "exit 3",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "exit 3"],
+    ...nodeSpec("process.exit(3)"),
   });
   await until(() => reg.read(id)!.status === "exited");
   const r = reg.read(id)!;
   assert.equal(r.status, "exited");
   assert.equal(r.exitCode, 3);
-  reg.killAll();
 });
 
-test("ShellRegistry: kill 能停掉长跑进程并标记 killed", async () => {
+test("ShellRegistry: kill 能停掉长跑进程并标记 killed", async (t) => {
   const dir = await scratch("anicode-shell-kill-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "sleep 30",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "sleep 30"],
+    ...nodeSpec("setInterval(() => {}, 1_000)"),
   });
   assert.equal(reg.read(id)!.status, "running");
   assert.equal(reg.kill(id), true);
   assert.equal(reg.read(id)!.status, "killed");
   assert.equal(reg.kill("bash_nope"), false);
-  reg.killAll();
 });
 
 test(
@@ -123,25 +131,25 @@ test("ShellRegistry: 未知 id 读取返回 null", () => {
   assert.equal(reg.read("bash_missing"), null);
 });
 
-test("ShellRegistry: list 反映运行中的 shell", async () => {
+test("ShellRegistry: list 反映运行中的 shell", async (t) => {
   const dir = await scratch("anicode-shell-list-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "sleep 30",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "sleep 30"],
+    ...nodeSpec("setInterval(() => {}, 1_000)"),
   });
   const list = reg.list();
   assert.equal(list.length, 1);
   assert.equal(list[0]!.id, id);
   assert.equal(list[0]!.command, "sleep 30");
   assert.equal(list[0]!.status, "running");
-  reg.killAll();
+  await reg.killAll();
   assert.equal(reg.list().length, 0, "killAll 后应清空");
 });
 
-test("bash run_in_background 立即返回 shell id 而不阻塞", async () => {
+test("bash run_in_background 立即返回 shell id 而不阻塞", POSIX_SHELL_ONLY, async (t) => {
+  t.after(() => shells.killAll());
   const dir = await scratch("anicode-bash-bg-");
   // sleep 30 若是前台会阻塞到超时；后台应立即返回。
   const started = Date.now();
@@ -152,10 +160,11 @@ test("bash run_in_background 立即返回 shell id 而不阻塞", async () => {
   // 通过 kill_shell 工具清理
   const killed = await killShellTool.run({ shell_id: m![0] }, ctx(dir));
   assert.match(killed, /bash_\d+/);
-  shells.killAll();
+  await shells.killAll();
 });
 
-test("bash_output 工具读取后台输出并报告状态", async () => {
+test("bash_output 工具读取后台输出并报告状态", POSIX_SHELL_ONLY, async (t) => {
+  t.after(() => shells.killAll());
   const dir = await scratch("anicode-bashoutput-");
   const out = await bashTool.run({ command: "echo from-tool", run_in_background: true }, ctx(dir));
   const id = /bash_\d+/.exec(out)![0];
@@ -165,7 +174,7 @@ test("bash_output 工具读取后台输出并报告状态", async () => {
     await new Promise((r) => setTimeout(r, 20));
   }
   assert.match(seen, /from-tool/);
-  shells.killAll();
+  await shells.killAll();
 });
 
 test("bash_output 对未知 id 抛出可自纠的错误", async () => {
@@ -173,7 +182,8 @@ test("bash_output 对未知 id 抛出可自纠的错误", async () => {
   await assert.rejects(() => bashOutputTool.run({ bash_id: "bash_9999" }, ctx(dir)), /bash_9999/);
 });
 
-test("bash_output filter 只保留匹配行", async () => {
+test("bash_output filter 只保留匹配行", POSIX_SHELL_ONLY, async (t) => {
+  t.after(() => shells.killAll());
   const dir = await scratch("anicode-bashoutput-filter-");
   const out = await bashTool.run(
     { command: "printf 'keep-me\\ndrop-this\\n'", run_in_background: true },
@@ -190,15 +200,16 @@ test("bash_output filter 只保留匹配行", async () => {
   }
   assert.match(body, /keep-me/);
   assert.doesNotMatch(body, /drop-this/, "filter 应滤掉不匹配的输出行");
-  shells.killAll();
+  await shells.killAll();
 });
 
-test("bash_output 非法 filter 正则报错", async () => {
+test("bash_output 非法 filter 正则报错", POSIX_SHELL_ONLY, async (t) => {
+  t.after(() => shells.killAll());
   const dir = await scratch("anicode-bashoutput-badre-");
   const out = await bashTool.run({ command: "echo x", run_in_background: true }, ctx(dir));
   const id = /bash_\d+/.exec(out)![0];
   await assert.rejects(() => bashOutputTool.run({ bash_id: id, filter: "([" }, ctx(dir)), /filter/);
-  shells.killAll();
+  await shells.killAll();
 });
 
 test("bash_output 与 kill_shell 是只读工具（可自动放行，不打断清理）", () => {
@@ -208,50 +219,49 @@ test("bash_output 与 kill_shell 是只读工具（可自动放行，不打断�
 
 // ---------- 回归：容量与数据丢失 ----------
 
-test("回归：已结束的 shell 占满上限后仍能启动新的（不会堵死 5 分钟）", async () => {
+test("回归：已结束的 shell 占满上限后仍能启动新的（不会堵死 5 分钟）", async (t) => {
   const dir = await scratch("anicode-shell-cap-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const ids: string[] = [];
   // 塞满 20 个秒退的 shell
   for (let i = 0; i < 20; i++) {
-    ids.push(reg.start({ command: "true", cwd: dir, file: "/bin/bash", args: ["-c", "true"] }));
+    ids.push(reg.start({ command: "true", cwd: dir, ...nodeSpec("process.exit(0)") }));
   }
   await until(() => ids.every((id) => reg.read(id)?.status !== "running"));
   // 读净输出后，第 21 个必须能起来：已结束的应被淘汰，而不是抛"上限"错误
-  const extra = reg.start({ command: "true", cwd: dir, file: "/bin/bash", args: ["-c", "true"] });
+  const extra = reg.start({ command: "true", cwd: dir, ...nodeSpec("process.exit(0)") });
   assert.match(extra, /^bash_\d+$/);
-  reg.killAll();
+  await until(() => reg.read(extra)?.status !== "running");
 });
 
-test("回归：全部在运行时才报上限错，且 kill 后即可重试成功", async () => {
+test("回归：全部在运行时才报上限错，且 kill 后即可重试成功", async (t) => {
   const dir = await scratch("anicode-shell-cap2-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const ids: string[] = [];
   for (let i = 0; i < 20; i++) {
     ids.push(
-      reg.start({ command: "sleep 30", cwd: dir, file: "/bin/bash", args: ["-c", "sleep 30"] }),
+      reg.start({ command: "sleep 30", cwd: dir, ...nodeSpec("setInterval(() => {}, 1_000)") }),
     );
   }
   // 全在跑 → 应报错
   assert.throws(
-    () => reg.start({ command: "true", cwd: dir, file: "/bin/bash", args: ["-c", "true"] }),
+    () => reg.start({ command: "true", cwd: dir, ...nodeSpec("process.exit(0)") }),
     /running|运行/,
   );
   // 按提示 kill 一个后，重试必须成功（否则提示就是空话）
-  reg.kill(ids[0]!);
-  const ok = reg.start({ command: "true", cwd: dir, file: "/bin/bash", args: ["-c", "true"] });
+  await reg.killAndWait(ids[0]!);
+  const ok = reg.start({ command: "true", cwd: dir, ...nodeSpec("process.exit(0)") });
   assert.match(ok, /^bash_\d+$/);
-  reg.killAll();
+  await until(() => reg.read(ok)?.status !== "running");
 });
 
-test("回归：filter 略过的行数被如实回报，不静默丢失", async () => {
+test("回归：filter 略过的行数被如实回报，不静默丢失", async (t) => {
   const dir = await scratch("anicode-shell-filtered-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "printf 'keep\\ndrop1\\ndrop2\\n'",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "printf 'keep\\ndrop1\\ndrop2\\n'"],
+    ...nodeSpec(`process.stdout.write("keep\\ndrop1\\ndrop2\\n")`),
   });
   let r = reg.read(id, /keep/)!;
   for (let i = 0; i < 100 && !r.chunk.includes("keep"); i++) {
@@ -260,32 +270,29 @@ test("回归：filter 略过的行数被如实回报，不静默丢失", async (
   }
   assert.match(r.chunk, /keep/);
   assert.ok(r.filtered > 0, "被 filter 略过的行数必须回报，而不是静默消失");
-  reg.killAll();
+  await until(() => reg.read(id)?.status !== "running");
 });
 
-test("回归：无输出时带 filter 读取不应凭空报出被略过的行", async () => {
+test("回归：无输出时带 filter 读取不应凭空报出被略过的行", async (t) => {
   const dir = await scratch("anicode-shell-emptyfilter-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "sleep 30",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "sleep 30"],
+    ...nodeSpec("setInterval(() => {}, 1_000)"),
   });
   const r = reg.read(id, /anything/)!;
   assert.equal(r.chunk, "");
   assert.equal(r.filtered, 0, "没有输出就不该报告任何行被略过（空串 split 的假行）");
-  reg.killAll();
 });
 
-test("回归：末尾换行不会让略过行数多算一行", async () => {
+test("回归：末尾换行不会让略过行数多算一行", async (t) => {
   const dir = await scratch("anicode-shell-trailnl-");
-  const reg = new ShellRegistry();
+  const reg = trackedRegistry(t);
   const id = reg.start({
     command: "printf 'keep\\n'",
     cwd: dir,
-    file: "/bin/bash",
-    args: ["-c", "printf 'keep\\n'"],
+    ...nodeSpec(`process.stdout.write("keep\\n")`),
   });
   let r = reg.read(id, /keep/)!;
   for (let i = 0; i < 100 && !r.chunk.includes("keep"); i++) {
@@ -294,10 +301,11 @@ test("回归：末尾换行不会让略过行数多算一行", async () => {
   }
   assert.match(r.chunk, /keep/);
   assert.equal(r.filtered, 0, "唯一的一行匹配上了，末尾换行不应被算成被略过的行");
-  reg.killAll();
+  await until(() => reg.read(id)?.status !== "running");
 });
 
-test("回归：bash_output 在 filter 略过内容时给出明确提示", async () => {
+test("回归：bash_output 在 filter 略过内容时给出明确提示", POSIX_SHELL_ONLY, async (t) => {
+  t.after(() => shells.killAll());
   const dir = await scratch("anicode-bashoutput-note-");
   const out = await bashTool.run(
     { command: "printf 'keep\\nnoise1\\nnoise2\\n'", run_in_background: true },
@@ -314,13 +322,17 @@ test("回归：bash_output 在 filter 略过内容时给出明确提示", async 
   }
   assert.match(bodyOf(text), /keep/);
   assert.match(text, /略过|skipped/, "应提示有行被 filter 略过");
-  shells.killAll();
+  await shells.killAll();
 });
 
-test("ShellRegistry.write: 向 cat 进程写 stdin 并回显；end 发 EOF 使其退出", async () => {
+test("ShellRegistry.write: 向 cat 进程写 stdin 并回显；end 发 EOF 使其退出", async (t) => {
   const dir = await scratch("anicode-shell-stdin-");
-  const reg = new ShellRegistry();
-  const id = reg.start({ command: "cat", cwd: dir, file: "/bin/cat", args: [] });
+  const reg = trackedRegistry(t);
+  const id = reg.start({
+    command: "cat",
+    cwd: dir,
+    ...nodeSpec("process.stdin.pipe(process.stdout)"),
+  });
   assert.equal(reg.write(id, "你好 stdin\n"), true);
   let seen = "";
   await until(() => {
@@ -337,10 +349,10 @@ test("ShellRegistry.write: 向 cat 进程写 stdin 并回显；end 发 EOF 使�
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("ShellRegistry.write: 已结束的 shell 报错", async () => {
+test("ShellRegistry.write: 已结束的 shell 报错", async (t) => {
   const dir = await scratch("anicode-shell-stdin-dead-");
-  const reg = new ShellRegistry();
-  const id = reg.start({ command: "true", cwd: dir, file: "/usr/bin/true", args: [] });
+  const reg = trackedRegistry(t);
+  const id = reg.start({ command: "true", cwd: dir, ...nodeSpec("process.exit(0)") });
   await until(() => {
     const r = reg.read(id);
     return (r?.status ?? "running") !== "running";
@@ -349,7 +361,8 @@ test("ShellRegistry.write: 已结束的 shell 报错", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("write_stdin / list_shells 工具：走共享注册表", async () => {
+test("write_stdin / list_shells 工具：走共享注册表", POSIX_SHELL_ONLY, async (t) => {
+  t.after(() => shells.killAll());
   const dir = await scratch("anicode-shell-tools2-");
   const { writeStdinTool, listShellsTool, startBackgroundShell } = await import("./shells.js");
   const c = ctx(dir);

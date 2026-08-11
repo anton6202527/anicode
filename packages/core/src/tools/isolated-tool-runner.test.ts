@@ -20,6 +20,11 @@ import {
   type ToolCapability,
 } from "./tool.js";
 
+const POSIX_NATIVE_RUNTIME_ONLY = {
+  skip:
+    process.platform === "win32" ? "the test-native module adapter requires a POSIX shell" : false,
+};
+
 /**
  * Test-only adapter that exercises IsolatedRuntime's real process-group termination. Production
  * deliberately does not advertise the native runtime as an untrusted-module security boundary;
@@ -361,81 +366,93 @@ test("isolated bundle integrity and file identity are proven before runtime disp
   }
 });
 
-test("isolated modules are self-contained data-url bundles with no relative imports", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-self-contained-"));
-  try {
-    await fs.writeFile(
-      path.join(root, "dependency.mjs"),
-      'export const value = "dependency";',
-      "utf8",
-    );
-    const tool = await moduleFixture(
-      root,
-      'import { value } from "./dependency.mjs"; export async function run() { return value; }',
-      { name: "relative" },
-    );
-    const result = await collect(
-      executor(root, tool).run(
-        [{ id: "relative", name: tool.def.name, args: {} }],
-        new AbortController().signal,
-      ),
-    );
-    assert.equal(result.results[0]?.isError, true);
-    assert.match(result.results[0]?.content ?? "", /isolated tool execution failed/i);
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+test(
+  "isolated modules are self-contained data-url bundles with no relative imports",
+  POSIX_NATIVE_RUNTIME_ONLY,
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-self-contained-"));
+    try {
+      await fs.writeFile(
+        path.join(root, "dependency.mjs"),
+        'export const value = "dependency";',
+        "utf8",
+      );
+      const tool = await moduleFixture(
+        root,
+        'import { value } from "./dependency.mjs"; export async function run() { return value; }',
+        { name: "relative" },
+      );
+      const result = await collect(
+        executor(root, tool).run(
+          [{ id: "relative", name: tool.def.name, args: {} }],
+          new AbortController().signal,
+        ),
+      );
+      assert.equal(result.results[0]?.isError, true);
+      assert.match(result.results[0]?.content ?? "", /isolated tool execution failed/i);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
-test("isolated module process starts with a minimal image-independent environment", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-env-"));
-  try {
-    const tool = await moduleFixture(
-      root,
-      "export async function run() { return JSON.stringify(process.env); }",
-      { name: "environment" },
-    );
-    const result = await collect(
-      executor(root, tool).run(
-        [{ id: "environment", name: tool.def.name, args: {} }],
-        new AbortController().signal,
-      ),
-    );
-    assert.equal(result.results[0]?.isError, undefined);
-    const environment = JSON.parse(result.results[0]?.content ?? "{}") as Record<string, string>;
-    assert.equal(environment["HOME"], "/tmp");
-    assert.equal(environment["NODE_OPTIONS"], "");
-    assert.equal(environment["NODE_PATH"], "");
-    assert.equal(environment["PATH"], undefined);
-    assert.deepEqual(
-      Object.keys(environment).filter((key) => !key.startsWith("__CF_")),
-      ["HOME", "NODE_OPTIONS", "NODE_PATH"],
-    );
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+test(
+  "isolated module process starts with a minimal image-independent environment",
+  POSIX_NATIVE_RUNTIME_ONLY,
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-env-"));
+    try {
+      const tool = await moduleFixture(
+        root,
+        "export async function run() { return JSON.stringify(process.env); }",
+        { name: "environment" },
+      );
+      const result = await collect(
+        executor(root, tool).run(
+          [{ id: "environment", name: tool.def.name, args: {} }],
+          new AbortController().signal,
+        ),
+      );
+      assert.equal(result.results[0]?.isError, undefined);
+      const environment = JSON.parse(result.results[0]?.content ?? "{}") as Record<string, string>;
+      assert.equal(environment["HOME"], "/tmp");
+      assert.equal(environment["NODE_OPTIONS"], "");
+      assert.equal(environment["NODE_PATH"], "");
+      assert.equal(environment["PATH"], undefined);
+      assert.deepEqual(
+        Object.keys(environment).filter((key) => !key.startsWith("__CF_")),
+        ["HOME", "NODE_OPTIONS", "NODE_PATH"],
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
-test("isolated busy loop times out only after the real process tree is closed", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-loop-"));
-  try {
-    const tool = await moduleFixture(root, "export function run() { while (true) {} }", {
-      name: "loop",
-    });
-    const started = Date.now();
-    const result = await collect(
-      executor(root, tool, 1_000).run(
-        [{ id: "1", name: tool.def.name, args: {} }],
-        new AbortController().signal,
-      ),
-    );
-    assert.equal(result.results[0]?.isError, true);
-    assert.match(result.results[0]?.content ?? "", /超时|timed out/i);
-    assert.ok(Date.now() - started < 4_000, "busy loop must be force-killed within the deadline");
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+test(
+  "isolated busy loop times out only after the real process tree is closed",
+  POSIX_NATIVE_RUNTIME_ONLY,
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-loop-"));
+    try {
+      const tool = await moduleFixture(root, "export function run() { while (true) {} }", {
+        name: "loop",
+      });
+      const started = Date.now();
+      const result = await collect(
+        executor(root, tool, 1_000).run(
+          [{ id: "1", name: tool.def.name, args: {} }],
+          new AbortController().signal,
+        ),
+      );
+      assert.equal(result.results[0]?.isError, true);
+      assert.match(result.results[0]?.content ?? "", /超时|timed out/i);
+      assert.ok(Date.now() - started < 4_000, "busy loop must be force-killed within the deadline");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("isolated runner rejects workspace/network projections before runtime dispatch", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-permission-"));
@@ -494,68 +511,75 @@ test("isolated runner rejects workspace/network projections before runtime dispa
   }
 });
 
-test("isolated success force-exits late timers, and close is stable while SIGTERM is ignored", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-close-"));
-  try {
-    const late = path.join(root, "late-success");
-    const success = await moduleFixture(
-      root,
-      `import { writeFileSync } from "node:fs";
+test(
+  "isolated success force-exits late timers, and close is stable while SIGTERM is ignored",
+  POSIX_NATIVE_RUNTIME_ONLY,
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-isolated-close-"));
+    try {
+      const late = path.join(root, "late-success");
+      const success = await moduleFixture(
+        root,
+        `import { writeFileSync } from "node:fs";
        export async function run(_input, { cwd, emit }) {
          console.log("attacker stdout is not the protocol");
          emit({ step: 1 });
          setTimeout(() => writeFileSync(cwd + "/${path.basename(late)}", "late"), 200);
          return "ok";
        }`,
-      {
-        name: "success",
-        capabilities: [],
-        readOnly: false,
-      },
-    );
-    const successResult = await collect(
-      executor(root, success).run(
-        [{ id: "1", name: success.def.name, args: {} }],
-        new AbortController().signal,
-      ),
-    );
-    assert.equal(successResult.results[0]?.content, "ok");
-    assert.equal(successResult.results[0]?.isError, undefined);
-    assert.equal(successResult.events.filter((event) => event.type === "tool_progress").length, 1);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await assert.rejects(fs.access(late));
+        {
+          name: "success",
+          capabilities: [],
+          readOnly: false,
+        },
+      );
+      const successResult = await collect(
+        executor(root, success).run(
+          [{ id: "1", name: success.def.name, args: {} }],
+          new AbortController().signal,
+        ),
+      );
+      assert.equal(successResult.results[0]?.content, "ok");
+      assert.equal(successResult.results[0]?.isError, undefined);
+      assert.equal(
+        successResult.events.filter((event) => event.type === "tool_progress").length,
+        1,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await assert.rejects(fs.access(late));
 
-    const ignoredLateMarker = path.join(root, "ignored-late");
-    const hanging = await moduleFixture(
-      root,
-      `export async function run() {
+      const ignoredLateMarker = path.join(root, "ignored-late");
+      const hanging = await moduleFixture(
+        root,
+        `export async function run() {
          try { process.on("SIGTERM", () => {}); }
          catch (error) { return "SIGNAL_" + String(error?.code ?? "FAILED"); }
          return await new Promise((resolve) => setTimeout(() => resolve("unexpected"), 5_000));
        }`,
-      {
-        name: "ignore",
-        capabilities: [],
-        readOnly: false,
-      },
-    );
-    const exec = executor(root, hanging, 10_000);
-    const running = collect(
-      exec.run([{ id: "2", name: hanging.def.name, args: {} }], new AbortController().signal),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const firstClose = exec.close();
-    const secondClose = exec.close();
-    assert.equal(firstClose, secondClose, "close must return one stable promise");
-    await firstClose;
-    const closedResult = await running;
-    assert.equal(closedResult.results[0]?.isError, true);
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    await assert.rejects(fs.access(ignoredLateMarker));
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+        {
+          name: "ignore",
+          capabilities: [],
+          readOnly: false,
+        },
+      );
+      const exec = executor(root, hanging, 10_000);
+      const running = collect(
+        exec.run([{ id: "2", name: hanging.def.name, args: {} }], new AbortController().signal),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const firstClose = exec.close();
+      const secondClose = exec.close();
+      assert.equal(firstClose, secondClose, "close must return one stable promise");
+      await firstClose;
+      const closedResult = await running;
+      assert.equal(closedResult.results[0]?.isError, true);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await assert.rejects(fs.access(ignoredLateMarker));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("native IsolatedRuntime never advertises an untrusted module boundary", () => {
   assert.equal(new IsolatedRuntime({ failClosed: true }).toolModuleEnvironment, "unsupported");

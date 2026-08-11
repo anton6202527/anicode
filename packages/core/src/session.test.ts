@@ -193,34 +193,43 @@ test("SessionStore: JSONL mtime 驱动最近活跃排序与 load.updatedAt", asy
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("SessionStore: 会话目录/文件为私有权限，并自动收紧旧文件", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-mode-"));
-  const dir = path.join(root, "sessions");
-  const store = new SessionStore(dir);
-  const meta = await store.create({ id: "s_private", cwd: "/x", model: "m" });
-  const file = path.join(dir, "s_private.jsonl");
+test(
+  "SessionStore: 会话目录/文件为私有权限，并自动收紧旧文件",
+  {
+    skip:
+      process.platform === "win32"
+        ? "POSIX owner/group/other mode bits are unavailable on Windows"
+        : false,
+  },
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-mode-"));
+    const dir = path.join(root, "sessions");
+    const store = new SessionStore(dir);
+    const meta = await store.create({ id: "s_private", cwd: "/x", model: "m" });
+    const file = path.join(dir, "s_private.jsonl");
 
-  assert.equal((await fs.stat(dir)).mode & 0o777, 0o700);
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(dir)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
 
-  // 模拟旧版本留下的宽权限；append/load/rewrite 都会迁移回私有权限。
-  await fs.chmod(dir, 0o755);
-  await fs.chmod(file, 0o644);
-  await store.append("s_private", {
-    role: "user",
-    content: [{ type: "text", text: "private prompt" }],
-  });
-  assert.equal((await fs.stat(dir)).mode & 0o777, 0o700);
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    // 模拟旧版本留下的宽权限；append/load/rewrite 都会迁移回私有权限。
+    await fs.chmod(dir, 0o755);
+    await fs.chmod(file, 0o644);
+    await store.append("s_private", {
+      role: "user",
+      content: [{ type: "text", text: "private prompt" }],
+    });
+    assert.equal((await fs.stat(dir)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
 
-  await fs.chmod(file, 0o644);
-  const loaded = await store.load("s_private");
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
-  await store.rewrite(meta, loaded.messages);
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    await fs.chmod(file, 0o644);
+    const loaded = await store.load("s_private");
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    await store.rewrite(meta, loaded.messages);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
 
-  await fs.rm(root, { recursive: true, force: true });
-});
+    await fs.rm(root, { recursive: true, force: true });
+  },
+);
 
 test("SessionStore: 会话 id 不能路径穿越，meta id 必须与文件名一致", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sess-boundary-"));

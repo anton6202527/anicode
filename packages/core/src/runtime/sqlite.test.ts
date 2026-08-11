@@ -115,48 +115,57 @@ test("SQLite runtime: close synchronously fences new work and is idempotent", as
   }
 });
 
-test("SQLite runtime: DB/WAL/SHM 权限私有且不修改自定义父目录", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-runtime-mode-"));
-  const file = path.join(root, "runtime.db");
-  await fs.chmod(root, 0o755);
-  const database = new SqliteRuntimeDatabase(file);
-  try {
-    await database.audit({ category: "runtime", action: "permission-check" });
-    assert.equal((await fs.stat(root)).mode & 0o777, 0o755);
-
-    const existing: string[] = [];
-    for (const candidate of [file, `${file}-wal`, `${file}-shm`]) {
-      try {
-        await fs.access(candidate);
-        existing.push(candidate);
-      } catch {
-        // A checkpoint may remove a sidecar; every sidecar that remains must be private.
-      }
-    }
-    assert.ok(existing.includes(file));
-    for (const candidate of existing) {
-      assert.equal((await fs.stat(candidate)).mode & 0o777, 0o600);
-      await fs.chmod(candidate, 0o666);
-    }
-
-    await database.auditLog();
-    for (const candidate of existing) {
-      assert.equal((await fs.stat(candidate)).mode & 0o777, 0o600);
-    }
-
-    await database.close();
-    await fs.chmod(file, 0o666);
-    const reopened = new SqliteRuntimeDatabase(file);
+test(
+  "SQLite runtime: DB/WAL/SHM 权限私有且不修改自定义父目录",
+  {
+    skip:
+      process.platform === "win32"
+        ? "POSIX owner/group/other mode bits are unavailable on Windows"
+        : false,
+  },
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-runtime-mode-"));
+    const file = path.join(root, "runtime.db");
+    await fs.chmod(root, 0o755);
+    const database = new SqliteRuntimeDatabase(file);
     try {
-      assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+      await database.audit({ category: "runtime", action: "permission-check" });
+      assert.equal((await fs.stat(root)).mode & 0o777, 0o755);
+
+      const existing: string[] = [];
+      for (const candidate of [file, `${file}-wal`, `${file}-shm`]) {
+        try {
+          await fs.access(candidate);
+          existing.push(candidate);
+        } catch {
+          // A checkpoint may remove a sidecar; every sidecar that remains must be private.
+        }
+      }
+      assert.ok(existing.includes(file));
+      for (const candidate of existing) {
+        assert.equal((await fs.stat(candidate)).mode & 0o777, 0o600);
+        await fs.chmod(candidate, 0o666);
+      }
+
+      await database.auditLog();
+      for (const candidate of existing) {
+        assert.equal((await fs.stat(candidate)).mode & 0o777, 0o600);
+      }
+
+      await database.close();
+      await fs.chmod(file, 0o666);
+      const reopened = new SqliteRuntimeDatabase(file);
+      try {
+        assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+      } finally {
+        await reopened.close();
+      }
     } finally {
-      await reopened.close();
+      await database.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
-  } finally {
-    await database.close();
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test("SQLite runtime: JSONL 会话幂等迁移，事务追加不丢消息", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-sessions-"));

@@ -7,7 +7,12 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { commandHook, commandHooksFromConfig, isHookEventName } from "./hooks-exec.js";
+import {
+  commandHook,
+  commandHooksFromConfig,
+  isHookEventName,
+  windowsCommandArguments,
+} from "./hooks-exec.js";
 import { HookExecutionBoundaryError, HookRunner } from "./hooks.js";
 import {
   RuntimeTerminationError,
@@ -27,6 +32,11 @@ function shellArg(value: string): string {
   if (process.platform === "win32") return `"${value.replaceAll('"', '""')}"`;
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
+
+test("命令 hook: Windows cmd 保留带空格 executable 的内层引号", () => {
+  const command = '"C:\\Program Files\\node.exe" "D:\\hook fixtures\\hook.mjs" allow';
+  assert.deepEqual(windowsCommandArguments(command), ["/d", "/s", "/c", `"${command}"`]);
+});
 
 test("命令 hook: stdout JSON 解析为 HookResult；stdin 收到 payload", async () => {
   const reg = commandHook({

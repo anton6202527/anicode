@@ -418,10 +418,14 @@ test("PatchSet: 拒绝 symlink 与运行时状态路径，且保留可执行权�
       { path: "private.sh", content: "#!/bin/sh\ntrue\n", mode: 0o700 },
     ]);
     await service.apply(patchset);
-    assert.equal((await fs.stat(path.join(root, "run.sh"))).mode & 0o777, 0o755);
-    assert.equal((await fs.stat(path.join(root, "private.sh"))).mode & 0o777, 0o700);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(path.join(root, "run.sh"))).mode & 0o777, 0o755);
+      assert.equal((await fs.stat(path.join(root, "private.sh"))).mode & 0o777, 0o700);
+    }
     await service.rollback(patchset);
-    assert.equal((await fs.stat(path.join(root, "run.sh"))).mode & 0o777, 0o755);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(path.join(root, "run.sh"))).mode & 0o777, 0o755);
+    }
   } finally {
     await fs.rm(root, { recursive: true, force: true });
     await fs.rm(outside, { recursive: true, force: true });

@@ -9,6 +9,13 @@ import type { ChatMessage } from "./types.js";
 
 const available = await sqliteAvailable();
 const opts = { skip: available ? false : "node:sqlite 不可用（旧 Node 运行时）" };
+const privateModeOpts = {
+  skip: !available
+    ? "node:sqlite 不可用（旧 Node 运行时）"
+    : process.platform === "win32"
+      ? "POSIX owner/group/other mode bits are unavailable on Windows"
+      : false,
+};
 
 const msg = (text: string): ChatMessage => ({ role: "user", content: [{ type: "text", text }] });
 
@@ -85,38 +92,42 @@ test("SqliteSessionStore: importFrom 从 JSONL 迁移且幂等", opts, async () 
   }
 });
 
-test("SqliteSessionStore: DB/WAL/SHM 始终为私有权限且不修改自定义父目录", opts, async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-mode-"));
-  const dbPath = path.join(dir, "s.db");
-  await fs.chmod(dir, 0o755);
-  const store = await SqliteSessionStore.open(dbPath);
-  try {
-    await store.create({ id: "s_private", cwd: dir, model: "m" });
-    await store.append("s_private", msg("secret"));
+test(
+  "SqliteSessionStore: DB/WAL/SHM 始终为私有权限且不修改自定义父目录",
+  privateModeOpts,
+  async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-mode-"));
+    const dbPath = path.join(dir, "s.db");
+    await fs.chmod(dir, 0o755);
+    const store = await SqliteSessionStore.open(dbPath);
+    try {
+      await store.create({ id: "s_private", cwd: dir, model: "m" });
+      await store.append("s_private", msg("secret"));
 
-    // 自定义目录可能由其他应用共享，存储层只收紧自己的数据库与 sidecar。
-    assert.equal((await fs.stat(dir)).mode & 0o777, 0o755);
-    const existing: string[] = [];
-    for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
-      try {
-        await fs.access(file);
-        existing.push(file);
-      } catch {
-        // SQLite may checkpoint and remove a sidecar; every sidecar that remains must be private.
+      // 自定义目录可能由其他应用共享，存储层只收紧自己的数据库与 sidecar。
+      assert.equal((await fs.stat(dir)).mode & 0o777, 0o755);
+      const existing: string[] = [];
+      for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+        try {
+          await fs.access(file);
+          existing.push(file);
+        } catch {
+          // SQLite may checkpoint and remove a sidecar; every sidecar that remains must be private.
+        }
       }
-    }
-    assert.ok(existing.includes(dbPath));
-    for (const file of existing) assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+      assert.ok(existing.includes(dbPath));
+      for (const file of existing) assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
 
-    // 模拟旧版本留下的宽权限；下一次写入会自动修复。
-    for (const file of existing) await fs.chmod(file, 0o666);
-    await store.append("s_private", msg("tighten"));
-    for (const file of existing) assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
-  } finally {
-    await store.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  }
-});
+      // 模拟旧版本留下的宽权限；下一次写入会自动修复。
+      for (const file of existing) await fs.chmod(file, 0o666);
+      await store.append("s_private", msg("tighten"));
+      for (const file of existing) assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    } finally {
+      await store.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "SqliteSessionStore: 相对路径在打开时冻结，不受后续 chdir 影响",
@@ -140,7 +151,9 @@ test(
 
       process.chdir(changedTo);
       await store.create({ id: "s_relative", cwd: openedFrom, model: "m" });
-      assert.equal((await fs.stat(databaseFile)).mode & 0o777, 0o600);
+      if (process.platform !== "win32") {
+        assert.equal((await fs.stat(databaseFile)).mode & 0o777, 0o600);
+      }
       await store.close();
       store = undefined;
     } finally {

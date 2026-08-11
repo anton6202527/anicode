@@ -150,6 +150,9 @@ async function runCommandHook(
         env: sanitizedShellEnv(),
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
+        // Match Node's own cmd.exe shell boundary: the /s outer-quote contract must reach cmd
+        // verbatim instead of being escaped a second time by libuv's generic argv serializer.
+        windowsVerbatimArguments: process.platform === "win32",
         windowsHide: true,
       });
     } catch {
@@ -233,13 +236,20 @@ async function runCommandHook(
 
 function hostCommandShell(command: string): { file: string; args: string[] } {
   if (process.platform === "win32") {
-    // /d disables registry AutoRun commands, keeping the configured hook as the only command body.
+    // /d disables registry AutoRun commands. With /s, cmd strips the first and last quote around
+    // the command string; provide that outer pair explicitly so an already-quoted executable path
+    // keeps its own quotes instead of being split at spaces.
     return {
       file: windowsCommandInterpreter(process.env),
-      args: ["/d", "/s", "/c", command],
+      args: windowsCommandArguments(command),
     };
   }
   return { file: "/bin/sh", args: ["-c", command] };
+}
+
+/** @internal Exported only so the Windows cmd quoting boundary has a platform-neutral unit test. */
+export function windowsCommandArguments(command: string): string[] {
+  return ["/d", "/s", "/c", `"${command}"`];
 }
 
 function windowsCommandInterpreter(env: NodeJS.ProcessEnv): string {

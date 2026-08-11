@@ -30,6 +30,20 @@ const serverCfg = {
   args: ["--import", "tsx", serverPath],
 };
 
+async function waitForProcessExit(pid: number, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    if (Date.now() >= deadline) assert.fail(`process ${pid} did not exit within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 const legacyServerScript = String.raw`
 let buffer = "";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
@@ -84,9 +98,12 @@ test("MCP: 握手 → 列工具 → 调用 → 错误路径", async () => {
 test("connectMcpServers: partial startup failure closes every previously started server", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-cleanup-"));
   const marker = path.join(directory, "closed.txt");
+  const pidFile = path.join(directory, "pid.txt");
   const cleanupServer = String.raw`
 const { writeFileSync } = require("node:fs");
-const marker = process.argv[1];
+const pidFile = process.argv[1];
+const marker = process.argv[2];
+writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
 let buffer = "";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 process.on("SIGTERM", () => {
@@ -123,7 +140,7 @@ process.stdin.on("data", (chunk) => {
           {
             name: "healthy-first",
             command: process.execPath,
-            args: ["-e", cleanupServer, marker],
+            args: ["-e", cleanupServer, pidFile, marker],
             timeoutMs: 1_000,
           },
           {
@@ -134,7 +151,12 @@ process.stdin.on("data", (chunk) => {
         ]),
       /ENOENT|spawn|missing-mcp-server/,
     );
-    assert.equal(await fs.readFile(marker, "utf8"), "closed");
+    const startedPid = Number(await fs.readFile(pidFile, "utf8"));
+    assert.ok(Number.isSafeInteger(startedPid) && startedPid > 0);
+    await waitForProcessExit(startedPid);
+    if (process.platform !== "win32") {
+      assert.equal(await fs.readFile(marker, "utf8"), "closed");
+    }
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -1215,6 +1237,7 @@ test("MCP(stdio): Broker credential stays a lease until the controlled runtime p
     scopes: [{ audiences: ["mcp:credential"], tools: ["stdio"], env: "MCP_TEST_TOKEN" }],
   });
   let prepared = false;
+  let serverScript = "";
   const runtime: ExecutionRuntime = {
     managedProcessBoundary: "close-confirmed",
     async run() {
@@ -1227,15 +1250,17 @@ test("MCP(stdio): Broker credential stays a lease until the controlled runtime p
       let env = { ...request.env };
       for (const lease of request.credentialLeases ?? []) env = broker.injectEnv(lease, env);
       return {
-        file: "/bin/bash",
-        args: ["-c", request.command],
+        // This controlled test boundary does not need a host shell: execute the already-known
+        // fixture directly so the credential-lease contract remains covered on Windows too.
+        file: process.execPath,
+        args: ["-e", serverScript],
         env,
         cwd: request.cwd,
         sandboxed: true,
       };
     },
   };
-  const script = String.raw`
+  serverScript = String.raw`
 let buffer = "";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 process.stdin.on("data", (chunk) => {
@@ -1261,7 +1286,7 @@ process.stdin.on("data", (chunk) => {
     {
       name: "credential",
       command: process.execPath,
-      args: ["-e", script],
+      args: ["-e", serverScript],
       credentialEnv: { MCP_TEST_TOKEN: "mcp-env-secret" },
     },
     { credentialBroker: broker, executionRuntime: runtime },

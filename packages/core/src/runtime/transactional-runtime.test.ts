@@ -23,7 +23,9 @@ test("TransactionalExecutionRuntime: successful shell changes commit through Pat
       policy: "workspace-write",
     });
     assert.equal(await fs.readFile(path.join(root, "old.txt"), "utf8"), "new");
-    assert.equal((await fs.stat(path.join(root, "added.sh"))).mode & 0o777, 0o700);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(path.join(root, "added.sh"))).mode & 0o777, 0o700);
+    }
     assert.match(result.output, /PatchSet ps_/);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
