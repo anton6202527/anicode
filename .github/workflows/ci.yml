@@ -73,6 +73,15 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
+      # Core shell tests exercise the production fail-closed Linux sandbox. ubuntu-latest does
+      # not guarantee bubblewrap is preinstalled, and Ubuntu 24.04's AppArmor policy blocks the
+      # unprivileged user namespace bwrap needs. This runner is ephemeral and receives no secrets.
+      - name: Install Linux shell sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Install
         run: npm ci
 

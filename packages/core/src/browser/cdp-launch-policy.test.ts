@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import {
   buildBrowserLaunchArguments,
+  buildBrowserProcessEnvironment,
   createPrivateBrowserAutomationProfile,
   isManagedBrowserAutomationProfile,
 } from "./cdp.js";
@@ -35,6 +36,52 @@ test("browser launch policy: Linux keeps password storage inside the private pro
 
   assert.ok(args.includes("--password-store=basic"));
   assert.ok(!args.includes("--use-mock-keychain"));
+});
+
+test("browser launch policy: Linux HOME and XDG state stay inside the disposable profile", () => {
+  const env = buildBrowserProcessEnvironment(
+    syntheticProfile,
+    {
+      HOME: "/home/developer",
+      XDG_CONFIG_HOME: "/home/developer/.config",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+      CHROME_CONFIG_HOME: "/home/developer/.chrome",
+      CHROME_USER_DATA_DIR: "/home/developer/.chrome/profile",
+    },
+    "linux",
+  );
+
+  assert.equal(env["HOME"], syntheticProfile);
+  for (const name of [
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+  ]) {
+    const value = env[name];
+    assert.ok(value === syntheticProfile || value?.startsWith(`${syntheticProfile}/`), name);
+  }
+  assert.equal(env["DBUS_SESSION_BUS_ADDRESS"], undefined);
+  assert.equal(env["CHROME_CONFIG_HOME"], undefined);
+  assert.equal(env["CHROME_USER_DATA_DIR"], undefined);
+});
+
+test("browser launch policy: Windows app-data roots stay inside the disposable profile", () => {
+  const env = buildBrowserProcessEnvironment(
+    syntheticProfile,
+    {
+      USERPROFILE: "C:\\Users\\developer",
+      APPDATA: "C:\\Users\\developer\\AppData\\Roaming",
+      LOCALAPPDATA: "C:\\Users\\developer\\AppData\\Local",
+    },
+    "win32",
+  );
+
+  assert.equal(env["HOME"], syntheticProfile);
+  assert.equal(env["USERPROFILE"], syntheticProfile);
+  assert.ok(env["APPDATA"]?.startsWith(`${syntheticProfile}/`));
+  assert.ok(env["LOCALAPPDATA"]?.startsWith(`${syntheticProfile}/`));
 });
 
 test("browser launch policy: Windows does not receive unsupported POSIX keyring switches", () => {

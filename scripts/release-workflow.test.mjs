@@ -12,6 +12,10 @@ const workflow = await readFile(
   "utf8",
 );
 const ciWorkflow = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const agentRuntimeWorkflow = await readFile(
+  new URL("../.github/workflows/agent-runtime.yml", import.meta.url),
+  "utf8",
+);
 const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const workspacePackages = await Promise.all(
   (await readdir(new URL("../packages/", import.meta.url), { withFileTypes: true }))
@@ -60,12 +64,16 @@ const workflowSources = await Promise.all(
     })),
 );
 
-function job(name, nextName) {
-  const start = workflow.indexOf(`  ${name}:\n`);
+function workflowJob(document, name, nextName) {
+  const start = document.indexOf(`  ${name}:\n`);
   assert.notEqual(start, -1, `missing ${name} job`);
-  const end = nextName ? workflow.indexOf(`  ${nextName}:\n`, start + 1) : workflow.length;
+  const end = nextName ? document.indexOf(`  ${nextName}:\n`, start + 1) : document.length;
   assert.notEqual(end, -1, `missing ${nextName} job`);
-  return workflow.slice(start, end);
+  return document.slice(start, end);
+}
+
+function job(name, nextName) {
+  return workflowJob(workflow, name, nextName);
 }
 
 function inlineRoleRules(document) {
@@ -112,6 +120,52 @@ test("developer entrypoints advertise CI-tested Node lines and never auto-grant 
   assert.match(rootPackage.scripts["dev:trust:status"], /trust status --cwd \./);
   assert.doesNotMatch(rootPackage.scripts["dev:tui"], /trust|grant/);
   assert.doesNotMatch(rootPackage.scripts["dev:tui:demo"], /trust|grant/);
+});
+
+test("Linux test gates provision trusted bubblewrap before exercising the shell sandbox", () => {
+  const gates = [
+    {
+      label: "CI quality",
+      body: workflowJob(ciWorkflow, "quality", "quality-platform"),
+      command: "run: npm test",
+    },
+    {
+      label: "agent runtime delivery",
+      body: workflowJob(agentRuntimeWorkflow, "verify-delivery", "build-images"),
+      command: "run: npm test",
+    },
+    {
+      label: "push release gate",
+      body: job("npm", "version-pr"),
+      command: "run: npm run verify:release",
+    },
+    {
+      label: "tagged release gate",
+      body: job("validate-release", "vsix"),
+      command: "run: npm run verify:release",
+    },
+  ];
+
+  for (const { label, body, command } of gates) {
+    const updateAt = body.indexOf("sudo apt-get update");
+    const installAt = body.indexOf("sudo apt-get install --yes bubblewrap");
+    const userNamespaceAt = body.indexOf(
+      "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+    );
+    const gateAt = body.indexOf(command);
+    assert.ok(updateAt >= 0, `${label} must refresh the signed Ubuntu package index`);
+    assert.ok(installAt > updateAt, `${label} must install the system bubblewrap package`);
+    assert.ok(
+      userNamespaceAt > installAt,
+      `${label} must enable bwrap user namespaces on the ephemeral Ubuntu runner`,
+    );
+    assert.ok(gateAt > userNamespaceAt, `${label} must provision bubblewrap before running tests`);
+    assert.doesNotMatch(
+      body,
+      /AGENTX_BASH_SANDBOX(?:\s*:\s*|=)none/,
+      `${label} must not bypass the production sandbox policy`,
+    );
+  }
 });
 
 test("tests and every release-gate child fail closed against the OS keychain", () => {

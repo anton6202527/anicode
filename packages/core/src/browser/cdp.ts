@@ -161,6 +161,40 @@ export interface BrowserLaunchArgumentOptions {
   extraArgs?: readonly string[];
 }
 
+/**
+ * Keep Chromium's auxiliary state in the same disposable private profile as its user data.
+ *
+ * `sanitizedShellEnv` intentionally points generic shell tools at `/nonexistent`, but recent Linux
+ * Chrome builds require a writable HOME/XDG runtime while their crash handler starts. Giving the
+ * browser the real developer HOME would re-open the credential/config boundary, so browser
+ * processes receive only profile-scoped locations instead.
+ */
+export function buildBrowserProcessEnvironment(
+  userDataDir: string,
+  source: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  if (!isAbsolute(userDataDir) || userDataDir.includes("\0")) {
+    throw new Error("Browser user-data directory must be an absolute path");
+  }
+  const env = sanitizedShellEnv(source);
+  delete env["CHROME_CONFIG_HOME"];
+  delete env["CHROME_USER_DATA_DIR"];
+  env["HOME"] = userDataDir;
+  env["USERPROFILE"] = userDataDir;
+  if (platform === "win32") {
+    env["APPDATA"] = join(userDataDir, "app-data");
+    env["LOCALAPPDATA"] = join(userDataDir, "local-app-data");
+  } else {
+    env["XDG_CONFIG_HOME"] = join(userDataDir, "xdg-config");
+    env["XDG_DATA_HOME"] = join(userDataDir, "xdg-data");
+    env["XDG_STATE_HOME"] = join(userDataDir, "xdg-state");
+    env["XDG_CACHE_HOME"] = join(userDataDir, "xdg-cache");
+    env["XDG_RUNTIME_DIR"] = userDataDir;
+  }
+  return env;
+}
+
 function chromiumSwitchName(argument: string): string | undefined {
   const match = /^--([^=\s]+)(?:=.*)?$/.exec(argument);
   return match?.[1]?.toLowerCase();
@@ -381,7 +415,7 @@ export class Browser {
     try {
       proc = spawn(bin, args, {
         stdio: "ignore",
-        env: sanitizedShellEnv(),
+        env: buildBrowserProcessEnvironment(profile.directory),
         detached: process.platform !== "win32",
         windowsHide: true,
       });
