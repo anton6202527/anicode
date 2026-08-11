@@ -319,7 +319,11 @@ test("daemon: 两个客户端共享同一会话，一个 send 两个都收事件
 test("daemon client: open 先交付 snapshot，再回放响应飞行期事件", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-race-"));
   const sockPath = testSocketPath(dir, "fake.sock");
+  const sockets = new Set<net.Socket>();
   const fake = net.createServer((sock) => {
+    sockets.add(sock);
+    sock.on("close", () => sockets.delete(sock));
+    sock.on("error", () => {});
     let buffer = "";
     sock.on("data", (chunk) => {
       buffer += chunk.toString();
@@ -369,31 +373,39 @@ test("daemon client: open 先交付 snapshot，再回放响应飞行期事件", 
     fake.listen(sockPath, resolve);
   });
 
-  const client = await DaemonClient.connect(sockPath);
-  const seen: SessionEvent[] = [];
-  const handle = await client.open("s_race", (event) => seen.push(event));
-  assert.equal(handle.snapshot.messages.length, 0);
-  assert.equal(seen.length, 0, "open resolve 时调用方应先有机会应用 snapshot");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(
-    seen.some(
-      (event) =>
-        event.type === "agent" && event.event.type === "text" && event.event.text === "响应中文",
-    ),
-    true,
-  );
-
-  client.dispose();
-  await new Promise<void>((resolve) => fake.close(() => resolve()));
-  await fs.rm(dir, { recursive: true, force: true });
+  let client: DaemonClient | undefined;
+  try {
+    client = await DaemonClient.connect(sockPath);
+    const seen: SessionEvent[] = [];
+    const handle = await client.open("s_race", (event) => seen.push(event));
+    assert.equal(handle.snapshot.messages.length, 0);
+    assert.equal(seen.length, 0, "open resolve 时调用方应先有机会应用 snapshot");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      seen.some(
+        (event) =>
+          event.type === "agent" && event.event.type === "text" && event.event.text === "响应中文",
+      ),
+      true,
+    );
+  } finally {
+    client?.dispose();
+    // net.Server.close() waits for accepted connections. A Windows named-pipe peer does not
+    // guarantee that the server-side handle observes client.destroy() before close() starts, so
+    // explicitly own and destroy every accepted test socket.
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => fake.close(() => resolve()));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("daemon client: dispose 立即拒绝 pending 并销毁半开 socket", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-daemon-dispose-"));
   const sockPath = testSocketPath(dir, "half-open.sock");
-  let accepted!: net.Socket;
+  let accept!: (socket: net.Socket) => void;
+  const accepted = new Promise<net.Socket>((resolve) => (accept = resolve));
   const fake = net.createServer({ allowHalfOpen: true }, (socket) => {
-    accepted = socket;
+    accept(socket);
     socket.on("data", () => {
       // 故意永不响应，也不主动 FIN。
     });
@@ -402,21 +414,27 @@ test("daemon client: dispose 立即拒绝 pending 并销毁半开 socket", async
     fake.once("error", reject);
     fake.listen(sockPath, resolve);
   });
-  const client = await DaemonClient.connect(sockPath);
-  const pending = client.listSessions();
+  let client: DaemonClient | undefined;
+  let acceptedSocket: net.Socket | undefined;
+  try {
+    client = await DaemonClient.connect(sockPath);
+    acceptedSocket = await accepted;
+    const pending = client.listSessions();
 
-  client.dispose();
-  await assert.rejects(pending, /已释放/);
-  await assert.rejects(client.listSessions(), /已释放/);
-  assert.equal(
-    (client as unknown as { sock: net.Socket }).sock.destroyed,
-    true,
-    "dispose 应同步 destroy，而不是停在 readOnly half-open",
-  );
-
-  accepted.destroy();
-  await new Promise<void>((resolve) => fake.close(() => resolve()));
-  await fs.rm(dir, { recursive: true, force: true });
+    client.dispose();
+    await assert.rejects(pending, /已释放/);
+    await assert.rejects(client.listSessions(), /已释放/);
+    assert.equal(
+      (client as unknown as { sock: net.Socket }).sock.destroyed,
+      true,
+      "dispose 应同步 destroy，而不是停在 readOnly half-open",
+    );
+  } finally {
+    client?.dispose();
+    acceptedSocket?.destroy();
+    await new Promise<void>((resolve) => fake.close(() => resolve()));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("daemon client: request timeout bounds a connected peer that never responds", async () => {
