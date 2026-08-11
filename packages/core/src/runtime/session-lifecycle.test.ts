@@ -340,12 +340,12 @@ test("durable lifecycle: an expired late artifact write is compensatingly purged
   const managerA = sqliteManager(databaseA, {
     artifacts: delayed,
     lifecycle: lifecycleA,
-    leaseMs: 120,
   });
-  const managerB = sqliteManager(databaseB, { leaseMs: 120 });
+  const managerB = sqliteManager(databaseB);
+  let lateWrite: Promise<unknown> | undefined;
   try {
     const session = await managerA.createSession({ cwd: root, model: "idle" });
-    const lateWrite = managerA.putArtifact({
+    lateWrite = managerA.putArtifact({
       sessionId: session.id,
       kind: "report",
       name: "late.txt",
@@ -353,11 +353,19 @@ test("durable lifecycle: an expired late artifact write is compensatingly purged
     });
     await delayed.started.promise;
     lifecycleA.drop = true;
+    // Expire only the producer lease; a tiny shared wall-clock TTL can also expire the unrelated
+    // deletion claim under CI scheduler pressure and turn this into a cleanup-ordering test.
+    const expired = await databaseA.run((db) =>
+      db
+        .prepare("UPDATE session_operation_leases SET expires_at = ? WHERE session_id = ?")
+        .run(new Date(0).toISOString(), session.id),
+    );
+    assert.equal(Number(expired.changes), 1, "the delayed producer must own one durable lease");
 
     await managerB.deleteSession(session.id);
     assert.deepEqual(await new SqliteArtifactStore(databaseB).list(session.id), []);
     delayed.release.resolve();
-    await assert.rejects(() => lateWrite, /lease.*lost/i);
+    await assert.rejects(lateWrite, /lease.*lost/i);
 
     assert.deepEqual(
       await new SqliteArtifactStore(databaseB).list(session.id),
@@ -372,6 +380,7 @@ test("durable lifecycle: an expired late artifact write is compensatingly purged
     );
   } finally {
     delayed.release.resolve();
+    await lateWrite?.catch(() => undefined);
     managerA.dispose();
     managerB.dispose();
     await databaseB.close();
