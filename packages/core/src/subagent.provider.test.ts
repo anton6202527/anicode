@@ -35,7 +35,7 @@ test("Subagent: provider/model override 通过 resolver 使用另一 provider", 
   const agent = new Agent({
     provider: parent,
     model: "parent-model",
-    cwd: "/tmp",
+    cwd: process.cwd(),
     projectMemory: false,
     permission: { mode: "auto" },
     subagents: [{ name: "cross", description: "cross provider", model: "other/child-model" }],

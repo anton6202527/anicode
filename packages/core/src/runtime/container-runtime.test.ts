@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -17,6 +17,9 @@ import {
 const POSIX_ONLY = {
   skip: process.platform === "win32" ? "requires a POSIX process group" : false,
 };
+
+const TEST_DOCKER_ENDPOINT =
+  process.platform === "win32" ? "npipe:////./pipe/docker_engine" : "unix:///var/run/docker.sock";
 
 const PROXY_ENVIRONMENT_KEYS = [
   "HTTP_PROXY",
@@ -265,7 +268,9 @@ test("Container runtime: an explicit trusted engine binary and local endpoint av
   });
   try {
     await runtime.run({ command: "true", cwd: root, network: false });
-    assert.equal(observedFile, await fs.realpath(engine));
+    // The runtime deliberately uses one synchronous canonicalizer for the trusted executable.
+    // Node's async realpath may expand a Windows 8.3 temp path to a different textual spelling.
+    assert.equal(observedFile, realpathSync(engine));
   } finally {
     await runtime.shutdown();
     await fs.rm(root, { recursive: true, force: true });
@@ -730,7 +735,7 @@ test("Container runtime: durable startup reconciliation removes a crash-orphan j
         {
           name,
           engine: "docker",
-          endpoint: "unix:///var/run/docker.sock",
+          endpoint: TEST_DOCKER_ENDPOINT,
           ownerToken,
           startedAt: new Date().toISOString(),
           tenantId: "tenant-a",
@@ -791,7 +796,7 @@ test("Container runtime: legacy missing records migrate to creating and never pr
         {
           name,
           engine: "docker",
-          endpoint: "unix:///var/run/docker.sock",
+          endpoint: TEST_DOCKER_ENDPOINT,
           ownerToken: "45454545-4545-4545-8545-454545454545",
           startedAt,
         },
@@ -823,7 +828,7 @@ test("Container runtime: legacy missing records migrate to creating and never pr
       {
         name,
         engine: "docker",
-        endpoint: "unix:///var/run/docker.sock",
+        endpoint: TEST_DOCKER_ENDPOINT,
         ownerToken: "45454545-4545-4545-8545-454545454545",
         startedAt,
         phase: "creating",
@@ -846,7 +851,7 @@ test("Container runtime: a durable reserved record clears without touching the d
         {
           name: "anicode-reserved-no-create",
           engine: "docker",
-          endpoint: "unix:///var/run/docker.sock",
+          endpoint: TEST_DOCKER_ENDPOINT,
           ownerToken: "46464646-4646-4646-8646-464646464646",
           startedAt: new Date().toISOString(),
           phase: "reserved",
@@ -970,7 +975,7 @@ test("Container runtime: unresolved crash orphan remains journaled and blocks re
         {
           name,
           engine: "docker",
-          endpoint: "unix:///var/run/docker.sock",
+          endpoint: TEST_DOCKER_ENDPOINT,
           ownerToken,
           startedAt: new Date().toISOString(),
         },
@@ -1107,7 +1112,7 @@ test(
           {
             name,
             engine: "docker",
-            endpoint: "unix:///var/run/docker.sock",
+            endpoint: TEST_DOCKER_ENDPOINT,
             ownerToken,
             startedAt: new Date().toISOString(),
           },

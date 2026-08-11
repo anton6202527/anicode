@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -96,7 +96,9 @@ test("LSP: production runtime 以只读、断网策略 prepare 持久进程", LS
   pool = new LspPool(dir, [cfg], runtime);
   const diagnostics = await pool.clientFor(".ts")!.diagnose(file, 3000);
   assert.equal(diagnostics.length, 1);
-  assert.deepEqual(requests, [`read-only:false:${await fs.realpath(dir)}`]);
+  // Use the same synchronous canonicalizer as LspClient.start. On Windows, Node can expose the
+  // same temp directory through its 8.3 and long path spellings depending on the fs API used.
+  assert.deepEqual(requests, [`read-only:false:${realpathSync(dir)}`]);
 });
 
 test(

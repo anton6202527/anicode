@@ -947,7 +947,7 @@ test("auth store: 多实例并发更新经文件锁串行，不丢 provider", as
       assert.equal((await stores[1]!.get(`provider-${index}`))?.access, `A${index}`);
     }
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

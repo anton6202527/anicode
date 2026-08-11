@@ -383,7 +383,7 @@ test(
         { name: "relative" },
       );
       const result = await collect(
-        executor(root, tool).run(
+        executor(root, tool, 10_000).run(
           [{ id: "relative", name: tool.def.name, args: {} }],
           new AbortController().signal,
         ),

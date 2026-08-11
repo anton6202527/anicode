@@ -449,7 +449,10 @@ export class TypedCodeGraph {
     const changed: TypedCodeFile[] = [];
     let totalSourceBytes = 0;
     for (const absolute of paths) {
-      const canonical = await fs.realpath(absolute);
+      // Keep one canonicalizer for the root and every descendant. On Windows, mixing
+      // realpathSync() with promises.realpath() can produce 8.3 and long spellings for the same
+      // directory; path.relative() then mistakes every source file for a workspace escape.
+      const canonical = realpathSync(absolute);
       if (!pathInside(this.root, canonical)) continue;
       const stat = await fs.stat(canonical, { bigint: true });
       if (!stat.isFile()) continue;

@@ -1529,7 +1529,10 @@ test("TUI: 结果页模型选择器遮住底层文字，选中后带历史切换
     );
 
     view.stdin.write("\r");
-    await waitFor(() => forked !== undefined && (view.lastFrame() ?? "").includes(marker));
+    await waitFor(() => {
+      const frame = view.lastFrame() ?? "";
+      return forked !== undefined && frame.includes(marker) && /debug\/demo|demo/.test(frame);
+    });
     assert.equal(created, false);
     assert.deepEqual(forked, { sessionId: "s_result", opts: { model: "debug/demo" } });
     assert.match(view.lastFrame() ?? "", /debug\/demo|demo/);

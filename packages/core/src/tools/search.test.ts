@@ -81,7 +81,7 @@ test("glob 匹配文件并按需返回相对路径", async () => {
   await fs.writeFile(path.join(dir, "src", "a.ts"), "x");
   await fs.writeFile(path.join(dir, "src", "b.js"), "x");
   const out = await globTool.run({ pattern: "**/*.ts" }, ctx(dir));
-  assert.match(out, /src\/a\.ts/);
+  assert.match(out, new RegExp(`src[\\\\/]a\\.ts`));
   assert.doesNotMatch(out, /b\.js/);
 });
 

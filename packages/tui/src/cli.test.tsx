@@ -586,7 +586,7 @@ test("CLI: 非 resume 路径只创建一次会话", async () => {
   const host: Pick<SessionHost, "createSession"> = {
     async createSession(input) {
       createCalls++;
-      assert.equal(input.cwd, "/work");
+      assert.equal(input.cwd, path.resolve("/work"));
       assert.equal(input.model, "openai/gpt-test");
       return {
         id: "session-new",
@@ -643,9 +643,9 @@ test("CLI: demo 与隔离会话目录适合零配置本地调试", () => {
   ]);
 
   assert.equal(args.model, "debug/demo");
-  assert.equal(args.cwd, "/work");
-  assert.equal(args.sessionsDir, "/tmp/anicode-test-sessions");
-  assert.equal(args.debugLog, "/tmp/anicode-test.jsonl");
+  assert.equal(args.cwd, path.resolve("/work"));
+  assert.equal(args.sessionsDir, path.resolve("/tmp/anicode-test-sessions"));
+  assert.equal(args.debugLog, path.resolve("/tmp/anicode-test.jsonl"));
   assert.equal(args.daemon, false);
   assert.equal(args.http, undefined);
   assert.match(helpText(), /无需 AniCode 后端服务|no AniCode backend\/server/);

@@ -11,7 +11,7 @@ import {
   sensitiveHostReadPaths,
   sandboxHostReadBoundary,
 } from "./sandbox.js";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildShellSpawn } from "./shell-spawn.js";
@@ -219,7 +219,9 @@ test("sandbox: sensitiveHostReadPaths 只返回存在路径并区分文件与目
   await fs.mkdir(path.join(home, ".ssh"));
   await fs.writeFile(path.join(home, ".npmrc"), "token=secret\n");
   const paths = sensitiveHostReadPaths(home);
-  const canonicalHome = await fs.realpath(home);
+  // Match the synchronous canonicalization used by the sandbox boundary. Windows may otherwise
+  // compare the same directory's 8.3 and long path spellings as unrelated paths.
+  const canonicalHome = realpathSync(home);
   assert.deepEqual(
     paths.map((item) => ({ path: path.relative(canonicalHome, item.path), kind: item.kind })),
     [
@@ -262,7 +264,7 @@ test("sandbox: sandboxHostReadBoundary 仅回挂存在的工具链，不回挂�
   await fs.mkdir(path.join(home, ".nvm", "versions"), { recursive: true });
   await fs.mkdir(path.join(home, ".config", "gh"), { recursive: true });
   const boundary = sandboxHostReadBoundary(home);
-  const canonicalHome = await fs.realpath(home);
+  const canonicalHome = realpathSync(home);
   assert.deepEqual(boundary.hiddenReadRoots, [canonicalHome]);
   assert.deepEqual(boundary.readableRoots, [path.join(canonicalHome, ".nvm", "versions")]);
   await fs.rm(home, { recursive: true, force: true });

@@ -1317,7 +1317,13 @@ test("MCP(stdio): unterminated oversized frames fail closed instead of growing f
       McpClient.start({
         name: "oversized",
         command: process.execPath,
-        args: ["-e", 'process.stdout.write("x".repeat(4 * 1024 * 1024 + 1))'],
+        // Keep the fixture alive until transport cleanup runs. Otherwise Windows may observe the
+        // direct process exiting before taskkill /T can establish a process-tree close proof,
+        // replacing the intended frame-limit error with the correct fail-closed cleanup error.
+        args: [
+          "-e",
+          'process.stdout.write("x".repeat(4 * 1024 * 1024 + 1)); setInterval(() => {}, 1_000)',
+        ],
         timeoutMs: 5_000,
       }),
     /MCP (?:帧超过|frame exceeds) 4194304 bytes/,

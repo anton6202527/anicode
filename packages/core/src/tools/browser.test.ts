@@ -155,9 +155,17 @@ const chromeAvailable = (() => {
   }
 })();
 
+const browserE2eAvailable = chromeAvailable && process.platform !== "win32";
+
 test(
   "browser 工具端到端：headless 打开 HTTP 页，抓到 console 错误并回传截图",
-  { skip: chromeAvailable ? false : "no Chrome/Chromium/Edge on this machine" },
+  {
+    skip: browserE2eAvailable
+      ? false
+      : process.platform === "win32"
+        ? "restricted Windows hosts do not expose the persistent browser process boundary"
+        : "no Chrome/Chromium/Edge on this machine",
+  },
   async () => {
     const tool = createBrowserTool();
     const server = createServer((_request, response) => {

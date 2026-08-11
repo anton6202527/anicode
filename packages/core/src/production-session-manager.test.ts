@@ -306,6 +306,10 @@ test("production composition keeps every local host on the same capability contr
       /no core-owned execution provenance/,
     );
 
+    // Exercise the native-isolated composition independently of the host running this contract
+    // test. A real Windows local stack is intentionally restricted and is asserted separately
+    // below, so inheriting its mode here would disable checkpoints, subagents and the browser.
+    const nativeStack = { ...stack, executionMode: "native-isolated" as const };
     const options = productionSessionManagerOptions(
       {
         cwd,
@@ -345,7 +349,7 @@ test("production composition keeps every local host on the same capability contr
         subagentDirs: [path.join(root, "agents")],
         disabledSkills,
       },
-      stack,
+      nativeStack,
       noTelemetry,
     );
 
@@ -414,7 +418,7 @@ test("production composition keeps every local host on the same capability contr
     assert.equal(tools?.isDeferred("deferred_fixture"), true);
     const nativeTools = productionSessionManagerOptions(
       { cwd, sessionsDir: path.join(root, "native-sessions") },
-      { ...stack, executionMode: "native-isolated" },
+      nativeStack,
       noTelemetry,
     ).tools?.();
     const nativeBashProperties = nativeTools?.get("bash")?.def.parameters["properties"] as

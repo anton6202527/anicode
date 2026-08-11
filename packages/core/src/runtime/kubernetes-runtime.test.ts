@@ -662,8 +662,8 @@ test("Kubernetes runtime: a timed-out Secret POST observes and removes only its 
     },
     resolver: async () => ["10.96.42.42"],
     pollMs: 5,
-    requestTimeoutMs: 15,
-    terminationTimeoutMs: 700,
+    requestTimeoutMs: 250,
+    terminationTimeoutMs: 1_000,
     fetch: (async (target, init) => {
       const url = new URL(String(target));
       const method = String(init?.method ?? "GET");
@@ -678,11 +678,19 @@ test("Kubernetes runtime: a timed-out Secret POST observes and removes only its 
       if (method === "POST" && url.pathname.endsWith("/secrets")) {
         postCalls++;
         secretBody = JSON.parse(String(init?.body));
+        const signal = init?.signal;
+        assert.ok(signal);
         return new Promise<Response>((resolve) => {
-          setTimeout(() => {
-            exists = true;
-            resolve(Response.json({ metadata: { ...secretBody.metadata, uid } }, { status: 201 }));
-          }, 40);
+          const commitAfterTimeout = () => {
+            setImmediate(() => {
+              exists = true;
+              resolve(
+                Response.json({ metadata: { ...secretBody.metadata, uid } }, { status: 201 }),
+              );
+            });
+          };
+          if (signal.aborted) commitAfterTimeout();
+          else signal.addEventListener("abort", commitAfterTimeout, { once: true });
         });
       }
       if (method === "DELETE" && url.pathname.includes("/secrets/")) {
@@ -703,7 +711,7 @@ test("Kubernetes runtime: a timed-out Secret POST observes and removes only its 
         network: true,
         workload: { tenantId: "tenant-a", executionId: "late-secret" },
       }),
-      /timed out/,
+      /Kubernetes API POST .*\/secrets timed out/,
     );
     assert.equal(postCalls, 1);
     assert.equal(deleted, true);
