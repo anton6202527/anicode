@@ -6,6 +6,10 @@ import react from "@vitejs/plugin-react";
 // 形式发布（exports 指向 ./src/index.ts），Node 无法直接 require，必须打进包里。
 const bundleCore = externalizeDepsPlugin({ exclude: ["@anicode/core"] });
 const nativeCoreDependencies = [
+  // pg exposes its optional native client through a lazy getter. Keep that missing peer external:
+  // bundling Vite's optional-peer shim would turn it into an eager startup error, while the app
+  // continues to use pg's bundled pure-JavaScript client.
+  "pg-native",
   /^@napi-rs\/keyring(?:\/|$)/,
   /^@ast-grep\/napi(?:\/|$)/,
   /^@ast-grep\/lang-(?:python|go|rust|java)(?:\/|$)/,

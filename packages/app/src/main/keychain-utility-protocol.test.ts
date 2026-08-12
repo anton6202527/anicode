@@ -48,5 +48,7 @@ test("Electron package keeps RunAsNode disabled and ships the utility/native bou
   ]);
   assert.match(fuses, /\[FuseV1Options\.RunAsNode\]: false/);
   assert.match(buildConfig, /"keychain-utility-helper"/);
+  assert.match(buildConfig, /["']pg-native["']/);
   assert.match(packageJson, /"asarUnpack"[\s\S]*@napi-rs\/keyring/);
+  assert.doesNotMatch(packageJson, /"pg-native"\s*:/);
 });
