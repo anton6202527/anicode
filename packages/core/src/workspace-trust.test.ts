@@ -258,6 +258,51 @@ test("workspace trust: execution tree 内 symlink 被拒绝而非跟随到工作
   }
 });
 
+test("workspace trust: HOME 中重合的用户能力目录不被误判为项目 symlink", async (t) => {
+  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  const { root, cwd, file, cleanup } = await fixture();
+  // macOS commonly exposes the temporary directory through /var -> /private/var. Use the real
+  // directory here because the HOME exemption intentionally does not accept a symlink alias.
+  const canonicalHome = await fs.realpath(cwd);
+  const store = new WorkspaceTrustStore({ file });
+  const previousHome = process.env["HOME"];
+  try {
+    process.env["HOME"] = canonicalHome;
+    const outside = path.join(root, "user-managed-skills");
+    await fs.mkdir(outside);
+    await fs.writeFile(path.join(outside, "SKILL.md"), "---\nname: shared\n---\n");
+    await fs.mkdir(path.join(cwd, ".claude", "skills"), { recursive: true });
+    await fs.symlink(outside, path.join(cwd, ".claude", "skills", "shared"), "dir");
+
+    const assessed = await store.assess(cwd);
+    assert.equal(assessed.reason, "not-trusted");
+    assert.equal(assessed.executionSources.includes(".claude/skills"), false);
+    assert.equal((await store.grant(cwd)).trusted, true);
+  } finally {
+    if (previousHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = previousHome;
+    await cleanup();
+  }
+});
+
+test("workspace trust: 普通项目中的 skill entry symlink 仍然 fail closed", async (t) => {
+  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  const { root, cwd, store, cleanup } = await fixture();
+  try {
+    const outside = path.join(root, "outside-skill");
+    await fs.mkdir(outside);
+    await fs.mkdir(path.join(cwd, ".claude", "skills"), { recursive: true });
+    await fs.symlink(outside, path.join(cwd, ".claude", "skills", "linked"), "dir");
+
+    const assessed = await store.assess(cwd);
+    assert.equal(assessed.reason, "inspection-failed");
+    assert.match(assessed.error ?? "", /contains symlink/);
+    await assert.rejects(() => store.grant(cwd), /contains symlink/);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("workspace trust: execution file symlink 被 O_NOFOLLOW 拒绝", async (t) => {
   if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
   const { root, cwd, store, cleanup } = await fixture();

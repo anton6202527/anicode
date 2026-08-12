@@ -52,19 +52,24 @@ async function runInteractivePty(entry, project, options = {}) {
     ...(options.debugLog ? ["--debug-log", options.debugLog] : []),
   ];
   const driver = path.join(root, "scripts", "run-cli-pty.py");
+  const childEnvironment = {
+    ...process.env,
+    ANICODE_CREDENTIAL_BACKEND: "memory",
+    ANICODE_DISABLE_OS_KEYCHAIN: "1",
+    ANICODE_LANG: "en",
+    CI: "1",
+    ...(options.screenReader ? { INK_SCREEN_READER: "true" } : {}),
+    ...(options.suspend ? { ANICODE_PTY_TEST_SUSPEND: "1" } : {}),
+    TERM: process.env.TERM || "xterm-256color",
+    ...(options.env ?? {}),
+  };
+  if (options.resolveKeychain === true) {
+    childEnvironment.ANICODE_CREDENTIAL_BACKEND = "keychain";
+    delete childEnvironment.ANICODE_DISABLE_OS_KEYCHAIN;
+  }
   const child = spawn("python3", [driver, ...cliArgs], {
     cwd: project,
-    env: {
-      ...process.env,
-      ANICODE_CREDENTIAL_BACKEND: "memory",
-      ANICODE_DISABLE_OS_KEYCHAIN: "1",
-      ANICODE_LANG: "en",
-      CI: "1",
-      ...(options.screenReader ? { INK_SCREEN_READER: "true" } : {}),
-      ...(options.suspend ? { ANICODE_PTY_TEST_SUSPEND: "1" } : {}),
-      TERM: process.env.TERM || "xterm-256color",
-      ...(options.env ?? {}),
-    },
+    env: childEnvironment,
     stdio: ["pipe", "pipe", "pipe"],
   });
   let output = "";
@@ -186,6 +191,44 @@ try {
   expect(providers.includes("custom"), "installed CLI omitted the built-in custom provider");
 
   if (process.platform !== "win32") {
+    // Reproduce npm's global-bin topology: argv[1] is a symlink outside the package, while the
+    // native Keychain dependency lives beside the real bundle. --demo constructs both Keychain
+    // backends (and therefore resolves the native loader) but performs no credential-store read.
+    const globalBin = path.join(temporary, "global-bin");
+    const globalEntry = path.join(globalBin, "anicode");
+    await fs.mkdir(globalBin);
+    await fs.symlink(entry, globalEntry);
+    // Also reproduce launching from HOME itself. User-level ~/.claude/skills commonly contains
+    // symlinks into ~/.agents/skills; those must not be reclassified as untrusted project input.
+    const keychainHomePath = path.join(temporary, "keychain-resolution-home");
+    await fs.mkdir(path.join(keychainHomePath, ".agents", "skills", "shared"), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(keychainHomePath, ".agents", "skills", "shared", "SKILL.md"),
+      "---\nname: shared\ndescription: packaged smoke fixture\n---\n",
+    );
+    await fs.mkdir(path.join(keychainHomePath, ".claude", "skills"), { recursive: true });
+    await fs.symlink(
+      path.join("..", "..", ".agents", "skills", "shared"),
+      path.join(keychainHomePath, ".claude", "skills", "shared"),
+      "dir",
+    );
+    const keychainHome = await fs.realpath(keychainHomePath);
+    const keychainOutput = await runInteractivePty(globalEntry, keychainHome, {
+      resolveKeychain: true,
+      sessionsDir: path.join(temporary, "keychain-resolution-sessions"),
+      env: { HOME: keychainHome },
+    });
+    expect(
+      !keychainOutput.includes("OS Keychain native backend is unavailable"),
+      `globally linked CLI could not resolve its packaged Keychain dependency\n${keychainOutput}`,
+    );
+    expect(
+      !/workspace inspection failed|reason:\s*inspection-failed/iu.test(keychainOutput),
+      `launching from HOME misclassified user-level capabilities as project input\n${keychainOutput}`,
+    );
+
     const defaultWorkspace = path.join(temporary, "default-model-workspace");
     const defaultHome = path.join(temporary, "default-model-home");
     const defaultDebugLog = path.join(temporary, "default-model.jsonl");

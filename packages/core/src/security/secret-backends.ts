@@ -558,12 +558,12 @@ function validOsKeychainModulePath(modulePath: string): string {
 
 /** Resolve package metadata only; this does not load the native module or open the Keychain. */
 function resolveDefaultOsKeychainModulePath(): string {
-  const moduleFilename =
-    typeof __filename === "string" && path.isAbsolute(__filename)
-      ? __filename
-      : path.resolve(process.argv[1] ?? path.join(process.cwd(), "anicode-keyring-resolver.cjs"));
   try {
-    return validOsKeychainModulePath(createRequire(moduleFilename).resolve("@napi-rs/keyring"));
+    // Resolve from the module which owns this trusted backend, not from argv[1]. npm global bins
+    // are symlinks outside the package tree, so argv-relative resolution cannot see dependencies
+    // installed beside the real bundle. esbuild preserves import.meta.url in the ESM CLI bundle,
+    // making this anchor correct for source, packaged and globally linked hosts alike.
+    return validOsKeychainModulePath(createRequire(import.meta.url).resolve("@napi-rs/keyring"));
   } catch {
     throw safeCredentialError(
       "OS Keychain native backend is unavailable; packaged hosts must provide its module path",

@@ -46,6 +46,18 @@ const PROJECT_EXECUTION_ROOTS = [
   path.join(".claude", "skills"),
 ] as const;
 
+/**
+ * These project-compatible roots are also loaded unconditionally as user-level capabilities.
+ * When the workspace itself is the user's real home directory, fingerprinting them a second time
+ * as project input is both redundant and incorrect: user-managed skill/plugin layouts commonly
+ * use symlinks, while project execution trees deliberately reject symlinks.
+ */
+const USER_EXECUTION_ROOTS = new Set<string>([
+  path.join(".anicode", "plugins"),
+  path.join(".claude", "agents"),
+  path.join(".claude", "skills"),
+]);
+
 const EXECUTION_CONFIG_KEYS = [
   "mcp",
   "agents",
@@ -588,9 +600,13 @@ async function inspectWorkspaceExecution(cwd: string): Promise<ExecutionInspecti
     memoryDirectory = parent;
   }
 
-  const executionRoots = rootGitStat?.isDirectory()
-    ? [...PROJECT_EXECUTION_ROOTS, path.join(".git", "hooks")]
+  const workspaceIsUserHome = await isExactUserHomeWorkspace(identity);
+  const projectExecutionRoots = workspaceIsUserHome
+    ? PROJECT_EXECUTION_ROOTS.filter((relative) => !USER_EXECUTION_ROOTS.has(relative))
     : [...PROJECT_EXECUTION_ROOTS];
+  const executionRoots = rootGitStat?.isDirectory()
+    ? [...projectExecutionRoots, path.join(".git", "hooks")]
+    : projectExecutionRoots;
   for (const relativeRoot of executionRoots) {
     const absoluteRoot = path.join(identity.canonicalRoot, relativeRoot);
     const walk = async (
@@ -683,6 +699,27 @@ async function inspectWorkspaceExecution(cwd: string): Promise<ExecutionInspecti
     executionHash: hash.digest("hex"),
     executionSources: sources.map(portable).sort(),
   };
+}
+
+async function isExactUserHomeWorkspace(identity: WorkspaceIdentity): Promise<boolean> {
+  const absoluteHome = path.resolve(os.homedir());
+  const normalize = (value: string): string =>
+    process.platform === "win32" ? value.toLowerCase() : value;
+  if (normalize(absoluteHome) !== normalize(identity.canonicalRoot)) return false;
+  try {
+    // Do not grant the exemption through a HOME symlink. Capability discovery uses the lexical
+    // HOME path, and a retargetable alias must not make an unrelated project tree disappear from
+    // the execution fingerprint.
+    const stat = await fs.lstat(absoluteHome, { bigint: true });
+    return (
+      stat.isDirectory() &&
+      !stat.isSymbolicLink() &&
+      stat.dev.toString() === identity.device &&
+      stat.ino.toString() === identity.inode
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function safeLstat(
