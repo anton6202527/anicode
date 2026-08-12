@@ -2304,6 +2304,10 @@ test("CredentialRotationManager: issuance consumes the shared write deadline bud
 
 test("CredentialRotationManager: cleanup timeout is bounded, quarantined, and safely retryable", async () => {
   const candidate = "cleanup-candidate-must-not-leak";
+  // Leave enough of the shared issue/write budget for a preempted CI worker to reach the backend.
+  // Cleanup still uses the real policy timer below, so timeout, abort, quarantine, and retry stay
+  // covered without relying on a sub-scheduler-quantum deadline.
+  const timeoutMs = 250;
   const backend: SecretBackend = {
     kind: "cleanup-timeout-backend",
     get: async () => "token-v1",
@@ -2327,7 +2331,7 @@ test("CredentialRotationManager: cleanup timeout is bounded, quarantined, and sa
     credentialId: "cleanup-timeout",
     backend,
     intervalMs: 60_000,
-    timeoutMs: 25,
+    timeoutMs,
     issue: async () => candidate,
     revokeIssued: async (issued, signal) => {
       cleanupAttempts++;
