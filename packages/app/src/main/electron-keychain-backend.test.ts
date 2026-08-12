@@ -19,7 +19,6 @@ import {
 type FakeMode = "failure" | "invalid" | "success" | "timeout";
 
 class FakeUtility extends EventEmitter implements ElectronKeychainUtilityProcess {
-  readonly pid = 4242;
   killed = false;
   request: Record<string, unknown> | undefined;
 
