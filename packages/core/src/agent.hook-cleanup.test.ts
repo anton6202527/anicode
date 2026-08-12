@@ -104,7 +104,8 @@ test("Agent.compactNow: budget abort drains close-confirmed command hook before 
     retry: false,
     projectMemory: false,
     injectEnv: false,
-    runBudget: { maxWallTimeMs: 10 },
+    // Leave enough startup margin for a loaded Windows runner to enter the hook before timeout.
+    runBudget: { maxWallTimeMs: 1_000 },
     compaction: {
       summarizer: async () => "summary",
     },

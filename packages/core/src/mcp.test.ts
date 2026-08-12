@@ -70,6 +70,45 @@ process.stdin.on("data", (chunk) => {
 });
 `;
 
+// The timeout test deliberately uses a sub-second request deadline. Keep its server fixture as
+// plain JavaScript so the assertion measures tools/call rather than a cold tsx loader startup.
+const timeoutServerScript = String.raw`
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.argv[1], String(process.pid), { mode: 0o600 });
+let buffer = "";
+const complete = (id, result) => process.stdout.write(JSON.stringify({
+  jsonrpc: "2.0",
+  id,
+  result: { ...result, resultType: "complete" }
+}) + "\n");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf8");
+  let newline;
+  while ((newline = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, newline).trim();
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "server/discover") {
+      complete(message.id, {
+        supportedVersions: ["2026-07-28"],
+        capabilities: { tools: {} }
+      });
+    } else if (message.method === "tools/list") {
+      complete(message.id, {
+        tools: [{
+          name: "hang",
+          description: "never responds",
+          inputSchema: { type: "object", properties: {} }
+        }]
+      });
+    } else if (message.method === "tools/call" && message.params?.name === "hang") {
+      // Deliberately never respond: the client deadline must terminate this process before reject.
+    }
+  }
+});
+`;
+
 test("MCP: 握手 → 列工具 → 调用 → 错误路径", async () => {
   const client = await McpClient.start(serverCfg);
   assert.equal(client.protocolVersion, "2026-07-28");
@@ -1208,14 +1247,29 @@ test("MCP: capabilities + resources/prompts 客户端方法", async () => {
 });
 
 test("MCP: per-request 超时（hang 工具在时限内报错，不永久挂起）", async () => {
-  const client = await McpClient.start({ ...serverCfg, timeoutMs: 400 });
-  const tools = await client.listTools();
-  const hang = tools.find((t) => t.def.name === "fake__hang")!;
-  await assert.rejects(
-    () => hang.run({}, { cwd: ".", signal: new AbortController().signal }),
-    /超时|timed out/,
-  );
-  await client.close();
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-mcp-timeout-"));
+  const pidFile = path.join(directory, "server.pid");
+  let client: McpClient | undefined;
+  try {
+    client = await McpClient.start({
+      name: "timeout",
+      command: process.execPath,
+      args: ["-e", timeoutServerScript, pidFile],
+      timeoutMs: 400,
+    });
+    const hang = (await client.listTools()).find((tool) => tool.def.name === "timeout__hang")!;
+    const pid = Number(await fs.readFile(pidFile, "utf8"));
+
+    await assert.rejects(
+      () => hang.run({}, { cwd: ".", signal: new AbortController().signal }),
+      /(?:MCP request timed out \(tools\/call, 400ms\)|MCP 请求超时（tools\/call，400ms）)/,
+    );
+    await waitForProcessExit(pid);
+    await assert.rejects(client.listTools(), /tools\/call.*400ms|tools\/call，400ms/);
+  } finally {
+    await client?.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("MCP(stdio): AbortSignal 贯穿 tools/call，并在返回前终止 server tree", async () => {

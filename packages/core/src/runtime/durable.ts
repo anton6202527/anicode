@@ -3,6 +3,10 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import {
+  retryTransientWindowsEperm,
+  type TransientWindowsEpermRetryOptions,
+} from "../security/exclusive-lock-file.js";
 import { MemorySessionLifecycleStore, type SessionLifecycleStore } from "./session-lifecycle.js";
 
 export interface RuntimeEvent<T = unknown> {
@@ -230,8 +234,16 @@ export class MemoryRuntimeSnapshotStore implements RuntimeSnapshotStore {
   }
 }
 
+export interface FileRuntimeSnapshotStoreOptions extends TransientWindowsEpermRetryOptions {
+  /** @internal Injectable rename operation for deterministic filesystem fault tests. */
+  rename?: (source: string, destination: string) => Promise<void>;
+}
+
 export class FileRuntimeSnapshotStore implements RuntimeSnapshotStore {
-  constructor(readonly root: string) {}
+  constructor(
+    readonly root: string,
+    private readonly options: FileRuntimeSnapshotStoreOptions = {},
+  ) {}
 
   private file(streamId: string): string {
     assertStreamId(streamId);
@@ -262,7 +274,10 @@ export class FileRuntimeSnapshotStore implements RuntimeSnapshotStore {
         mode: 0o600,
         flag: "wx",
       });
-      await fs.rename(temporary, target);
+      await retryTransientWindowsEperm(
+        () => (this.options.rename ?? fs.rename)(temporary, target),
+        this.options,
+      );
       await fs.chmod(target, 0o600);
     } finally {
       await fs.rm(temporary, { force: true });
@@ -317,6 +332,7 @@ function projectRuntimeEvents(
 
 export class DurableRuntime {
   readonly lifecycle: SessionLifecycleStore;
+  private readonly streamTails = new Map<string, Promise<unknown>>();
 
   constructor(
     readonly store: RuntimeEventStore,
@@ -328,15 +344,17 @@ export class DurableRuntime {
   }
 
   async record<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
-    const event = await this.store.append(input);
-    if (
-      this.snapshots &&
-      (event.sequence % Math.max(1, this.snapshotEvery) === 0 ||
-        ["prompt.completed", "prompt.failed", "prompt.cancelled"].includes(event.type))
-    ) {
-      await this.writeSnapshot(input.streamId);
-    }
-    return event;
+    return this.withStreamLock(input.streamId, async () => {
+      const event = await this.store.append(input);
+      if (
+        this.snapshots &&
+        (event.sequence % Math.max(1, this.snapshotEvery) === 0 ||
+          ["prompt.completed", "prompt.failed", "prompt.cancelled"].includes(event.type))
+      ) {
+        await this.writeSnapshotUnlocked(input.streamId);
+      }
+      return event;
+    });
   }
 
   events(streamId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
@@ -351,7 +369,13 @@ export class DurableRuntime {
 
   async writeSnapshot(streamId: string): Promise<RuntimeSnapshot | undefined> {
     if (!this.snapshots) return undefined;
-    const previous = await this.snapshots.get(streamId);
+    return this.withStreamLock(streamId, () => this.writeSnapshotUnlocked(streamId));
+  }
+
+  private async writeSnapshotUnlocked(streamId: string): Promise<RuntimeSnapshot | undefined> {
+    const snapshots = this.snapshots;
+    if (!snapshots) return undefined;
+    const previous = await snapshots.get(streamId);
     const events = await this.store.read(streamId, previous?.sequence ?? 0);
     const state = projectRuntimeEvents(streamId, events, previous);
     const snapshot: RuntimeSnapshot = {
@@ -359,13 +383,26 @@ export class DurableRuntime {
       createdAt: new Date().toISOString(),
       ...state,
     };
-    await this.snapshots.put(snapshot);
+    await snapshots.put(snapshot);
     return snapshot;
   }
 
+  private withStreamLock<T>(streamId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.streamTails.get(streamId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(work);
+    this.streamTails.set(streamId, current);
+    const cleanup = () => {
+      if (this.streamTails.get(streamId) === current) this.streamTails.delete(streamId);
+    };
+    void current.then(cleanup, cleanup);
+    return current;
+  }
+
   async deleteStream(streamId: string): Promise<void> {
-    await this.snapshots?.delete(streamId);
-    await this.store.delete(streamId);
+    await this.withStreamLock(streamId, async () => {
+      await this.snapshots?.delete(streamId);
+      await this.store.delete(streamId);
+    });
   }
 
   /**
