@@ -75,7 +75,7 @@ test("GitHub App token source: RS256 JWT、repository scope、cache 与强制轮
   assert.equal(await source.token(), "ghs_3");
 });
 
-test("GitHub App token source: non-cooperative token exchange has a hard abort deadline", async () => {
+test("GitHub App token source: non-cooperative token exchange has a hard abort deadline", async (t) => {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privatePem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   const broker = new CredentialBroker();
@@ -92,11 +92,16 @@ test("GitHub App token source: non-cooperative token exchange has a hard abort d
   });
   let requestSignal: AbortSignal | undefined;
   let installationJwt = "";
+  let requestStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    requestStarted = resolve;
+  });
   const proxy = new NetworkProxy({
     resolver: async () => ["93.184.216.34"],
     fetch: async (_target, init) => {
       requestSignal = init?.signal ?? undefined;
       installationJwt = new Headers(init?.headers).get("authorization") ?? "";
+      requestStarted();
       return new Promise<Response>(() => undefined);
     },
   });
@@ -111,7 +116,12 @@ test("GitHub App token source: non-cooperative token exchange has a hard abort d
     apiBase: "https://api.github.test",
     requestTimeoutMs: 20,
   });
-  const error = await capturedError(source.token());
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const token = source.token();
+  await started;
+  assert.ok(requestSignal, "token exchange fetch must start before the deadline is advanced");
+  t.mock.timers.tick(20);
+  const error = await capturedError(token);
   assert.match(error.message, /timed out after 20ms/);
   assert.equal(requestSignal?.aborted, true);
   assert.ok(installationJwt.startsWith("Bearer "));
