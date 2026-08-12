@@ -1,5 +1,11 @@
 # anicode
 
+## 0.3.2
+
+### Patch Changes
+
+- 9e6ff65: Fix globally installed CLI startup by resolving the native OS Keychain loader from the real package bundle instead of the npm bin symlink. Starting AniCode from the user's home directory also no longer misclassifies user-level skill symlinks as untrusted project execution input.
+
 ## 0.3.1
 
 ### Patch Changes
