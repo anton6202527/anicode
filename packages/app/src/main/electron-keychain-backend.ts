@@ -398,7 +398,9 @@ export class ElectronUtilityKeychainBackend implements SecretBackend {
         () => finish(new ElectronKeychainBoundaryError("timed-out"), undefined, true),
         this.timeoutMs,
       );
-      timer.unref();
+      // This timer is the utility call's final fail-closed completion source when the host has no
+      // other active handles. Keep it referenced until finish() clears it so short-lived Node 22
+      // and packaged hosts cannot exit with an indeterminate Keychain operation still pending.
       child.once("spawn", onSpawn);
       child.once("message", onMessage);
       child.once("error", onFailure);

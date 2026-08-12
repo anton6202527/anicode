@@ -167,7 +167,9 @@ test(
         : "no Chrome/Chromium/Edge on this machine",
   },
   async () => {
-    const tool = createBrowserTool();
+    // Shared CI images can cold-start the system Chrome more slowly than the production default;
+    // this E2E validates browser behavior rather than enforcing the launcher latency SLA.
+    const tool = createBrowserTool({ launchTimeoutMs: 30_000 });
     const server = createServer((_request, response) => {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       response.end(
