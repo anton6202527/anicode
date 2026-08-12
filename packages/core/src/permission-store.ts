@@ -13,6 +13,7 @@ import { hostname } from "node:os";
 import { performance } from "node:perf_hooks";
 import { promises as fs, type BigIntStats } from "node:fs";
 import * as path from "node:path";
+import { retryTransientWindowsEperm } from "./security/exclusive-lock-file.js";
 
 const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_LOCK_RETRY_MS = 10;
@@ -324,7 +325,7 @@ async function readLockSnapshot(lock: string): Promise<LockSnapshot> {
 
   let handle: import("node:fs/promises").FileHandle;
   try {
-    handle = await fs.open(lock, "r");
+    handle = await retryTransientWindowsEperm(() => fs.open(lock, "r"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw error;

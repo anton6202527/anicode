@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { FileHandle } from "node:fs/promises";
-import { openExclusiveLockFile } from "./exclusive-lock-file.js";
+import { openExclusiveLockFile, retryTransientWindowsEperm } from "./exclusive-lock-file.js";
 
 function errno(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(code), { code });
@@ -35,6 +35,58 @@ test("exclusive lock file: Windows transient EPERM is retried before success", a
     ["test.lock", "wx", 0o600],
   ]);
   assert.deepEqual(waits, [10, 10]);
+});
+
+test("lock file: Windows transient EPERM while opening an existing lock is retried", async () => {
+  const lockContents = Symbol("lock contents");
+  const waits: number[] = [];
+  let attempts = 0;
+
+  const result = await retryTransientWindowsEperm(
+    async () => {
+      attempts++;
+      if (attempts <= 2) throw errno("EPERM");
+      return lockContents;
+    },
+    {
+      platform: "win32",
+      wait(milliseconds) {
+        waits.push(milliseconds);
+        return Promise.resolve();
+      },
+    },
+  );
+
+  assert.equal(result, lockContents);
+  assert.equal(attempts, 3);
+  assert.deepEqual(waits, [10, 10]);
+});
+
+test("lock file: persistent Windows EPERM while opening an existing lock fails closed", async () => {
+  const permissionError = errno("EPERM");
+  let attempts = 0;
+  let waits = 0;
+
+  await assert.rejects(
+    () =>
+      retryTransientWindowsEperm(
+        async () => {
+          attempts++;
+          throw permissionError;
+        },
+        {
+          platform: "win32",
+          wait() {
+            waits++;
+            return Promise.resolve();
+          },
+        },
+      ),
+    (error) => error === permissionError,
+  );
+
+  assert.equal(attempts, 21);
+  assert.equal(waits, 20);
 });
 
 test("exclusive lock file: persistent Windows EPERM fails closed after a bounded retry", async () => {

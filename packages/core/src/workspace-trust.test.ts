@@ -56,7 +56,10 @@ test("workspace trust: grant 持久化到私有用户存储，revoke 立即失�
 });
 
 test("workspace trust: realpath 使符号链接别名共享身份", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, store, cleanup } = await fixture();
   try {
     const alias = path.join(root, "project-alias");
@@ -242,7 +245,10 @@ test("workspace trust: 损坏或过宽权限的 store 始终 fail closed", async
 });
 
 test("workspace trust: execution tree 内 symlink 被拒绝而非跟随到工作区外", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, store, cleanup } = await fixture();
   try {
     const outside = path.join(root, "outside-skills");
@@ -259,7 +265,10 @@ test("workspace trust: execution tree 内 symlink 被拒绝而非跟随到工作
 });
 
 test("workspace trust: HOME 中重合的用户能力目录不被误判为项目 symlink", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, file, cleanup } = await fixture();
   // macOS commonly exposes the temporary directory through /var -> /private/var. Use the real
   // directory here because the HOME exemption intentionally does not accept a symlink alias.
@@ -286,7 +295,10 @@ test("workspace trust: HOME 中重合的用户能力目录不被误判为项目 
 });
 
 test("workspace trust: 普通项目中的 skill entry symlink 仍然 fail closed", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, store, cleanup } = await fixture();
   try {
     const outside = path.join(root, "outside-skill");
@@ -304,7 +316,10 @@ test("workspace trust: 普通项目中的 skill entry symlink 仍然 fail closed
 });
 
 test("workspace trust: execution file symlink 被 O_NOFOLLOW 拒绝", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, store, cleanup } = await fixture();
   try {
     const outside = path.join(root, "outside.env");
@@ -319,7 +334,10 @@ test("workspace trust: execution file symlink 被 O_NOFOLLOW 拒绝", async (t) 
 });
 
 test("workspace trust: 文件在 open 后被替换时从同一 fd 检测并 fail closed", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, store, cleanup } = await fixture();
   const canonicalCwd = await fs.realpath(cwd);
   const source = path.join(canonicalCwd, ".env");
@@ -353,7 +371,10 @@ test("workspace trust: 文件在 open 后被替换时从同一 fd 检测并 fail
 });
 
 test("workspace trust: 目录枚举期间路径被替换时 fail closed", async (t) => {
-  if (process.platform === "win32") t.skip("Windows symlink privileges vary by host policy");
+  if (process.platform === "win32") {
+    t.skip("Windows symlink privileges vary by host policy");
+    return;
+  }
   const { root, cwd, store, cleanup } = await fixture();
   const canonicalCwd = await fs.realpath(cwd);
   const directory = path.join(canonicalCwd, ".anicode", "plugins");

@@ -4,13 +4,48 @@ import type { FileHandle } from "node:fs/promises";
 const WINDOWS_EPERM_RETRY_LIMIT = 20;
 const WINDOWS_EPERM_RETRY_DELAY_MS = 10;
 
-export interface ExclusiveLockFileOpenOptions {
+export interface TransientWindowsEpermRetryOptions {
   /** @internal Injectable operating system for deterministic portability tests. */
   platform?: NodeJS.Platform;
-  /** @internal Injectable exclusive-open operation for deterministic fault tests. */
-  open?: (file: string, flags: "wx", mode: number) => Promise<FileHandle>;
   /** @internal Injectable delay for deterministic fault tests. */
   wait?: (milliseconds: number) => Promise<void>;
+}
+
+export interface ExclusiveLockFileOpenOptions extends TransientWindowsEpermRetryOptions {
+  /** @internal Injectable exclusive-open operation for deterministic fault tests. */
+  open?: (file: string, flags: "wx", mode: number) => Promise<FileHandle>;
+}
+
+/**
+ * Retry a file operation through the short sharing-violation window Windows can expose while a
+ * concurrent process closes and unlinks the same path. The retry is Windows-only, EPERM-only and
+ * bounded; a persistent permission failure is returned unchanged.
+ */
+export async function retryTransientWindowsEperm<T>(
+  operation: () => Promise<T>,
+  options: TransientWindowsEpermRetryOptions = {},
+): Promise<T> {
+  const platform = options.platform ?? process.platform;
+  const wait =
+    options.wait ??
+    ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let epermRetries = 0;
+
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (
+        platform !== "win32" ||
+        (error as NodeJS.ErrnoException).code !== "EPERM" ||
+        epermRetries >= WINDOWS_EPERM_RETRY_LIMIT
+      ) {
+        throw error;
+      }
+      epermRetries++;
+      await wait(WINDOWS_EPERM_RETRY_DELAY_MS);
+    }
+  }
 }
 
 /**
@@ -26,26 +61,6 @@ export async function openExclusiveLockFile(
   mode: number,
   options: ExclusiveLockFileOpenOptions = {},
 ): Promise<FileHandle> {
-  const platform = options.platform ?? process.platform;
   const open = options.open ?? fs.open;
-  const wait =
-    options.wait ??
-    ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
-  let epermRetries = 0;
-
-  for (;;) {
-    try {
-      return await open(file, "wx", mode);
-    } catch (error) {
-      if (
-        platform !== "win32" ||
-        (error as NodeJS.ErrnoException).code !== "EPERM" ||
-        epermRetries >= WINDOWS_EPERM_RETRY_LIMIT
-      ) {
-        throw error;
-      }
-      epermRetries++;
-      await wait(WINDOWS_EPERM_RETRY_DELAY_MS);
-    }
-  }
+  return retryTransientWindowsEperm(() => open(file, "wx", mode), options);
 }
