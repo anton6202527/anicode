@@ -38,6 +38,12 @@ npm install
 npm run dev:tui
 ```
 
+`dev:tui` 是源码仓库专用入口：它只从仓库根 `.env` 提取唯一的 `DEEPSEEK_API_KEY`，固定直连
+`deepseek/deepseek-v4-flash`，并使用进程内凭证 Broker；不会恢复 AniCode Cloud 登录，也不会打开
+OS Keychain。wrapper 本身不会导入 `.env` 的其它变量；已授信工作区仍保留原有项目环境加载规则，但固定
+的 DeepSeek 模型与官方 endpoint 不会被它改写。`.env` 不会进入 Git 或构建产物，Workspace Trust 仍
+照常控制项目配置、hooks、MCP 与工具权限。`dev:tui:demo` 完全不读取 `.env`，继续使用离线 demo 模型。
+
 `.nvmrc` 固定 Node 24 LTS，保证日常开发和发布构建可复现。运行时与已发布 CLI 使用仅含最低门槛的
 Node `>=22.15.0` 声明，不会因为新的 Node 主版本产生误报；CI 会持续验证最低版本、发布 LTS 和
 `current` 最新稳定版。已经 EOL 的 Node 主版本不作为正式支持基线。日常开发与 CI 要求 npm
@@ -279,9 +285,13 @@ anicode mcp remove context7
 它自己的单一 refresh-token 条目，普通 provider 的会话恢复和模型浏览仍不会枚举或读取 Keychain。
 
 ```bash
-npm run dev:app      # 开发模式（electron-vite，热更新）
+npm run dev:app      # 开发模式：根 .env + 直连 DeepSeek，不恢复 Cloud/Keychain
 npm run build:app    # 打包 main/preload/renderer 到 packages/app/out
 ```
+
+`dev:app` 与 `dev:tui` 使用同一条本地调试边界：本地开发进程把仓库根 `.env` 中的 Key 导入
+memory Broker（不持久化），默认模型固定为直连 DeepSeek。打包后的桌面应用不读取这条开发变量，仍按
+用户登录态使用 AniCode Cloud。
 
 功能亮点：
 

@@ -28,6 +28,7 @@ import { trustedExternalUrl, trustedRendererDevUrl } from "../shared/security.js
 import { CloudAuthService } from "./cloud-auth.js";
 import { ANICODE_CLOUD_CONFIG, ANICODE_CLOUD_DEFAULT_MODEL } from "./cloud-config.js";
 import { registerAnicodeCloudProvider } from "./cloud-provider.js";
+import { resolveAppStartupPolicy } from "./startup-policy.js";
 
 // electron-vite 会注入渲染层入口：dev 下是 devServer URL，prod 下是打包 HTML。
 const rendererDevUrlInput = process.env["ELECTRON_RENDERER_URL"];
@@ -90,10 +91,22 @@ function trustedIpcSender(event: IpcMainInvokeEvent): boolean {
 
 async function createBridge(): Promise<Bridge> {
   const userData = app.getPath("userData");
-  const cwd = process.cwd();
+  const developmentWorkspace =
+    process.env["ANICODE_DEV_WORKSPACE"] ??
+    process.env["npm_config_local_prefix"] ??
+    process.env["INIT_CWD"];
+  const developmentDefaultModel = process.env["ANICODE_DEV_DEFAULT_MODEL"];
+  const startup = resolveAppStartupPolicy({
+    isPackaged: app.isPackaged,
+    processCwd: process.cwd(),
+    developmentDirect: process.env["ANICODE_DEV_DIRECT"] === "1",
+    ...(developmentWorkspace ? { developmentWorkspace } : {}),
+    ...(developmentDefaultModel ? { developmentDefaultModel } : {}),
+  });
+  const cwd = startup.cwd;
   const workspaceTrustStore = new WorkspaceTrustStore();
   const workspaceTrust = await workspaceTrustStore.assess(cwd);
-  await loadProjectEnv({ cwd, workspaceTrust });
+  if (startup.loadProjectEnv) await loadProjectEnv({ cwd, workspaceTrust });
   const { config } = await loadConfig({ cwd, workspaceTrust });
   const credentialKind = process.env["ANICODE_CREDENTIAL_BACKEND"]?.trim() || "keychain";
   const credentialBackend =
@@ -103,7 +116,7 @@ async function createBridge(): Promise<Bridge> {
         )
       : undefined;
   const cloudAuth =
-    credentialKind === "keychain"
+    startup.cloudEnabled && credentialKind === "keychain"
       ? new CloudAuthService({
           backend: createElectronKeychainBackend("dev.anicode.cloud-auth"),
           projectUrl: ANICODE_CLOUD_CONFIG.projectUrl,
@@ -111,8 +124,8 @@ async function createBridge(): Promise<Bridge> {
         })
       : undefined;
   if (cloudAuth) {
-    // Desktop startup must not wait on an unavailable Keychain/network. The service remains
-    // registered after this bounded implicit restore so a later Cloud model selection can retry.
+    // Packaged desktop startup must not wait on an unavailable Keychain/network. Development
+    // explicitly uses the repository .env through the memory Broker and never constructs Cloud.
     await cloudAuth.restore({ signal: AbortSignal.timeout(2_000) }).catch(() => undefined);
     registerAnicodeCloudProvider(cloudAuth);
   }
@@ -124,7 +137,11 @@ async function createBridge(): Promise<Bridge> {
       modelsFile: path.join(userData, "models.json"),
       appName: app.getName(),
       appVersion: app.getVersion(),
-      ...(config.model ? { defaultModel: config.model } : {}),
+      ...(startup.defaultModel
+        ? { defaultModel: startup.defaultModel }
+        : config.model
+          ? { defaultModel: config.model }
+          : {}),
       config,
       workspaceTrust: workspaceTrustStore,
       workspaceTrusted: workspaceTrust.trusted,

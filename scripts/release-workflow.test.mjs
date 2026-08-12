@@ -120,6 +120,15 @@ test("developer entrypoints advertise CI-tested Node lines and never auto-grant 
   assert.match(rootPackage.scripts["dev:trust:status"], /trust status --cwd \./);
   assert.doesNotMatch(rootPackage.scripts["dev:tui"], /trust|grant/);
   assert.doesNotMatch(rootPackage.scripts["dev:tui:demo"], /trust|grant/);
+
+  assert.match(rootPackage.scripts["dev:tui"], /run-local-direct\.mjs tui/);
+  assert.match(rootPackage.scripts["dev:app"], /run-local-direct\.mjs app/);
+  assert.match(rootPackage.scripts["dev:tui:demo"], /--demo/);
+  assert.doesNotMatch(rootPackage.scripts["dev:tui:demo"], /--env-file|--model/);
+  assertOsKeychainDisabled(
+    rootPackage.scripts["dev:tui:demo"],
+    "offline TUI development must not open the OS keychain",
+  );
 });
 
 test("Linux test gates provision trusted bubblewrap before exercising the shell sandbox", () => {
