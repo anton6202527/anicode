@@ -9,14 +9,23 @@ const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-package-smoke-"));
 
 function run(command, args, options = {}) {
+  const inheritedEnvironment = { ...process.env };
+  if (options.stripCredentials === true) {
+    for (const name of Object.keys(inheritedEnvironment)) {
+      if (/(?:API_?KEY|ACCESS_KEY|PRIVATE_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(name)) {
+        delete inheritedEnvironment[name];
+      }
+    }
+  }
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? root,
     env: {
-      ...process.env,
+      ...inheritedEnvironment,
       ANICODE_CREDENTIAL_BACKEND: "memory",
       ANICODE_DISABLE_OS_KEYCHAIN: "1",
       ANICODE_LANG: "en",
       NO_COLOR: "1",
+      ...(options.env ?? {}),
     },
     encoding: "utf8",
     ...(options.input !== undefined ? { input: options.input } : {}),
@@ -189,6 +198,24 @@ try {
   expect(models.includes("debug/demo"), "installed CLI model catalog is incomplete");
   const providers = run(process.execPath, [entry, "--list-providers"], { cwd: project });
   expect(providers.includes("custom"), "installed CLI omitted the built-in custom provider");
+  const trustHome = path.join(temporary, "trust-home");
+  await fs.mkdir(trustHome);
+  const trustEnvironment = {
+    HOME: trustHome,
+    USERPROFILE: trustHome,
+    XDG_CONFIG_HOME: path.join(trustHome, ".config"),
+  };
+  const trustStatus = JSON.parse(
+    run(process.execPath, [entry, "trust", "status", "--cwd", project, "--json"], {
+      cwd: project,
+      env: trustEnvironment,
+      stripCredentials: true,
+    }),
+  );
+  expect(
+    trustStatus.identity?.canonicalRoot === (await fs.realpath(project)),
+    "installed CLI routed `trust status` through the interactive argument parser",
+  );
 
   if (process.platform !== "win32") {
     // Reproduce npm's global-bin topology: argv[1] is a symlink outside the package, while the
@@ -198,6 +225,17 @@ try {
     const globalEntry = path.join(globalBin, "anicode");
     await fs.mkdir(globalBin);
     await fs.symlink(entry, globalEntry);
+    const linkedTrustStatus = JSON.parse(
+      run(process.execPath, [globalEntry, "trust", "status", "--cwd", project, "--json"], {
+        cwd: project,
+        env: trustEnvironment,
+        stripCredentials: true,
+      }),
+    );
+    expect(
+      linkedTrustStatus.identity?.canonicalRoot === trustStatus.identity.canonicalRoot,
+      "globally linked CLI did not dispatch the `trust` subcommand",
+    );
     // Also reproduce launching from HOME itself. User-level ~/.claude/skills commonly contains
     // symlinks into ~/.agents/skills; those must not be reclassified as untrusted project input.
     const keychainHomePath = path.join(temporary, "keychain-resolution-home");
