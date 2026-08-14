@@ -8,7 +8,7 @@
  *   user 消息中拆出来，顺序保持在文本之前
  */
 
-import OpenAI from "openai";
+import type OpenAI from "openai";
 import type {
   ChatMessage,
   Provider,
@@ -47,42 +47,59 @@ export interface OpenAICompatOptions {
 
 export type MaxTokensField = "max_completion_tokens" | "max_tokens" | false;
 
+let openAIConstructor: Promise<typeof import("openai").default> | undefined;
+
+/** Load the comparatively heavy SDK only when a provider dispatches its first request. */
+function loadOpenAI(): Promise<typeof import("openai").default> {
+  return (openAIConstructor ??= import("openai").then((module) => module.default));
+}
+
 export class OpenAICompatProvider implements Provider {
   readonly name: string;
   private readonly options: OpenAICompatOptions;
   private client: OpenAI | undefined;
+  private clientPromise: Promise<OpenAI> | undefined;
 
   constructor(opts: OpenAICompatOptions = {}) {
     this.name = opts.name ?? "openai";
     this.options = { ...opts };
   }
 
-  private getClient(): OpenAI {
-    if (!this.client) {
-      const officialOpenAI = this.name === "openai";
-      const apiKey =
-        this.options.apiKey !== undefined ? this.options.apiKey : officialOpenAI ? undefined : "";
-      const clientOptions: ConstructorParameters<typeof OpenAI>[0] = {
-        // 显式空 key 也要传递：DeepSeek 等端点缺自己的 key 时，不能悄悄回退
-        // 到 OPENAI_API_KEY 并把错误凭证发往第三方。
-        ...(apiKey !== undefined ? { apiKey } : {}),
-        // OpenAI SDK 还会隐式读取管理员 key/组织/项目。其中管理员 key
-        // 会覆盖上面显式传入的第三方 key，所以非官方端点必须显式隔离。
-        ...(!officialOpenAI ? { adminAPIKey: null, organization: null, project: null } : {}),
-        ...(this.options.baseURL !== undefined ? { baseURL: this.options.baseURL } : {}),
-        maxRetries: this.options.maxRetries ?? 0,
-        ...(this.options.defaultHeaders ? { defaultHeaders: this.options.defaultHeaders } : {}),
-        ...(this.options.fetch ? { fetch: this.options.fetch } : {}),
-      };
+  private async getClient(): Promise<OpenAI> {
+    if (this.client) return this.client;
 
-      // OPENAI_CUSTOM_HEADERS 没有对应的 SDK 关闭选项，并且会在构造器中与
-      // defaultHeaders 合并。构造器全程同步，因此在这个同步临界区暂时
-      // 隐藏该变量，然后立即恢复；调用方显式 defaultHeaders 不受影响。
-      this.client = officialOpenAI
-        ? new OpenAI(clientOptions)
-        : withoutEnvironmentVariable("OPENAI_CUSTOM_HEADERS", () => new OpenAI(clientOptions));
-    }
-    return this.client;
+    this.clientPromise ??= loadOpenAI()
+      .then((OpenAI) => {
+        if (this.client) return this.client;
+        const officialOpenAI = this.name === "openai";
+        const apiKey =
+          this.options.apiKey !== undefined ? this.options.apiKey : officialOpenAI ? undefined : "";
+        const clientOptions: ConstructorParameters<typeof OpenAI>[0] = {
+          // 显式空 key 也要传递：DeepSeek 等端点缺自己的 key 时，不能悄悄回退
+          // 到 OPENAI_API_KEY 并把错误凭证发往第三方。
+          ...(apiKey !== undefined ? { apiKey } : {}),
+          // OpenAI SDK 还会隐式读取管理员 key/组织/项目。其中管理员 key
+          // 会覆盖上面显式传入的第三方 key，所以非官方端点必须显式隔离。
+          ...(!officialOpenAI ? { adminAPIKey: null, organization: null, project: null } : {}),
+          ...(this.options.baseURL !== undefined ? { baseURL: this.options.baseURL } : {}),
+          maxRetries: this.options.maxRetries ?? 0,
+          ...(this.options.defaultHeaders ? { defaultHeaders: this.options.defaultHeaders } : {}),
+          ...(this.options.fetch ? { fetch: this.options.fetch } : {}),
+        };
+
+        // OPENAI_CUSTOM_HEADERS 没有对应的 SDK 关闭选项，并且会在构造器中与
+        // defaultHeaders 合并。构造器全程同步，因此在这个同步临界区暂时
+        // 隐藏该变量，然后立即恢复；调用方显式 defaultHeaders 不受影响。
+        this.client = officialOpenAI
+          ? new OpenAI(clientOptions)
+          : withoutEnvironmentVariable("OPENAI_CUSTOM_HEADERS", () => new OpenAI(clientOptions));
+        return this.client;
+      })
+      .catch((error: unknown) => {
+        this.clientPromise = undefined;
+        throw error;
+      });
+    return this.clientPromise;
   }
 
   async *stream(req: StreamRequest): AsyncIterable<StreamEvent> {
@@ -109,7 +126,8 @@ export class OpenAICompatProvider implements Provider {
         : {}),
       messages: toOpenAIMessages(req.system, req.messages),
     };
-    const stream = await this.getClient().chat.completions.create(
+    const client = await this.getClient();
+    const stream = await client.chat.completions.create(
       body as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
       { ...(req.signal ? { signal: req.signal } : {}) },
     );

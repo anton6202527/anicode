@@ -5,8 +5,10 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./cli-runtime": "./src/cli-runtime.ts",
     "./i18n": "./src/i18n.ts",
-    "./mcp-catalog": "./src/mcp-catalog.ts"
+    "./mcp-catalog": "./src/mcp-catalog.ts",
+    "./tui-runtime": "./src/tui-runtime.ts"
   },
   "bin": {
     "anicode-daemon": "./bin/anicode-daemon.mjs"

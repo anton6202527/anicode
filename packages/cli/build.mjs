@@ -1,4 +1,4 @@
-// 把工作区源码打包成一个自包含的 dist/cli.js。
+// 把工作区源码打包成一个自包含的 CLI runtime + 按需 Ink UI chunk。
 //
 // 两个关键处理：
 //  1. NodeNext 的相对 import 都写成 ".js"，但真实文件是 .ts/.tsx —— 加一个 resolve
@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const outdir = path.join(here, "dist");
 const outfile = path.join(here, "dist", "cli.js");
 
 // 版本号单一事实源：从发布包 package.json 注入，避免源码里硬编码版本与之漂移。
@@ -67,11 +68,17 @@ const externalizePlugin = {
 // 打包后作为 dist/cli.js 执行会正确触发一次（用 wrapper 再调一次会重复运行）。
 const entry = path.resolve(here, "..", "tui", "src", "cli.tsx");
 
-await fs.rm(path.join(here, "dist"), { recursive: true, force: true });
+await fs.rm(outdir, { recursive: true, force: true });
 await build({
-  entryPoints: [entry],
-  outfile,
+  entryPoints: {
+    cli: entry,
+    interactive: path.resolve(here, "..", "tui", "src", "interactive.tsx"),
+  },
+  outdir,
   bundle: true,
+  splitting: true,
+  entryNames: "[name]",
+  chunkNames: "chunks/[name]-[hash]",
   platform: "node",
   format: "esm",
   target: "node22",

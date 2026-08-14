@@ -153,8 +153,18 @@ try {
   const artifact = packed[0];
   const paths = artifact.files.map((entry) => entry.path).sort();
   expect(
-    JSON.stringify(paths) ===
-      JSON.stringify(["LICENSE", "README.md", "dist/cli.js", "package.json"]),
+    paths.includes("LICENSE") &&
+      paths.includes("README.md") &&
+      paths.includes("dist/cli.js") &&
+      paths.includes("dist/interactive.js") &&
+      paths.includes("package.json") &&
+      paths.every(
+        (entryPath) =>
+          entryPath === "LICENSE" ||
+          entryPath === "README.md" ||
+          entryPath === "package.json" ||
+          /^dist\/(?:cli|interactive)\.js$|^dist\/chunks\/[a-z0-9_-]+\.js$/iu.test(entryPath),
+      ),
     `published package contains unexpected files: ${paths.join(", ")}`,
   );
   expect(artifact.unpackedSize < 2 * 1024 * 1024, "published CLI exceeds the 2 MiB package budget");
@@ -187,6 +197,35 @@ try {
     "published package has an invalid bin mapping",
   );
   const entry = path.join(installedRoot, "dist", "cli.js");
+  const interactiveEntry = path.join(installedRoot, "dist", "interactive.js");
+  const [headlessBundle, interactiveBundle, nonInteractiveRuntime] = await Promise.all([
+    fs.readFile(entry, "utf8"),
+    fs.readFile(interactiveEntry, "utf8"),
+    Promise.all(
+      paths
+        .filter(
+          (entryPath) =>
+            entryPath.startsWith("dist/") &&
+            entryPath.endsWith(".js") &&
+            entryPath !== "dist/interactive.js",
+        )
+        .map((entryPath) => fs.readFile(path.join(installedRoot, entryPath), "utf8")),
+    ).then((bundles) => bundles.join("\n")),
+  ]);
+  expect(
+    !/^import .* from ["'](?:ink|react|react\/jsx-runtime|openai)["'];?$/mu.test(
+      nonInteractiveRuntime,
+    ),
+    "non-interactive CLI runtime eagerly imports React/Ink or the OpenAI SDK",
+  );
+  expect(
+    headlessBundle.includes('import("./interactive.js")'),
+    "headless CLI omitted the deferred interactive frontend import",
+  );
+  expect(
+    /^import .* from ["']ink["'];?$/mu.test(interactiveBundle),
+    "interactive frontend bundle omitted Ink",
+  );
   const version = run(process.execPath, [entry, "--version"], { cwd: project });
   expect(
     version === installed.version,

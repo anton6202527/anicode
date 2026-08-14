@@ -37,7 +37,7 @@ import {
   getLang,
   setLang,
   onLangChange,
-} from "@anicode/core";
+} from "@anicode/core/tui-runtime";
 import type {
   ChatMessage,
   CustomCommand,

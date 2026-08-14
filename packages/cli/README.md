@@ -89,7 +89,8 @@ POSIX 终端中 `Ctrl+Z` 挂起、`fg` 恢复，默认 `Ctrl+Q` 退出。
 
 ## 说明
 
-本包是自包含产物:core / shared / TUI 的源码已打包进单个 `dist/cli.js`,
+本包是自包含产物：core / shared / TUI 的源码已打包进 `dist/cli.js`，React/Ink 交互前端位于
+按需加载的 `dist/interactive.js`，因此 `--help`、`--version`、`trust` 等无头命令不会初始化 UI。
 所有外置运行时依赖均在 `package.json` 中声明并由发布门禁校验。需要 Node >= 22.15.0；CI 会持续
 验证最低版本、发布用 Node 24 LTS 和 Node `current` 最新稳定版。npm 包内含 MIT LICENSE。
 

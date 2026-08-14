@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { terminateProcessTree } from "@anicode/core";
+import { terminateProcessTree } from "@anicode/core/tui-runtime";
 
 const DEFAULT_BASE = "http://127.0.0.1:11434";
 

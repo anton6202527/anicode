@@ -9,7 +9,7 @@
  */
 import { constants as fsConstants, promises as fs } from "node:fs";
 import * as path from "node:path";
-import { t } from "@anicode/core";
+import { t } from "@anicode/core/i18n";
 
 const MAX_BYTES = 100 * 1024;
 const MENTION_RE = /(^|\s)@([^\s@]+)/g;

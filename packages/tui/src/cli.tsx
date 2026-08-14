@@ -15,8 +15,6 @@ import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
-import React from "react";
-import { render } from "ink";
 import {
   createProvider,
   diagnoseProvider,
@@ -81,10 +79,10 @@ import {
   type McpServerConfig,
   type WorkspaceTrustAssessment,
   type WorkspaceTrustSource,
-} from "@anicode/core";
-import { App, type TuiKeybindingAction } from "./app.js";
+} from "@anicode/core/cli-runtime";
 import { DebugLogger, withDebugLogging } from "./debug-log.js";
-import { TuiErrorBoundary } from "./error-boundary.js";
+import type { TuiKeybindingAction } from "./app.js";
+import type { InteractiveTuiInstance } from "./interactive.js";
 import { createTerminalCaretOutput, RESET_FULLSCREEN_VIEWPORT } from "./terminal-caret.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -2647,6 +2645,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     );
   }
 
+  // React/Ink is the heaviest client-only dependency. Start loading it in parallel with trusted
+  // workspace/runtime preparation, while headless commands never evaluate it at all.
+  const interactiveUi = import("./interactive.js");
+  void interactiveUi.catch(() => undefined);
+
   const workspaceTrustStore = new WorkspaceTrustStore();
   const initialWorkspaceTrust = await workspaceTrustStore.assess(args.cwd);
   await loadProjectEnv({ cwd: args.cwd, workspaceTrust: initialWorkspaceTrust });
@@ -2963,7 +2966,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       color: !args.noColor,
       alternateScreen,
     });
-    let instance: ReturnType<typeof render> | undefined;
+    let instance: InteractiveTuiInstance | undefined;
     let stopRawModeWatchdog = () => {};
     const emergencyTerminalCleanup = () => {
       try {
@@ -2986,56 +2989,43 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     };
     const removeTerminalExitGuard = installTerminalExitGuard(emergencyTerminalCleanup);
     try {
-      instance = render(
-        <TuiErrorBoundary
-          onError={(error, componentStack) =>
-            debugLogger?.log("tui.render_crash", {
-              message: error.message,
-              stack: error.stack,
-              componentStack,
-            })
-          }
-        >
-          <App
-            host={host}
-            cwd={args.cwd}
-            model={args.model}
-            sessionId={sessionId}
-            providers={listProviderDetails()}
-            catalog={listModelCatalog()}
-            commands={commands}
-            {...(mcpStatus ? { mcpStatus } : {})}
-            version={CLI_VERSION}
-            workspaceTrusted={!args.daemon && !args.http && workspaceTrust.trusted}
-            requireWorkspaceTrust
-            canInspectWorkspace={!args.daemon && !args.http}
-            allowPermissionControls={!args.daemon && !args.http}
-            mouse={mouse}
-            experimentalOverlay={experimentalOverlay}
-            terminalCaret={terminalCaret.controller}
-            {...(config.tui?.keybindings
-              ? {
-                  keybindings: config.tui.keybindings as Partial<
-                    Record<TuiKeybindingAction, string>
-                  >,
-                }
-              : {})}
-            terminalControl
-          />
-        </TuiErrorBoundary>,
-        {
-          stdout: terminalOutput,
-          alternateScreen,
-          // Ink 7 only invalidates its incremental line cache when terminal width shrinks.
-          // Growing either dimension can therefore diff against stale physical coordinates and
-          // leave old logos/composers behind. Complete frames make resize reset + repaint atomic.
-          incrementalRendering: TUI_INCREMENTAL_RENDERING,
-          isScreenReaderEnabled: screenReader,
-          // Ink otherwise disables input whenever CI=1, even for a real PTY.
-          interactive: process.stdin.isTTY === true,
-          maxFps: 30,
+      const { renderInteractiveTui } = await interactiveUi;
+      instance = renderInteractiveTui({
+        appProps: {
+          host,
+          cwd: args.cwd,
+          model: args.model,
+          sessionId,
+          providers: listProviderDetails(),
+          catalog: listModelCatalog(),
+          commands,
+          ...(mcpStatus ? { mcpStatus } : {}),
+          version: CLI_VERSION,
+          workspaceTrusted: !args.daemon && !args.http && workspaceTrust.trusted,
+          requireWorkspaceTrust: true,
+          canInspectWorkspace: !args.daemon && !args.http,
+          allowPermissionControls: !args.daemon && !args.http,
+          mouse,
+          experimentalOverlay,
+          terminalCaret: terminalCaret.controller,
+          ...(config.tui?.keybindings
+            ? {
+                keybindings: config.tui.keybindings as Partial<Record<TuiKeybindingAction, string>>,
+              }
+            : {}),
+          terminalControl: true,
         },
-      );
+        output: terminalOutput,
+        alternateScreen,
+        screenReader,
+        incrementalRendering: TUI_INCREMENTAL_RENDERING,
+        onError: (error, componentStack) =>
+          debugLogger?.log("tui.render_crash", {
+            message: error.message,
+            stack: error.stack,
+            componentStack,
+          }),
+      });
       stopRawModeWatchdog = startRawModeWatchdog();
       try {
         await instance.waitUntilExit();

@@ -9,7 +9,7 @@
  * 只在真实 TTY 生效；ink-testing 用的是另一个 stdout，测试仍走 app.tsx 的 in-tree 渲染。
  */
 
-import { t } from "@anicode/core";
+import { t } from "@anicode/core/i18n";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import { graphemes, terminalWidth, truncateTerminalWidth } from "./text-layout.js";
 
