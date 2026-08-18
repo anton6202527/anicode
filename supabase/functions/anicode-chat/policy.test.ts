@@ -94,12 +94,14 @@ Deno.test("normalizes a V4 streaming request through strict field allowlists", (
   assert(!serialized.includes("caller_extension"));
 });
 
-Deno.test("defaults only to currently deployed DeepSeek V4 models", () => {
+Deno.test("defaults the free gateway to DeepSeek V4 Flash only", () => {
   assert(
     JSON.stringify([...configuredModels(undefined)]) ===
-      JSON.stringify(["deepseek-v4-flash", "deepseek-v4-pro"]),
+      JSON.stringify(["deepseek-v4-flash"]),
   );
-  assert(configuredModels("private-model").has("private-model"));
+  assert(
+    configuredModels("private-model,deepseek-v4-pro").has("deepseek-v4-pro"),
+  );
   rejects(() => configuredModels("../../invalid model"));
 });
 

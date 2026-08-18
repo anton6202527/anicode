@@ -542,9 +542,62 @@ function validUsage(usage: Usage): boolean {
   ].every((value) => Number.isSafeInteger(value) && value >= 0);
 }
 
+const HARD_QUOTA_CODES = new Set([
+  "gateway_disabled",
+  "upstream_balance_exhausted",
+  "device_daily_token_limit",
+  "device_daily_request_limit",
+  "user_daily_token_limit",
+  "user_daily_request_limit",
+  "global_daily_token_limit",
+  "global_daily_request_limit",
+  "user_quota_exceeded",
+  "global_quota_exceeded",
+  "quota_exceeded",
+  // OpenAI-compatible providers commonly use this code when purchased credit is exhausted.
+  "insufficient_quota",
+]);
+
+function providerErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const direct = (err as { code?: unknown }).code;
+  if (typeof direct === "string" && direct.trim()) return direct.trim().toLowerCase();
+  const nested = (err as { error?: unknown }).error;
+  if (!nested || typeof nested !== "object") return undefined;
+  const nestedCode = (nested as { code?: unknown }).code;
+  return typeof nestedCode === "string" && nestedCode.trim()
+    ? nestedCode.trim().toLowerCase()
+    : undefined;
+}
+
+function providerErrorHeader(err: unknown, name: string): string | null {
+  const headers = (err as { headers?: unknown })?.headers;
+  if (!headers) return null;
+  if (typeof (headers as Headers).get === "function") {
+    return (headers as Headers).get(name);
+  }
+  if (typeof headers !== "object") return null;
+  const expected = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() !== expected) continue;
+    if (typeof value === "string") return value;
+    if (Array.isArray(value) && typeof value[0] === "string") return value[0];
+  }
+  return null;
+}
+
+function isHardQuotaError(err: unknown): boolean {
+  if (providerErrorHeader(err, "x-anicode-retryable")?.trim().toLowerCase() === "false") {
+    return true;
+  }
+  const code = providerErrorCode(err);
+  return code !== undefined && HARD_QUOTA_CODES.has(code);
+}
+
 /** 判定 provider 错误是否值得重试（限流/服务端/网络层；4xx 业务错误不重试） */
 function isTransientError(err: unknown): boolean {
   if (err == null) return false;
+  if (isHardQuotaError(err)) return false;
   const status = (err as { status?: unknown }).status;
   if (typeof status === "number") {
     return status === 408 || status === 429 || status >= 500;
@@ -560,17 +613,7 @@ function isTransientError(err: unknown): boolean {
  * SDK 错误通常带 headers（Headers 实例或普通对象）。
  */
 export function retryAfterMs(err: unknown, now: number = Date.now()): number | null {
-  const headers = (err as { headers?: unknown })?.headers;
-  if (!headers) return null;
-  let raw: string | null = null;
-  if (typeof (headers as Headers).get === "function") {
-    raw = (headers as Headers).get("retry-after");
-  } else if (typeof headers === "object") {
-    const rec = headers as Record<string, unknown>;
-    const v = rec["retry-after"] ?? rec["Retry-After"];
-    if (typeof v === "string") raw = v;
-    else if (Array.isArray(v) && typeof v[0] === "string") raw = v[0];
-  }
+  const raw = providerErrorHeader(err, "retry-after");
   if (!raw) return null;
   const secs = Number(raw);
   if (Number.isFinite(secs)) return secs >= 0 ? Math.round(secs * 1000) : null;

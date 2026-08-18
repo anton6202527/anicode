@@ -170,9 +170,13 @@ export class Conversation {
   /** 把尚未落盘的新消息按序 append 进会话文件。 */
   async flush(signal?: AbortSignal): Promise<void> {
     if (!this.persist) return;
-    const snapshot = [...this.history];
+    // Appends never mutate existing slots, so retaining the current array plus a high-water mark is
+    // a stable snapshot without copying the entire conversation on every incremental flush. A
+    // rewrite/rewind swaps the array reference and remains ordered behind this operation.
+    const snapshot = this.history;
+    const end = snapshot.length;
     await this.enqueuePersist(async () => {
-      for (let i = this.persistedCount; i < snapshot.length; i++) {
+      for (let i = this.persistedCount; i < end; i++) {
         await this.persist!.store.append(this.persist!.meta.id, snapshot[i]!);
         this.persistedCount = i + 1;
       }

@@ -3,8 +3,15 @@ import assert from "node:assert/strict";
 import { promises as fs, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import { LspClient, LspPool, pickLspServer } from "./lsp.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  LspClient,
+  LspPool,
+  MAX_LSP_DIAGNOSTICS_PER_DOCUMENT,
+  MAX_LSP_DIAGNOSTIC_MESSAGE_CHARS,
+  MAX_LSP_OPEN_DOCUMENTS,
+  pickLspServer,
+} from "./lsp.js";
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
 import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
 
@@ -57,6 +64,62 @@ test("LSP: diagnostics 工具格式化输出；未配置扩展名给出提示", 
   const none = await tool.run({ path: "readme.md" }, ctx);
   assert.match(none, /没有为 .md 配置语言服务器/);
 });
+
+test(
+  "LSP: long sessions bound open documents and cached diagnostic payloads",
+  LSP_TEST_OPTIONS,
+  async (t) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lsp-bounded-"));
+    const lifecycleLog = path.join(dir, "lifecycle.jsonl");
+    let client: LspClient | undefined;
+    t.after(async () => {
+      try {
+        await client?.close();
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    });
+    const many = path.join(dir, "many.ts");
+    const otherFiles = Array.from({ length: MAX_LSP_OPEN_DOCUMENTS }, (_, index) =>
+      path.join(dir, `file-${index}.ts`),
+    );
+    await Promise.all([many, ...otherFiles].map((file) => fs.writeFile(file, "const x = 1;\n")));
+    client = LspClient.start(dir, { ...cfg, args: [serverPath, lifecycleLog] });
+
+    const diagnostics = await client.diagnose(many, 3000);
+    assert.equal(diagnostics.length, MAX_LSP_DIAGNOSTICS_PER_DOCUMENT);
+    assert.ok(
+      diagnostics.every(
+        (diagnostic) => diagnostic.message.length <= MAX_LSP_DIAGNOSTIC_MESSAGE_CHARS,
+      ),
+    );
+    for (const file of otherFiles) await client.definition(file, { line: 0, character: 0 });
+
+    let lifecycle = (await fs.readFile(lifecycleLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method: string; uri: string });
+    assert.equal(lifecycle.filter((event) => event.method === "open").length, 65);
+    assert.deepEqual(
+      lifecycle.filter((event) => event.method === "close").map((event) => event.uri),
+      [pathToFileURL(await fs.realpath(many)).href],
+    );
+
+    // Reusing the evicted file transparently reopens it and closes the next least-recent document.
+    await client.diagnose(many, 3000);
+    lifecycle = (await fs.readFile(lifecycleLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method: string; uri: string });
+    assert.deepEqual(
+      lifecycle.filter((event) => event.method === "close").map((event) => event.uri),
+      [
+        pathToFileURL(await fs.realpath(many)).href,
+        pathToFileURL(await fs.realpath(otherFiles[0]!)).href,
+      ],
+    );
+  },
+);
 
 test("LSP: pickLspServer 按扩展名匹配（大小写不敏感）", () => {
   const s = pickLspServer([cfg], ".TS");

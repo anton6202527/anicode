@@ -13,6 +13,8 @@ import { registerAnicodeCloudProvider } from "./cloud-provider.js";
 const PROJECT_URL = "https://fixture.supabase.co";
 const GATEWAY_URL = `${PROJECT_URL}/functions/v1/anicode-chat/v1/chat/completions`;
 const STORAGE_KEY = "auth:supabase-refresh";
+const INSTALLATION_TOKEN_KEY = "device:installation-token-v1";
+const INSTALLATION_TOKEN_HEADER = "x-anicode-installation-token";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -465,6 +467,51 @@ test("cloud auth: concurrent expired-session requests share one refresh", async 
   assert.equal(gatewayCalls, 6);
   assert.deepEqual(new Set(gatewayAuthorizations), new Set([`Bearer ${rotated.access_token}`]));
   await service.close();
+});
+
+test("cloud auth: host injects one persistent installation token and overrides caller spoofing", async () => {
+  const backend = new MemorySecretBackend();
+  const initial = session("device-token");
+  const observed: Array<string | null> = [];
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = requestUrl(input);
+    if (url.searchParams.get("grant_type") === "password") return Response.json(initial);
+    if (url.pathname.startsWith("/functions/v1/anicode-chat/")) {
+      observed.push(requestHeaders(input, init).get(INSTALLATION_TOKEN_HEADER));
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/auth/v1/logout") return new Response(null, { status: 204 });
+    throw new Error(`unexpected request ${url}`);
+  }) as typeof fetch;
+
+  const first = createService(backend, fetchImpl);
+  first.attachBroker(new CredentialBroker());
+  await first.signIn("device-token@example.test", "password123");
+  await Promise.all([
+    first.gatewayFetch(GATEWAY_URL, {
+      method: "POST",
+      headers: { [INSTALLATION_TOKEN_HEADER]: "caller-controlled-value" },
+      body: "{}",
+    }),
+    first.gatewayFetch(GATEWAY_URL, { method: "POST", body: "{}" }),
+  ]);
+  const persisted = backend.values.get(INSTALLATION_TOKEN_KEY);
+  assert.match(persisted ?? "", /^[A-Za-z0-9_-]{43}$/u);
+  assert.deepEqual(observed, [persisted, persisted]);
+  await first.signOut();
+  assert.equal(
+    backend.values.get(INSTALLATION_TOKEN_KEY),
+    persisted,
+    "sign-out must not reset today's installation quota identity",
+  );
+  await first.close();
+
+  const restored = createService(backend, fetchImpl);
+  restored.attachBroker(new CredentialBroker());
+  await restored.signIn("device-token@example.test", "password123");
+  await restored.gatewayFetch(GATEWAY_URL, { method: "POST", body: "{}" });
+  assert.equal(observed.at(-1), persisted, "a new process must retain the same device quota key");
+  await restored.close();
 });
 
 test("cloud auth: staggered 401s for one access revision refresh only once", async () => {

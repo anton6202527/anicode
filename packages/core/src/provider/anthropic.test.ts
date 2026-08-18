@@ -5,10 +5,48 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildAnthropicRequest, CLAUDE_CODE_IDENTITY } from "./anthropic.js";
-import type { ChatMessage } from "../types.js";
+import { AnthropicProvider, buildAnthropicRequest, CLAUDE_CODE_IDENTITY } from "./anthropic.js";
+import type { ChatMessage, StreamEvent } from "../types.js";
 
 const tools = [{ name: "read", description: "读文件", parameters: { type: "object" as const } }];
+
+async function streamAnthropicToolArgumentFragments(fragments: string[]): Promise<StreamEvent[]> {
+  const wireEvents = [
+    {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "tool_stream", name: "read", input: {} },
+    },
+    ...fragments.map((partial_json) => ({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json },
+    })),
+    { type: "content_block_stop", index: 0 },
+  ];
+  const fakeStream = {
+    async *[Symbol.asyncIterator]() {
+      yield* wireEvents;
+    },
+    async finalMessage() {
+      return {
+        stop_reason: "tool_use",
+        content: [{ type: "tool_use", id: "tool_stream", name: "read", input: {} }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    },
+  };
+  const provider = new AnthropicProvider({ apiKey: "test" });
+  (provider as unknown as { client: { messages: { stream: () => typeof fakeStream } } }).client = {
+    messages: { stream: () => fakeStream },
+  };
+
+  const events: StreamEvent[] = [];
+  for await (const event of provider.stream({ model: "fake", messages: [] })) {
+    events.push(event);
+  }
+  return events;
+}
 
 test("缓存断点: system 块 + 最后一条消息的最后块", () => {
   const messages: ChatMessage[] = [
@@ -139,4 +177,49 @@ test("adaptive thinking: profile 明确允许时才发送 thinking 与 effort", 
   );
   assert.deepEqual(req.thinking, { type: "adaptive" });
   assert.deepEqual(req.output_config, { effort: "high" });
+});
+
+test("Anthropic 流: CJK 与跨 chunk surrogate 参数按原值拼接", async () => {
+  const expectedJson = '{"text":"你好🙂"}';
+  const events = await streamAnthropicToolArgumentFragments([
+    '{"text":"你',
+    "好\ud83d",
+    '\ude42"}',
+  ]);
+  const deltas = events
+    .filter((event) => event.type === "tool_call_delta")
+    .map((event) => (event.type === "tool_call_delta" ? event.argsText : ""));
+  assert.equal(deltas.join(""), expectedJson);
+  const end = events.find((event) => event.type === "tool_call_end");
+  assert.ok(end && end.type === "tool_call_end");
+  assert.deepEqual(end.part.args, { text: "你好🙂" });
+});
+
+test("Anthropic 流: 工具参数按真实 UTF-8 字节执行 2 MiB 边界", async () => {
+  const limit = 2 * 1024 * 1024;
+  const prefix = '{"value":"';
+  const suffix = '"}';
+  const high = "\ud83d";
+  const low = "\ude42";
+  const fixedBytes = Buffer.byteLength(prefix + high + low + suffix, "utf8");
+  const fill = "a".repeat(limit - fixedBytes);
+  const fragments = [
+    prefix,
+    ...Array.from({ length: 128 }, (_, index) =>
+      fill.slice((index * fill.length) / 128, ((index + 1) * fill.length) / 128),
+    ),
+    high,
+    low,
+    suffix,
+  ];
+
+  const events = await streamAnthropicToolArgumentFragments(fragments);
+  const end = events.find((event) => event.type === "tool_call_end");
+  assert.ok(end && end.type === "tool_call_end");
+  assert.equal((end.part.args.value as string).length, fill.length + 2);
+
+  await assert.rejects(
+    () => streamAnthropicToolArgumentFragments([...fragments.slice(0, -1), "x", suffix]),
+    /Provider tool-call arguments limit exceeded/,
+  );
 });

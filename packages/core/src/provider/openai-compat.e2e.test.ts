@@ -161,7 +161,9 @@ before(async () => {
             usage: {
               prompt_tokens: 100,
               completion_tokens: 20,
-              prompt_tokens_details: { cached_tokens: 40 },
+              // DeepSeek reports cache hits at the top level rather than in OpenAI's
+              // prompt_tokens_details object.
+              prompt_cache_hit_tokens: 40,
             },
           },
         ]);
@@ -273,4 +275,56 @@ test("OpenAI 兼容层: 累计全文快照不会被重复拼接", async () => {
   ]);
 
   assertToolArgumentStream(events, expectedJson);
+});
+
+test("OpenAI 兼容层: CJK 与跨 chunk surrogate 在增量和累计快照中保持原值", async () => {
+  const high = "\ud83d";
+  const low = "\ude42";
+  const expectedJson = '{"text":"你好🙂"}';
+
+  const incremental = await streamToolArgumentFragments(['{"text":"你', `好${high}`, `${low}"}`]);
+  assertToolArgumentStream(incremental, expectedJson);
+
+  const prefix = `{"text":"你好${high}`;
+  const snapshots = await streamToolArgumentFragments([prefix, `${prefix}${low}`, expectedJson]);
+  assertToolArgumentStream(snapshots, expectedJson);
+});
+
+test("OpenAI 兼容层: 工具参数按真实 UTF-8 字节执行 2 MiB 边界", async () => {
+  const limit = 2 * 1024 * 1024;
+  const prefix = '{"value":"';
+  const suffix = '"}';
+  const high = "\ud83d";
+  const low = "\ude42";
+  const fixedBytes = Buffer.byteLength(prefix + high + low + suffix, "utf8");
+  const fill = "a".repeat(limit - fixedBytes);
+  const fragments = [
+    prefix,
+    ...Array.from({ length: 128 }, (_, index) =>
+      fill.slice((index * fill.length) / 128, ((index + 1) * fill.length) / 128),
+    ),
+    high,
+    low,
+    suffix,
+  ];
+
+  const events = await streamToolArgumentFragments(fragments);
+  const end = events.find((event) => event.type === "tool_call_end");
+  assert.ok(end && end.type === "tool_call_end");
+  assert.equal((end.part.args.value as string).length, fill.length + 2);
+  assert.equal(
+    Buffer.byteLength(
+      events
+        .filter((event) => event.type === "tool_call_delta")
+        .map((event) => (event.type === "tool_call_delta" ? event.argsText : ""))
+        .join(""),
+      "utf8",
+    ),
+    limit,
+  );
+
+  await assert.rejects(
+    () => streamToolArgumentFragments([...fragments.slice(0, -1), "x", suffix]),
+    /Provider tool-call arguments limit exceeded/,
+  );
 });

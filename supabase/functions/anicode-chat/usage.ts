@@ -4,6 +4,9 @@ export interface GatewayUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  reasoningTokens: number;
 }
 
 export type GatewaySettlementStatus = "completed" | "failed" | "aborted";
@@ -46,7 +49,10 @@ export class OpenAiUsageMeter {
       if (!payload || payload === "[DONE]") continue;
       try {
         const parsed = JSON.parse(payload) as {
-          usage?: Record<string, unknown>;
+          usage?: Record<string, unknown> & {
+            prompt_tokens_details?: Record<string, unknown>;
+            completion_tokens_details?: Record<string, unknown>;
+          };
         };
         const promptTokens = nonNegativeInteger(
           parsed.usage?.["prompt_tokens"],
@@ -64,11 +70,35 @@ export class OpenAiUsageMeter {
         // Every accepted chat request has a non-empty prompt. An all-zero event is therefore not a
         // trustworthy final usage record; treating it as missing charges the reservation instead.
         if (!Number.isSafeInteger(summedTotal) || summedTotal === 0) continue;
+        const reportedCacheHit = nonNegativeInteger(
+          parsed.usage?.["prompt_cache_hit_tokens"] ??
+            parsed.usage?.prompt_tokens_details?.["cached_tokens"],
+        );
+        const promptCacheHitTokens = Math.min(
+          promptTokens,
+          reportedCacheHit ?? 0,
+        );
+        const reportedCacheMiss = nonNegativeInteger(
+          parsed.usage?.["prompt_cache_miss_tokens"],
+        );
+        const promptCacheMissTokens = reportedCacheMiss !== undefined &&
+            promptCacheHitTokens + reportedCacheMiss <= promptTokens
+          ? reportedCacheMiss
+          : promptTokens - promptCacheHitTokens;
+        const reasoningTokens = Math.min(
+          completionTokens,
+          nonNegativeInteger(
+            parsed.usage?.completion_tokens_details?.["reasoning_tokens"],
+          ) ?? 0,
+        );
         const next: GatewayUsage = {
           promptTokens,
           completionTokens,
           // Never let a malformed or stale total under-count its own component values.
           totalTokens: Math.max(reportedTotal ?? summedTotal, summedTotal),
+          promptCacheHitTokens,
+          promptCacheMissTokens,
+          reasoningTokens,
         };
         // Providers normally emit usage only in the final chunk. Retaining the greatest valid
         // observation also fails safely if an intermediary/proxy repeats an older smaller value.
@@ -90,6 +120,7 @@ export interface MeteredSseOptions {
   settle(
     chargedTokens: number,
     status: GatewaySettlementStatus,
+    usage?: GatewayUsage,
   ): void | Promise<void>;
 }
 
@@ -120,11 +151,10 @@ export function meteredSseStream(
   const completion = piping.then(
     async () => {
       const usage = meter.finish();
-      const charged = Math.min(
-        options.reservedTokens,
-        usage?.totalTokens ?? options.reservedTokens,
-      );
-      await options.settle(charged, "completed");
+      // A reservation is a concurrency fence, not a cap on the provider's authoritative bill.
+      // Preserve any overrun so subsequent requests are blocked and operators can investigate it.
+      const charged = usage?.totalTokens ?? options.reservedTokens;
+      await options.settle(charged, "completed", usage);
     },
     async () => {
       await options.settle(

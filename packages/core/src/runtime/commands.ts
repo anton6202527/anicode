@@ -523,10 +523,11 @@ export class DurableOutbox {
     const published: RuntimeEvent[] = [];
     // 每条投递后立即持久化 ack，避免一个大批次末尾崩溃导致全部重发；重发本身也幂等。
     for (;;) {
+      if (published.length >= limit) break;
       const pending = this.store.claimMessage
         ? await this.store.claimMessage(this.owner, 60_000)
         : (await this.store.read()).find((message) => message.status === "pending");
-      if (!pending || published.length >= limit) break;
+      if (!pending) break;
       try {
         const event = await this.runtime.record(pending.event);
         if (this.store.markSent) await this.store.markSent(pending, this.owner, event.id);

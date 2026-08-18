@@ -1617,7 +1617,9 @@ export class SessionManager {
       await heartbeat.assertOwned();
       const runBudgetSnapshot = session.running
         ? undefined
-        : await this.recoverRunBudgetSnapshot(sessionId, claimed);
+        : claimed.attempts === 1
+          ? this.initialRunBudgetSnapshot(claimed)
+          : await this.recoverRunBudgetSnapshot(sessionId, claimed);
       const effectiveSendOptions = {
         ...sendOptions,
         ...(runBudgetSnapshot ? { runBudgetSnapshot } : {}),

@@ -226,6 +226,18 @@ function sseControlFrame(ev: EventEnvelope): string {
   return `data: ${JSON.stringify(ev)}\n\n`;
 }
 
+interface BufferedSseEvent {
+  event: EventEnvelope;
+  frame: string;
+  bytes: number;
+}
+
+/** Serialize once before replay retention and multi-client fan-out. */
+function bufferedSseEvent(event: EventEnvelope): BufferedSseEvent {
+  const frame = sseEventFrame(event);
+  return { event, frame, bytes: Buffer.byteLength(frame) };
+}
+
 /** @internal Minimal ServerResponse surface used by the bounded SSE writer. */
 export interface SseWritable {
   write(frame: string): boolean;
@@ -236,7 +248,8 @@ export interface SseWritable {
 
 /** @internal Exported for deterministic backpressure tests; not re-exported from the package. */
 export class SseBackpressureWriter {
-  private readonly queue: { frame: string; bytes: number }[] = [];
+  private readonly queue: ({ frame: string; bytes: number } | undefined)[] = [];
+  private queueHead = 0;
   private queuedBytes = 0;
   private blocked = false;
   private closed = false;
@@ -259,7 +272,7 @@ export class SseBackpressureWriter {
     if (bytes > this.limits.maxPendingBytes) return this.overflow();
     if (this.blocked) {
       if (
-        this.queue.length >= this.limits.maxPendingEvents ||
+        this.queuedEventCount() >= this.limits.maxPendingEvents ||
         this.queuedBytes + bytes > this.limits.maxPendingBytes
       ) {
         return this.overflow();
@@ -295,7 +308,7 @@ export class SseBackpressureWriter {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.queue.length = 0;
+    this.clearQueue();
     this.queuedBytes = 0;
     this.sink.off("drain", this.drain);
     this.rejectFlushWaiters(new Error("SSE connection closed"));
@@ -304,12 +317,20 @@ export class SseBackpressureWriter {
   private readonly drain = (): void => {
     if (this.closed) return;
     this.blocked = false;
-    while (!this.blocked && this.queue.length > 0) {
-      const next = this.queue.shift()!;
+    while (!this.blocked && this.queueHead < this.queue.length) {
+      const next = this.queue[this.queueHead];
+      this.queue[this.queueHead++] = undefined;
+      if (!next) continue;
       this.queuedBytes -= next.bytes;
-      if (!this.writeToSink(next.frame)) return;
+      if (!this.writeToSink(next.frame)) {
+        this.compactQueue();
+        return;
+      }
     }
-    if (!this.blocked && this.queue.length === 0) this.resolveFlushWaiters();
+    if (!this.blocked && this.queuedEventCount() === 0) {
+      this.clearQueue();
+      this.resolveFlushWaiters();
+    }
   };
 
   private writeToSink(frame: string): boolean {
@@ -329,7 +350,7 @@ export class SseBackpressureWriter {
   private overflow(): false {
     if (this.closed) return false;
     this.closed = true;
-    this.queue.length = 0;
+    this.clearQueue();
     this.queuedBytes = 0;
     this.sink.off("drain", this.drain);
     this.rejectFlushWaiters(new Error("SSE client exceeded the pending buffer limit"));
@@ -339,7 +360,7 @@ export class SseBackpressureWriter {
 
   private flushed(): Promise<void> {
     if (this.closed) return Promise.reject(new Error("SSE connection closed"));
-    if (!this.blocked && this.queue.length === 0) return Promise.resolve();
+    if (!this.blocked && this.queuedEventCount() === 0) return Promise.resolve();
     return new Promise((resolve, reject) => {
       this.flushWaiters.add({ resolve, reject });
     });
@@ -353,6 +374,21 @@ export class SseBackpressureWriter {
   private rejectFlushWaiters(error: Error): void {
     for (const waiter of this.flushWaiters) waiter.reject(error);
     this.flushWaiters.clear();
+  }
+
+  private queuedEventCount(): number {
+    return this.queue.length - this.queueHead;
+  }
+
+  private compactQueue(): void {
+    if (this.queueHead < 256 || this.queueHead * 2 < this.queue.length) return;
+    this.queue.splice(0, this.queueHead);
+    this.queueHead = 0;
+  }
+
+  private clearQueue(): void {
+    this.queue.length = 0;
+    this.queueHead = 0;
   }
 }
 
@@ -417,39 +453,61 @@ function deriveNamedEvents(
 }
 
 /** 有界环形缓冲：支持按 Last-Event-ID 回放其后事件（未命中返回 null → 需整份重同步）。 */
-class EventRing {
-  private buf: { event: EventEnvelope; bytes: number }[] = [];
+/** @internal Exported for deterministic retention tests; not re-exported from the package. */
+export class EventRing {
+  private buf: (BufferedSseEvent | undefined)[] = [];
+  private head = 0;
   private bytes = 0;
   constructor(
     private max: number,
     private maxBytes: number,
   ) {}
-  push(ev: EventEnvelope): void {
-    const bytes = Buffer.byteLength(sseEventFrame(ev));
-    if (bytes > this.maxBytes) {
+  push(item: BufferedSseEvent): void {
+    if (item.bytes > this.maxBytes) {
       // The live writer applies its own bound. Do not retain one adversarial event forever;
       // reconnecting session clients will fall back to a fresh snapshot.
       this.buf = [];
+      this.head = 0;
       this.bytes = 0;
       return;
     }
-    this.buf.push({ event: ev, bytes });
-    this.bytes += bytes;
-    while (this.buf.length > this.max || this.bytes > this.maxBytes) {
-      this.bytes -= this.buf.shift()!.bytes;
+    this.buf.push(item);
+    this.bytes += item.bytes;
+    while (this.size() > this.max || this.bytes > this.maxBytes) {
+      const retired = this.buf[this.head];
+      this.buf[this.head++] = undefined;
+      if (retired) this.bytes -= retired.bytes;
     }
+    this.compact();
   }
-  replayAfter(id: string): EventEnvelope[] | null {
-    const i = this.buf.findIndex((item) => item.event.id === id);
-    return i === -1 ? null : this.buf.slice(i + 1).map((item) => item.event);
+  replayAfter(id: string): BufferedSseEvent[] | null {
+    for (let index = this.head; index < this.buf.length; index++) {
+      if (this.buf[index]?.event.id === id) {
+        return this.buf
+          .slice(index + 1)
+          .filter((item): item is BufferedSseEvent => item !== undefined);
+      }
+    }
+    return null;
   }
   clear(): void {
     this.buf = [];
+    this.head = 0;
     this.bytes = 0;
+  }
+
+  private size(): number {
+    return this.buf.length - this.head;
+  }
+
+  private compact(): void {
+    if (this.head < 256 || this.head * 2 < this.buf.length) return;
+    this.buf = this.buf.slice(this.head);
+    this.head = 0;
   }
 }
 
-type Writer = (ev: EventEnvelope) => void;
+type Writer = (event: BufferedSseEvent) => void;
 
 /** 单会话事件扇出：一份 manager 订阅 + 一份 PartsProjector + 环形缓冲，广播给多连接。 */
 interface SessionFeed {
@@ -1311,8 +1369,9 @@ export class HttpDaemonServer {
       const ring = new EventRing(this.replayBufferSize, this.replayBufferBytes);
       const projector = new PartsProjector(sessionId);
       const emit = (ev: EventEnvelope) => {
-        ring.push(ev);
-        for (const w of writers) w(ev);
+        const event = bufferedSseEvent(ev);
+        ring.push(event);
+        for (const writer of writers) writer(event);
       };
       const handle = await inst.manager
         .open(sessionId, (event: SessionEvent) => {
@@ -1393,20 +1452,20 @@ export class HttpDaemonServer {
       }, this.feedLingerMs);
       feed.linger.unref?.();
     };
-    const pending: { event: EventEnvelope; bytes: number }[] = [];
+    const pending: (BufferedSseEvent | undefined)[] = [];
+    let pendingHead = 0;
     let pendingBytes = 0;
     let captureOverflow = false;
     const capture: Writer = (event) => {
-      const bytes = Buffer.byteLength(sseEventFrame(event));
       if (
-        pending.length >= this.sseMaxPendingEvents ||
-        pendingBytes + bytes > this.sseMaxPendingBytes
+        pending.length - pendingHead >= this.sseMaxPendingEvents ||
+        pendingBytes + event.bytes > this.sseMaxPendingBytes
       ) {
         captureOverflow = true;
         return;
       }
-      pending.push({ event, bytes });
-      pendingBytes += bytes;
+      pending.push(event);
+      pendingBytes += event.bytes;
     };
     feed.writers.add(capture);
     const attachment = this.attach(res, feed.writers, onEmpty, undefined, false);
@@ -1418,17 +1477,23 @@ export class HttpDaemonServer {
       );
       const replay = lastEventId ? feed.ring.replayAfter(lastEventId) : null;
       if (replay) {
-        for (const event of replay) await connection.eventAndFlush(event);
+        for (const event of replay) await connection.rawAndFlush(event.frame);
       } else {
         const snapshot = feed.peek();
         if (!snapshot) throw new HttpRequestError(404, "NOT_FOUND", "session not found");
         await this.writeSnapshot(connection, sessionId, snapshot);
       }
-      while (pending.length > 0) {
+      while (pendingHead < pending.length) {
         if (captureOverflow) throw new Error("SSE initial event buffer exceeded its safety limit");
-        const next = pending.shift()!;
+        const next = pending[pendingHead];
+        pending[pendingHead++] = undefined;
+        if (!next) continue;
         pendingBytes -= next.bytes;
-        await connection.eventAndFlush(next.event);
+        await connection.rawAndFlush(next.frame);
+        if (pendingHead >= 256 && pendingHead * 2 >= pending.length) {
+          pending.splice(0, pendingHead);
+          pendingHead = 0;
+        }
       }
       if (captureOverflow) throw new Error("SSE initial event buffer exceeded its safety limit");
       // Synchronous handoff: no manager event can land between removing capture and activating the
@@ -1484,8 +1549,9 @@ export class HttpDaemonServer {
     const ring = new EventRing(this.replayBufferSize, this.replayBufferBytes);
     const projectors = new Map<string, PartsProjector>();
     const emit = (ev: EventEnvelope) => {
-      ring.push(ev);
-      for (const w of writers) w(ev);
+      const event = bufferedSseEvent(ev);
+      ring.push(event);
+      for (const writer of writers) writer(event);
     };
     const unsub = inst.manager.subscribeAll((sessionId, event) => {
       emit(envelope("session.event", { sessionId, event }));
@@ -1533,7 +1599,7 @@ export class HttpDaemonServer {
         connection.raw("retry: 1000\n\n");
         connection.control(envelope("server.connected", { protocol: PROTOCOL_VERSION }));
         const replay = lastEventId ? fh.ring.replayAfter(lastEventId) : null;
-        if (replay) for (const ev of replay) connection.event(ev);
+        if (replay) for (const event of replay) connection.raw(event.frame);
       },
     );
   }
@@ -1549,7 +1615,7 @@ export class HttpDaemonServer {
     let cleaned = false;
     let active = false;
     let connection: SseBackpressureWriter;
-    const writer: Writer = (ev) => connection.event(ev);
+    const writer: Writer = (event) => connection.raw(event.frame);
     const cleanup = (destroy = false) => {
       if (cleaned) return;
       cleaned = true;

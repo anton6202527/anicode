@@ -109,7 +109,7 @@ export class AnthropicProvider implements Provider {
     );
 
     // 按块索引跟踪进行中的 tool_use，便于在 block stop 时按序发出 tool_call_end
-    const pendingTools = new Map<number, { id: string; name: string; json: string }>();
+    const pendingTools = new Map<number, { id: string; name: string; args: ToolArgumentBuffer }>();
     let eventCount = 0;
     let textBytes = 0;
 
@@ -122,7 +122,11 @@ export class AnthropicProvider implements Provider {
             if (pendingTools.size >= MAX_STREAM_TOOL_CALLS) {
               throw new Error("Provider tool-call count limit exceeded");
             }
-            pendingTools.set(event.index, { id: block.id, name: block.name, json: "" });
+            pendingTools.set(event.index, {
+              id: block.id,
+              name: block.name,
+              args: new ToolArgumentBuffer(),
+            });
             yield { type: "tool_call_start", id: block.id, name: block.name };
           }
           break;
@@ -144,8 +148,8 @@ export class AnthropicProvider implements Provider {
           } else if (d.type === "input_json_delta") {
             const t = pendingTools.get(event.index);
             if (t) {
-              t.json += d.partial_json;
-              if (Buffer.byteLength(t.json, "utf8") > MAX_STREAM_TOOL_ARGUMENT_BYTES) {
+              t.args.append(d.partial_json);
+              if (t.args.byteLength > MAX_STREAM_TOOL_ARGUMENT_BYTES) {
                 throw new Error("Provider tool-call arguments limit exceeded");
               }
               yield { type: "tool_call_delta", id: t.id, argsText: d.partial_json };
@@ -157,7 +161,10 @@ export class AnthropicProvider implements Provider {
           const t = pendingTools.get(event.index);
           if (t) {
             pendingTools.delete(event.index);
-            yield { type: "tool_call_end", part: parseToolCall(t) };
+            yield {
+              type: "tool_call_end",
+              part: parseToolCall({ id: t.id, name: t.name, json: t.args.toString() }),
+            };
           }
           break;
         }
@@ -171,6 +178,31 @@ export class AnthropicProvider implements Provider {
       message: fromAnthropicContent(final.content),
       usage: mapUsage(final.usage),
     };
+  }
+}
+
+/** Append-only tool JSON buffer with exact incremental UTF-8 accounting. */
+class ToolArgumentBuffer {
+  private readonly fragments: string[] = [];
+  private bytes = 0;
+  private trailingHighSurrogate = false;
+
+  get byteLength(): number {
+    return this.bytes;
+  }
+
+  append(fragment: string): void {
+    if (!fragment) return;
+    const first = fragment.charCodeAt(0);
+    const joinsPreviousSurrogate = this.trailingHighSurrogate && first >= 0xdc00 && first <= 0xdfff;
+    this.bytes += Buffer.byteLength(fragment, "utf8") - (joinsPreviousSurrogate ? 2 : 0);
+    const last = fragment.charCodeAt(fragment.length - 1);
+    this.trailingHighSurrogate = last >= 0xd800 && last <= 0xdbff;
+    this.fragments.push(fragment);
+  }
+
+  toString(): string {
+    return this.fragments.join("");
   }
 }
 

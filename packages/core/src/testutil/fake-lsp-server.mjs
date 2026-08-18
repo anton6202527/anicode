@@ -3,7 +3,14 @@
  * LSP JSON-RPC over stdio（Content-Length 分帧）：
  *   initialize → 空 capabilities；textDocument/didOpen → 立刻回一条 error 诊断。
  */
+import { appendFileSync } from "node:fs";
+
 let buffer = Buffer.alloc(0);
+const lifecycleLog = process.argv[2];
+
+function logLifecycle(method, uri) {
+  if (lifecycleLog) appendFileSync(lifecycleLog, `${JSON.stringify({ method, uri })}\n`);
+}
 
 function writeFrame(obj) {
   const body = Buffer.from(JSON.stringify(obj), "utf8");
@@ -16,21 +23,23 @@ function handle(msg) {
     writeFrame({ jsonrpc: "2.0", id: msg.id, result: { capabilities: {} } });
   } else if (msg.method === "textDocument/didOpen") {
     const uri = msg.params.textDocument.uri;
+    logLifecycle("open", uri);
+    const flood = uri.endsWith("/many.ts");
     writeFrame({
       jsonrpc: "2.0",
       method: "textDocument/publishDiagnostics",
       params: {
         uri,
-        diagnostics: [
-          {
-            range: { start: { line: 2, character: 4 }, end: { line: 2, character: 9 } },
-            severity: 1,
-            source: "fake",
-            message: "类型不匹配（测试诊断）",
-          },
-        ],
+        diagnostics: Array.from({ length: flood ? 150 : 1 }, (_, index) => ({
+          range: { start: { line: 2, character: 4 }, end: { line: 2, character: 9 } },
+          severity: 1,
+          source: "fake",
+          message: flood ? `${index}:${"x".repeat(4_096)}` : "类型不匹配（测试诊断）",
+        })),
       },
     });
+  } else if (msg.method === "textDocument/didClose") {
+    logLifecycle("close", msg.params.textDocument.uri);
   } else if (msg.method === "textDocument/definition") {
     writeFrame({
       jsonrpc: "2.0",

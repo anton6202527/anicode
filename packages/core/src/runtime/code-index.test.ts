@@ -55,3 +55,36 @@ test("CodeIndex: 内存模式复用未变化文件且不写索引", async () => 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("CodeIndex: broad symbol queries preserve deterministic forward and reverse references", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-index-wide-"));
+  try {
+    await Promise.all([
+      fs.writeFile(path.join(root, "a.ts"), "export function alphaTarget() {}\n"),
+      fs.writeFile(
+        path.join(root, "b.ts"),
+        "export function betaTarget() { return alphaTarget(); }\n",
+      ),
+      fs.writeFile(
+        path.join(root, "c.ts"),
+        "export function caller() { alphaTarget(); betaTarget(); }\n",
+      ),
+      fs.writeFile(path.join(root, "d.ts"), "export const result = alphaTarget();\n"),
+    ]);
+    const index = new IncrementalCodeIndex(root, {
+      extractSymbols,
+      indexFile: path.join(root, ".cache", "index.json"),
+      persist: false,
+    });
+    await index.refresh();
+
+    const hits = await index.search("target", 10);
+    const byPath = new Map(hits.map((hit) => [hit.path, hit]));
+    assert.deepEqual(byPath.get("a.ts")?.references, ["b.ts", "c.ts", "d.ts"]);
+    assert.deepEqual(byPath.get("b.ts")?.references, ["a.ts", "c.ts"]);
+    assert.ok((byPath.get("a.ts")?.graph ?? 0) > 0);
+    assert.ok((byPath.get("c.ts")?.graph ?? 0) > 0);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

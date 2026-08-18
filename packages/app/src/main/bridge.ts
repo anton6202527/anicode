@@ -266,6 +266,8 @@ export class Bridge {
   private readonly plugins: PluginRuntime;
   private readonly runtimeStack: LocalRuntimeStack;
   private readonly telemetry: Telemetry;
+  private initPromise: Promise<void> | undefined;
+  private workspaceTrustGeneration = 0;
   private disposePromise: Promise<void> | undefined;
   /**
    * 被市场关闭的文件系统技能名。稳定引用传给 SessionManager 的 skills.disabled，
@@ -393,8 +395,10 @@ export class Bridge {
   }
 
   /** 启动时发现文件系统技能、读取已保存的插件状态并连接已启用的 MCP，需在处理请求前调用。 */
-  async init(): Promise<void> {
-    await this.reconcileWorkspaceTrust(this.options.workspaceTrusted !== false);
+  init(): Promise<void> {
+    return (this.initPromise ??= this.reconcileWorkspaceTrust(
+      this.options.workspaceTrusted !== false,
+    ));
   }
 
   /** 把「被关闭的文件系统技能」同步进传给 agent 的稳定数组（原地更新，保持引用）。 */
@@ -444,7 +448,8 @@ export class Bridge {
       }
     });
     handle("host:listSessions", () => this.manager.listSessions());
-    handle("host:createSession", (_event, value) => {
+    handle("host:createSession", async (_event, value) => {
+      await this.init();
       const input = record(value, "session");
       const cwd = path.resolve(stringValue(input["cwd"], "session.cwd"));
       return this.manager.createSession({
@@ -455,9 +460,10 @@ export class Bridge {
           : {}),
       });
     });
-    handle("host:send", (_event, id, text) =>
-      this.manager.send(sessionId(id), stringValue(text, "text", 1_048_576)),
-    );
+    handle("host:send", async (_event, id, text) => {
+      await this.init();
+      return this.manager.send(sessionId(id), stringValue(text, "text", 1_048_576));
+    });
     handle("host:interrupt", (_event, id) => this.manager.interrupt(sessionId(id)));
     handle("host:setTitle", (_event, id, title) =>
       this.manager.setTitle(sessionId(id), stringValue(title, "title", 512)),
@@ -481,6 +487,7 @@ export class Bridge {
     });
 
     handle("host:open", async (event, id) => {
+      await this.init();
       const subId = randomUUID();
       const sender = event.sender;
       const forwarder = new SessionEventForwarder(sender, subId);
@@ -508,8 +515,12 @@ export class Bridge {
       this.removeUserModel(stringValue(spec, "model spec", 384)),
     );
 
-    handle("plugins:list", () => this.listPlugins());
+    handle("plugins:list", async () => {
+      await this.init();
+      return this.listPlugins();
+    });
     handle("plugins:setEnabled", async (_event, id, enabled) => {
+      await this.init();
       if (typeof enabled !== "boolean") throw new TypeError("enabled must be boolean");
       if (!(await this.workspaceTrusted())) {
         await this.plugins.setSuspended(true);
@@ -679,9 +690,10 @@ export class Bridge {
       cwd: this.options.cwd,
       sessionsDir: this.options.sessionsDir,
       defaultModel:
-        cloudReady && this.options.cloudDefaultModel
+        this.options.defaultModel ??
+        (cloudReady && this.options.cloudDefaultModel
           ? this.options.cloudDefaultModel
-          : (this.options.defaultModel ?? this.runtimeStack.providers.resolveDefaultModel()),
+          : this.runtimeStack.providers.resolveDefaultModel()),
       inspectProviderCredentials: true,
     };
   }
@@ -719,6 +731,7 @@ export class Bridge {
   }
 
   private async reconcileWorkspaceTrust(trusted: boolean): Promise<void> {
+    const generation = ++this.workspaceTrustGeneration;
     if (!trusted) {
       await this.plugins.setSuspended(true);
       return;
@@ -726,8 +739,11 @@ export class Bridge {
     // Load state while suspended, then connect. This prevents a trust transition from exposing a
     // partially reconciled registry to the replacement Agent.
     await this.plugins.setSuspended(true);
+    if (generation !== this.workspaceTrustGeneration) return;
     await this.plugins.refreshSkills(this.options.cwd);
+    if (generation !== this.workspaceTrustGeneration) return;
     await this.plugins.setState(await this.readSavedPlugins());
+    if (generation !== this.workspaceTrustGeneration) return;
     this.syncDisabledSkills();
     await this.plugins.setSuspended(false);
   }

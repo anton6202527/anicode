@@ -14,6 +14,7 @@ import {
   registerOpenAICompatibleProvider,
   registerProvider,
   type CredentialBroker,
+  type McpClient,
   type Provider,
   type SecretBackend,
 } from "@anicode/core";
@@ -132,6 +133,124 @@ test("Bridge: rejects IPC from an untrusted renderer", async () => {
     await assert.rejects(() => invoke("app:info", new FakeSender()), /untrusted IPC sender/);
   } finally {
     await bridge.dispose();
+  }
+});
+
+test("Bridge: window-safe metadata stays responsive while the first agent drive waits for plugins", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-background-init-"));
+  const pluginsFile = path.join(dir, "plugins.json");
+  await fs.writeFile(pluginsFile, JSON.stringify(["mcp.context7"]));
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => (markStarted = resolve));
+  let releaseConnect!: () => void;
+  const connectGate = new Promise<void>((resolve) => (releaseConnect = resolve));
+  const bridge = new Bridge({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile,
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    env: memoryCredentialEnv(),
+    mcpConnector: async () => {
+      markStarted();
+      await connectGate;
+      return {
+        tools: [],
+        clients: [{ close: async () => undefined } as McpClient],
+      };
+    },
+    isTrustedSender: () => true,
+  });
+  const { ipcMain, invoke } = fakeIpc();
+  bridge.register(ipcMain);
+  const sender = new FakeSender();
+  try {
+    const initialization = bridge.init();
+    await started;
+
+    const info = (await invoke("app:info", sender)) as { name: string };
+    assert.equal(info.name, "anicode", "safe shell metadata must not wait for optional MCP I/O");
+    let sessionSettled = false;
+    const session = invoke("host:createSession", sender, {
+      cwd: dir,
+      model: "debug/demo",
+    }).then((value) => {
+      sessionSettled = true;
+      return value;
+    });
+    let openSettled = false;
+    const opening = invoke("host:open", sender, "missing-session").then(
+      () => {
+        openSettled = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        openSettled = true;
+        return error;
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sessionSettled, false, "an agent must not observe a partial plugin registry");
+    assert.equal(openSettled, false, "resumed agents must wait for the same plugin readiness gate");
+
+    releaseConnect();
+    await initialization;
+    assert.ok((await session) as object);
+    assert.ok((await opening) instanceof Error);
+    const plugins = (await invoke("plugins:list", sender)) as PluginEntry[];
+    assert.equal(plugins.find((entry) => entry.id === "mcp.context7")?.runtime?.connected, true);
+  } finally {
+    releaseConnect();
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bridge: stale trusted reconciliation cannot cross a newer trust revocation", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-trust-generation-"));
+  const pluginsFile = path.join(dir, "plugins.json");
+  await fs.writeFile(pluginsFile, JSON.stringify(["mcp.context7"]));
+  let connectCalls = 0;
+  const bridge = new Bridge({
+    cwd: dir,
+    sessionsDir: path.join(dir, "sessions"),
+    pluginsFile,
+    modelsFile: path.join(dir, "models.json"),
+    appName: "anicode",
+    appVersion: "0.0.1-test",
+    env: memoryCredentialEnv(),
+    mcpConnector: async () => {
+      connectCalls++;
+      return { tools: [], clients: [] };
+    },
+    isTrustedSender: () => true,
+  });
+  let markRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => (markRefreshStarted = resolve));
+  let releaseRefresh!: () => void;
+  const refreshGate = new Promise<void>((resolve) => (releaseRefresh = resolve));
+  const internals = bridge as unknown as {
+    plugins: { refreshSkills(cwd: string): Promise<void> };
+    reconcileWorkspaceTrust(trusted: boolean): Promise<void>;
+  };
+  internals.plugins.refreshSkills = async () => {
+    markRefreshStarted();
+    await refreshGate;
+  };
+
+  try {
+    const staleTrusted = internals.reconcileWorkspaceTrust(true);
+    await refreshStarted;
+    await internals.reconcileWorkspaceTrust(false);
+    releaseRefresh();
+    await staleTrusted;
+
+    assert.equal(connectCalls, 0, "the stale trusted pass must not resume MCP connections");
+  } finally {
+    releaseRefresh();
+    await bridge.dispose();
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -323,7 +442,7 @@ test("Bridge: 未显式指定默认模型时使用自身 runtimeStack provider �
   }
 });
 
-test("Bridge: 登录后云端模型优先，auth IPC 只返回脱敏状态", async () => {
+test("Bridge: 显式模型优先于登录后的云端回退，auth IPC 只返回脱敏状态", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-app-cloud-auth-"));
   let status: CloudAuthStatus = {
     state: "signed_in",
@@ -372,7 +491,11 @@ test("Bridge: 登录后云端模型优先，auth IPC 只返回脱敏状态", asy
   const sender = new FakeSender();
   try {
     const info = (await invoke("app:info", sender)) as { defaultModel: string };
-    assert.equal(info.defaultModel, "anicode-cloud/deepseek-v4-flash");
+    assert.equal(
+      info.defaultModel,
+      "custom/local-model",
+      "an explicit model must take precedence over the signed-in cloud fallback",
+    );
 
     const auth = (await invoke("auth:status", sender)) as CloudAuthStatus;
     assert.deepEqual(auth, {

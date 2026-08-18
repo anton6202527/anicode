@@ -238,10 +238,14 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     bridge = await createBridge();
     bridge.register(ipcMain);
-    // 连接已启用的 MCP 插件后再建窗；连接失败不阻塞启动（状态在市场里展示）。
-    await bridge.init().catch(() => {});
+    // Start trust/skill/MCP initialization first, but overlap it with window and renderer startup.
+    // Bridge gates the first agent drive and plugin mutations on this shared readiness Promise.
+    const initialization = bridge.init();
     createWindow();
     startAutoUpdates();
+    void initialization.catch((error) =>
+      console.error("anicode app: background initialization failed", error),
+    );
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

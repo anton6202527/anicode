@@ -2289,7 +2289,7 @@ export async function runExecCommand(
   if (args.listModels) {
     const specs = listModelCatalog().map((entry) => entry.spec);
     if (!specs.includes(ANICODE_CLOUD_DEFAULT_MODEL)) {
-      specs.push(ANICODE_CLOUD_DEFAULT_MODEL, `${ANICODE_CLOUD_PROVIDER_ID}/deepseek-v4-pro`);
+      specs.push(ANICODE_CLOUD_DEFAULT_MODEL);
     }
     output.write(`${specs.join("\n")}\n`);
     return;
@@ -2623,12 +2623,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         `${ANICODE_CLOUD_DEFAULT_MODEL}\trecommended\t${t(
           "Sign in with `anicode auth login`; the shared provider key never reaches the client",
           "使用 `anicode auth login` 登录；共享 provider key 不会下发到客户端",
-        )}`,
-      );
-      rows.push(
-        `${ANICODE_CLOUD_PROVIDER_ID}/deepseek-v4-pro\t-\t${t(
-          "AniCode Cloud account required",
-          "需要 AniCode Cloud 账户",
         )}`,
       );
     }

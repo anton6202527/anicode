@@ -45,6 +45,14 @@ function fakeConnector(): { connect: McpConnector; calls: McpServerConfig[][]; c
   };
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 test("PluginRuntime: 默认启用内建工具，工具集含全部默认工具", async () => {
   const rt = new PluginRuntime(fakeConnector().connect, {});
   await rt.setState([]);
@@ -108,6 +116,129 @@ test("PluginRuntime: 远程 MCP 凭证只以 Broker 引用交给连接器", asyn
   assert.equal(config.url, "https://api.githubcopilot.com/mcp/");
   assert.equal(config.headers?.["X-MCP-Lockdown"], "true");
   assert.ok(rt.buildToolRegistry().names().includes("github__do"));
+});
+
+test("PluginRuntime: independent MCP servers connect concurrently and isolate failures", async () => {
+  const gate = deferred();
+  let started = 0;
+  let active = 0;
+  let peak = 0;
+  const connect: McpConnector = async ([config]) => {
+    assert.ok(config);
+    started += 1;
+    active += 1;
+    peak = Math.max(peak, active);
+    if (started === 3) gate.resolve();
+    await gate.promise;
+    active -= 1;
+    if (config.name === "github") throw new Error("github unavailable");
+    return {
+      tools: [fakeTool(`${config.name}__do`)],
+      clients: [{ close: async () => undefined } as McpClient],
+    };
+  };
+  const env = { GITHUB_TOKEN: "x", SENTRY_ACCESS_TOKEN: "y" };
+  const rt = new PluginRuntime(connect, env, credentialBrokerFromEnv(env, { remove: true }));
+
+  await rt.setState(["mcp.context7", "mcp.github", "mcp.sentry"]);
+
+  assert.equal(peak, 3, "independent startup latency should be max(server), not sum(server)");
+  const names = rt.buildToolRegistry().names();
+  assert.ok(names.includes("context7__do"));
+  assert.ok(names.includes("sentry__do"));
+  assert.ok(!names.includes("github__do"));
+  const github = rt.entriesWithStatus().find((entry) => entry.id === "mcp.github")?.runtime;
+  assert.equal(github?.connected, false);
+  assert.match(github?.error ?? "", /github unavailable/);
+  await rt.dispose();
+});
+
+test("PluginRuntime: state changes serialize behind an in-flight connection", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let closed = 0;
+  const connect: McpConnector = async ([config]) => {
+    assert.equal(config?.name, "context7");
+    entered.resolve();
+    await release.promise;
+    return {
+      tools: [fakeTool("context7__do")],
+      clients: [{ close: async () => void closed++ } as McpClient],
+    };
+  };
+  const rt = new PluginRuntime(connect, {});
+
+  const enable = rt.setState(["mcp.context7"]);
+  await entered.promise;
+  const disable = rt.setState([]);
+  release.resolve();
+  await Promise.all([enable, disable]);
+
+  assert.equal(closed, 1, "the later state must close the just-connected client");
+  assert.ok(!rt.buildToolRegistry().names().includes("context7__do"));
+  await rt.dispose();
+});
+
+test("PluginRuntime: trust revocation hides tools before an in-flight connection settles", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let closed = 0;
+  const connect: McpConnector = async ([config]) => {
+    assert.ok(config);
+    if (config.name === "github") {
+      entered.resolve();
+      await release.promise;
+    }
+    return {
+      tools: [fakeTool(`${config.name}__do`)],
+      clients: [{ close: async () => void closed++ } as McpClient],
+    };
+  };
+  const env = { GITHUB_TOKEN: "x" };
+  const rt = new PluginRuntime(connect, env, credentialBrokerFromEnv(env, { remove: true }));
+  await rt.setState(["mcp.context7"]);
+  assert.ok(rt.buildToolRegistry().names().includes("context7__do"));
+
+  const addGithub = rt.setState(["mcp.context7", "mcp.github"]);
+  await entered.promise;
+  const suspend = rt.setSuspended(true);
+  assert.ok(
+    !rt.buildToolRegistry().names().includes("context7__do"),
+    "revocation must be a synchronous tool-visibility fence",
+  );
+  release.resolve();
+  await Promise.all([addGithub, suspend]);
+
+  assert.equal(closed, 2);
+  await rt.dispose();
+});
+
+test("PluginRuntime: a queued resume cannot cross a newer trust revocation", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let closed = 0;
+  const connect: McpConnector = async () => {
+    entered.resolve();
+    await release.promise;
+    return {
+      tools: [fakeTool("context7__do")],
+      clients: [{ close: async () => void closed++ } as McpClient],
+    };
+  };
+  const rt = new PluginRuntime(connect, {});
+
+  const state = rt.setState(["mcp.context7"]);
+  await entered.promise;
+  const firstRevoke = rt.setSuspended(true);
+  const resume = rt.setSuspended(false);
+  const revoke = rt.setSuspended(true);
+
+  release.resolve();
+  await Promise.all([state, firstRevoke, resume, revoke]);
+
+  assert.ok(!rt.buildToolRegistry().names().includes("context7__do"));
+  assert.equal(closed, 1);
+  await rt.dispose();
 });
 
 test("PluginRuntime: 原始进程密钥不能绕过 Credential Broker", async () => {

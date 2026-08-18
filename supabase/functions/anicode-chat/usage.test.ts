@@ -25,6 +25,22 @@ Deno.test("extracts usage across split SSE chunks and never trusts a smaller tot
   assert(usage?.totalTokens === 19);
   assert(usage.promptTokens === 12);
   assert(usage.completionTokens === 7);
+  assert(usage.promptCacheHitTokens === 0);
+  assert(usage.promptCacheMissTokens === 12);
+  assert(usage.reasoningTokens === 0);
+});
+
+Deno.test("extracts DeepSeek cache and reasoning usage without exceeding component totals", () => {
+  const meter = new OpenAiUsageMeter();
+  meter.push(
+    encoder.encode(
+      'data: {"usage":{"prompt_tokens":12,"prompt_cache_hit_tokens":8,"prompt_cache_miss_tokens":4,"completion_tokens":7,"completion_tokens_details":{"reasoning_tokens":3},"total_tokens":19}}\n\n',
+    ),
+  );
+  const usage = meter.finish();
+  assert(usage?.promptCacheHitTokens === 8);
+  assert(usage.promptCacheMissTokens === 4);
+  assert(usage.reasoningTokens === 3);
 });
 
 Deno.test("ignores unsafe integer usage values", () => {
@@ -102,6 +118,30 @@ Deno.test("missing usage settles the full reservation", async () => {
   await completion;
   assert(settlement?.charged === 123);
   assert(settlement.status === "completed");
+});
+
+Deno.test("authoritative usage overrun is not silently clamped to the reservation", async () => {
+  const upstream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode(
+          'data: {"usage":{"prompt_tokens":90,"completion_tokens":30,"total_tokens":120}}\n\n',
+        ),
+      );
+      controller.close();
+    },
+  });
+  let charged = 0;
+  const { readable, completion } = meteredSseStream(upstream, {
+    signal: new AbortController().signal,
+    reservedTokens: 100,
+    settle(value) {
+      charged = value;
+    },
+  });
+  await new Response(readable).arrayBuffer();
+  await completion;
+  assert(charged === 120);
 });
 
 Deno.test("an aborted stream settles exactly once as aborted", async () => {

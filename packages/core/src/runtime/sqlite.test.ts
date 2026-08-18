@@ -4,8 +4,12 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MigratingSessionStore, SessionStore } from "../session.js";
+import { CommandInbox, DurableOutbox } from "./commands.js";
+import { DurableRuntime } from "./durable.js";
 import { DurableWorkerQueue } from "./worker.js";
 import {
+  SqliteCommandInboxStore,
+  SqliteOutboxStore,
   SqliteRuntimeDatabase,
   SqliteRuntimeEventStore,
   SqliteRuntimeSessionStore,
@@ -72,6 +76,227 @@ test("SQLite runtime: BEGIN IMMEDIATE 回滚、事件幂等与 fencing token", a
     assert.equal((await queue.list())[0]?.status, "succeeded");
   } finally {
     await database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite command inbox: row fast paths preserve idempotency, fencing, and unrelated rows", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-command-fast-path-"));
+  const file = path.join(root, "runtime.db");
+  const databaseA = new SqliteRuntimeDatabase(file);
+  const databaseB = new SqliteRuntimeDatabase(file);
+  try {
+    const inboxA = new CommandInbox(new SqliteCommandInboxStore(databaseA));
+    const inboxB = new CommandInbox(new SqliteCommandInboxStore(databaseB));
+    const first = await inboxA.accept({
+      sessionId: "session_fast",
+      text: "first",
+      model: "deepseek-chat",
+      idempotencyKey: "command-fast-first",
+    });
+    const duplicate = await inboxB.accept({
+      sessionId: "session_fast",
+      text: "first",
+      model: "deepseek-chat",
+      idempotencyKey: "command-fast-first",
+    });
+    assert.equal(duplicate.id, first.id);
+    await assert.rejects(
+      inboxB.accept({
+        sessionId: "session_fast",
+        text: "different payload",
+        model: "deepseek-chat",
+        idempotencyKey: "command-fast-first",
+      }),
+      /different prompt or model/,
+    );
+
+    const untouched = await inboxA.accept({
+      sessionId: "session_fast",
+      text: "must stay byte-for-byte stable",
+      idempotencyKey: "command-fast-untouched",
+    });
+    const untouchedBefore = await databaseA.run(
+      (db) =>
+        db
+          .prepare("SELECT rowid, * FROM commands WHERE session_id = ? AND id = ?")
+          .get("session_fast", untouched.id) as Record<string, unknown>,
+    );
+
+    const claims = await Promise.allSettled([
+      inboxA.claim("session_fast", first.id, "command-owner-a", 60_000),
+      inboxB.claim("session_fast", first.id, "command-owner-b", 60_000),
+    ]);
+    const successful = claims.filter(
+      (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof inboxA.claim>>> =>
+        result.status === "fulfilled",
+    );
+    assert.equal(successful.length, 1, "a command row can have only one live owner");
+    assert.equal(successful[0]!.value.fencingToken, 1);
+    assert.equal(claims.filter((result) => result.status === "rejected").length, 1);
+    assert.equal(
+      (await inboxA.recoverable("session_fast", Number.MAX_SAFE_INTEGER)).some(
+        (command) => command.id === first.id,
+      ),
+      false,
+      "SQLite's clock, not a skewed caller timestamp, owns lease recovery",
+    );
+
+    await databaseA.run((db) =>
+      db
+        .prepare("UPDATE commands SET lease_expires_at = ? WHERE session_id = ? AND id = ?")
+        .run("2000-01-01T00:00:00.000Z", "session_fast", first.id),
+    );
+    const reclaimed = await inboxB.claim("session_fast", first.id, "command-owner-c", 60_000);
+    assert.equal(reclaimed.fencingToken, 2);
+    await assert.rejects(
+      inboxA.finish("session_fast", first.id, "completed", undefined, {
+        owner: successful[0]!.value.leaseOwner!,
+        fencingToken: successful[0]!.value.fencingToken!,
+      }),
+      /Stale fencing token/,
+    );
+    await inboxB.heartbeat(
+      "session_fast",
+      first.id,
+      "command-owner-c",
+      60_000,
+      reclaimed.fencingToken,
+    );
+    await inboxB.finish("session_fast", first.id, "completed", undefined, {
+      owner: "command-owner-c",
+      fencingToken: reclaimed.fencingToken!,
+    });
+    await inboxA.finish("session_fast", first.id, "completed");
+
+    const untouchedAfter = await databaseA.run(
+      (db) =>
+        db
+          .prepare("SELECT rowid, * FROM commands WHERE session_id = ? AND id = ?")
+          .get("session_fast", untouched.id) as Record<string, unknown>,
+    );
+    assert.deepEqual(
+      untouchedAfter,
+      untouchedBefore,
+      "claim/heartbeat/finish must not delete and reinsert sibling command rows",
+    );
+  } finally {
+    await databaseB.close();
+    await databaseA.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite outbox: row claims are ordered, fenced, and do not lease beyond flush limit", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-outbox-fast-path-"));
+  const file = path.join(root, "runtime.db");
+  const databaseA = new SqliteRuntimeDatabase(file);
+  const databaseB = new SqliteRuntimeDatabase(file);
+  try {
+    const storeA = new SqliteOutboxStore(databaseA);
+    const storeB = new SqliteOutboxStore(databaseB);
+    const runtime = new DurableRuntime(new SqliteRuntimeEventStore(databaseA));
+    const outbox = new DurableOutbox(storeA, runtime);
+    const first = await outbox.enqueue({
+      streamId: "outbox-fast",
+      type: "first",
+      data: { value: 1 },
+      idempotencyKey: "outbox-fast-first",
+    });
+    assert.equal(
+      (
+        await outbox.enqueue({
+          streamId: "outbox-fast",
+          type: "first-retry",
+          data: { value: "ignored" },
+          idempotencyKey: "outbox-fast-first",
+        })
+      ).id,
+      first.id,
+    );
+    const untouched = await outbox.enqueue({
+      streamId: "outbox-fast",
+      type: "untouched",
+      data: { stable: true },
+      idempotencyKey: "outbox-fast-untouched",
+    });
+    const untouchedBefore = await databaseA.run(
+      (db) =>
+        db.prepare("SELECT rowid, * FROM outbox WHERE id = ?").get(untouched.id) as Record<
+          string,
+          unknown
+        >,
+    );
+
+    const firstLease = await storeA.claimMessage("outbox-owner-a", 60_000);
+    assert.equal(firstLease?.id, first.id, "the oldest pending row must be claimed first");
+    assert.equal(firstLease?.fencingToken, 1);
+    await storeA.markFailed(firstLease!, "outbox-owner-a", "retry");
+    const secondLease = await storeB.claimMessage("outbox-owner-b", 60_000);
+    assert.equal(secondLease?.id, first.id, "a released oldest row keeps its queue position");
+    assert.equal(secondLease?.fencingToken, 2);
+
+    await databaseA.run((db) =>
+      db
+        .prepare("UPDATE outbox SET lease_expires_at = ? WHERE id = ?")
+        .run("2000-01-01T00:00:00.000Z", first.id),
+    );
+    await assert.rejects(
+      storeB.markSent(secondLease!, "outbox-owner-b", "stale-event"),
+      /Stale or expired fencing token/,
+    );
+    const finalLease = await storeA.claimMessage("outbox-owner-c", 60_000);
+    assert.equal(finalLease?.id, first.id);
+    assert.equal(finalLease?.fencingToken, 3);
+    await storeA.markSent(finalLease!, "outbox-owner-c", "event-first");
+
+    const untouchedAfter = await databaseA.run(
+      (db) =>
+        db.prepare("SELECT rowid, * FROM outbox WHERE id = ?").get(untouched.id) as Record<
+          string,
+          unknown
+        >,
+    );
+    assert.deepEqual(
+      untouchedAfter,
+      untouchedBefore,
+      "claim/fail/sent must not rewrite sibling outbox rows",
+    );
+
+    const owners = ["outbox-racer-a", "outbox-racer-b"];
+    const raced = await Promise.all([
+      storeA.claimMessage(owners[0]!, 60_000),
+      storeB.claimMessage(owners[1]!, 60_000),
+    ]);
+    assert.equal(raced.filter(Boolean).length, 1, "one pending row can be leased only once");
+    const winner = raced.findIndex(Boolean);
+    assert.notEqual(winner, -1);
+    assert.equal(raced[winner]?.id, untouched.id);
+    assert.equal(raced[winner]?.fencingToken, 1);
+    await storeA.markSent(raced[winner]!, owners[winner]!, "event-untouched");
+
+    const third = await outbox.enqueue({
+      streamId: "outbox-fast",
+      type: "third",
+      data: {},
+      idempotencyKey: "outbox-fast-third",
+    });
+    const fourth = await outbox.enqueue({
+      streamId: "outbox-fast",
+      type: "fourth",
+      data: {},
+      idempotencyKey: "outbox-fast-fourth",
+    });
+    const flushed = await outbox.flush(1);
+    assert.equal(flushed.length, 1);
+    assert.equal(flushed[0]?.type, "third");
+    assert.equal((await storeA.getMessage(third.id))?.status, "sent");
+    const notOverClaimed = await storeA.getMessage(fourth.id);
+    assert.equal(notOverClaimed?.status, "pending");
+    assert.equal(notOverClaimed?.leaseOwner, undefined, "flush(limit) must not lease limit + 1");
+  } finally {
+    await databaseB.close();
+    await databaseA.close();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -339,7 +564,7 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
     );
     assert.deepEqual(
       migrations.map((row) => Number(row.version)),
-      [1, 2, 3],
+      [1, 2, 3, 4],
     );
     assert.ok(migrations.every((row) => /^[a-f0-9]{64}$/.test(String(row.checksum))));
 
@@ -379,7 +604,7 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("SQLite runtime: v2 database upgrades to v3 without changing old checksums", async () => {
+test("SQLite runtime: v2 database upgrades to v4 without changing old checksums", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-v2-upgrade-"));
   const file = path.join(root, "runtime.db");
   const seeded = new SqliteRuntimeDatabase(file);
@@ -393,11 +618,16 @@ test("SQLite runtime: v2 database upgrades to v3 without changing old checksums"
     );
     await seeded.run((db) => {
       db.exec(`
+        DROP INDEX idx_outbox_pending;
+        ALTER TABLE outbox DROP COLUMN fencing_token;
+        ALTER TABLE outbox DROP COLUMN lease_expires_at;
+        ALTER TABLE outbox DROP COLUMN lease_owner;
+        CREATE INDEX idx_outbox_pending ON outbox(status, updated_at);
         DROP TABLE session_operation_leases;
         DROP TABLE session_lifecycle;
         ALTER TABLE sessions DROP COLUMN workspace_device;
         ALTER TABLE sessions DROP COLUMN workspace_inode;
-        DELETE FROM schema_migrations WHERE version = 3;
+        DELETE FROM schema_migrations WHERE version IN (3, 4);
       `);
     });
   } finally {
@@ -412,14 +642,14 @@ test("SQLite runtime: v2 database upgrades to v3 without changing old checksums"
         .all()
         .map((row) => Number((row as Record<string, unknown>).version)),
     );
-    assert.deepEqual(versions, [1, 2, 3]);
+    assert.deepEqual(versions, [1, 2, 3, 4]);
     const checksums = await upgraded.run((db) =>
       db
         .prepare("SELECT checksum FROM schema_migrations WHERE version IN (1, 2) ORDER BY version")
         .all()
         .map((row) => String((row as Record<string, unknown>).checksum)),
     );
-    assert.deepEqual(checksums, oldChecksums, "v3 must not rewrite historical migration records");
+    assert.deepEqual(checksums, oldChecksums, "v4 must not rewrite historical migration records");
     const columns = await upgraded.run((db) =>
       db
         .prepare("PRAGMA table_info(sessions)")
@@ -428,6 +658,15 @@ test("SQLite runtime: v2 database upgrades to v3 without changing old checksums"
     );
     assert.ok(columns.includes("workspace_device"));
     assert.ok(columns.includes("workspace_inode"));
+    const outboxColumns = await upgraded.run((db) =>
+      db
+        .prepare("PRAGMA table_info(outbox)")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).name)),
+    );
+    assert.ok(outboxColumns.includes("lease_owner"));
+    assert.ok(outboxColumns.includes("lease_expires_at"));
+    assert.ok(outboxColumns.includes("fencing_token"));
     assert.ok(
       await upgraded.run((db) =>
         Boolean(

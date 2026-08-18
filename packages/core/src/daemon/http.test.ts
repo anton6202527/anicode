@@ -12,6 +12,7 @@ import { EventEmitter } from "node:events";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  EventRing,
   HttpDaemonServer,
   SseBackpressureWriter,
   waitForHttpDrain,
@@ -122,6 +123,25 @@ class FakeSseWritable extends EventEmitter implements SseWritable {
   }
 }
 
+class QuotaSseWritable extends EventEmitter implements SseWritable {
+  readonly writes: string[] = [];
+  writableLength = 0;
+  private quota = 0;
+
+  write(frame: string): boolean {
+    this.writes.push(frame);
+    this.writableLength += Buffer.byteLength(frame);
+    this.quota--;
+    return this.quota > 0;
+  }
+
+  drain(quota: number): void {
+    this.quota = quota;
+    this.writableLength = 0;
+    this.emit("drain");
+  }
+}
+
 test("HTTP artifact drain wait rejects on client close and releases every listener", async () => {
   const response = Object.assign(new EventEmitter(), {
     destroyed: false,
@@ -166,6 +186,49 @@ test("SSE writer: write(false) queues in order, drain resumes, and slow clients 
   assert.equal(slow.listenerCount("drain"), 0, "overflow must release the drain listener");
   slow.drain();
   assert.deepEqual(slow.writes, ["blocked"], "closed slow clients must never flush stale frames");
+});
+
+test("SSE writer: large queues drain incrementally without retaining shifted prefixes", () => {
+  const sink = new QuotaSseWritable();
+  let overflowed = 0;
+  const writer = new SseBackpressureWriter(
+    sink,
+    { maxPendingBytes: 1024 * 1024, maxPendingEvents: 2048 },
+    () => overflowed++,
+  );
+  const frames = Array.from({ length: 1025 }, (_, index) => `frame-${index}`);
+  for (const frame of frames) assert.equal(writer.raw(frame), true);
+  assert.deepEqual(sink.writes, [frames[0]]);
+
+  // Each drain accepts exactly one queued frame before applying backpressure again. This forces
+  // the internal cursor through several compaction windows rather than draining in one burst.
+  sink.drain(1);
+  const queue = (writer as unknown as { queue: unknown[] }).queue;
+  assert.equal(queue[0], undefined, "a drained frame must release its array-slot reference");
+  while (sink.writes.length < frames.length - 1) sink.drain(1);
+  sink.drain(2);
+
+  assert.deepEqual(sink.writes, frames);
+  assert.equal(overflowed, 0);
+  writer.close();
+});
+
+test("SSE replay ring releases evicted frame slots immediately", () => {
+  const ring = new EventRing(1, 1024);
+  ring.push({
+    event: { id: "old", type: "session.event", properties: {} },
+    frame: "old-frame",
+    bytes: 9,
+  });
+  ring.push({
+    event: { id: "new", type: "session.event", properties: {} },
+    frame: "new-frame",
+    bytes: 9,
+  });
+
+  const slots = (ring as unknown as { buf: unknown[] }).buf;
+  assert.equal(slots[0], undefined, "an evicted replay frame must not remain strongly referenced");
+  assert.equal(ring.replayAfter("old"), null);
 });
 
 test("sse 解析：分帧/多 data 行/心跳注释/半帧留存", () => {

@@ -242,9 +242,10 @@ export class IncrementalCodeIndex {
     const snapshot = this.snapshot ?? (await this.refresh());
     const queryTerms = [...new Set(terms(query))];
     const queryVector = this.options.embed ? (await this.options.embed([query]))[0] : undefined;
+    const allFiles = Object.values(snapshot.files);
     const definitions = new Map<string, string[]>();
     const identifierTotals = new Map<string, number>();
-    for (const file of Object.values(snapshot.files)) {
+    for (const file of allFiles) {
       for (const symbol of file.symbols) {
         const key = symbol.name.toLowerCase();
         definitions.set(key, [...(definitions.get(key) ?? []), file.path]);
@@ -256,7 +257,25 @@ export class IncrementalCodeIndex {
     const queriedSymbols = [...definitions.keys()].filter((name) =>
       queryTerms.some((term) => name.includes(term)),
     );
-    const ranked = Object.values(snapshot.files).map((file) => {
+    const queriedSymbolOrder = new Map(queriedSymbols.map((name, index) => [name, index]));
+    const queriedSymbolSet = new Set(queriedSymbols);
+    const queriedSymbolsByFile = new Map<string, string[]>();
+    const referencingFiles = new Map<string, string[]>();
+    // Build the query-specific reverse graph once. The old implementation rescanned every file
+    // for every matching definition, which made broad repo-map queries quadratic in file count.
+    for (const file of allFiles) {
+      const matched = Object.entries(file.identifiers)
+        .filter(([identifier, count]) => count > 0 && queriedSymbolSet.has(identifier))
+        .map(([identifier]) => identifier)
+        .sort((a, b) => queriedSymbolOrder.get(a)! - queriedSymbolOrder.get(b)!);
+      queriedSymbolsByFile.set(file.path, matched);
+      for (const identifier of matched) {
+        const files = referencingFiles.get(identifier);
+        if (files) files.push(file.path);
+        else referencingFiles.set(identifier, [file.path]);
+      }
+    }
+    const ranked = allFiles.map((file) => {
       const pathTerms = new Set(terms(file.path));
       const symbolTerms = new Set(file.symbols.flatMap((symbol) => terms(symbol.name)));
       let lexical = 0;
@@ -267,14 +286,14 @@ export class IncrementalCodeIndex {
         if (symbolTerms.has(term)) lexical += 5;
         lexical += Math.min(3, file.identifiers[term] ?? 0) * 0.6;
         if ((file.identifiers[term] ?? 0) > 0) {
-          for (const target of definitions.get(term) ?? []) {
+          const targets = definitions.get(term) ?? [];
+          for (const target of targets) {
             if (target !== file.path) references.add(target);
           }
-          if ((definitions.get(term)?.length ?? 0) > 0) graph += 2;
+          if (targets.length > 0) graph += 2;
         }
       }
-      for (const symbolName of queriedSymbols) {
-        if ((file.identifiers[symbolName] ?? 0) === 0) continue;
+      for (const symbolName of queriedSymbolsByFile.get(file.path) ?? []) {
         graph += 2;
         for (const target of definitions.get(symbolName) ?? []) {
           if (target !== file.path) references.add(target);
@@ -282,11 +301,12 @@ export class IncrementalCodeIndex {
       }
       // 命中定义文件时，把引用该符号的文件边反向计分。
       for (const symbol of file.symbols) {
-        if (!queriedSymbols.includes(symbol.name.toLowerCase())) continue;
-        for (const other of Object.values(snapshot.files)) {
-          if (other.path !== file.path && (other.identifiers[symbol.name.toLowerCase()] ?? 0) > 0) {
+        const symbolName = symbol.name.toLowerCase();
+        if (!queriedSymbolSet.has(symbolName)) continue;
+        for (const otherPath of referencingFiles.get(symbolName) ?? []) {
+          if (otherPath !== file.path) {
             graph += 0.5;
-            references.add(other.path);
+            references.add(otherPath);
           }
         }
       }

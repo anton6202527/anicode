@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { bearerToken } from "./auth.ts";
+import { installationToken, quotaSubjects } from "./device.ts";
 import { supabaseApiKey } from "./environment.ts";
 import {
   boundedJson,
@@ -9,21 +10,27 @@ import {
   reservationTokens,
   safeJsonError,
 } from "./policy.ts";
-import { type GatewaySettlementStatus, meteredSseStream } from "./usage.ts";
+import {
+  type GatewayRpcError,
+  type QuotaRejection,
+  quotaRejection,
+  quotaResponseHeaders,
+} from "./quota.ts";
+import {
+  type GatewaySettlementStatus,
+  type GatewayUsage,
+  meteredSseStream,
+} from "./usage.ts";
+import { upstreamFailure } from "./upstream.ts";
 
-const DEEPSEEK_CHAT_URL = "https://api.deepseek.com/v1/chat/completions";
+const DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions";
 const UPSTREAM_TIMEOUT_MS = 135_000;
-
-interface RpcError {
-  code?: string;
-  message: string;
-}
 
 interface AdminClient {
   rpc(
     name: string,
     parameters: Record<string, unknown>,
-  ): Promise<{ error: RpcError | null }>;
+  ): Promise<{ data?: unknown; error: GatewayRpcError | null }>;
 }
 
 function requiredEnv(name: string): string {
@@ -99,24 +106,83 @@ function adminClient(): AdminClient {
   }) as unknown as AdminClient;
 }
 
-type ReservationOutcome = "reserved" | "quota-exceeded" | "unavailable";
+type ReservationOutcome =
+  | { state: "reserved" }
+  | { state: "rejected"; rejection: QuotaRejection }
+  | { state: "unavailable" };
+
+async function reclaimStale(admin: AdminClient): Promise<number | undefined> {
+  const { data, error } = await admin.rpc(
+    "reclaim_anicode_llm_stale_requests_v2",
+    {},
+  );
+  if (error || !Number.isSafeInteger(data) || Number(data) < 0) {
+    return undefined;
+  }
+  return Number(data);
+}
+
+async function reserveOnce(
+  admin: AdminClient,
+  userId: string,
+  deviceSubject: string,
+  requestId: string,
+  tokens: number,
+  model: string,
+): Promise<ReservationOutcome> {
+  const { error } = await admin.rpc("reserve_anicode_llm_request_v2", {
+    p_user_id: userId,
+    p_device_subject: deviceSubject,
+    p_request_id: requestId,
+    p_reserved_tokens: tokens,
+    p_model: model,
+  });
+  if (!error) return { state: "reserved" };
+  const rejection = quotaRejection(error);
+  return rejection
+    ? { state: "rejected", rejection }
+    : { state: "unavailable" };
+}
 
 async function reserve(
   admin: AdminClient,
   userId: string,
+  deviceSubject: string,
   requestId: string,
   tokens: number,
+  model: string,
 ): Promise<ReservationOutcome> {
   try {
-    const { error } = await admin.rpc("reserve_anicode_llm_request", {
-      p_user_id: userId,
-      p_request_id: requestId,
-      p_reserved_tokens: tokens,
-    });
-    if (!error) return "reserved";
-    return error.code === "P0001" ? "quota-exceeded" : "unavailable";
+    // This must be a separate RPC so cleanup commits even when the following reservation is
+    // rejected. Keeping it here also makes DB-before-Edge rolling deployment fail closed.
+    if ((await reclaimStale(admin)) === undefined) {
+      return { state: "unavailable" };
+    }
+    const first = await reserveOnce(
+      admin,
+      userId,
+      deviceSubject,
+      requestId,
+      tokens,
+      model,
+    );
+    if (first.state !== "rejected") return first;
+    // If a reservation crossed the legacy five-minute cutoff between the two RPCs, the rejected
+    // transaction rolled that internal cleanup back. Commit a final reaper pass and retry this
+    // never-inserted request ID once so a false daily-quota classification does not reach clients.
+    const reclaimed = await reclaimStale(admin);
+    if (reclaimed === undefined) return { state: "unavailable" };
+    if (reclaimed === 0) return first;
+    return await reserveOnce(
+      admin,
+      userId,
+      deviceSubject,
+      requestId,
+      tokens,
+      model,
+    );
   } catch {
-    return "unavailable";
+    return { state: "unavailable" };
   }
 }
 
@@ -125,12 +191,18 @@ async function settle(
   requestId: string,
   chargedTokens: number,
   status: GatewaySettlementStatus,
+  usage?: GatewayUsage,
 ): Promise<void> {
   try {
-    const { error } = await admin.rpc("settle_anicode_llm_request", {
+    const { error } = await admin.rpc("settle_anicode_llm_request_v2", {
       p_request_id: requestId,
       p_charged_tokens: chargedTokens,
       p_status: status,
+      p_prompt_tokens: usage?.promptTokens ?? null,
+      p_completion_tokens: usage?.completionTokens ?? null,
+      p_prompt_cache_hit_tokens: usage?.promptCacheHitTokens ?? null,
+      p_prompt_cache_miss_tokens: usage?.promptCacheMissTokens ?? null,
+      p_reasoning_tokens: usage?.reasoningTokens ?? null,
     });
     if (error) {
       console.error("anicode gateway quota settlement failed", requestId);
@@ -161,6 +233,34 @@ function modelList(models: ReadonlySet<string>): Response {
 }
 
 async function chat(request: Request, userId: string): Promise<Response> {
+  const token = installationToken(request);
+  if (!token) {
+    return safeJsonError(
+      400,
+      "a protected installation credential is required",
+      "installation_credential_required",
+      { "x-anicode-retryable": "false" },
+    );
+  }
+
+  let deviceSubject: string;
+  let upstreamUserId: string;
+  let upstreamApiKey: string;
+  try {
+    ({ deviceSubject, upstreamUserId } = await quotaSubjects(
+      requiredEnv("ANICODE_DEVICE_PSEUDONYM_KEY"),
+      token,
+      userId,
+    ));
+    upstreamApiKey = requiredEnv("DEEPSEEK_API_KEY");
+  } catch {
+    return safeJsonError(
+      503,
+      "model gateway is not configured",
+      "gateway_unavailable",
+    );
+  }
+
   const allowedModels = configuredModels(
     Deno.env.get("ANICODE_DEEPSEEK_MODELS"),
   );
@@ -185,6 +285,10 @@ async function chat(request: Request, userId: string): Promise<Response> {
     return safeJsonError(400, message, "invalid_request");
   }
 
+  // DeepSeek uses this pseudonym for cache/scheduling/safety isolation. It is deliberately scoped
+  // to the authenticated account and installation and contains no email, hardware ID, or raw token.
+  normalized.body["user_id"] = upstreamUserId;
+
   const requestId = crypto.randomUUID();
   const reservedTokens = reservationTokens(parsed.bytes, normalized.maxTokens);
   let admin: AdminClient;
@@ -197,19 +301,33 @@ async function chat(request: Request, userId: string): Promise<Response> {
       "gateway_unavailable",
     );
   }
-  const reservation = await reserve(admin, userId, requestId, reservedTokens);
-  if (reservation !== "reserved") {
-    return reservation === "quota-exceeded"
-      ? safeJsonError(
-        429,
-        "usage limit reached; retry later",
-        "rate_limit_exceeded",
-      )
-      : safeJsonError(
-        503,
-        "usage service is temporarily unavailable",
-        "quota_unavailable",
+  const reservation = await reserve(
+    admin,
+    userId,
+    deviceSubject,
+    requestId,
+    reservedTokens,
+    normalized.model,
+  );
+  if (reservation.state !== "reserved") {
+    if (reservation.state === "rejected") {
+      const disabled = reservation.rejection.code === "gateway_disabled";
+      return safeJsonError(
+        disabled ? 503 : 429,
+        disabled
+          ? "model gateway is temporarily unavailable"
+          : reservation.rejection.retryable
+          ? "request limit reached; retry later"
+          : "daily free usage limit reached",
+        reservation.rejection.code,
+        quotaResponseHeaders(reservation.rejection),
       );
+    }
+    return safeJsonError(
+      503,
+      "usage service is temporarily unavailable",
+      "quota_unavailable",
+    );
   }
 
   const timeout = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
@@ -221,7 +339,7 @@ async function chat(request: Request, userId: string): Promise<Response> {
       redirect: "error",
       signal,
       headers: {
-        authorization: `Bearer ${requiredEnv("DEEPSEEK_API_KEY")}`,
+        authorization: `Bearer ${upstreamApiKey}`,
         "content-type": "application/json",
       },
       body: JSON.stringify(normalized.body),
@@ -230,7 +348,9 @@ async function chat(request: Request, userId: string): Promise<Response> {
     await settle(
       admin,
       requestId,
-      0,
+      // Once fetch has started, a disconnect/timeout cannot prove that DeepSeek produced no
+      // billable output. Charge the reservation conservatively instead of opening a cost leak.
+      reservedTokens,
       request.signal.aborted ? "aborted" : "failed",
     );
     return safeJsonError(
@@ -244,22 +364,38 @@ async function chat(request: Request, userId: string): Promise<Response> {
     ?.trim().toLowerCase();
   if (!upstream.ok || !upstream.body || contentType !== "text/event-stream") {
     await upstream.body?.cancel().catch(() => undefined);
-    await settle(admin, requestId, 0, "failed");
-    const status = upstream.status === 429 ? 429 : 502;
+    // A malformed 2xx may still represent billable generation. Non-success responses are known
+    // not to contain a completion, but an unexpected success protocol is charged conservatively.
+    await settle(admin, requestId, upstream.ok ? reservedTokens : 0, "failed");
+    const failure = upstreamFailure(upstream);
+    console.warn(
+      "anicode gateway upstream failure",
+      requestId,
+      upstream.status,
+      failure.code,
+    );
     return safeJsonError(
-      status,
-      status === 429
-        ? "model capacity is temporarily limited"
-        : "model request failed",
-      status === 429 ? "upstream_rate_limited" : "upstream_failed",
+      failure.status,
+      failure.message,
+      failure.code,
+      failure.headers,
     );
   }
 
   const { readable, completion } = meteredSseStream(upstream.body, {
     signal: request.signal,
     reservedTokens,
-    settle: (chargedTokens, status) =>
-      settle(admin, requestId, chargedTokens, status),
+    settle: async (chargedTokens, status, usage) => {
+      if (chargedTokens > reservedTokens) {
+        console.warn(
+          "anicode gateway reservation overrun",
+          requestId,
+          reservedTokens,
+          chargedTokens,
+        );
+      }
+      await settle(admin, requestId, chargedTokens, status, usage);
+    },
   });
   // Supabase needs the pipe/settlement promise to remain live after the streaming Response returns.
   // The catch is defensive even though settle itself is deliberately non-throwing.

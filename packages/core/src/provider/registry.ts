@@ -246,6 +246,7 @@ export interface OpenAICompatibleProviderRegistration {
   streamUsage?: boolean;
   maxTokensField?: MaxTokensField;
   reasoningEffort?: boolean;
+  thinkingMode?: "enabled" | "disabled";
 }
 
 const providers = new Map<string, RegisteredProvider>();
@@ -521,22 +522,25 @@ function openAI(
 }
 
 const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
-  openAI("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", {
+  openAI("deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY", {
     baseURLEnv: "DEEPSEEK_BASE_URL",
     requireHttps: true,
     streamUsage: true,
     maxTokensField: "max_tokens",
     reasoningEffort: false,
+    // V4 defaults to thinking. AniCode's OpenAI-compatible adapter does not persist
+    // reasoning_content across tool turns, so direct DeepSeek must use the compatible mode.
+    thinkingMode: "disabled",
     capabilities: cloudDefaults,
     limits: { contextWindow: 1_000_000, maxOutputTokens: 384_000 },
     models: [
       {
         pattern: "deepseek-v4-flash",
-        cost: { input: 0.14, output: 0.28, cacheRead: 0.0028 },
+        cost: { input: 0.44, output: 1.32, cacheRead: 0.014 },
       },
       {
         pattern: "deepseek-v4-pro",
-        cost: { input: 0.435, output: 0.87, cacheRead: 0.003625 },
+        cost: { input: 1.32, output: 3.96, cacheRead: 0.044 },
       },
       {
         pattern: "deepseek-chat",
@@ -556,13 +560,13 @@ const OPENAI_BUILTINS: OpenAICompatibleProviderRegistration[] = [
         label: "DeepSeek V4 Flash",
         openWeight: true,
         recommended: true,
-        note: "开放权重、官方直连；优先使用赠送余额，超出后按量计费",
+        note: "开放权重、官方直连；按官方峰时上界估算，实际随时段变化",
       },
       {
         model: "deepseek-v4-pro",
         label: "DeepSeek V4 Pro",
         openWeight: true,
-        note: "更强的官方模型，按量计费",
+        note: "更强的官方模型；按官方峰时上界估算，实际随时段变化",
       },
     ],
   }),
@@ -841,6 +845,7 @@ export function registerOpenAICompatibleProvider(
         ...(input.streamUsage !== undefined ? { streamUsage: input.streamUsage } : {}),
         ...(input.maxTokensField !== undefined ? { maxTokensField: input.maxTokensField } : {}),
         ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+        ...(input.thinkingMode !== undefined ? { thinkingMode: input.thinkingMode } : {}),
       });
     },
   });

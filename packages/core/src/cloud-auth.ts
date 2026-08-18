@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { CredentialBroker } from "./security/credentials.js";
 import type { SecretBackend } from "./security/secret-backends.js";
 import { NetworkProxy } from "./runtime/network-proxy.js";
@@ -8,12 +9,15 @@ import {
 } from "./security/cloud-auth-lock.js";
 
 const REFRESH_STORAGE_KEY = "auth:supabase-refresh";
+const INSTALLATION_TOKEN_STORAGE_KEY = "device:installation-token-v1";
+const INSTALLATION_TOKEN_HEADER = "x-anicode-installation-token";
 const ACCESS_CREDENTIAL_ID = "gateway:supabase-access";
 const ACCESS_REFRESH_SKEW_MS = 60_000;
 const AUTH_TIMEOUT_MS = 30_000;
 const LOGOUT_TIMEOUT_MS = 5_000;
 const MAX_AUTH_RESPONSE_BYTES = 1024 * 1024;
 const MAX_GATEWAY_REQUEST_BYTES = 512 * 1024;
+const INSTALLATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 
 type AuthState = "signed_out" | "configured" | "refreshing" | "signed_in";
 
@@ -224,6 +228,8 @@ export class CloudAuthService {
   private signInGeneration: number | undefined;
   private refreshTask: Promise<CloudSession> | undefined;
   private refreshController: AbortController | undefined;
+  private installationTokenValue: string | undefined;
+  private installationTokenTask: Promise<string> | undefined;
   /** Serialize Keychain reads and mutations so logout's tombstone is ordered after stale writes. */
   private storageTail: Promise<void> = Promise.resolve();
   private readonly lifecycleController = new AbortController();
@@ -687,6 +693,10 @@ export class CloudAuthService {
     const broker = this.broker;
     if (!broker) throw new CloudAuthError("temporarily_unavailable", "模型网关尚未初始化");
     const headers = new Headers(init.headers);
+    // The renderer/provider cannot choose or replace the installation credential. It is generated
+    // in the trusted host, persisted in the OS credential store, and sent only to our fixed HTTPS
+    // gateway. The server stores an HMAC pseudonym rather than this bearer value.
+    headers.set(INSTALLATION_TOKEN_HEADER, await this.installationToken());
     headers.set("apikey", this.publishableKey);
     const lease = broker.lease({
       credentialId: ACCESS_CREDENTIAL_ID,
@@ -713,6 +723,49 @@ export class CloudAuthService {
       }),
       accessRevision,
     };
+  }
+
+  private installationToken(): Promise<string> {
+    if (this.installationTokenValue) return Promise.resolve(this.installationTokenValue);
+    if (this.installationTokenTask) return this.installationTokenTask;
+    const signal = this.lifecycleController.signal;
+    const task = this.enqueueStorage(async () => {
+      try {
+        return await this.coordinationLock.runExclusive(
+          async () => {
+            throwIfAborted(signal);
+            const existing = await this.backend.get(INSTALLATION_TOKEN_STORAGE_KEY, signal);
+            throwIfAborted(signal);
+            if (existing && INSTALLATION_TOKEN_PATTERN.test(existing)) return existing;
+            const created = randomBytes(32).toString("base64url");
+            await this.backend.put(INSTALLATION_TOKEN_STORAGE_KEY, created, signal);
+            throwIfAborted(signal);
+            return created;
+          },
+          { signal },
+        );
+      } catch (error) {
+        if (
+          signal.aborted ||
+          (error instanceof CloudAuthLockError && error.reason === "cancelled")
+        ) {
+          throw new CloudAuthError("temporarily_unavailable", "设备凭证初始化已取消");
+        }
+        throw new CloudAuthError("storage_unavailable", "无法安全保存本机设备凭证");
+      }
+    });
+    this.installationTokenTask = task.then(
+      (value) => {
+        this.installationTokenValue = value;
+        this.installationTokenTask = undefined;
+        return value;
+      },
+      (error: unknown) => {
+        this.installationTokenTask = undefined;
+        throw error;
+      },
+    );
+    return this.installationTokenTask;
   }
 
   private async authRequest(

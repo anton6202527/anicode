@@ -28,6 +28,7 @@ import {
 } from "../index.js";
 import { NetworkProxy } from "../runtime/network-proxy.js";
 import type { ChatMessage } from "../index.js";
+import { OpenAICompatProvider } from "./openai-compat.js";
 
 class CountingProviderSecretBackend implements SyncSecretBackend {
   readonly kind = "sentinel-provider-backend";
@@ -65,6 +66,36 @@ test("registry: 解析 provider/model 前缀", () => {
   const nested = createProvider("deepseek/vendor/nested-model");
   assert.equal(nested.providerId, "deepseek");
   assert.equal(nested.model, "vendor/nested-model");
+});
+
+test("registry: DeepSeek 官方根地址由 OpenAI SDK 正确拼成 chat/completions", async () => {
+  const diagnostics = bindProviderRegistry({ environment: {} }).diagnoseProvider(
+    "deepseek/deepseek-chat",
+  );
+  assert.equal(diagnostics.baseURL, "https://api.deepseek.com");
+
+  let requestUrl = "";
+  let requestBody: Record<string, unknown> | undefined;
+  const provider = new OpenAICompatProvider({
+    name: "deepseek",
+    baseURL: diagnostics.baseURL,
+    apiKey: "test-only-key",
+    maxRetries: 0,
+    thinkingMode: "disabled",
+    fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+      requestUrl = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(
+        'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }) as typeof fetch,
+  });
+  for await (const _event of provider.stream({ model: "deepseek-chat", messages: [] })) {
+    // Drain the SDK stream so the request path and SSE response are both exercised.
+  }
+  assert.equal(requestUrl, "https://api.deepseek.com/chat/completions");
+  assert.deepEqual(requestBody?.["thinking"], { type: "disabled" });
 });
 
 test("registry: 裸模型名按前缀推断（唯一云端 DeepSeek）", () => {
@@ -197,6 +228,10 @@ test("registry: 内置模型目录含 DeepSeek 官方模型 + 零网络 debug/de
   const flash = createProvider("deepseek/deepseek-v4-flash");
   assert.equal(flash.modelInfo.limits.contextWindow, 1_000_000);
   assert.equal(flash.modelInfo.limits.maxOutputTokens, 384_000);
+  assert.deepEqual(flash.modelInfo.cost, { input: 0.44, output: 1.32, cacheRead: 0.014 });
+  const pro = createProvider("deepseek/deepseek-v4-pro");
+  assert.deepEqual(pro.modelInfo.cost, { input: 1.32, output: 3.96, cacheRead: 0.044 });
+  assert.ok(deepseek.every((entry) => entry.note?.includes("实际随时段变化")));
 });
 
 test("registry: defaultSmallModel 为 DeepSeek 返回可解析的小模型，其他返回 undefined", () => {

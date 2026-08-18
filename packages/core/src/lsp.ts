@@ -43,6 +43,9 @@ const SEVERITY: Record<number, Diagnostic["severity"]> = {
 const MAX_LSP_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_LSP_BUFFER_BYTES = MAX_LSP_FRAME_BYTES + 64 * 1024;
 const MAX_LSP_RESULT_ITEMS = 1_000;
+export const MAX_LSP_OPEN_DOCUMENTS = 64;
+export const MAX_LSP_DIAGNOSTICS_PER_DOCUMENT = 100;
+export const MAX_LSP_DIAGNOSTIC_MESSAGE_CHARS = 2_048;
 export const MAX_LSP_DOCUMENT_BYTES = MAX_LSP_FRAME_BYTES;
 
 function isInside(root: string, target: string): boolean {
@@ -362,6 +365,7 @@ export class LspClient {
     this.buffer = Buffer.alloc(0);
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
+    this.clearDocumentState();
     void this.stopProcess().catch(() => undefined);
   }
 
@@ -382,12 +386,12 @@ export class LspClient {
     if (msg.method === "textDocument/publishDiagnostics") {
       const uri: string = msg.params.uri;
       const diags: Diagnostic[] = (msg.params.diagnostics ?? [])
-        .slice(0, MAX_LSP_RESULT_ITEMS)
+        .slice(0, MAX_LSP_DIAGNOSTICS_PER_DOCUMENT)
         .map((d: any) => ({
           line: (d.range?.start?.line ?? 0) + 1,
           column: (d.range?.start?.character ?? 0) + 1,
           severity: SEVERITY[d.severity] ?? "info",
-          message: String(d.message ?? "").slice(0, 16 * 1024),
+          message: String(d.message ?? "").slice(0, MAX_LSP_DIAGNOSTIC_MESSAGE_CHARS),
           ...(d.source ? { source: String(d.source).slice(0, 256) } : {}),
         }));
       void this.acceptDiagnostics(uri, diags);
@@ -403,6 +407,9 @@ export class LspClient {
     } catch {
       return;
     }
+    // publishDiagnostics is push-based and a server may continue publishing workspace-wide files.
+    // Retain only documents that this client deliberately opened, keeping long sessions bounded.
+    if (!this.opened.has(canonicalUri)) return;
     this.diagnostics.set(canonicalUri, diags);
     const waiters = this.diagWaiters.get(canonicalUri);
     if (waiters) {
@@ -424,11 +431,19 @@ export class LspClient {
     const text = await fs.readFile(canonical, "utf8");
     const languageId = this.cfg.languageId ?? guessLanguageId(ext);
     if (this.opened.has(uri)) {
+      // Set insertion order doubles as an LRU: a recently used document moves to the tail.
+      this.opened.delete(uri);
+      this.opened.add(uri);
       this.notify("textDocument/didChange", {
         textDocument: { uri, version: this.nextId++ },
         contentChanges: [{ text }],
       });
     } else {
+      while (this.opened.size >= MAX_LSP_OPEN_DOCUMENTS) {
+        const oldest = this.opened.values().next().value as string | undefined;
+        if (!oldest) break;
+        this.closeDocument(oldest);
+      }
       this.opened.add(uri);
       this.notify("textDocument/didOpen", {
         textDocument: { uri, languageId, version: 1, text },
@@ -538,7 +553,28 @@ export class LspClient {
   }
 
   close(): Promise<void> {
+    this.clearDocumentState();
     return this.stopProcess();
+  }
+
+  private closeDocument(uri: string): void {
+    if (!this.opened.delete(uri)) return;
+    this.diagnostics.delete(uri);
+    const waiters = this.diagWaiters.get(uri);
+    if (waiters) {
+      this.diagWaiters.delete(uri);
+      for (const waiter of waiters) waiter([]);
+    }
+    this.notify("textDocument/didClose", { textDocument: { uri } });
+  }
+
+  private clearDocumentState(): void {
+    this.opened.clear();
+    this.diagnostics.clear();
+    for (const waiters of this.diagWaiters.values()) {
+      for (const waiter of waiters) waiter([]);
+    }
+    this.diagWaiters.clear();
   }
 
   private stopProcess(): Promise<void> {

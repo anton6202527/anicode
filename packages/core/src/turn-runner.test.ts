@@ -19,11 +19,12 @@ function okProvider(text: string): Provider {
   };
 }
 
-function failingProvider(err: unknown): Provider {
+function failingProvider(err: unknown, onCall: () => void = () => undefined): Provider {
   return {
     name: "fake-bad",
     // eslint-disable-next-line require-yield
     async *stream() {
+      onCall();
       throw err;
     },
   };
@@ -40,6 +41,74 @@ async function drain(
   }
   return { events, outcome: r.value };
 }
+
+test("TurnRunner: 硬额度 429 按 error code 或响应 header 终止，不消耗重试预算", async () => {
+  const hardQuotaErrors: unknown[] = [
+    { status: 429, code: "device_daily_token_limit" },
+    { status: 429, code: "device_daily_request_limit" },
+    { status: 429, code: "user_quota_exceeded" },
+    { status: 429, code: "global_quota_exceeded" },
+    { status: 429, error: { code: "quota_exceeded" } },
+    { status: 429, code: "insufficient_quota" },
+    { status: 503, code: "gateway_disabled" },
+    { status: 503, code: "upstream_balance_exhausted" },
+    {
+      status: 429,
+      code: "device_minute_rate_limit",
+      headers: new Headers({ "x-anicode-retryable": "false" }),
+    },
+    {
+      status: 503,
+      code: "upstream_balance_exhausted",
+      headers: new Headers({ "x-anicode-retryable": "false" }),
+    },
+  ];
+
+  for (const error of hardQuotaErrors) {
+    let calls = 0;
+    const runner = new TurnRunner({
+      provider: failingProvider(error, () => calls++),
+      model: "main",
+      retry: { maxRetries: 3, baseDelayMs: 0 },
+      small: { provider: okProvider("small"), model: "small" },
+    });
+    const { events, outcome } = await drain(
+      runner.runTurn({
+        system: "",
+        messages: [],
+        toolDefs: [],
+        signal: new AbortController().signal,
+      }),
+    );
+    assert.equal((outcome as { type: string }).type, "error");
+    assert.equal(calls, 1);
+    assert.equal(
+      events.some((event) => event.type === "retry"),
+      false,
+    );
+  }
+});
+
+test("TurnRunner: 分钟限速 429 仍按瞬时错误重试", async () => {
+  let calls = 0;
+  const runner = new TurnRunner({
+    provider: failingProvider({ status: 429, code: "device_minute_rate_limit" }, () => calls++),
+    model: "main",
+    retry: { maxRetries: 1, baseDelayMs: 0 },
+    small: { provider: okProvider("small"), model: "small" },
+  });
+  const { events, outcome } = await drain(
+    runner.runTurn({
+      system: "",
+      messages: [],
+      toolDefs: [],
+      signal: new AbortController().signal,
+    }),
+  );
+  assert.equal((outcome as { type: string }).type, "error");
+  assert.equal(calls, 2);
+  assert.equal(events.filter((event) => event.type === "retry").length, 1);
+});
 
 test("TurnRunner: 主模型失败 → 按降级链切换并完成本轮；restore 还原主模型", async () => {
   const good = okProvider("hi");

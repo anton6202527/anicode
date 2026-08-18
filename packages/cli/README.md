@@ -28,12 +28,15 @@ anicode credentials remove OPENAI_API_KEY
 普通启动不会枚举 OS Keychain，也不会把 `.env` 或 shell 中的密钥自动持久化。若启用了系统凭证库，
 本地 TUI、`exec` 和 MCP host 仅在需要判断默认路由、明确选择 Cloud 或恢复未知会话时读取 AniCode Cloud
 专用命名空间中的单个 refresh 记录；动态 HTTP host 启动时也会恢复它。`--demo`、明确的非 Cloud 模型和
-非 Cloud `config.model` 不触碰该记录。Keychain 中只持久化 refresh token，短期 access token 只进入内存 Credential Broker。
+非 Cloud `config.model` 不触碰该记录。Keychain 中持久化 refresh token，以及独立的 256-bit 随机安装
+凭证；短期 access token 只进入内存 Credential Broker。安装凭证只发送到固定 AniCode Gateway，服务端仅保存
+HMAC 标识，并在退出登录后保留，避免通过反复登录重置当日免费额度。
 没有显式模型来源时，启动恢复使用短硬截止；Keychain 或登录服务慢/离线会安全取消本次恢复并快速回落到用户自己的
 `deepseek/deepseek-v4-flash`，迟到的读取或响应不能再写回登录态。显式 `--model anicode-cloud[/...]` 或 Cloud
 `config.model` 不会被静默改写，并使用完整认证截止后给出明确错误。裸 `anicode-cloud` 等价于
 `anicode-cloud/deepseek-v4-flash`。
-共享 DeepSeek key 始终留在服务端网关，不会下发、写入配置或出现在 CLI 状态 DTO/日志中。环境密钥只在当前进程
+共享 DeepSeek key 始终留在服务端网关，不会下发、写入配置或出现在 CLI 状态 DTO/日志中。免费目录只公开
+`deepseek-v4-flash`；Pro 需要付费 entitlement 或用户自带 Key。环境密钥只在当前进程
 Broker 中使用；长期保存必须通过 `credentials import` 明确执行，运行时再用
 `ANICODE_CREDENTIAL_KEYS` 指定允许按需读取的精确名称。provider 诊断、默认模型选择和会话
 create/open/resume 都是 metadata-only；懒加载引用直到该会话首次实际 `send/stream` 才读取，失败后可在

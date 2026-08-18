@@ -9,7 +9,13 @@ import { chmodSync, closeSync, lstatSync, mkdirSync, openSync } from "node:fs";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Artifact, ArtifactInput, ArtifactRecord, ArtifactStore } from "./artifacts.js";
-import type { CommandInboxStore, DurableCommand, OutboxMessage, OutboxStore } from "./commands.js";
+import {
+  CommandIdempotencyConflictError,
+  type CommandInboxStore,
+  type DurableCommand,
+  type OutboxMessage,
+  type OutboxStore,
+} from "./commands.js";
 import type { ISessionStore, SessionData, SessionMeta } from "../session.js";
 import type { ChatMessage } from "../types.js";
 import type {
@@ -179,6 +185,16 @@ const RUNTIME_SCHEMA_V3 = `
     ON session_operation_leases(session_id, expires_at);
 `;
 
+const RUNTIME_SCHEMA_V4 = `
+  ALTER TABLE outbox ADD COLUMN lease_owner TEXT;
+  ALTER TABLE outbox ADD COLUMN lease_expires_at TEXT;
+  ALTER TABLE outbox ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0;
+
+  DROP INDEX idx_outbox_pending;
+  CREATE INDEX idx_outbox_pending
+    ON outbox(status, lease_expires_at, updated_at);
+`;
+
 const SQLITE_MIGRATIONS = [
   { version: 1, description: "initial durable runtime schema", sql: RUNTIME_SCHEMA_V1 },
   { version: 2, description: "retention and compaction indexes", sql: RUNTIME_SCHEMA_V2 },
@@ -186,6 +202,11 @@ const SQLITE_MIGRATIONS = [
     version: 3,
     description: "durable session lifecycle leases and workspace identity",
     sql: RUNTIME_SCHEMA_V3,
+  },
+  {
+    version: 4,
+    description: "outbox leases and fencing tokens",
+    sql: RUNTIME_SCHEMA_V4,
   },
 ] as const;
 
@@ -251,6 +272,41 @@ function json<T>(value: unknown): T {
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function sqliteTimestamp(db: DatabaseSync): string {
+  const row = db.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS value").get() as Row;
+  const value = String(row.value);
+  if (!Number.isFinite(Date.parse(value))) throw new Error("SQLite failed to provide its clock");
+  return value;
+}
+
+function leaseExpiresAt(now: string, leaseMs: number): string {
+  return new Date(Date.parse(now) + Math.max(1_000, leaseMs)).toISOString();
+}
+
+function commandFromSqliteRow(row: Row): DurableCommand {
+  const command = json<DurableCommand>(row.data);
+  command.status = String(row.status) as DurableCommand["status"];
+  command.updatedAt = String(row.updated_at);
+  command.fencingToken = Number(row.fencing_token ?? 0);
+  if (row.lease_owner == null) delete command.leaseOwner;
+  else command.leaseOwner = String(row.lease_owner);
+  if (row.lease_expires_at == null) delete command.leaseExpiresAt;
+  else command.leaseExpiresAt = String(row.lease_expires_at);
+  return command;
+}
+
+function outboxFromSqliteRow(row: Row): OutboxMessage {
+  const message = json<OutboxMessage>(row.data);
+  message.status = String(row.status) as OutboxMessage["status"];
+  message.updatedAt = String(row.updated_at);
+  message.fencingToken = Number(row.fencing_token ?? 0);
+  if (row.lease_owner == null) delete message.leaseOwner;
+  else message.leaseOwner = String(row.lease_owner);
+  if (row.lease_expires_at == null) delete message.leaseExpiresAt;
+  else message.leaseExpiresAt = String(row.lease_expires_at);
+  return message;
 }
 
 function assertIdentifier(value: string, label: string): void {
@@ -1233,6 +1289,215 @@ export class SqliteCommandInboxStore implements CommandInboxStore {
     );
   }
 
+  insertCommand(command: DurableCommand): Promise<DurableCommand> {
+    assertIdentifier(command.sessionId, "command session id");
+    assertIdentifier(command.id, "command id");
+    return this.database.transaction((db) => {
+      const inserted = db
+        .prepare(
+          `INSERT INTO commands
+           (session_id, id, idempotency_key, status, lease_owner, lease_expires_at,
+            fencing_token, data, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id, idempotency_key) DO NOTHING`,
+        )
+        .run(
+          command.sessionId,
+          command.id,
+          command.idempotencyKey,
+          command.status,
+          command.leaseOwner ?? null,
+          command.leaseExpiresAt ?? null,
+          command.fencingToken ?? 0,
+          JSON.stringify(command),
+          command.updatedAt,
+        );
+      if (Number(inserted.changes) === 1) return clone(command);
+
+      const duplicate = db
+        .prepare(
+          `SELECT * FROM commands
+           WHERE session_id = ? AND idempotency_key = ?`,
+        )
+        .get(command.sessionId, command.idempotencyKey) as Row | undefined;
+      if (!duplicate) throw new Error("Command idempotency conflict disappeared");
+      const existing = commandFromSqliteRow(duplicate);
+      if (existing.text !== command.text || existing.model !== command.model) {
+        throw new CommandIdempotencyConflictError(command.idempotencyKey);
+      }
+      return existing;
+    });
+  }
+
+  claimCommand(
+    sessionId: string,
+    commandId: string,
+    owner: string,
+    leaseMs: number,
+    _now: number,
+  ): Promise<DurableCommand> {
+    assertIdentifier(sessionId, "command session id");
+    assertIdentifier(commandId, "command id");
+    return this.database.transaction((db) => {
+      const row = db
+        .prepare("SELECT * FROM commands WHERE session_id = ? AND id = ?")
+        .get(sessionId, commandId) as Row | undefined;
+      if (!row) throw new Error(`Unknown durable command: ${commandId}`);
+
+      const now = sqliteTimestamp(db);
+      const current = commandFromSqliteRow(row);
+      const leaseActive = current.leaseExpiresAt !== undefined && current.leaseExpiresAt > now;
+      if (current.status === "running" && leaseActive) {
+        throw new Error(`Durable command ${commandId} is leased by ${current.leaseOwner}`);
+      }
+      if (current.status !== "accepted" && current.status !== "running") {
+        throw new Error(`Durable command ${commandId} is already ${current.status}`);
+      }
+
+      current.status = "running";
+      current.attempts++;
+      current.fencingToken = (current.fencingToken ?? 0) + 1;
+      current.leaseOwner = owner;
+      current.leaseExpiresAt = leaseExpiresAt(now, leaseMs);
+      current.updatedAt = now;
+      db.prepare(
+        `UPDATE commands
+         SET status = ?, lease_owner = ?, lease_expires_at = ?, fencing_token = ?,
+             data = ?, updated_at = ?
+         WHERE session_id = ? AND id = ?`,
+      ).run(
+        current.status,
+        current.leaseOwner,
+        current.leaseExpiresAt,
+        current.fencingToken,
+        JSON.stringify(current),
+        current.updatedAt,
+        sessionId,
+        commandId,
+      );
+      return clone(current);
+    });
+  }
+
+  heartbeatCommand(
+    sessionId: string,
+    commandId: string,
+    owner: string,
+    leaseMs: number,
+    fencingToken?: number,
+  ): Promise<void> {
+    assertIdentifier(sessionId, "command session id");
+    assertIdentifier(commandId, "command id");
+    return this.database.transaction((db) => {
+      const row = db
+        .prepare("SELECT * FROM commands WHERE session_id = ? AND id = ?")
+        .get(sessionId, commandId) as Row | undefined;
+      const current = row ? commandFromSqliteRow(row) : undefined;
+      if (!current || current.status !== "running" || current.leaseOwner !== owner) {
+        throw new Error(`Cannot heartbeat unowned command ${commandId}`);
+      }
+      if (fencingToken !== undefined && current.fencingToken !== fencingToken) {
+        throw new Error(`Stale fencing token for command ${commandId}`);
+      }
+      const now = sqliteTimestamp(db);
+      if (!current.leaseExpiresAt || current.leaseExpiresAt <= now) {
+        throw new Error(`Expired lease for command ${commandId}`);
+      }
+
+      current.leaseExpiresAt = leaseExpiresAt(now, leaseMs);
+      current.updatedAt = now;
+      db.prepare(
+        `UPDATE commands
+         SET lease_expires_at = ?, data = ?, updated_at = ?
+         WHERE session_id = ? AND id = ?`,
+      ).run(
+        current.leaseExpiresAt,
+        JSON.stringify(current),
+        current.updatedAt,
+        sessionId,
+        commandId,
+      );
+    });
+  }
+
+  finishCommand(
+    sessionId: string,
+    commandId: string,
+    status: "completed" | "failed" | "cancelled",
+    error?: string,
+    lease?: { owner: string; fencingToken: number },
+  ): Promise<void> {
+    assertIdentifier(sessionId, "command session id");
+    assertIdentifier(commandId, "command id");
+    return this.database.transaction((db) => {
+      const row = db
+        .prepare("SELECT * FROM commands WHERE session_id = ? AND id = ?")
+        .get(sessionId, commandId) as Row | undefined;
+      if (!row) throw new Error(`Unknown durable command: ${commandId}`);
+      const current = commandFromSqliteRow(row);
+      if (
+        current.status === "completed" ||
+        current.status === "failed" ||
+        current.status === "cancelled"
+      ) {
+        if (!lease && current.status === status && current.error === (error || undefined)) return;
+        throw new Error(`Durable command ${commandId} is already ${current.status}`);
+      }
+
+      const now = sqliteTimestamp(db);
+      if (
+        lease &&
+        (current.leaseOwner !== lease.owner ||
+          current.fencingToken !== lease.fencingToken ||
+          !current.leaseExpiresAt ||
+          current.leaseExpiresAt <= now)
+      ) {
+        throw new Error(`Stale fencing token for command ${commandId}`);
+      }
+
+      current.status = status;
+      current.updatedAt = now;
+      delete current.leaseOwner;
+      delete current.leaseExpiresAt;
+      if (error) current.error = error;
+      else delete current.error;
+      db.prepare(
+        `UPDATE commands
+         SET status = ?, lease_owner = NULL, lease_expires_at = NULL, data = ?, updated_at = ?
+         WHERE session_id = ? AND id = ?`,
+      ).run(current.status, JSON.stringify(current), current.updatedAt, sessionId, commandId);
+    });
+  }
+
+  getCommand(sessionId: string, commandId: string): Promise<DurableCommand | undefined> {
+    assertIdentifier(sessionId, "command session id");
+    assertIdentifier(commandId, "command id");
+    return this.database.run((db) => {
+      const row = db
+        .prepare("SELECT * FROM commands WHERE session_id = ? AND id = ?")
+        .get(sessionId, commandId) as Row | undefined;
+      return row ? commandFromSqliteRow(row) : undefined;
+    });
+  }
+
+  recoverableCommands(sessionId: string, _now: number): Promise<DurableCommand[]> {
+    assertIdentifier(sessionId, "command session id");
+    return this.database.run((db) => {
+      const now = sqliteTimestamp(db);
+      return db
+        .prepare(
+          `SELECT * FROM commands
+           WHERE session_id = ?
+             AND (status = 'accepted' OR
+                  (status = 'running' AND
+                   (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+           ORDER BY rowid`,
+        )
+        .all(sessionId, now)
+        .map((row) => commandFromSqliteRow(row as Row));
+    });
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     assertIdentifier(sessionId, "command session id");
     await this.database.transaction((db) => {
@@ -1242,9 +1507,9 @@ export class SqliteCommandInboxStore implements CommandInboxStore {
 
   private readDirect(db: DatabaseSync, sessionId: string): DurableCommand[] {
     return db
-      .prepare("SELECT data FROM commands WHERE session_id = ? ORDER BY rowid")
+      .prepare("SELECT * FROM commands WHERE session_id = ? ORDER BY rowid")
       .all(sessionId)
-      .map((row) => json<DurableCommand>((row as Row).data));
+      .map((row) => commandFromSqliteRow(row as Row));
   }
 
   private writeDirect(db: DatabaseSync, sessionId: string, commands: DurableCommand[]): void {
@@ -1291,24 +1556,176 @@ export class SqliteOutboxStore implements OutboxStore {
     });
   }
 
+  insertMessage(message: OutboxMessage): Promise<OutboxMessage> {
+    assertIdentifier(message.id, "outbox message id");
+    return this.database.transaction((db) => {
+      const idempotencyKey = message.event.idempotencyKey ?? message.id;
+      const inserted = db
+        .prepare(
+          `INSERT INTO outbox
+           (id, idempotency_key, status, lease_owner, lease_expires_at,
+            fencing_token, data, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(idempotency_key) DO NOTHING`,
+        )
+        .run(
+          message.id,
+          idempotencyKey,
+          message.status,
+          message.leaseOwner ?? null,
+          message.leaseExpiresAt ?? null,
+          message.fencingToken ?? 0,
+          JSON.stringify(message),
+          message.updatedAt,
+        );
+      if (Number(inserted.changes) === 1) return clone(message);
+
+      const duplicate = db
+        .prepare("SELECT * FROM outbox WHERE idempotency_key = ?")
+        .get(idempotencyKey) as Row | undefined;
+      if (!duplicate) throw new Error("Outbox idempotency conflict disappeared");
+      return outboxFromSqliteRow(duplicate);
+    });
+  }
+
+  claimMessage(owner: string, leaseMs: number): Promise<OutboxMessage | undefined> {
+    return this.database.transaction((db) => {
+      const now = sqliteTimestamp(db);
+      const row = db
+        .prepare(
+          `SELECT * FROM outbox
+           WHERE status = 'pending'
+             AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+           ORDER BY rowid
+           LIMIT 1`,
+        )
+        .get(now) as Row | undefined;
+      if (!row) return undefined;
+
+      const current = outboxFromSqliteRow(row);
+      current.leaseOwner = owner;
+      current.leaseExpiresAt = leaseExpiresAt(now, leaseMs);
+      current.fencingToken = (current.fencingToken ?? 0) + 1;
+      current.updatedAt = now;
+      db.prepare(
+        `UPDATE outbox
+         SET lease_owner = ?, lease_expires_at = ?, fencing_token = ?, data = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        current.leaseOwner,
+        current.leaseExpiresAt,
+        current.fencingToken,
+        JSON.stringify(current),
+        current.updatedAt,
+        current.id,
+      );
+      return clone(current);
+    });
+  }
+
+  markSent(message: OutboxMessage, owner: string, sentEventId: string): Promise<void> {
+    return this.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM outbox WHERE id = ?").get(message.id) as
+        Row | undefined;
+      const current = row ? outboxFromSqliteRow(row) : undefined;
+      const now = sqliteTimestamp(db);
+      if (
+        !current ||
+        current.status !== "pending" ||
+        current.leaseOwner !== owner ||
+        current.fencingToken !== message.fencingToken ||
+        !current.leaseExpiresAt ||
+        current.leaseExpiresAt <= now
+      ) {
+        throw new Error(`Stale or expired fencing token for outbox message ${message.id}`);
+      }
+
+      current.status = "sent";
+      current.sentEventId = sentEventId;
+      current.attempts++;
+      current.updatedAt = now;
+      delete current.leaseOwner;
+      delete current.leaseExpiresAt;
+      delete current.error;
+      db.prepare(
+        `UPDATE outbox
+         SET status = 'sent', lease_owner = NULL, lease_expires_at = NULL,
+             data = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(JSON.stringify(current), current.updatedAt, current.id);
+    });
+  }
+
+  markFailed(message: OutboxMessage, owner: string, error: string): Promise<void> {
+    return this.database.transaction((db) => {
+      const row = db.prepare("SELECT * FROM outbox WHERE id = ?").get(message.id) as
+        Row | undefined;
+      const current = row ? outboxFromSqliteRow(row) : undefined;
+      const now = sqliteTimestamp(db);
+      if (
+        !current ||
+        current.status !== "pending" ||
+        current.leaseOwner !== owner ||
+        current.fencingToken !== message.fencingToken ||
+        !current.leaseExpiresAt ||
+        current.leaseExpiresAt <= now
+      ) {
+        throw new Error(`Stale or expired fencing token for outbox message ${message.id}`);
+      }
+
+      current.attempts++;
+      current.error = error;
+      current.updatedAt = now;
+      delete current.leaseOwner;
+      delete current.leaseExpiresAt;
+      db.prepare(
+        `UPDATE outbox
+         SET lease_owner = NULL, lease_expires_at = NULL, data = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(JSON.stringify(current), current.updatedAt, current.id);
+    });
+  }
+
+  getMessage(id: string): Promise<OutboxMessage | undefined> {
+    assertIdentifier(id, "outbox message id");
+    return this.database.run((db) => {
+      const row = db.prepare("SELECT * FROM outbox WHERE id = ?").get(id) as Row | undefined;
+      return row ? outboxFromSqliteRow(row) : undefined;
+    });
+  }
+
+  pendingMessages(): Promise<OutboxMessage[]> {
+    return this.database.run((db) =>
+      db
+        .prepare("SELECT * FROM outbox WHERE status = 'pending' ORDER BY rowid")
+        .all()
+        .map((row) => outboxFromSqliteRow(row as Row)),
+    );
+  }
+
   private readDirect(db: DatabaseSync): OutboxMessage[] {
     return db
-      .prepare("SELECT data FROM outbox ORDER BY rowid")
+      .prepare("SELECT * FROM outbox ORDER BY rowid")
       .all()
-      .map((row) => json<OutboxMessage>((row as Row).data));
+      .map((row) => outboxFromSqliteRow(row as Row));
   }
 
   private writeDirect(db: DatabaseSync, messages: OutboxMessage[]): void {
     db.prepare("DELETE FROM outbox").run();
     const insert = db.prepare(
-      `INSERT INTO outbox(id, idempotency_key, status, data, updated_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO outbox
+       (id, idempotency_key, status, lease_owner, lease_expires_at,
+        fencing_token, data, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const message of messages) {
       insert.run(
         message.id,
         message.event.idempotencyKey ?? message.id,
         message.status,
+        message.leaseOwner ?? null,
+        message.leaseExpiresAt ?? null,
+        message.fencingToken ?? 0,
         JSON.stringify(message),
         message.updatedAt,
       );

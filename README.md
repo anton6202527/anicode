@@ -5,6 +5,8 @@
 
 最新的 Core/TUI 生产审查、已落地控制与外部验收边界见
 [2026-07-31 production-readiness audit](docs/architecture/2026-07-31-core-tui-production-audit.md)。
+免费 DeepSeek 网关、安装实例配额、成本熔断与上线步骤见
+[2026-08-17 free DeepSeek device quota](docs/architecture/2026-08-17-free-deepseek-device-quota.md)。
 
 一个 TypeScript 编写、前端无关的通用型 AI Agent：调研、分析、写作、规划、数据与工具协作都是一等能力，软件工程是重点强化的核心长项。当前仓库包含：
 
@@ -62,8 +64,10 @@ Key，或显式使用 `--demo`。真正使用普通云端 provider 时，会在�
 精确凭据，失败则 fail closed，不会继续打开其他 fallback Keychain 条目。
 
 CLI 默认就是独立本地应用：`SessionManager` 与工具运行在同一进程，会话存在内置 SQLite；当前环境
-凭证只在进程内使用，明确导入的长期凭证才进入本机 OS Keychain。Supabase 登录的 refresh token 使用
-独立 Keychain 命名空间；共享 DeepSeek Key 始终只存在于服务端 gateway，不会下载到客户端。CLI 的
+凭证只在进程内使用，明确导入的长期凭证才进入本机 OS Keychain。Supabase 登录的 refresh token 与随机
+安装凭证使用独立 Keychain 命名空间；安装凭证只用于每日免费额度且退出登录后继续保留，共享 DeepSeek Key
+始终只存在于服务端 gateway，不会下载到客户端。免费 Cloud 目录只公开 Flash，Pro 需要后续付费
+entitlement 或用户自带 Key。CLI 的
 SessionManager、工具和 SQLite 仍完全在本机运行，不需要 PostgreSQL 或单独启动 daemon。`--daemon`、
 `--http`、PostgreSQL、Vault/KMS、S3 和 Remote Runtime 都是显式可选的团队/远程能力。
 

@@ -40,12 +40,27 @@ interface Connection {
   tools: Tool[];
 }
 
+interface ConnectionAttempt {
+  entry: PluginEntry;
+  connection?: Connection;
+  status: PluginRuntimeStatus;
+}
+
 export class PluginRuntime {
   private savedIds: string[] = [];
   private skills: SkillMeta[] = [];
   private readonly connections = new Map<string, Connection>();
   private readonly status = new Map<string, PluginRuntimeStatus>();
   private suspended = false;
+  private desiredSuspended = false;
+  /**
+   * State changes stay linearizable while one reconciliation connects several independent MCP
+   * servers in parallel. The swallowed branch belongs only to the queue tail: each caller still
+   * receives its own operation error.
+   */
+  private operationTail: Promise<void> = Promise.resolve();
+  private disposePromise: Promise<void> | undefined;
+  private disposed = false;
 
   constructor(
     private readonly connect: McpConnector = connectMcpServers,
@@ -71,16 +86,31 @@ export class PluginRuntime {
   }
 
   /** 更新已保存状态并 reconcile MCP 连接（连接新启用的、断开已停用的）。 */
-  async setState(savedIds: readonly string[]): Promise<void> {
-    this.savedIds = [...savedIds];
-    await this.reconcile();
+  setState(savedIds: readonly string[]): Promise<void> {
+    const next = [...savedIds];
+    return this.enqueue(async () => {
+      this.assertActive();
+      this.savedIds = next;
+      await this.reconcile();
+    });
   }
 
   /** Trust revocation closes every process/network sidecar before a restricted Agent is rebuilt. */
-  async setSuspended(suspended: boolean): Promise<void> {
-    if (this.suspended === suspended) return;
-    this.suspended = suspended;
-    await this.reconcile();
+  setSuspended(suspended: boolean): Promise<void> {
+    // Revocation is a synchronous visibility fence: buildToolRegistry() must stop exposing current
+    // tools even when an earlier network connection is still occupying the reconciliation queue.
+    // Physical client cleanup remains serialized below. Resume does the inverse inside the queue,
+    // after every prior close has settled.
+    this.desiredSuspended = suspended;
+    if (suspended) this.suspended = true;
+    return this.enqueue(async () => {
+      this.assertActive();
+      // A newer trust transition supersedes this queued operation. In particular, an old resume
+      // must never cross a later synchronous revocation fence and expose remote tools again.
+      if (this.desiredSuspended !== suspended) return;
+      this.suspended = suspended;
+      await this.reconcile();
+    });
   }
 
   private entries(): PluginEntry[] {
@@ -102,73 +132,90 @@ export class PluginRuntime {
     const enabledMcp = entries.filter((e) => e.enabled && e.mcpServer);
     const enabledIds = new Set(enabledMcp.map((e) => e.id));
 
-    // 断开不再启用的 MCP。
-    for (const [id, conn] of [...this.connections]) {
-      if (!enabledIds.has(id)) {
-        await Promise.allSettled(conn.clients.map((client) => client.close()));
-        this.connections.delete(id);
-        this.status.delete(id);
-      }
+    // Independent servers must not turn startup into the sum of every close/connect latency.
+    // Commit mutations after the batch so registry/status iteration order remains deterministic.
+    const stale = [...this.connections].filter(([id]) => !enabledIds.has(id));
+    await Promise.all(
+      stale.map(([, conn]) => Promise.allSettled(conn.clients.map((client) => client.close()))),
+    );
+    for (const [id] of stale) {
+      this.connections.delete(id);
+      this.status.delete(id);
     }
 
     // 连接新启用的 MCP（凭证就绪才连）。
-    for (const entry of enabledMcp) {
-      if (this.connections.has(entry.id)) continue;
-      const missing = (entry.requiresEnv ?? []).filter((name) =>
-        isCredentialEnvironmentName(name)
-          ? !this.broker?.has(`env:${name}`)
-          : !this.env[name]?.trim(),
-      );
-      if (missing.length > 0) {
-        this.status.set(entry.id, {
+    const attempts = await Promise.all(
+      enabledMcp
+        .filter((entry) => !this.connections.has(entry.id))
+        .map((entry) => this.connectEntry(entry)),
+    );
+    for (const attempt of attempts) {
+      if (attempt.connection) this.connections.set(attempt.entry.id, attempt.connection);
+      this.status.set(attempt.entry.id, attempt.status);
+    }
+  }
+
+  private async connectEntry(entry: PluginEntry): Promise<ConnectionAttempt> {
+    const missing = (entry.requiresEnv ?? []).filter((name) =>
+      isCredentialEnvironmentName(name)
+        ? !this.broker?.has(`env:${name}`)
+        : !this.env[name]?.trim(),
+    );
+    if (missing.length > 0) {
+      return {
+        entry,
+        status: {
           connected: false,
           error: t(
             `Missing environment variable ${missing.join(", ")}`,
             `缺少环境变量 ${missing.join(", ")}`,
           ),
-        });
-        continue;
-      }
-      const spec = entry.mcpServer!;
-      if (!("url" in spec)) {
-        // Native stdio children can detach into a new session outside killpg. Reject before the
-        // connector gets any chance to spawn; HTTP remains the production plugin transport.
-        this.status.set(entry.id, {
+        },
+      };
+    }
+    const spec = entry.mcpServer!;
+    if (!("url" in spec)) {
+      // Native stdio children can detach into a new session outside killpg. Reject before the
+      // connector gets any chance to spawn; HTTP remains the production plugin transport.
+      return {
+        entry,
+        status: {
           connected: false,
           error: "stdio MCP requires managed cgroup/container/job-object containment",
-        });
-        continue;
-      }
-      try {
-        const config: McpServerConfig = {
-          ...spec,
-          ...(spec.headers ? { headers: { ...spec.headers } } : {}),
-        };
-        const { tools, clients } = await this.connect([config], this.connectHandlers);
-        if (
-          tools.some(
-            (tool) =>
-              tool.execution?.kind === "managed-external" &&
-              tool.execution.protocol === "mcp-stdio",
-          )
-        ) {
-          const closed = await Promise.allSettled(clients.map((client) => client.close()));
-          const failures = closed.flatMap((result) =>
-            result.status === "rejected" ? [result.reason] : [],
+        },
+      };
+    }
+    try {
+      const config: McpServerConfig = {
+        ...spec,
+        ...(spec.headers ? { headers: { ...spec.headers } } : {}),
+      };
+      const { tools, clients } = await this.connect([config], this.connectHandlers);
+      if (
+        tools.some(
+          (tool) =>
+            tool.execution?.kind === "managed-external" && tool.execution.protocol === "mcp-stdio",
+        )
+      ) {
+        const closed = await Promise.allSettled(clients.map((client) => client.close()));
+        const failures = closed.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (failures.length > 0) {
+          throw new AggregateError(
+            failures,
+            "Rejected stdio MCP connection and failed to close its clients",
           );
-          if (failures.length > 0) {
-            throw new AggregateError(
-              failures,
-              "Rejected stdio MCP connection and failed to close its clients",
-            );
-          }
-          throw new Error("stdio MCP requires managed process containment");
         }
-        this.connections.set(entry.id, { clients, tools });
-        this.status.set(entry.id, { connected: true, toolCount: tools.length });
-      } catch (err) {
-        this.status.set(entry.id, { connected: false, error: errorText(err) });
+        throw new Error("stdio MCP requires managed process containment");
       }
+      return {
+        entry,
+        connection: { clients, tools },
+        status: { connected: true, toolCount: tools.length },
+      };
+    } catch (err) {
+      return { entry, status: { connected: false, error: errorText(err) } };
     }
   }
 
@@ -208,20 +255,38 @@ export class PluginRuntime {
     });
   }
 
-  async dispose(): Promise<void> {
-    const results = await Promise.allSettled(
-      [...this.connections.values()].flatMap((conn) =>
-        conn.clients.map((client) => client.close()),
-      ),
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposePromise = this.enqueue(async () => {
+      this.disposed = true;
+      const results = await Promise.allSettled(
+        [...this.connections.values()].flatMap((conn) =>
+          conn.clients.map((client) => client.close()),
+        ),
+      );
+      this.connections.clear();
+      this.status.clear();
+      const failures = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Failed to close MCP plugin process trees");
+      }
+    });
+    return this.disposePromise;
+  }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const current = this.operationTail.then(operation, operation);
+    this.operationTail = current.then(
+      () => undefined,
+      () => undefined,
     );
-    this.connections.clear();
-    this.status.clear();
-    const failures = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
-    );
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "Failed to close MCP plugin process trees");
-    }
+    return current;
+  }
+
+  private assertActive(): void {
+    if (this.disposed) throw new Error("PluginRuntime is disposed");
   }
 }
 

@@ -84,3 +84,38 @@ test("Conversation persistence: metadata rewrite queues behind append and become
   await Promise.all([flush, title, conversation.whenPersisted()]);
   assert.deepEqual(order, ["append:start", "append:end", "rewrite:new"]);
 });
+
+test("Conversation persistence: an in-flight append keeps a stable high-water mark", async () => {
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+  const persisted: string[] = [];
+  const store: ISessionStore = {
+    async create() {
+      return meta;
+    },
+    async append(_id, message) {
+      const text = message.content.find((part) => part.type === "text")?.text ?? "";
+      if (persisted.length === 0) await firstGate;
+      persisted.push(text);
+    },
+    async rewrite() {},
+    async load() {
+      return { ...meta, messages: [] };
+    },
+    async list() {
+      return [meta];
+    },
+    async delete() {},
+  };
+  const conversation = new Conversation({ store, meta });
+  conversation.pushUser("first");
+  const firstFlush = conversation.flush();
+  await Promise.resolve();
+  conversation.pushUser("second");
+  const secondFlush = conversation.flush();
+
+  releaseFirst();
+  await Promise.all([firstFlush, secondFlush, conversation.whenPersisted()]);
+
+  assert.deepEqual(persisted, ["first", "second"]);
+});

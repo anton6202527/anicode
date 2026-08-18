@@ -71,11 +71,20 @@ export function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [info, cat, provs, plugs, ums, auth] = await Promise.all([
+        // Plugin discovery/MCP readiness can involve external processes or networks. Load it in
+        // parallel without holding back the first shell paint and the local model catalog.
+        void window.anicode
+          .listPlugins()
+          .then((plugs) => {
+            if (!cancelled) setPlugins(plugs);
+          })
+          .catch((err) => {
+            if (!cancelled) setBanner(errorMessage(err));
+          });
+        const [info, cat, provs, ums, auth] = await Promise.all([
           window.anicode.appInfo(),
           window.anicode.listModelCatalog(),
           window.anicode.listProviders(),
-          window.anicode.listPlugins(),
           window.anicode.listUserModels(),
           window.anicode.authStatus(),
         ]);
@@ -83,7 +92,6 @@ export function App() {
         setAppInfo(info);
         setCatalog(cat);
         setProviders(provs);
-        setPlugins(plugs);
         setUserModels(ums);
         setCloudAuth(auth);
         setCurrentModel(info.defaultModel);
@@ -451,15 +459,17 @@ const CloudAccount = React.memo(function CloudAccount({
       <h2>{t("AniCode Cloud", "AniCode Cloud")}</h2>
       <p className="settings-note">
         {t(
-          "Sign in to use the shared DeepSeek quota on any device. Only the refresh session is kept in the OS credential store; the DeepSeek key never reaches this app.",
-          "登录后可在任意设备使用共享 DeepSeek 额度。系统凭证库只保存刷新会话，DeepSeek Key 不会下发到本应用。",
+          "Sign in for a daily free DeepSeek Flash allowance. The OS credential store keeps the refresh session and a random installation credential; the DeepSeek key never reaches this app.",
+          "登录即可使用每日免费 DeepSeek Flash 额度。系统凭证库保存刷新会话和随机安装凭证，DeepSeek Key 不会下发到本应用。",
         )}
       </p>
       {status?.signedIn ? (
         <div className="cloud-account-row">
           <div>
             <strong>{status.user?.email ?? t("Signed in", "已登录")}</strong>
-            <div className="settings-note">{t("Hosted quota enabled", "已启用托管额度")}</div>
+            <div className="settings-note">
+              {t("Daily free allowance enabled", "已启用每日免费额度")}
+            </div>
           </div>
           <button className="btn" disabled={busy} onClick={() => void logout()}>
             {busy ? t("Signing out…", "正在退出…") : t("Sign out", "退出登录")}

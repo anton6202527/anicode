@@ -22,6 +22,39 @@ const provider: Provider = {
   },
 };
 
+test("SessionManager: a fresh command does not replay historical runtime events", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-fresh-budget-"));
+  try {
+    const runtime = new DurableRuntime(
+      new FileRuntimeEventStore(path.join(root, "events")),
+      new FileRuntimeSnapshotStore(path.join(root, "snapshots")),
+      1,
+    );
+    let eventReads = 0;
+    const originalEvents = runtime.events.bind(runtime);
+    runtime.events = async (...args) => {
+      eventReads += 1;
+      return originalEvents(...args);
+    };
+    const manager = new SessionManager({
+      store: new SessionStore(path.join(root, "sessions")),
+      resolveProvider: () => ({ provider, model: "test" }),
+      commandInbox: new CommandInbox(new FileCommandInboxStore(path.join(root, "inbox"))),
+      runtime,
+      outbox: new DurableOutbox(new FileOutboxStore(path.join(root, "outbox")), runtime),
+      recoverCommands: false,
+    });
+    const created = await manager.createSession({ cwd: root, model: "test" });
+
+    await manager.send(created.id, "first attempt");
+
+    assert.equal(eventReads, 0, "attempt 1 cannot have a prior execution checkpoint to recover");
+    await manager.shutdown();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("SessionManager: 启动扫描过期 inbox lease 并真正续跑到 completed", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-recovery-"));
   try {

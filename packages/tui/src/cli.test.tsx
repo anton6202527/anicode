@@ -1066,6 +1066,20 @@ test("CLI: 无模型来源时已登录优先 Cloud DeepSeek，否则稳定使用
   }
 });
 
+test("CLI exec: --list-models 的 Cloud 静态目录只公开 Flash", async () => {
+  const chunks: string[] = [];
+  const output = {
+    write(chunk: string | Uint8Array) {
+      chunks.push(String(chunk));
+      return true;
+    },
+  } as NodeJS.WritableStream;
+  await runExecCommand(["--list-models"], { output, error: output });
+  const models = chunks.join("").trim().split("\n");
+  assert.ok(models.includes(ANICODE_CLOUD_DEFAULT_MODEL));
+  assert.equal(models.includes("anicode-cloud/deepseek-v4-pro"), false);
+});
+
 test("CLI: 配置/显式模型保持权威，合法 custom 不会被过宽迁移", () => {
   const missingCredentials = {
     diagnoseProvider(model: string) {

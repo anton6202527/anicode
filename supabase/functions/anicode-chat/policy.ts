@@ -7,7 +7,6 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
 // Keep the default gateway catalog limited to the current, explicitly supported model IDs.
 export const DEFAULT_ALLOWED_MODELS = [
   "deepseek-v4-flash",
-  "deepseek-v4-pro",
 ] as const;
 
 type JsonObject = Record<string, unknown>;
@@ -430,15 +429,16 @@ export function safeJsonError(
   status: number,
   message: string,
   code: string,
+  additionalHeaders?: HeadersInit,
 ): Response {
+  const headers = new Headers(additionalHeaders);
+  headers.set("cache-control", "no-store");
+  headers.set("x-content-type-options", "nosniff");
   return Response.json(
     { error: { message, type: "anicode_gateway_error", code } },
     {
       status,
-      headers: {
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff",
-      },
+      headers,
     },
   );
 }

@@ -60,19 +60,15 @@ export function registerAnicodeCloudProvider(auth: CloudAuthService): void {
     maxTokensField: "max_tokens",
     reasoningEffort: false,
     capabilities: { tools: true, reasoning: false, images: false },
-    limits: { contextWindow: 1_000_000, maxOutputTokens: 8_192 },
-    models: [{ pattern: "deepseek-v4-flash" }, { pattern: "deepseek-v4-pro" }],
+    limits: { contextWindow: 128_000, maxOutputTokens: 8_192 },
+    models: [{ pattern: "deepseek-v4-flash" }],
     catalog: [
       {
         model: "deepseek-v4-flash",
         label: "DeepSeek V4 Flash · AniCode Cloud",
+        free: true,
         recommended: true,
-        note: "登录后使用 AniCode 托管额度；共享 Key 不下发到客户端",
-      },
-      {
-        model: "deepseek-v4-pro",
-        label: "DeepSeek V4 Pro · AniCode Cloud",
-        note: "登录后使用 AniCode 托管额度；受每日配额限制",
+        note: "登录即可使用每日免费额度；共享 Key 不下发到客户端",
       },
     ],
   });
