@@ -1,5 +1,16 @@
 # anicode
 
+## 0.4.0
+
+### Minor Changes
+
+- 4e92dbe: Provide signed-in users a default free DeepSeek V4 Flash route through AniCode Cloud, with a host-owned installation credential, atomic daily token quotas, authoritative streaming usage settlement, and non-retryable hard-quota errors.
+
+### Patch Changes
+
+- 4e92dbe: Reduce long-session latency and memory with row-level SQLite command/outbox operations, bounded LSP and SSE buffers, linear-time streamed tool arguments and repo-map queries, incremental conversation persistence, and concurrent background MCP readiness.
+- f9f2877: Reduce CLI startup work by using a narrow core runtime entry, loading the OpenAI SDK only on first provider dispatch, and deferring the React/Ink frontend for headless commands.
+
 ## 0.3.2
 
 ### Patch Changes
