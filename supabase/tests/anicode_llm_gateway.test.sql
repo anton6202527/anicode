@@ -39,6 +39,182 @@ grant execute on function private.existing_auth_policy_fixture_can_access() to a
 \ir ../migrations/202608170001_anicode_device_quota.sql
 -- Device quota migration is also safe to reapply during a scoped shared-project bootstrap.
 \ir ../migrations/202608170001_anicode_device_quota.sql
+\ir ../migrations/202608190001_anicode_policy_linearization.sql
+-- The additive hot-policy fix must also be safe when deployment tooling retries the migration.
+\ir ../migrations/202608190001_anicode_policy_linearization.sql
+\ir ../migrations/202608190002_anicode_cloud_entitlements.sql
+-- Entitlement bootstrap is additive and must remain safe if deployment tooling retries it.
+\ir ../migrations/202608190002_anicode_cloud_entitlements.sql
+\ir ../checks/anicode_llm_gateway_preflight.sql
+
+do $$
+declare
+  entitled_user constant uuid := '09000000-0000-4000-8000-000000000001';
+  entitled_request constant uuid := '09000000-0000-4000-8000-000000000002';
+  denied_request constant uuid := '09000000-0000-4000-8000-000000000003';
+  entitled_device text := 'd_' || repeat('z', 43);
+  blocked boolean := false;
+  error_message text;
+  row_count integer;
+  wrapper_definition text;
+  entitlement_lock_position integer;
+  quota_call_position integer;
+begin
+  if not coalesce(
+       (
+         select relrowsecurity
+         from pg_catalog.pg_class
+         where oid = 'private.anicode_cloud_entitlements'::regclass
+       ),
+       false
+     ) then
+    raise exception 'cloud entitlement table is missing its deny-by-default RLS barrier';
+  end if;
+
+  if has_table_privilege(
+       'authenticated',
+       'private.anicode_cloud_entitlements',
+       'select,insert,update,delete'
+     )
+     or has_table_privilege(
+       'anon',
+       'private.anicode_cloud_entitlements',
+       'select,insert,update,delete'
+     )
+     or has_table_privilege(
+       'service_role',
+       'private.anicode_cloud_entitlements',
+       'select,insert,update,delete'
+     ) then
+    raise exception 'cloud entitlement rows are directly exposed to an API role';
+  end if;
+
+  if has_function_privilege(
+       'authenticated',
+       'public.has_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or has_function_privilege(
+       'authenticated',
+       'public.grant_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or has_function_privilege(
+       'authenticated',
+       'public.revoke_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or has_function_privilege(
+       'anon',
+       'public.has_anicode_cloud_entitlement(uuid)',
+       'execute'
+     ) then
+    raise exception 'cloud entitlement RPCs are exposed to an untrusted API role';
+  end if;
+
+  if not has_function_privilege(
+       'service_role',
+       'public.has_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or not has_function_privilege(
+       'service_role',
+       'public.grant_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or not has_function_privilege(
+       'service_role',
+       'public.revoke_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or not has_function_privilege(
+       'service_role',
+       'public.reserve_anicode_llm_entitled_request_v2(uuid,text,uuid,integer,text)',
+       'execute'
+     ) then
+    raise exception 'service role cannot manage cloud entitlements through RPCs';
+  end if;
+  if has_function_privilege(
+       'service_role',
+       'public.reserve_anicode_llm_request(uuid,uuid,integer)',
+       'execute'
+     )
+     or has_function_privilege(
+       'service_role',
+       'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)',
+       'execute'
+     ) then
+    raise exception 'service role can bypass product authorization through an older reserve RPC';
+  end if;
+  select pg_catalog.pg_get_functiondef(
+    'public.reserve_anicode_llm_entitled_request_v2(uuid,text,uuid,integer,text)'::regprocedure
+  ) into wrapper_definition;
+  entitlement_lock_position := strpos(wrapper_definition, 'for share');
+  quota_call_position := strpos(
+    wrapper_definition,
+    'perform public.reserve_anicode_llm_request_v2'
+  );
+  if entitlement_lock_position = 0 or quota_call_position <= entitlement_lock_position then
+    raise exception 'entitlement is not locked through quota reservation';
+  end if;
+
+  insert into auth.users(id) values (entitled_user);
+  if public.has_anicode_cloud_entitlement(entitled_user) then
+    raise exception 'a new authenticated account was implicitly entitled';
+  end if;
+
+  perform public.grant_anicode_cloud_entitlement(entitled_user);
+  if not public.has_anicode_cloud_entitlement(entitled_user) then
+    raise exception 'grant did not enable the cloud entitlement';
+  end if;
+
+  perform public.revoke_anicode_cloud_entitlement(entitled_user);
+  if public.has_anicode_cloud_entitlement(entitled_user) then
+    raise exception 'revoke did not disable the cloud entitlement';
+  end if;
+
+  -- Re-granting an existing row is the supported operational rollout path and must be idempotent.
+  perform public.grant_anicode_cloud_entitlement(entitled_user);
+  perform public.grant_anicode_cloud_entitlement(entitled_user);
+  if not public.has_anicode_cloud_entitlement(entitled_user) then
+    raise exception 'idempotent re-grant did not restore the cloud entitlement';
+  end if;
+
+  perform public.reserve_anicode_llm_entitled_request_v2(
+    entitled_user,
+    entitled_device,
+    entitled_request,
+    1,
+    'deepseek-v4-flash'
+  );
+  perform public.settle_anicode_llm_request_v2(
+    entitled_request, 0, 'failed', null, null, null, null, null
+  );
+  select count(*) into row_count
+  from private.anicode_llm_requests
+  where request_id = entitled_request;
+  if row_count <> 1 then raise exception 'entitled reservation was not recorded'; end if;
+
+  perform public.revoke_anicode_cloud_entitlement(entitled_user);
+  begin
+    perform public.reserve_anicode_llm_entitled_request_v2(
+      entitled_user,
+      entitled_device,
+      denied_request,
+      1,
+      'deepseek-v4-flash'
+    );
+  exception when sqlstate 'P0001' then
+    get stacked diagnostics error_message = message_text;
+    blocked := error_message = 'cloud_entitlement_required';
+  end;
+  if not blocked then raise exception 'revoked entitlement still reserved quota'; end if;
+  select count(*) into row_count
+  from private.anicode_llm_requests
+  where request_id = denied_request;
+  if row_count <> 0 then raise exception 'denied reservation mutated the request ledger'; end if;
+end;
+$$;
 
 do $$
 declare
@@ -78,12 +254,12 @@ begin
      ) then
     raise exception 'quota functions are exposed to callers';
   end if;
-  if not has_function_privilege(
+  if has_function_privilege(
     'service_role',
     'public.reserve_anicode_llm_request(uuid,uuid,integer)',
     'execute'
   ) then
-    raise exception 'service role cannot reserve quota';
+    raise exception 'service role can bypass entitlement through legacy reserve';
   end if;
 
   insert into auth.users(id) values (user_one);
@@ -209,6 +385,11 @@ declare
   before_user_charge bigint;
   before_global_charge bigint;
   row_count integer;
+  wrapper_definition text;
+  advisory_lock_position integer;
+  global_lock_position integer;
+  policy_lock_position integer;
+  worker_call_position integer;
 begin
   if has_table_privilege('authenticated', 'private.anicode_llm_policy', 'select')
      or has_function_privilege(
@@ -228,16 +409,55 @@ begin
      ) then
     raise exception 'device quota objects are exposed to callers';
   end if;
-  if not has_function_privilege(
+  if has_function_privilege(
     'service_role',
     'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)',
+    'execute'
+  ) or not has_function_privilege(
+    'service_role',
+    'public.reserve_anicode_llm_entitled_request_v2(uuid,text,uuid,integer,text)',
     'execute'
   ) or not has_function_privilege(
     'service_role',
     'public.reclaim_anicode_llm_stale_requests_v2()',
     'execute'
   ) then
-    raise exception 'service role cannot reserve device quota';
+    raise exception 'service role entitlement-aware quota boundary is invalid';
+  end if;
+  if pg_catalog.to_regprocedure(
+       'private.reserve_anicode_llm_request_v2_policy_locked(uuid,text,uuid,integer,text)'
+     ) is null
+     or has_function_privilege(
+       'service_role',
+       'private.reserve_anicode_llm_request_v2_policy_locked(uuid,text,uuid,integer,text)',
+       'execute'
+     )
+     or has_function_privilege(
+       'authenticated',
+       'private.reserve_anicode_llm_request_v2_policy_locked(uuid,text,uuid,integer,text)',
+       'execute'
+     ) then
+    raise exception 'the policy-locked reservation worker is missing or externally callable';
+  end if;
+
+  -- Contract-test the additive wrapper's linearization order. A request may read policy once for
+  -- the disabled fast path, but its authoritative read must happen after device/global locking and
+  -- remain locked through the private worker call.
+  select pg_catalog.pg_get_functiondef(
+    'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)'::regprocedure
+  ) into wrapper_definition;
+  advisory_lock_position := strpos(wrapper_definition, 'pg_advisory_xact_lock');
+  global_lock_position := strpos(wrapper_definition, 'for update;');
+  policy_lock_position := strpos(wrapper_definition, 'for share;');
+  worker_call_position := strpos(
+    wrapper_definition,
+    'perform private.reserve_anicode_llm_request_v2_policy_locked'
+  );
+  if advisory_lock_position = 0
+     or global_lock_position <= advisory_lock_position
+     or policy_lock_position <= global_lock_position
+     or worker_call_position <= policy_lock_position then
+    raise exception 'device/global/policy reservation linearization order regressed';
   end if;
 
   -- Leave the legacy contract test's global/user counters in a neutral state.

@@ -1,6 +1,15 @@
 import { createClient } from "@supabase/supabase-js";
-import { bearerToken } from "./auth.ts";
+import {
+  authenticatedUserIdFromVerifiedClaims,
+  bearerToken,
+  isAuthVerificationUnavailable,
+} from "./auth.ts";
 import { installationToken, quotaSubjects } from "./device.ts";
+import {
+  cloudEntitlementDeniedResponse,
+  isCloudEntitlementDenial,
+  requireCloudEntitlement,
+} from "./entitlement.ts";
 import { supabaseApiKey } from "./environment.ts";
 import {
   boundedJson,
@@ -61,6 +70,30 @@ function secretApiKey(): string {
   );
 }
 
+interface AuthenticationContext {
+  client: ReturnType<typeof createClient>;
+  projectUrl: string;
+}
+
+let authenticationContextValue: AuthenticationContext | undefined;
+
+/** Reuse the Auth client across warm invocations so auth-js can retain its in-memory JWKS cache. */
+function authenticationContext(): AuthenticationContext {
+  if (authenticationContextValue) return authenticationContextValue;
+  const projectUrl = requiredEnv("SUPABASE_URL");
+  authenticationContextValue = {
+    projectUrl,
+    client: createClient(projectUrl, publicApiKey(), {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+        detectSessionInUrl: false,
+      },
+    }),
+  };
+  return authenticationContextValue;
+}
+
 function positiveInteger(
   value: string | undefined,
   fallback: number,
@@ -77,23 +110,22 @@ function positiveInteger(
 /**
  * Function-level verification is authoritative. config.toml deliberately disables the legacy
  * gateway verifier so modern asymmetric Supabase signing keys remain deployable, but no route
- * reaches models or quota RPCs until Auth has validated the bearer token for this exact project.
+ * reaches models or quota RPCs until Auth has verified the bearer token and its authorization
+ * claims for this exact project.
  */
 async function authenticatedUser(
   request: Request,
 ): Promise<{ id: string } | undefined> {
   const token = bearerToken(request);
   if (!token) return undefined;
-  const client = createClient(requiredEnv("SUPABASE_URL"), publicApiKey(), {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-      detectSessionInUrl: false,
-    },
-  });
-  const { data, error } = await client.auth.getUser(token);
-  if (error || !data.user?.id) return undefined;
-  return { id: data.user.id };
+  const { client, projectUrl } = authenticationContext();
+  const { data, error } = await client.auth.getClaims(token);
+  if (error) {
+    if (isAuthVerificationUnavailable(error)) throw error;
+    return undefined;
+  }
+  const id = authenticatedUserIdFromVerifiedClaims(data?.claims, projectUrl);
+  return id ? { id } : undefined;
 }
 
 function adminClient(): AdminClient {
@@ -108,6 +140,7 @@ function adminClient(): AdminClient {
 
 type ReservationOutcome =
   | { state: "reserved" }
+  | { state: "entitlement_denied" }
   | { state: "rejected"; rejection: QuotaRejection }
   | { state: "unavailable" };
 
@@ -130,14 +163,20 @@ async function reserveOnce(
   tokens: number,
   model: string,
 ): Promise<ReservationOutcome> {
-  const { error } = await admin.rpc("reserve_anicode_llm_request_v2", {
-    p_user_id: userId,
-    p_device_subject: deviceSubject,
-    p_request_id: requestId,
-    p_reserved_tokens: tokens,
-    p_model: model,
-  });
+  const { error } = await admin.rpc(
+    "reserve_anicode_llm_entitled_request_v2",
+    {
+      p_user_id: userId,
+      p_device_subject: deviceSubject,
+      p_request_id: requestId,
+      p_reserved_tokens: tokens,
+      p_model: model,
+    },
+  );
   if (!error) return { state: "reserved" };
+  if (isCloudEntitlementDenial(error)) {
+    return { state: "entitlement_denied" };
+  }
   const rejection = quotaRejection(error);
   return rejection
     ? { state: "rejected", rejection }
@@ -232,7 +271,11 @@ function modelList(models: ReadonlySet<string>): Response {
   );
 }
 
-async function chat(request: Request, userId: string): Promise<Response> {
+async function chat(
+  request: Request,
+  userId: string,
+  admin: AdminClient,
+): Promise<Response> {
   const token = installationToken(request);
   if (!token) {
     return safeJsonError(
@@ -291,16 +334,6 @@ async function chat(request: Request, userId: string): Promise<Response> {
 
   const requestId = crypto.randomUUID();
   const reservedTokens = reservationTokens(parsed.bytes, normalized.maxTokens);
-  let admin: AdminClient;
-  try {
-    admin = adminClient();
-  } catch {
-    return safeJsonError(
-      503,
-      "model gateway is not configured",
-      "gateway_unavailable",
-    );
-  }
   const reservation = await reserve(
     admin,
     userId,
@@ -310,6 +343,9 @@ async function chat(request: Request, userId: string): Promise<Response> {
     normalized.model,
   );
   if (reservation.state !== "reserved") {
+    if (reservation.state === "entitlement_denied") {
+      return cloudEntitlementDeniedResponse();
+    }
     if (reservation.state === "rejected") {
       const disabled = reservation.rejection.code === "gateway_disabled";
       return safeJsonError(
@@ -435,16 +471,34 @@ Deno.serve(async (request) => {
     if (!user) return safeJsonError(401, "sign in required", "unauthorized");
 
     const pathname = new URL(request.url).pathname.replace(/\/+$/u, "");
-    const models = configuredModels(Deno.env.get("ANICODE_DEEPSEEK_MODELS"));
-    if (request.method === "GET" && pathname.endsWith("/v1/models")) {
-      return modelList(models);
+    const isModelList = request.method === "GET" &&
+      pathname.endsWith("/v1/models");
+    const isChat = request.method === "POST" &&
+      pathname.endsWith("/v1/chat/completions");
+    if (!isModelList && !isChat) {
+      return safeJsonError(404, "endpoint not found", "not_found");
     }
-    if (
-      request.method === "POST" && pathname.endsWith("/v1/chat/completions")
-    ) {
-      return chat(request, user.id);
+
+    let admin: AdminClient;
+    try {
+      admin = adminClient();
+    } catch {
+      return safeJsonError(
+        503,
+        "cloud authorization is temporarily unavailable",
+        "entitlement_unavailable",
+        { "x-anicode-retryable": "true" },
+      );
     }
-    return safeJsonError(404, "endpoint not found", "not_found");
+    const entitlementRejection = await requireCloudEntitlement(admin, user.id);
+    if (entitlementRejection) return entitlementRejection;
+
+    if (isModelList) {
+      return modelList(
+        configuredModels(Deno.env.get("ANICODE_DEEPSEEK_MODELS")),
+      );
+    }
+    return chat(request, user.id, admin);
   } catch {
     return safeJsonError(
       503,

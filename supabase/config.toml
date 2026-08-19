@@ -1,8 +1,9 @@
 project_id = "anicode"
 
 [functions.anicode-chat]
-# Modern Supabase signing keys are verified inside the function with auth.getUser(). The legacy
-# gateway verifier can reject those keys before the function gets a chance to validate them.
+# Modern Supabase signing keys and strict user claims are verified inside the function with
+# auth.getClaims(). Keep this off until the platform verifier is canaried with this project's ES256
+# tokens; current Supabase guidance for asymmetric keys is contradictory.
 verify_jwt = false
 
 # Keep local streaming pipes/background quota settlement alive after the Response is returned.

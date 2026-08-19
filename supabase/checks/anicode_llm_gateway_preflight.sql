@@ -1,4 +1,4 @@
--- Read-only production gate after both migrations and before deploying the v2 Edge Function.
+-- Read-only production gate after all additive migrations and before deploying the Edge Function.
 -- Any missing signature or privilege aborts the deployment command via ON_ERROR_STOP semantics.
 do $$
 declare
@@ -12,9 +12,24 @@ begin
        'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)'
      ) is null
      or pg_catalog.to_regprocedure(
+       'public.reserve_anicode_llm_entitled_request_v2(uuid,text,uuid,integer,text)'
+     ) is null
+     or pg_catalog.to_regprocedure(
        'public.settle_anicode_llm_request_v2(uuid,integer,text,integer,integer,integer,integer,integer)'
+     ) is null
+     or pg_catalog.to_regclass(
+       'private.anicode_cloud_entitlements'
+     ) is null
+     or pg_catalog.to_regprocedure(
+       'public.has_anicode_cloud_entitlement(uuid)'
+     ) is null
+     or pg_catalog.to_regprocedure(
+       'public.grant_anicode_cloud_entitlement(uuid)'
+     ) is null
+     or pg_catalog.to_regprocedure(
+       'public.revoke_anicode_cloud_entitlement(uuid)'
      ) is null then
-    raise exception 'AniCode gateway v2 RPC contract is incomplete';
+    raise exception 'AniCode gateway database contract is incomplete';
   end if;
 
   if not pg_catalog.has_function_privilege(
@@ -24,22 +39,72 @@ begin
      )
      or not pg_catalog.has_function_privilege(
        'service_role',
-       'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)',
+       'public.reserve_anicode_llm_entitled_request_v2(uuid,text,uuid,integer,text)',
        'execute'
      )
      or not pg_catalog.has_function_privilege(
        'service_role',
        'public.settle_anicode_llm_request_v2(uuid,integer,text,integer,integer,integer,integer,integer)',
        'execute'
+     )
+     or not pg_catalog.has_function_privilege(
+       'service_role',
+       'public.has_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or not pg_catalog.has_function_privilege(
+       'service_role',
+       'public.grant_anicode_cloud_entitlement(uuid)',
+       'execute'
+     )
+     or not pg_catalog.has_function_privilege(
+       'service_role',
+       'public.revoke_anicode_cloud_entitlement(uuid)',
+       'execute'
      ) then
-    raise exception 'AniCode gateway v2 RPCs are not executable by service_role';
+    raise exception 'AniCode gateway RPCs are not executable by service_role';
+  end if;
+
+  if pg_catalog.has_function_privilege(
+       'service_role',
+       'public.reserve_anicode_llm_request(uuid,uuid,integer)',
+       'execute'
+     )
+     or pg_catalog.has_function_privilege(
+       'service_role',
+       'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)',
+       'execute'
+     ) then
+    raise exception 'service_role can bypass the entitlement-aware reservation RPC';
+  end if;
+
+  if pg_catalog.has_table_privilege(
+       'service_role',
+       'private.anicode_cloud_entitlements',
+       'select,insert,update,delete'
+     ) then
+    raise exception 'service_role has direct entitlement-table access';
+  end if;
+  if not coalesce(
+       (
+         select relrowsecurity
+         from pg_catalog.pg_class
+         where oid = 'private.anicode_cloud_entitlements'::regclass
+       ),
+       false
+     ) then
+    raise exception 'AniCode entitlement RLS barrier is disabled';
   end if;
 
   foreach application_role in array array['anon', 'authenticated'] loop
     foreach function_signature in array array[
       'public.reclaim_anicode_llm_stale_requests_v2()',
       'public.reserve_anicode_llm_request_v2(uuid,text,uuid,integer,text)',
-      'public.settle_anicode_llm_request_v2(uuid,integer,text,integer,integer,integer,integer,integer)'
+      'public.reserve_anicode_llm_entitled_request_v2(uuid,text,uuid,integer,text)',
+      'public.settle_anicode_llm_request_v2(uuid,integer,text,integer,integer,integer,integer,integer)',
+      'public.has_anicode_cloud_entitlement(uuid)',
+      'public.grant_anicode_cloud_entitlement(uuid)',
+      'public.revoke_anicode_cloud_entitlement(uuid)'
     ] loop
       if pg_catalog.has_function_privilege(
         application_role,
@@ -51,6 +116,13 @@ begin
           application_role;
       end if;
     end loop;
+    if pg_catalog.has_table_privilege(
+         application_role,
+         'private.anicode_cloud_entitlements',
+         'select,insert,update,delete'
+       ) then
+      raise exception 'AniCode entitlement table is exposed to %', application_role;
+    end if;
   end loop;
 end;
 $$;
