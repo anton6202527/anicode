@@ -54,7 +54,7 @@ import {
   providerSummarizer,
   type CompactionConfig,
 } from "./context.js";
-import type { RepoMapOptions } from "./repomap.js";
+import { gatherRepoMap, prewarmRepoMap, type RepoMapOptions } from "./repomap.js";
 import {
   ContextAssembler,
   envProvider,
@@ -421,6 +421,8 @@ export class Agent {
   private readonly sandbox: AgentOptions["sandbox"];
   /** 静态上下文装配管线（架构 v2）：env / 项目记忆 / repo map / skills / browser 指引。 */
   private readonly assembler: ContextAssembler;
+  private readonly repoMapOptions: RepoMapOptions | undefined;
+  private readonly repoMapPrewarm: { settled: boolean; promise: Promise<void> } | undefined;
   /** SessionStart hook 段 —— 装配的最后一步（在 subagent 发现之后跑）。 */
   private readonly postAssembler: ContextAssembler;
   /** 归一化后的 subagents 选项；discover=true 时 task 工具推迟到首次 send 注册。 */
@@ -454,6 +456,8 @@ export class Agent {
       discovered: SubagentDefinition[];
     }>;
   } | null = null;
+  private memorySources: ContextSource[] = [];
+  private repoMapRefreshPending = false;
   private subagentToolsRegistered = false;
   /** 会话历史 + 持久化 + 记账（架构 v2：唯一能改写历史的对象）。 */
   private readonly conv: Conversation;
@@ -538,6 +542,22 @@ export class Agent {
       repoMap && opts.lsp
         ? { ...(typeof repoMap === "object" ? repoMap : {}), lspPool: opts.lsp }
         : repoMap;
+    this.repoMapOptions = repoMapOpt
+      ? typeof repoMapOpt === "object"
+        ? repoMapOpt
+        : {}
+      : undefined;
+    if (repoMapOpt && this.repoMapOptions!.incremental !== true) {
+      const prewarm = { settled: false, promise: Promise.resolve() };
+      // Session creation normally precedes the first prompt by at least one host round-trip. Use
+      // that otherwise idle window to populate the bounded index; gatherRepoMap deduplicates an
+      // overlapping first send against the same refresh promise.
+      prewarm.promise = prewarmRepoMap(this.cwd, this.repoMapOptions!).finally(() => {
+        prewarm.settled = true;
+      });
+      this.repoMapPrewarm = prewarm;
+      void prewarm.promise.catch(() => undefined);
+    }
     // 静态上下文装配（架构 v2）：provider 顺序 = v1 的 sections.push 顺序（字节稳定）。
     this.assembler = new ContextAssembler([
       ...((opts.injectEnv ?? true) ? [envProvider()] : []),
@@ -1140,22 +1160,15 @@ export class Agent {
     // interrupt 可能发生在异步 hook / 持久化期间；closing 不得重新回到 active。
     this.inbox.open(!signal.aborted);
 
-    // 工作区快照：在模型动手前记一份，供用户 undo 回滚本轮的文件改动。尽力而为，失败不影响主流程。
-    if (this.snapshots && !recovering) {
-      const snap = await raceWithSignal(
-        this.snapshots.take(userText.replace(/\s+/g, " ").trim().slice(0, 60)),
-        signal,
-      );
-      if (snap) {
-        yield {
-          type: "checkpoint",
-          id: snap.id,
-          tree: snap.tree,
-          label: snap.label,
-          messageCount: preTurnCount,
-        };
-      }
-    }
+    // Git snapshot collection can be much slower than provider dispatch on a large dirty tree.
+    // Start it now, but do not put it on the first-token path. We join it immediately after the
+    // first provider stream and before interpreting/executing any tool call, so the undo boundary
+    // still predates every model-triggered workspace side effect.
+    const checkpointTask =
+      this.snapshots && !recovering
+        ? this.snapshots.take(userText.replace(/\s+/g, " ").trim().slice(0, 60))
+        : undefined;
+    let checkpointEmitted = false;
 
     let stopContinuations = 0;
     let verificationAttempts = 0;
@@ -1214,6 +1227,19 @@ export class Agent {
         signal,
         reserveModelCall: (request) => budget!.reserveModelCall(request),
       });
+      if (checkpointTask && !checkpointEmitted) {
+        const snap = await raceWithSignal(checkpointTask, signal);
+        checkpointEmitted = true;
+        if (snap) {
+          yield {
+            type: "checkpoint",
+            id: snap.id,
+            tree: snap.tree,
+            label: snap.label,
+            messageCount: preTurnCount,
+          };
+        }
+      }
       if (outcome.type === "error") {
         if (outcome.usage) {
           this.conv.accumulate(outcome.usage);
@@ -1563,12 +1589,16 @@ export class Agent {
   }
 
   /**
-   * 首次 send 前装配静态上下文；此后 system 不再变（缓存友好）。
+   * 首次 send 前装配静态上下文。若有界 repo-map 冷启动超时，后台 generation 会在后续
+   * drive 开始前补入一次；除此之外 system 保持稳定（缓存友好）。
    * 段落顺序由 assembler 的 provider 顺序决定（env → 记忆 → repo map → skills →
    * browser 指引），subagent 发现夹在中间（不贡献段落），SessionStart hook 收尾。
    */
   private async ensureMemory(query: string, signal: AbortSignal): Promise<void> {
-    if (this.memoryLoaded) return;
+    if (this.memoryLoaded) {
+      await this.refreshDeferredRepoMap(query, signal);
+      return;
+    }
     const span = this.telemetry.startSpan("anicode.context.compile", undefined, this.traceParent);
     const ctx = {
       cwd: this.cwd,
@@ -1640,6 +1670,13 @@ export class Agent {
         content,
         ...(presets[id] ?? { kind: "runtime", priority: 50 }),
       }));
+      this.memorySources = sources;
+      // A bounded cold gather intentionally returns no contribution while its shared prewarm
+      // continues. Remember that absence and perform one no-I/O warm render on a later drive;
+      // otherwise the once-only static memory cache would drop repo-map for the entire session.
+      this.repoMapRefreshPending = Boolean(
+        this.repoMapPrewarm && !sources.some((source) => source.id === "repo-map"),
+      );
       if (sources.length > 0) {
         const compiled = this.contextCompiler.compile({ query, sources });
         throwIfAborted(signal);
@@ -1659,6 +1696,34 @@ export class Agent {
     } finally {
       span.end();
     }
+  }
+
+  private async refreshDeferredRepoMap(query: string, signal: AbortSignal): Promise<void> {
+    if (!this.repoMapRefreshPending || !this.repoMapOptions || !this.repoMapPrewarm?.settled) {
+      return;
+    }
+    let map: string;
+    try {
+      map = await raceWithSignal(
+        gatherRepoMap(this.cwd, { ...this.repoMapOptions, ...(query ? { query } : {}) }),
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // Optional context retains its historical fail-soft behavior. A completed prewarm followed
+      // by another failure is not retried every turn.
+      this.repoMapRefreshPending = false;
+      return;
+    }
+    this.repoMapRefreshPending = false;
+    if (!map) return;
+    this.memorySources = [
+      ...this.memorySources.filter((source) => source.id !== "repo-map"),
+      { id: "repo-map", content: map, kind: "repository", priority: 65 },
+    ];
+    const compiled = this.contextCompiler.compile({ query, sources: this.memorySources });
+    throwIfAborted(signal);
+    this.system = composeSystem(this.baseSystem, compiled.text);
   }
 }
 

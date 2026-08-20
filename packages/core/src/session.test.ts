@@ -161,12 +161,17 @@ test("SessionStore: create/append/load/list 往返", async () => {
   assert.equal(meta.id, id);
 
   await store.append(id, { role: "user", content: [{ type: "text", text: "hi" }] });
-  await store.append(id, { role: "assistant", content: [{ type: "text", text: "hello" }] });
+  await store.appendMany(id, [
+    { role: "assistant", content: [{ type: "text", text: "hello" }] },
+    { role: "user", content: [{ type: "text", text: "batch" }] },
+  ]);
 
   const data = await store.load(id);
   assert.equal(data.title, "测试会话");
-  assert.equal(data.messages.length, 2);
+  assert.equal(data.messages.length, 3);
   assert.equal((data.messages[0]!.content[0] as any).text, "hi");
+  assert.equal((await store.getMeta(id))?.title, "测试会话");
+  assert.equal(await store.getMeta("s_missing"), undefined);
 
   const list = await store.list();
   assert.equal(list.length, 1);

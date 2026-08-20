@@ -88,3 +88,41 @@ test("CodeIndex: broad symbol queries preserve deterministic forward and reverse
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("CodeIndex: 当前 generation 可无 I/O 渲染，查询无关投影每代只构建一次", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-index-generation-"));
+  try {
+    const source = path.join(root, "main.ts");
+    const index = new IncrementalCodeIndex(root, {
+      extractSymbols,
+      persist: false,
+    });
+    assert.equal(index.hasSnapshot(), false);
+    assert.equal(await index.renderCurrent("main"), undefined);
+
+    await fs.writeFile(source, "export function firstGeneration() {}\n");
+    await index.refresh();
+    assert.equal(index.generation, 1);
+    assert.match((await index.renderCurrent("first")) ?? "", /firstGeneration/);
+    await index.renderCurrent("unrelated second query");
+    assert.equal(
+      index.stats.projectionBuilds,
+      1,
+      "query-independent definitions/frequencies should be built once per generation",
+    );
+
+    await index.refresh();
+    assert.equal(index.generation, 1, "metadata-identical refresh keeps the adopted generation");
+    await index.renderCurrent("third query");
+    assert.equal(index.stats.projectionBuilds, 1);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await fs.writeFile(source, "export function secondGenerationWithLongerName() {}\n");
+    await index.refresh();
+    assert.equal(index.generation, 2);
+    assert.match((await index.renderCurrent("second")) ?? "", /secondGenerationWithLongerName/);
+    assert.equal(index.stats.projectionBuilds, 2);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

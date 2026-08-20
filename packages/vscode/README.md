@@ -25,6 +25,11 @@ npm run watch --workspace anicode-vscode    # 监听重建
 npm run package --workspace anicode-vscode
 ```
 
+桌面与 Remote Extension Host 的最低支持版本为 VS Code 1.101（Node 22.15.1）。扩展把
+`@anicode/core` 的 `node:sqlite` 运行时打入主机 bundle，因此旧版 Node 20 Extension Host 不受支持。
+构建和 VSIX 预发布会运行静态兼容性检查：manifest、最低版本 API 类型、esbuild target，以及 bundle
+中的每一个 `node:` builtin 必须与这条基线一致。
+
 Tree-sitter 与 OS Keychain 使用 N-API，因此本地命令生成的是当前平台 VSIX。构建会显式复制最小
 Keychain JS loader 和当前平台 binding 到 `out/keyring`，扩展宿主把该绝对路径交给隔离 helper；不会
 依赖 CJS 中不可用的 `import.meta` 或残留的 hashed native 文件。Release workflow 会在 Linux x64/arm64、

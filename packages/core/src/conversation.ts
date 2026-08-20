@@ -176,6 +176,14 @@ export class Conversation {
     const snapshot = this.history;
     const end = snapshot.length;
     await this.enqueuePersist(async () => {
+      if (this.persist!.store.appendMany) {
+        const pending = snapshot.slice(this.persistedCount, end);
+        if (pending.length > 0) {
+          await this.persist!.store.appendMany(this.persist!.meta.id, pending);
+          this.persistedCount = end;
+        }
+        return;
+      }
       for (let i = this.persistedCount; i < end; i++) {
         await this.persist!.store.append(this.persist!.meta.id, snapshot[i]!);
         this.persistedCount = i + 1;
@@ -205,8 +213,12 @@ export class Conversation {
   async updatePersistenceMeta(meta: SessionMeta, signal?: AbortSignal): Promise<void> {
     if (!this.persist) return;
     const nextMeta = { ...meta };
-    const snapshot = [...this.history];
     await this.enqueuePersist(async () => {
+      if (this.persist!.store.updateMeta) {
+        this.persist!.meta = await this.persist!.store.updateMeta(nextMeta);
+        return;
+      }
+      const snapshot = [...this.history];
       await this.persist!.store.rewrite(nextMeta, snapshot);
       this.persist!.meta = nextMeta;
       this.persistedCount = snapshot.length;

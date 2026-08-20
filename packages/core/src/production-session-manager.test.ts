@@ -359,7 +359,7 @@ test("production composition keeps every local host on the same capability contr
     assert.equal(options.webSearchProvider, undefined);
     assert.equal(options.webSearchDisabledReason, "credential_not_configured");
     assert.equal(options.checkpoints, true);
-    assert.equal(options.repoMap, true);
+    assert.deepEqual(options.repoMap, { coldStartTimeoutMs: 25 });
     assert.equal(options.autoTitle, true);
     const colliding = productionSessionManagerOptions(
       {

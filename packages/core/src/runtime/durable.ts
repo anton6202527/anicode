@@ -39,6 +39,8 @@ export interface AppendRuntimeEvent<T = unknown> {
 export interface RuntimeEventStore {
   /** Shared lifecycle backend colocated with event persistence when available. */
   readonly lifecycle?: SessionLifecycleStore;
+  /** Opaque database identity used to prove a composite inbox/event/outbox commit is atomic. */
+  readonly atomicPersistenceBackend?: object;
   append<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>>;
   read(streamId: string, afterSequence?: number): Promise<RuntimeEvent[]>;
   listStreams(): Promise<string[]>;
@@ -346,15 +348,21 @@ export class DurableRuntime {
   async record<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
     return this.withStreamLock(input.streamId, async () => {
       const event = await this.store.append(input);
-      if (
-        this.snapshots &&
-        (event.sequence % Math.max(1, this.snapshotEvery) === 0 ||
-          ["prompt.completed", "prompt.failed", "prompt.cancelled"].includes(event.type))
-      ) {
+      if (this.requiresSnapshot(event)) {
         await this.writeSnapshotUnlocked(input.streamId);
       }
       return event;
     });
+  }
+
+  /**
+   * Maintain the normal snapshot cadence for an event committed by a same-database composite
+   * transaction. The common path is a local predicate only; the occasional snapshot boundary is
+   * serialized with ordinary record() calls and may read through a later sequence safely.
+   */
+  async maintainSnapshotAfterExternalCommit(event: RuntimeEvent): Promise<void> {
+    if (!this.requiresSnapshot(event)) return;
+    await this.withStreamLock(event.streamId, () => this.writeSnapshotUnlocked(event.streamId));
   }
 
   events(streamId: string, afterSequence = 0): Promise<RuntimeEvent[]> {
@@ -385,6 +393,14 @@ export class DurableRuntime {
     };
     await snapshots.put(snapshot);
     return snapshot;
+  }
+
+  private requiresSnapshot(event: Pick<RuntimeEvent, "sequence" | "type">): boolean {
+    return Boolean(
+      this.snapshots &&
+      (event.sequence % Math.max(1, this.snapshotEvery) === 0 ||
+        ["prompt.completed", "prompt.failed", "prompt.cancelled"].includes(event.type)),
+    );
   }
 
   private withStreamLock<T>(streamId: string, work: () => Promise<T>): Promise<T> {

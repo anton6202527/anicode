@@ -9,6 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,7 +17,15 @@ import { SessionManager, type SessionEvent } from "./session-manager.js";
 import { MigratingSessionStore, SessionStore } from "./session.js";
 import { MemoryArtifactStore, type ArtifactStore } from "./runtime/artifacts.js";
 import { DurableRuntime, MemoryRuntimeEventStore } from "./runtime/durable.js";
-import { CommandInbox, MemoryCommandInboxStore, type DurableCommand } from "./runtime/commands.js";
+import { WorktreeOwnership } from "./runtime/worker.js";
+import {
+  CommandInbox,
+  DurableOutbox,
+  MemoryCommandInboxStore,
+  MemoryOutboxStore,
+  type DurableCommand,
+  type FencedCommandEventCommit,
+} from "./runtime/commands.js";
 import type { IsolatedRunRequest } from "./runtime/isolated-runtime.js";
 import { PatchSetService } from "./runtime/patchset.js";
 import type { Provider, StreamEvent, ChatMessage, StreamRequest } from "./types.js";
@@ -643,16 +652,16 @@ test("SessionManager: scoped artifact/runtime/delete APIs preflight ownership be
 
     const releasePreflight = deferred();
     const preflightStarted = deferred();
-    const originalStoreList = store.list.bind(store);
+    const originalStoreGetMeta = store.getMeta.bind(store);
     let blockNextPreflight = true;
-    store.list = async () => {
-      const listed = await originalStoreList();
+    store.getMeta = async (sessionId) => {
+      const meta = await originalStoreGetMeta(sessionId);
       if (blockNextPreflight) {
         blockNextPreflight = false;
         preflightStarted.resolve();
         await releasePreflight.promise;
       }
-      return listed;
+      return meta;
     };
     const firstDeletion = manager.deleteSession("scope-owned");
     const secondDeletion = manager.deleteSession("scope-owned");
@@ -2357,6 +2366,404 @@ test("SessionManager: command fencing heartbeat 失败时在 provider/tool 前 f
   }
 });
 
+test("SessionManager: provider dispatch revalidates the shorter session actor lease", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-actor-provider-fence-"));
+  class LostActorOwnership extends WorktreeOwnership {
+    heartbeats = 0;
+
+    override async heartbeat(
+      worktree: string,
+      owner: string,
+      leaseMs = 60_000,
+      fencingToken?: number,
+    ): Promise<void> {
+      this.heartbeats++;
+      // prepare fence + pre-Agent fence succeed; the budget checkpoint immediately before the
+      // provider is the third exact heartbeat and must stop dispatch when ownership changed.
+      if (this.heartbeats === 3) throw new Error("stale session actor fencing token");
+      await super.heartbeat(worktree, owner, leaseMs, fencingToken);
+    }
+  }
+
+  let providerCalls = 0;
+  const provider: Provider = {
+    name: "actor-fenced-provider",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerCalls++;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "unsafe" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const ownership = new LostActorOwnership();
+  const store = new SessionStore(path.join(dir, "sessions"));
+  const manager = new SessionManager({
+    store,
+    sessionDriveOwnership: ownership,
+    resolveProvider: () => ({ provider, model: "actor-fenced-provider" }),
+    recoverCommands: false,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "actor-fenced-provider" });
+    await assert.rejects(
+      manager.send(session.id, "do not dispatch"),
+      /stale session actor fencing token/,
+    );
+    assert.equal(providerCalls, 0);
+    assert.equal(
+      (await store.load(session.id)).messages.some((message) =>
+        message.content.some((part) => part.type === "text" && part.text === "unsafe"),
+      ),
+      false,
+    );
+  } finally {
+    await manager.shutdown().catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: drive prepare revalidates actor before accepting a durable command", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-actor-prepare-fence-"));
+  class LostDuringPrepareOwnership extends WorktreeOwnership {
+    override async heartbeat(): Promise<void> {
+      throw new Error("actor expired while refreshing the session");
+    }
+  }
+
+  let providerCalls = 0;
+  const provider: Provider = {
+    name: "prepare-fenced-provider",
+    async *stream(): AsyncIterable<StreamEvent> {
+      providerCalls++;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: { role: "assistant", content: [{ type: "text", text: "unsafe" }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const commandStore = new MemoryCommandInboxStore();
+  const manager = new SessionManager({
+    store: new SessionStore(path.join(dir, "sessions")),
+    commandInbox: new CommandInbox(commandStore),
+    sessionDriveOwnership: new LostDuringPrepareOwnership(),
+    resolveProvider: () => ({ provider, model: "prepare-fenced-provider" }),
+    recoverCommands: false,
+  });
+  try {
+    const session = await manager.createSession({ cwd: dir, model: "prepare-fenced-provider" });
+    await assert.rejects(
+      manager.send(session.id, "must not be accepted"),
+      /actor expired while refreshing the session/,
+    );
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(await commandStore.read(session.id), []);
+  } finally {
+    await manager.shutdown().catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: session actor serializes compact across managers before transcript rewrite", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-actor-compact-"));
+  const sessionsDir = path.join(dir, "sessions");
+  const activeStarted = deferred();
+  const releaseActive = deferred();
+  const contention = deferred();
+  const ownership = new WorktreeOwnership();
+  const originalAcquire = ownership.acquire.bind(ownership);
+  let observeContention = false;
+  ownership.acquire = async (...args: Parameters<WorktreeOwnership["acquire"]>) => {
+    try {
+      return await originalAcquire(...args);
+    } catch (error) {
+      if (observeContention) contention.resolve();
+      throw error;
+    }
+  };
+
+  let providerTurn = 0;
+  const providerA: Provider = {
+    name: "actor-compact-writer",
+    async *stream(): AsyncIterable<StreamEvent> {
+      const turn = providerTurn++;
+      if (turn === 2) {
+        activeStarted.resolve();
+        await releaseActive.promise;
+      }
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `reply-${turn}` }],
+        },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const providerB = scriptedProvider([]);
+  const storeA = new SessionStore(sessionsDir);
+  const storeB = new SessionStore(sessionsDir);
+  let rewritesByB = 0;
+  const originalRewrite = storeB.rewrite.bind(storeB);
+  storeB.rewrite = async (...args: Parameters<SessionStore["rewrite"]>) => {
+    rewritesByB++;
+    await originalRewrite(...args);
+  };
+  const managerA = new SessionManager({
+    store: storeA,
+    sessionDriveOwnership: ownership,
+    resolveProvider: () => ({ provider: providerA, model: "actor-compact" }),
+    recoverCommands: false,
+  });
+  const managerB = new SessionManager({
+    store: storeB,
+    sessionDriveOwnership: ownership,
+    resolveProvider: () => ({ provider: providerB, model: "actor-compact" }),
+    compaction: { keepRecentMessages: 1, summarizer: async () => "older summary" },
+    recoverCommands: false,
+  });
+  let activeSend: Promise<void> | undefined;
+  try {
+    const session = await managerA.createSession({ cwd: dir, model: "actor-compact" });
+    await managerA.send(session.id, "seed-1");
+    await managerA.send(session.id, "seed-2");
+    await managerB.resumeSession(session.id);
+
+    activeSend = managerA.send(session.id, "active");
+    await activeStarted.promise;
+    observeContention = true;
+    let compactSettled = false;
+    const compact = managerB.compact(session.id).finally(() => {
+      compactSettled = true;
+    });
+    await contention.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(compactSettled, false, "compact must wait for the active send actor");
+    assert.equal(rewritesByB, 0, "the stale manager must not rewrite while send owns the actor");
+
+    releaseActive.resolve();
+    await activeSend;
+    const result = await compact;
+    assert.equal(result.compacted, true);
+    assert.equal(rewritesByB, 1);
+    const stored = await storeA.load(session.id);
+    const visibleText = stored.messages.flatMap((message) =>
+      message.content.flatMap((part) =>
+        part.type === "text" && !part.internal ? [part.text] : [],
+      ),
+    );
+    assert.deepEqual(visibleText.slice(-2), ["active", "reply-2"]);
+  } finally {
+    releaseActive.resolve();
+    await activeSend?.catch(() => undefined);
+    await Promise.allSettled([managerA.shutdown(), managerB.shutdown()]);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: session actor serializes undo across managers before transcript rewrite", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-actor-undo-"));
+  const workspace = path.join(dir, "workspace");
+  const sessionsDir = path.join(dir, "sessions");
+  await fs.mkdir(workspace);
+  execFileSync("git", ["init", "-q"], { cwd: workspace });
+  execFileSync("git", ["config", "user.email", "actor-test@anicode.local"], {
+    cwd: workspace,
+  });
+  execFileSync("git", ["config", "user.name", "Anicode Actor Test"], { cwd: workspace });
+  await fs.writeFile(path.join(workspace, "tracked.txt"), "initial\n");
+  execFileSync("git", ["add", "tracked.txt"], { cwd: workspace });
+  execFileSync("git", ["commit", "-qm", "initial"], { cwd: workspace });
+
+  const activeStarted = deferred();
+  const releaseActive = deferred();
+  const contention = deferred();
+  const ownership = new WorktreeOwnership();
+  const originalAcquire = ownership.acquire.bind(ownership);
+  let observeContention = false;
+  ownership.acquire = async (...args: Parameters<WorktreeOwnership["acquire"]>) => {
+    try {
+      return await originalAcquire(...args);
+    } catch (error) {
+      if (observeContention) contention.resolve();
+      throw error;
+    }
+  };
+
+  let providerTurn = 0;
+  const provider: Provider = {
+    name: "actor-undo-writer",
+    async *stream(): AsyncIterable<StreamEvent> {
+      const turn = providerTurn++;
+      if (turn === 1) {
+        activeStarted.resolve();
+        await releaseActive.promise;
+      }
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `reply-${turn}` }],
+        },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const runtime = new DurableRuntime(new MemoryRuntimeEventStore());
+  const storeA = new SessionStore(sessionsDir);
+  const storeB = new SessionStore(sessionsDir);
+  let rewritesByB = 0;
+  const originalRewrite = storeB.rewrite.bind(storeB);
+  storeB.rewrite = async (...args: Parameters<SessionStore["rewrite"]>) => {
+    rewritesByB++;
+    await originalRewrite(...args);
+  };
+  const managerA = new SessionManager({
+    store: storeA,
+    runtime,
+    sessionDriveOwnership: ownership,
+    resolveProvider: () => ({ provider, model: "actor-undo" }),
+    checkpoints: true,
+    recoverCommands: false,
+  });
+  const managerB = new SessionManager({
+    store: storeB,
+    runtime,
+    sessionDriveOwnership: ownership,
+    resolveProvider: () => ({ provider, model: "actor-undo" }),
+    checkpoints: true,
+    recoverCommands: false,
+  });
+  let activeSend: Promise<void> | undefined;
+  try {
+    const session = await managerA.createSession({ cwd: workspace, model: "actor-undo" });
+    await managerA.send(session.id, "initial turn");
+    await managerB.resumeSession(session.id);
+    assert.equal((await managerB.listCheckpoints(session.id)).length, 1);
+
+    activeSend = managerA.send(session.id, "active turn");
+    await activeStarted.promise;
+    observeContention = true;
+    let undoSettled = false;
+    const undo = managerB.undo(session.id, undefined, "conversation").finally(() => {
+      undoSettled = true;
+    });
+    await contention.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(undoSettled, false, "undo must wait for the active send actor");
+    assert.equal(rewritesByB, 0, "the stale manager must not rewind while send owns the actor");
+
+    releaseActive.resolve();
+    await activeSend;
+    const result = await undo;
+    assert.equal(result.removedMessages, 2);
+    assert.equal(rewritesByB, 1);
+    const stored = await storeA.load(session.id);
+    const visibleText = stored.messages.flatMap((message) =>
+      message.content.flatMap((part) =>
+        part.type === "text" && !part.internal ? [part.text] : [],
+      ),
+    );
+    assert.deepEqual(visibleText, ["initial turn", "reply-0"]);
+  } finally {
+    releaseActive.resolve();
+    await activeSend?.catch(() => undefined);
+    await Promise.allSettled([managerA.shutdown(), managerB.shutdown()]);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SessionManager: budget checkpoint only selects the composite path for one shared backend", async () => {
+  class MarkedRuntimeStore extends MemoryRuntimeEventStore {
+    constructor(readonly atomicPersistenceBackend: object) {
+      super();
+    }
+  }
+  class MarkedOutboxStore extends MemoryOutboxStore {
+    constructor(readonly atomicPersistenceBackend: object) {
+      super();
+    }
+  }
+  class CompositeCommandStore extends MemoryCommandInboxStore {
+    commits = 0;
+
+    constructor(
+      readonly atomicPersistenceBackend: object,
+      private readonly events: MarkedRuntimeStore,
+    ) {
+      super();
+    }
+
+    async commitFencedEvent(input: FencedCommandEventCommit) {
+      this.commits++;
+      return this.events.append(input.event);
+    }
+  }
+
+  const run = async (mode: "shared" | "mismatched" | "generic") => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `anicode-budget-fast-${mode}-`));
+    const commandBackend = {};
+    const runtimeStore = new MarkedRuntimeStore(commandBackend);
+    const runtime = new DurableRuntime(runtimeStore);
+    const outboxStore = new MarkedOutboxStore(mode === "mismatched" ? {} : commandBackend);
+    const outbox = new DurableOutbox(outboxStore, runtime);
+    const commandStore =
+      mode === "generic"
+        ? new MemoryCommandInboxStore()
+        : new CompositeCommandStore(commandBackend, runtimeStore);
+    let budgetOutboxPublishes = 0;
+    const publish = outbox.publish.bind(outbox);
+    outbox.publish = async (event) => {
+      if (event.type === "command.budget_checkpoint") budgetOutboxPublishes++;
+      return publish(event);
+    };
+    const manager = new SessionManager({
+      store: new SessionStore(path.join(dir, "sessions")),
+      commandInbox: new CommandInbox(commandStore),
+      runtime,
+      outbox,
+      resolveProvider: () => ({
+        provider: scriptedProvider([
+          [{ role: "assistant", content: [{ type: "text", text: "budgeted" }] }],
+        ]),
+        model: "budget-fast-path",
+      }),
+      runBudget: { maxTotalTokens: 100 },
+      recoverCommands: false,
+    });
+    try {
+      const session = await manager.createSession({ cwd: dir, model: "budget-fast-path" });
+      await manager.send(session.id, "checkpoint");
+      return {
+        commits: commandStore instanceof CompositeCommandStore ? commandStore.commits : 0,
+        budgetOutboxPublishes,
+      };
+    } finally {
+      await manager.shutdown().catch(() => undefined);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  };
+
+  const shared = await run("shared");
+  assert.ok(shared.commits > 0, "same-backend stores must use the single-commit path");
+  assert.equal(shared.budgetOutboxPublishes, 0);
+
+  const mismatched = await run("mismatched");
+  assert.equal(mismatched.commits, 0, "a cross-backend combination cannot claim atomicity");
+  assert.ok(mismatched.budgetOutboxPublishes > 0, "mismatched stores retain the durable fallback");
+
+  const generic = await run("generic");
+  assert.equal(generic.commits, 0);
+  assert.ok(generic.budgetOutboxPublishes > 0, "generic stores retain the portable outbox path");
+});
+
 test("SessionManager: setTitle 更新标题并持久化，list/resume 都可见", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sm-"));
   const m = await mgr(
@@ -2482,15 +2889,15 @@ test("SessionManager: delete fence 等待迟到持久化，并拒绝新 load/sen
   const store = new SessionStore(path.join(dir, "sessions"));
   const appendStarted = deferred();
   const releaseAppend = deferred();
-  const originalAppend = store.append.bind(store);
+  const originalAppendMany = store.appendMany.bind(store);
   let blockFirstAppend = true;
-  store.append = async (id, message) => {
+  store.appendMany = async (id, messages) => {
     if (blockFirstAppend) {
       blockFirstAppend = false;
       appendStarted.resolve();
       await releaseAppend.promise;
     }
-    await originalAppend(id, message);
+    await originalAppendMany(id, messages);
   };
   const manager = new SessionManager({
     store,

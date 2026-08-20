@@ -32,6 +32,8 @@
     "build:app": "npm run build --workspace @anicode/app",
     "build:vscode": "npm run build --workspace anicode-vscode",
     "size:check": "node scripts/check-bundle-size.mjs",
+    "benchmark:core": "npm run benchmark:performance --workspace @anicode/core --",
+    "test:performance": "npm run test:performance --workspace @anicode/core",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "cross-env ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 npm run test --workspaces --if-present",
     "eval": "npm run eval --workspace @anicode/eval --",

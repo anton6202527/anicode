@@ -609,13 +609,41 @@ export interface WorktreeLease {
   fencingToken: number;
 }
 
+/**
+ * A live owner currently holds the requested durable lease. Callers which deliberately queue
+ * behind another owner may retry this error; every other acquisition failure remains fatal.
+ */
+export class WorktreeOwnershipBusyError extends Error {
+  constructor(
+    readonly worktree: string,
+    options?: { cause?: unknown; owner?: string },
+  ) {
+    super(
+      options?.cause instanceof Error
+        ? options.cause.message
+        : `Worktree is owned by ${options?.owner ?? "another owner"}: ${worktree}`,
+      options,
+    );
+    this.name = "WorktreeOwnershipBusyError";
+  }
+}
+
 export class WorktreeOwnership {
   constructor(private readonly store: WorkerQueueStore = new MemoryWorkerQueueStore()) {}
 
-  acquire(worktree: string, owner: string, leaseMs = 60_000): Promise<WorktreeLease> {
+  async acquire(worktree: string, owner: string, leaseMs = 60_000): Promise<WorktreeLease> {
     const resolved = path.resolve(worktree);
     if (this.store.acquireWorktree) {
-      return this.store.acquireWorktree(resolved, owner, leaseMs);
+      try {
+        return await this.store.acquireWorktree(resolved, owner, leaseMs);
+      } catch (error) {
+        // Normalized stores deliberately report a conflicting live owner with this stable prefix.
+        // Convert only that expected contention path so callers never retry corruption/I/O errors.
+        if (error instanceof Error && error.message.startsWith("Worktree is owned by ")) {
+          throw new WorktreeOwnershipBusyError(resolved, { cause: error });
+        }
+        throw error;
+      }
     }
     return this.store.transact(async (rows) => {
       // 复用 store 的 JSON 事务能力，ownership 记录用保留 job type 编码。
@@ -628,7 +656,9 @@ export class WorktreeOwnership {
         row.leaseExpiresAt &&
         Date.parse(row.leaseExpiresAt) > now
       )
-        throw new Error(`Worktree is owned by ${row.leaseOwner}: ${worktree}`);
+        throw new WorktreeOwnershipBusyError(resolved, {
+          owner: row.leaseOwner ?? "another owner",
+        });
       const expiresAt = new Date(now + Math.max(1_000, leaseMs)).toISOString();
       const fencingToken = (row?.fencingToken ?? 0) + 1;
       if (row) {

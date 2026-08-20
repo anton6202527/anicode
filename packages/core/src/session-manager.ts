@@ -84,7 +84,11 @@ import type { SpanContext, Telemetry } from "./runtime/telemetry.js";
 import { noTelemetry, parseTraceparent, traceparent } from "./runtime/telemetry.js";
 import type { SecurityPolicyEngine } from "./security/policy.js";
 import type { ExecutionRuntime } from "./runtime/isolated-runtime.js";
-import type { WorktreeOwnership } from "./runtime/worker.js";
+import {
+  WorktreeOwnershipBusyError,
+  type WorktreeLease,
+  type WorktreeOwnership,
+} from "./runtime/worker.js";
 import type { NetworkProxy } from "./runtime/network-proxy.js";
 import {
   parsePersistedTaskRecord,
@@ -364,6 +368,13 @@ export interface SessionManagerOptions {
   telemetry?: Telemetry;
   isolatedRuntime?: ExecutionRuntime;
   worktreeOwnership?: WorktreeOwnership;
+  /**
+   * Durable ownership used to serialize one Agent drive per session across SessionManager
+   * instances. Production normally reuses `worktreeOwnership`; embedders with separate backends
+   * may provide an explicitly shared owner here. Permission answers and interrupts never acquire
+   * this lease, so they can unblock a suspended drive.
+   */
+  sessionDriveOwnership?: WorktreeOwnership;
   networkProxy?: NetworkProxy;
   /** prompt 正文与状态的耐久 inbox；缺省内存，生产宿主应传文件实现。 */
   commandInbox?: CommandInbox;
@@ -421,6 +432,18 @@ interface SendOutcome {
 interface CommandLeaseHeartbeat {
   assertOwned(): Promise<void>;
   stop(): Promise<void>;
+}
+
+interface SessionDriveGuard {
+  readonly sessionId: string;
+  readonly fencingToken: number;
+  /** Retain the same local drive owner for steering or detached descendants. */
+  retain(): "owner" | "shared" | undefined;
+  /** Single-flight refresh before any local caller may enter the owned Agent. */
+  prepare(run: () => Promise<void>): Promise<void>;
+  /** Exact-token check used immediately before every tool side effect. */
+  assertOwned(): Promise<void>;
+  release(): Promise<void>;
 }
 
 interface RecoveredSessionProjection {
@@ -1159,6 +1182,12 @@ export class SessionManager {
   private readonly shutdownTimeoutMs: number;
   private readonly telemetry: Telemetry;
   private readonly workerId = `runtime_${process.pid}_${randomUUID().slice(0, 8)}`;
+  /** Production reuses the normalized worktree lease table as a generic fenced ownership store. */
+  private readonly sessionDriveOwnership: WorktreeOwnership | undefined;
+  /** Same-manager steering retains the current durable drive owner. */
+  private readonly sessionDriveGuards = new Map<string, SessionDriveGuard>();
+  /** Last generation this manager released cleanly; gaps force a transcript reload. */
+  private readonly sessionDriveFences = new Map<string, number>();
   private readonly activeCommands = new Map<string, Map<string, DurableCommand>>();
   /**
    * Commands deliberately fenced by a user interrupt. Losing their durable command lease is the
@@ -1241,6 +1270,7 @@ export class SessionManager {
       opts.workspaceScope !== undefined ? path.resolve(opts.workspaceScope) : undefined;
     this.runtime = opts.runtime ?? new DurableRuntime(new MemoryRuntimeEventStore());
     this.lifecycle = this.runtime.lifecycle;
+    this.sessionDriveOwnership = opts.sessionDriveOwnership ?? opts.worktreeOwnership;
     this.sessionLifecycleLeaseMs = opts.sessionLifecycleLeaseMs ?? SESSION_OPERATION_LEASE_MS;
     this.sessionLifecyclePollMs = opts.sessionLifecyclePollMs ?? SESSION_LIFECYCLE_POLL_MS;
     this.shutdownTimeoutMs = opts.shutdownTimeoutMs ?? SESSION_MANAGER_SHUTDOWN_TIMEOUT_MS;
@@ -1362,6 +1392,10 @@ export class SessionManager {
         ...(input.title ? { title: input.title } : {}),
       });
       this.instantiate(meta, [], inspected, workspaceTrust);
+      // A successful create proves this manager owns the empty generation before any drive lease.
+      // Token 1 can therefore reuse it; any intervening owner advances the durable token and
+      // forces refreshSessionForDrive to reload instead.
+      if (this.sessionDriveOwnership) this.sessionDriveFences.set(meta.id, 0);
       await this.runtime.record({
         streamId: meta.id,
         type: "session.created",
@@ -1421,6 +1455,7 @@ export class SessionManager {
         // 复制的历史整体落盘（rewrite 原子替换含 meta 头的整份文件）。
         await this.opts.store.rewrite(meta, messages);
         this.instantiate(meta, messages, inspected, workspaceTrust);
+        if (this.sessionDriveOwnership) this.sessionDriveFences.set(meta.id, 0);
         return { ...meta, running: false };
       });
     });
@@ -1506,7 +1541,14 @@ export class SessionManager {
     }
     const interruptEpoch = this.interruptEpochs.get(sessionId) ?? 0;
     return this.runSessionOperation(sessionId, () =>
-      this.sendInternal(sessionId, text, opts, interruptEpoch),
+      this.withSessionDrive(
+        sessionId,
+        () => {
+          this.assertSessionAvailable(sessionId);
+          this.assertSendGeneration(sessionId, interruptEpoch);
+        },
+        (drive) => this.sendInternal(sessionId, text, opts, interruptEpoch, drive),
+      ),
     );
   }
 
@@ -1515,6 +1557,7 @@ export class SessionManager {
     text: string,
     opts?: { model?: string; idempotencyKey?: string; traceparent?: string },
     interruptEpoch = this.interruptEpochs.get(sessionId) ?? 0,
+    drive?: SessionDriveGuard,
   ): Promise<void> {
     this.assertSendGeneration(sessionId, interruptEpoch);
     const interruptTask = this.interruptTasks.get(sessionId);
@@ -1614,6 +1657,7 @@ export class SessionManager {
       // a durable cancelled command rather than becoming an unaudited side effect.
       this.assertSendGeneration(sessionId, interruptEpoch);
       this.assertSessionAvailable(sessionId);
+      await drive?.assertOwned();
       await heartbeat.assertOwned();
       const runBudgetSnapshot = session.running
         ? undefined
@@ -1623,13 +1667,22 @@ export class SessionManager {
       const effectiveSendOptions = {
         ...sendOptions,
         ...(runBudgetSnapshot ? { runBudgetSnapshot } : {}),
-        beforeToolExecution: () => this.assertCommandOwnership(claimed),
-        onRunBudgetCheckpoint: (snapshot: RunBudgetSnapshot) =>
-          this.persistRunBudgetCheckpoint(claimed, snapshot),
+        beforeToolExecution: async () => {
+          await drive?.assertOwned();
+          await this.assertCommandOwnership(claimed);
+        },
+        onRunBudgetCheckpoint: async (snapshot: RunBudgetSnapshot) => {
+          await this.persistRunBudgetCheckpoint(claimed, snapshot);
+          // Every provider reservation/settlement crosses this checkpoint. Revalidate the shorter
+          // session actor lease after persistence and immediately before the provider or its
+          // returned message can advance the transcript; the command lease alone has a longer TTL.
+          await drive?.assertOwned();
+        },
       };
       const steering = session.running ? session.send(text, effectiveSendOptions) : undefined;
       const outcome = await (steering ?? session.send(text, effectiveSendOptions));
       await this.flushRuntimeWrites(sessionId);
+      await drive?.assertOwned();
       // A normal foreground drive resolves its ManagedSession waiter after abort cleanup. The
       // interrupt operation may already have durably cancelled the command and released its lease
       // by then. Treat that known user-cancellation as the successful completion of interrupt
@@ -1668,7 +1721,13 @@ export class SessionManager {
       } else {
         const backgroundTaskIds = steering ? [] : session.runningBackgroundTaskIds();
         if (backgroundTaskIds.length > 0) {
-          this.finalizeCommandAfterBackgroundTasks(session, claimed, heartbeat, backgroundTaskIds);
+          this.finalizeCommandAfterBackgroundTasks(
+            session,
+            claimed,
+            heartbeat,
+            backgroundTaskIds,
+            drive,
+          );
           ownershipTransferred = true;
         } else {
           await this.commandInbox.finish(sessionId, command.id, "completed", undefined, {
@@ -1745,16 +1804,22 @@ export class SessionManager {
     command: DurableCommand,
     heartbeat: CommandLeaseHeartbeat,
     taskIds: readonly string[],
+    drive?: SessionDriveGuard,
   ): void {
     const sessionId = command.sessionId;
     if (this.backgroundCommandFinalizations.has(sessionId)) {
       throw new Error(`Session ${sessionId} already has a detached command tree`);
+    }
+    const retainedDrive = drive?.retain();
+    if (drive && !retainedDrive) {
+      throw new Error(`Session drive lease for ${sessionId} is already closing`);
     }
     const finalization = (async () => {
       try {
         await session.whenBackgroundTasksIdle();
         await session.whenPersistenceIdle();
         await this.flushRuntimeWrites(sessionId);
+        await drive?.assertOwned();
         await heartbeat.assertOwned();
         const current = await this.commandInbox.get(sessionId, command.id);
         if (current?.status === "cancelled") {
@@ -1796,6 +1861,7 @@ export class SessionManager {
       } finally {
         await heartbeat.stop();
         this.deactivateCommand(sessionId, command.id);
+        await drive?.release();
       }
     })();
     this.backgroundCommandFinalizations.set(sessionId, finalization);
@@ -1891,10 +1957,16 @@ export class SessionManager {
     }
     const current = this.recoveringCommands.get(sessionId);
     if (current) return current;
-    const work = this.runSessionOperation(sessionId, async () => {
-      const session = await this.ensureLive(sessionId);
-      return this.recoverSessionCommands(session);
-    });
+    const work = this.runSessionOperation(sessionId, () =>
+      this.withSessionDrive(
+        sessionId,
+        () => this.assertSessionAvailable(sessionId),
+        async (drive) => {
+          const session = await this.ensureLive(sessionId);
+          return this.recoverSessionCommands(session, drive);
+        },
+      ),
+    );
     this.recoveringCommands.set(sessionId, work);
     const cleanup = () => {
       if (this.recoveringCommands.get(sessionId) === work)
@@ -1937,10 +2009,16 @@ export class SessionManager {
   compact(
     sessionId: string,
   ): Promise<{ compacted: boolean; beforeTokens: number; afterTokens: number }> {
-    return this.runSessionOperation(sessionId, async () => {
-      const session = await this.ensureLive(sessionId);
-      return session.compact();
-    });
+    return this.runSessionOperation(sessionId, () =>
+      this.withSessionDrive(
+        sessionId,
+        () => this.assertSessionAvailable(sessionId),
+        async () => {
+          const session = await this.ensureLive(sessionId);
+          return session.compact();
+        },
+      ),
+    );
   }
 
   /** 撤销会话到某快照（缺省=最近一个）。mode: files（默认）/conversation/both。 */
@@ -1949,10 +2027,16 @@ export class SessionManager {
     checkpointId?: string,
     mode: RewindMode = "files",
   ): Promise<{ restored: number; deleted: number; removedMessages: number }> {
-    return this.runSessionOperation(sessionId, async () => {
-      const session = await this.ensureLive(sessionId);
-      return session.undo(checkpointId, mode);
-    });
+    return this.runSessionOperation(sessionId, () =>
+      this.withSessionDrive(
+        sessionId,
+        () => this.assertSessionAvailable(sessionId),
+        async () => {
+          const session = await this.ensureLive(sessionId);
+          return session.undo(checkpointId, mode);
+        },
+      ),
+    );
   }
 
   /** 运行时切换会话的权限模式。 */
@@ -2612,7 +2696,9 @@ export class SessionManager {
   ): Promise<ScopedWorkspaceIdentity | undefined> {
     if (!this.workspaceScopePath) return undefined;
     await this.resolveCanonicalWorkspaceScope();
-    const meta = (await this.opts.store.list()).find((candidate) => candidate.id === sessionId);
+    const meta = this.opts.store.getMeta
+      ? await this.opts.store.getMeta(sessionId)
+      : (await this.opts.store.list()).find((candidate) => candidate.id === sessionId);
     if (!meta) throw this.workspaceScopeViolation();
     return this.assertWorkspaceInScope(meta.cwd, meta.workspaceIdentity, true);
   }
@@ -2705,6 +2791,211 @@ export class SessionManager {
     for (const reader of [...(this.activeArtifactReaders.get(sessionId) ?? [])]) {
       reader.abort(reason);
     }
+  }
+
+  /**
+   * Serialize the model/tool drive across hosts while leaving permission answers and interrupts
+   * outside this fence. Same-manager steering retains the existing owner instead of deadlocking
+   * behind the drive it is intended to steer.
+   */
+  private async withSessionDrive<T>(
+    sessionId: string,
+    validate: () => void,
+    run: (drive?: SessionDriveGuard) => Promise<T>,
+  ): Promise<T> {
+    if (!this.sessionDriveOwnership) return run();
+    const { drive } = await this.retainSessionDrive(sessionId, validate);
+    try {
+      validate();
+      await drive.prepare(() => this.refreshSessionForDrive(sessionId, drive.fencingToken));
+      validate();
+      await drive.assertOwned();
+      validate();
+      return await run(drive);
+    } finally {
+      await drive.release();
+    }
+  }
+
+  private async retainSessionDrive(
+    sessionId: string,
+    validate: () => void,
+  ): Promise<{ drive: SessionDriveGuard; role: "owner" | "shared" }> {
+    let resource: string | undefined;
+    for (;;) {
+      validate();
+      const active = this.sessionDriveGuards.get(sessionId);
+      if (active) {
+        const role = active.retain();
+        if (role) return { drive: active, role };
+        if (this.sessionDriveGuards.get(sessionId) === active) {
+          this.sessionDriveGuards.delete(sessionId);
+        }
+      }
+
+      let drive!: SessionDriveGuard;
+      try {
+        if (!resource) resource = await this.sessionDriveResource(sessionId);
+        drive = await this.acquireSessionDrive(sessionId, resource, () => {
+          if (this.sessionDriveGuards.get(sessionId) === drive) {
+            this.sessionDriveGuards.delete(sessionId);
+          }
+        });
+      } catch (error) {
+        if (!(error instanceof WorktreeOwnershipBusyError)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, this.sessionLifecyclePollMs));
+        continue;
+      }
+      const role = drive.retain();
+      if (!role) {
+        throw new Error(`New session drive lease for ${sessionId} could not be retained`);
+      }
+      this.sessionDriveGuards.set(sessionId, drive);
+      return { drive, role };
+    }
+  }
+
+  private async acquireSessionDrive(
+    sessionId: string,
+    resource: string,
+    onClosing: () => void,
+  ): Promise<SessionDriveGuard> {
+    const ownership = this.sessionDriveOwnership!;
+    const owner = `${this.workerId}:drive:${randomUUID().slice(0, 8)}`;
+    const lease: WorktreeLease = await ownership.acquire(
+      resource,
+      owner,
+      this.sessionLifecycleLeaseMs,
+    );
+
+    let references = 0;
+    let closing = false;
+    let stopped = false;
+    let lost: Error | undefined;
+    let tail: Promise<void> = Promise.resolve();
+    let releaseTask: Promise<void> | undefined;
+    let prepareTask: Promise<void> | undefined;
+    let prepared = false;
+    const lose = (error: unknown): void => {
+      if (lost) return;
+      lost = error instanceof Error ? error : new Error(String(error));
+      this.retireSessionAfterCommandLeaseLoss(sessionId);
+    };
+    const renew = (): Promise<void> => {
+      if (stopped) return tail;
+      tail = tail
+        .catch(() => undefined)
+        .then(() =>
+          ownership.heartbeat(
+            lease.worktree,
+            lease.owner,
+            this.sessionLifecycleLeaseMs,
+            lease.fencingToken,
+          ),
+        )
+        .catch(lose);
+      return tail;
+    };
+    const timer = setInterval(
+      () => void renew(),
+      Math.max(25, Math.floor(this.sessionLifecycleLeaseMs / 3)),
+    );
+    timer.unref?.();
+
+    const drive: SessionDriveGuard = {
+      sessionId,
+      fencingToken: lease.fencingToken,
+      retain: () => {
+        if (closing || lost) return undefined;
+        references++;
+        return references === 1 ? "owner" : "shared";
+      },
+      prepare: (run) =>
+        (prepareTask ??= run().then(() => {
+          prepared = true;
+        })),
+      assertOwned: async () => {
+        if (lost) throw lost;
+        await renew();
+        if (lost) throw lost;
+      },
+      release: async () => {
+        if (references <= 0) return releaseTask;
+        references--;
+        if (references > 0) return;
+        if (releaseTask) return releaseTask;
+        closing = true;
+        onClosing();
+        releaseTask = (async () => {
+          stopped = true;
+          clearInterval(timer);
+          await tail;
+          if (lost) throw lost;
+          try {
+            // A suspended event loop can miss timer ticks. The exact-token heartbeat is the final
+            // fence before the owner is considered cleanly released and reusable in memory.
+            await ownership.heartbeat(
+              lease.worktree,
+              lease.owner,
+              this.sessionLifecycleLeaseMs,
+              lease.fencingToken,
+            );
+            await ownership.release(lease.worktree, lease.owner, lease.fencingToken);
+            if (prepared) this.sessionDriveFences.set(sessionId, lease.fencingToken);
+          } catch (error) {
+            lose(error);
+            throw error;
+          }
+        })();
+        return releaseTask;
+      },
+    };
+    return drive;
+  }
+
+  private async sessionDriveWorkspace(sessionId: string): Promise<ScopedWorkspaceIdentity> {
+    const preflight = await this.preflightSessionWorkspace(sessionId);
+    if (preflight) return preflight;
+    const liveMeta = this.sessions.get(sessionId)?.meta;
+    const lifecycle = liveMeta ? undefined : await this.lifecycle.get(sessionId);
+    const workspace = liveMeta?.cwd ?? lifecycle?.workspace;
+    const identity = liveMeta?.workspaceIdentity ?? lifecycle?.workspaceIdentity;
+    if (!workspace) throw new Error(`Session not found: ${sessionId}`);
+    return {
+      canonicalPath: workspace,
+      ...(identity ? { device: identity.device, inode: identity.inode } : {}),
+    };
+  }
+
+  private async sessionDriveResource(sessionId: string): Promise<string> {
+    const workspace = await this.sessionDriveWorkspace(sessionId);
+    return path.join(
+      workspace.canonicalPath,
+      ".anicode",
+      ".runtime-session-drives",
+      createHash("sha256").update(sessionId).digest("hex"),
+    );
+  }
+
+  /** A fencing-token gap proves another manager may have advanced the transcript. */
+  private async refreshSessionForDrive(sessionId: string, fencingToken: number): Promise<void> {
+    const existing = this.sessions.get(sessionId);
+    if (!existing || this.sessionDriveFences.get(sessionId) === fencingToken - 1) return;
+    const listeners = existing.subscriberSet();
+    existing.stopBackgroundTasks();
+    existing.close();
+    await Promise.all([
+      existing.whenIdle(),
+      existing.whenBackgroundTasksIdle(),
+      existing.whenToolExecutionsIdle(),
+      existing.whenPersistenceIdle(),
+    ]);
+    await existing.closeToolResources();
+    await this.closeSessionLspPool(sessionId).catch(() => undefined);
+    await this.waitForLspTermination(sessionId);
+    this.assertSessionAvailable(sessionId);
+    if (this.sessions.get(sessionId) === existing) this.sessions.delete(sessionId);
+    await this.loadSession(sessionId, undefined, listeners);
   }
 
   private runSessionOperation<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
@@ -4228,13 +4519,48 @@ export class SessionManager {
     const sessionId = command.sessionId;
     this.assertSessionAvailable(sessionId);
     const snapshot = validateRunBudgetSnapshot(input);
-    await this.assertCommandOwnership(command);
-    await this.outbox.publish({
+    const event = {
       streamId: sessionId,
       type: "command.budget_checkpoint",
       data: { commandId: command.id, snapshot },
       idempotencyKey: `command:${command.id}:budget:${snapshot.revision}`,
-    });
+    };
+    const commandStore = this.commandInbox.store;
+    const atomicBackend = commandStore.atomicPersistenceBackend;
+    if (
+      commandStore.commitFencedEvent &&
+      atomicBackend !== undefined &&
+      atomicBackend === this.outbox.store.atomicPersistenceBackend &&
+      atomicBackend === this.runtime.store.atomicPersistenceBackend
+    ) {
+      try {
+        if (this.activeCommands.get(sessionId)?.get(command.id) !== command) {
+          throw new Error(`Durable command ${command.id} no longer owns this execution tree`);
+        }
+        const committed = await commandStore.commitFencedEvent({
+          sessionId,
+          commandId: command.id,
+          owner: this.workerId,
+          fencingToken: command.fencingToken ?? 0,
+          leaseMs: 60_000,
+          event,
+        });
+        await this.runtime.maintainSnapshotAfterExternalCommit(committed);
+        if (this.activeCommands.get(sessionId)?.get(command.id) !== command) {
+          throw new Error(`Durable command ${command.id} changed during the execution fence`);
+        }
+      } catch (error) {
+        if (this.interruptedCommands.get(sessionId)?.has(command.id)) {
+          throw new Error(t("Session interrupted", "会话已中断"), { cause: error });
+        }
+        this.retireSessionAfterCommandLeaseLoss(sessionId);
+        throw error;
+      }
+      return;
+    }
+
+    await this.assertCommandOwnership(command);
+    await this.outbox.publish(event);
     await this.assertCommandOwnership(command);
   }
 
@@ -4365,7 +4691,10 @@ export class SessionManager {
     }
   }
 
-  private async recoverSessionCommands(session: ManagedSession): Promise<number> {
+  private async recoverSessionCommands(
+    session: ManagedSession,
+    drive?: SessionDriveGuard,
+  ): Promise<number> {
     const sessionId = session.meta.id;
     // A process can die after the inbox terminal update commits but before the separate outbox
     // enqueue. Rebuild the canonical event first; outbox/runtime idempotency makes every startup
@@ -4405,6 +4734,7 @@ export class SessionManager {
         idempotencyKey: `command:${command.id}:recovered:${claimed.attempts}`,
       });
       try {
+        await drive?.assertOwned();
         await heartbeat.assertOwned();
         const recoveredTraceParent = parseTraceparent(command.traceparent);
         const runBudgetSnapshot = await this.recoverRunBudgetSnapshot(sessionId, claimed);
@@ -4420,11 +4750,18 @@ export class SessionManager {
             ...(historyAdvanced ? { resume: true } : {}),
             ...(recoveredTraceParent ? { traceParent: recoveredTraceParent } : {}),
             runBudgetSnapshot,
-            beforeToolExecution: () => this.assertCommandOwnership(claimed),
-            onRunBudgetCheckpoint: (snapshot) => this.persistRunBudgetCheckpoint(claimed, snapshot),
+            beforeToolExecution: async () => {
+              await drive?.assertOwned();
+              await this.assertCommandOwnership(claimed);
+            },
+            onRunBudgetCheckpoint: async (snapshot) => {
+              await this.persistRunBudgetCheckpoint(claimed, snapshot);
+              await drive?.assertOwned();
+            },
           },
         );
         await this.flushRuntimeWrites(sessionId);
+        await drive?.assertOwned();
         await heartbeat.assertOwned();
         if (outcome.error) {
           await this.commandInbox.finish(sessionId, command.id, "failed", outcome.error.message, {

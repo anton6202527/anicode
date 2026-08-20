@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "../session-manager.js";
 import type { ISessionStore } from "../session.js";
-import type { Provider } from "../types.js";
+import type { ChatMessage, Provider, StreamEvent } from "../types.js";
 import type { ArtifactStore } from "./artifacts.js";
 import { CommandInbox, DurableOutbox } from "./commands.js";
 import { DurableRuntime } from "./durable.js";
@@ -18,7 +18,9 @@ import {
   SqliteRuntimeSessionStore,
   SqliteRuntimeSnapshotStore,
   SqliteSessionLifecycleStore,
+  SqliteWorkerQueueStore,
 } from "./sqlite.js";
+import { WorktreeOwnership } from "./worker.js";
 import type {
   AcquireSessionOperationInput,
   ClaimSessionDeletionInput,
@@ -56,6 +58,8 @@ function sqliteManager(
     lifecycle?: SessionLifecycleStore;
     workspaceScope?: string;
     leaseMs?: number;
+    provider?: Provider;
+    sessionDriveOwnership?: WorktreeOwnership;
   } = {},
 ): SessionManager {
   const events = new SqliteRuntimeEventStore(database);
@@ -71,8 +75,11 @@ function sqliteManager(
     artifacts: options.artifacts ?? new SqliteArtifactStore(database),
     commandInbox: new CommandInbox(new SqliteCommandInboxStore(database)),
     outbox: new DurableOutbox(new SqliteOutboxStore(database), runtime),
-    resolveProvider: () => ({ provider: idleProvider, model: "idle" }),
+    resolveProvider: () => ({ provider: options.provider ?? idleProvider, model: "idle" }),
     recoverCommands: false,
+    ...(options.sessionDriveOwnership
+      ? { sessionDriveOwnership: options.sessionDriveOwnership }
+      : {}),
     ...(options.workspaceScope ? { workspaceScope: options.workspaceScope } : {}),
     ...(options.leaseMs
       ? { sessionLifecycleLeaseMs: options.leaseMs, sessionLifecyclePollMs: 5 }
@@ -156,6 +163,91 @@ class DroppedOperationRenewals implements SessionLifecycleStore {
     return this.backing.completeDeletion(claim);
   }
 }
+
+test("durable session drive: two managers serialize one session and reload intervening history", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-session-drive-"));
+  const file = path.join(root, "runtime.sqlite");
+  const databaseA = new SqliteRuntimeDatabase(file);
+  const databaseB = new SqliteRuntimeDatabase(file);
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  const secondRequests: ChatMessage[][] = [];
+  let secondCalls = 0;
+  const firstProvider: Provider = {
+    name: "drive-first",
+    async *stream(): AsyncIterable<StreamEvent> {
+      firstStarted.resolve();
+      await releaseFirst.promise;
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "reply-first" }],
+        },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const secondProvider: Provider = {
+    name: "drive-second",
+    async *stream(request): AsyncIterable<StreamEvent> {
+      secondCalls++;
+      secondRequests.push(structuredClone(request.messages));
+      yield {
+        type: "done",
+        stopReason: "end_turn",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "reply-second" }],
+        },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      };
+    },
+  };
+  const managerA = sqliteManager(databaseA, {
+    provider: firstProvider,
+    sessionDriveOwnership: new WorktreeOwnership(new SqliteWorkerQueueStore(databaseA)),
+  });
+  const managerB = sqliteManager(databaseB, {
+    provider: secondProvider,
+    sessionDriveOwnership: new WorktreeOwnership(new SqliteWorkerQueueStore(databaseB)),
+  });
+  try {
+    const created = await managerA.createSession({ cwd: root, model: "idle" });
+    const first = managerA.send(created.id, "first");
+    await firstStarted.promise;
+
+    const second = managerB.send(created.id, "second");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(secondCalls, 0, "a second manager must wait outside the active Agent drive");
+
+    releaseFirst.resolve();
+    await Promise.all([first, second]);
+    assert.equal(secondCalls, 1);
+    const visibleText = secondRequests[0]!.flatMap((message) =>
+      message.content.flatMap((part) =>
+        part.type === "text" && !part.internal ? [part.text] : [],
+      ),
+    );
+    assert.deepEqual(visibleText, ["first", "reply-first", "second"]);
+
+    const stored = await new SqliteRuntimeSessionStore(databaseA).load(created.id);
+    assert.deepEqual(
+      stored.messages.flatMap((message) =>
+        message.content.flatMap((part) =>
+          part.type === "text" && !part.internal ? [part.text] : [],
+        ),
+      ),
+      ["first", "reply-first", "second", "reply-second"],
+    );
+  } finally {
+    releaseFirst.resolve();
+    await Promise.allSettled([managerA.shutdown(), managerB.shutdown()]);
+    await Promise.allSettled([databaseA.close(), databaseB.close()]);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("durable lifecycle: two managers drain a shared SQLite producer before purge", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-lifecycle-drain-"));

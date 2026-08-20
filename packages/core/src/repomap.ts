@@ -10,7 +10,9 @@
  * 异步 gatherRepoMap(cwd, opts) 负责走盘采集（跳过 node_modules/.git/产物目录，限量限大小）。
  */
 
+import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import type { LspPool } from "./lsp.js";
 import { IncrementalCodeIndex, type CodeEmbedding } from "./runtime/code-index.js";
 import type { VectorStore } from "./runtime/vector-store.js";
@@ -39,6 +41,18 @@ export interface RepoMapOptions {
   maxCacheBytes?: number;
   /** 一次刷新最多处理的源文件总字节数；轻量 prompt 索引默认 16 MiB。 */
   maxTotalSourceBytes?: number;
+  /**
+   * 轻量索引快照在后台校验期间可直接复用的最长时间。默认 30 秒、最高 5 分钟；设为 0
+   * 强制阻塞刷新。
+   * 该窗口只适用于 realpath + device + inode 身份未变化的同一工作区。
+   */
+  maxStaleMs?: number;
+  /**
+   * Maximum time a caller may wait for the first lightweight generation. Omitted preserves the
+   * blocking API; production hosts use a small bound and let the already-started prewarm finish
+   * for the next turn. Values are clamped to 0..1000 ms.
+   */
+  coldStartTimeoutMs?: number;
 }
 
 export interface SourceFile {
@@ -199,12 +213,19 @@ export async function gatherRepoMap(cwd: string, opts: RepoMapOptions = {}): Pro
       await index.close();
     }
   }
-  return gatherLightweightRepoMap(cwd, opts);
+  try {
+    return await gatherLightweightRepoMap(cwd, opts);
+  } catch {
+    // Repo-map context is optional. Keep the exported API fail-soft even when the workspace root
+    // disappears between session construction and collection, or realpath/stat is unavailable.
+    return "";
+  }
 }
 
 interface LightweightRepoMapEntry {
   readonly index: IncrementalCodeIndex;
   refreshing?: Promise<void>;
+  lastValidatedAt: number;
   lastUsed: number;
 }
 
@@ -212,14 +233,85 @@ const MAX_LIGHTWEIGHT_INDEXES = 4;
 // The rendered prompt is only ~6 KiB. Capping retained source analysis at 16 MiB keeps the
 // process-wide workspace LRU bounded while still covering this repository (~4.8 MiB).
 const DEFAULT_LIGHTWEIGHT_SOURCE_BYTES = 16 * 1024 * 1024;
+const DEFAULT_LIGHTWEIGHT_MAX_STALE_MS = 30_000;
+const MAX_LIGHTWEIGHT_MAX_STALE_MS = 5 * 60_000;
 const lightweightIndexes = new Map<string, LightweightRepoMapEntry>();
 
 async function gatherLightweightRepoMap(cwd: string, opts: RepoMapOptions): Promise<string> {
-  const root = path.resolve(cwd);
+  const entry = await lightweightEntry(cwd, opts);
+  const requestedMaxStaleMs = opts.maxStaleMs ?? DEFAULT_LIGHTWEIGHT_MAX_STALE_MS;
+  const maxStaleMs = Number.isFinite(requestedMaxStaleMs)
+    ? Math.min(MAX_LIGHTWEIGHT_MAX_STALE_MS, Math.max(0, requestedMaxStaleMs))
+    : DEFAULT_LIGHTWEIGHT_MAX_STALE_MS;
+  const canServeStale =
+    maxStaleMs > 0 &&
+    entry.index.hasSnapshot() &&
+    performance.now() - entry.lastValidatedAt <= maxStaleMs;
+
+  if (canServeStale) {
+    // Render the adopted generation before starting I/O. This guarantees that a warm request
+    // never waits behind readdir/stat/read work, while the bounded background refresh makes the
+    // next request observe edits. Workspace identity is revalidated by lightweightEntry first.
+    const current = await entry.index.renderCurrent(opts.query ?? "", opts.tokenBudget ?? 1500);
+    if (current !== undefined) {
+      // Yield through setImmediate so provider dispatch can leave the first-token critical path
+      // before directory traversal starts consuming I/O and event-loop time.
+      void refreshLightweightEntry(entry, true);
+      return current;
+    }
+  }
+
+  const refresh = refreshLightweightEntry(entry);
+  if (opts.coldStartTimeoutMs !== undefined) {
+    const requested = opts.coldStartTimeoutMs;
+    const timeoutMs = Number.isFinite(requested) ? Math.min(1_000, Math.max(0, requested)) : 0;
+    if (timeoutMs === 0) return "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refreshed = await Promise.race([
+      refresh.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    if (!refreshed) return "";
+  } else {
+    await refresh;
+  }
+  return (await entry.index.renderCurrent(opts.query ?? "", opts.tokenBudget ?? 1500)) ?? "";
+}
+
+/**
+ * Explicitly populate or revalidate the lightweight repo-map generation without rendering it.
+ * Hosts can call this after workspace trust is granted so the first prompt stays off the scan path.
+ */
+export async function prewarmRepoMap(cwd: string, opts: RepoMapOptions = {}): Promise<void> {
+  if (opts.incremental === true) {
+    // The typed graph owns its own trusted external cache; gathering once warms that cache.
+    await gatherRepoMap(cwd, opts);
+    return;
+  }
+  const entry = await lightweightEntry(cwd, opts);
+  await refreshLightweightEntry(entry);
+}
+
+async function lightweightEntry(
+  cwd: string,
+  opts: RepoMapOptions,
+): Promise<LightweightRepoMapEntry> {
+  // path.resolve alone is insufficient for a process-wide cache: a symlink retarget or directory
+  // replacement could otherwise reuse symbols from a different workspace. A changed identity gets
+  // a cold index and never receives the previous workspace's snapshot.
+  const requestedRoot = path.resolve(cwd);
+  const root = await fs.realpath(requestedRoot);
+  const rootStat = await fs.stat(root);
+  if (!rootStat.isDirectory())
+    throw new Error(`Repo map root is not a directory: ${requestedRoot}`);
   const maxFiles = opts.maxFiles ?? 2000;
   const maxBytes = opts.maxFileBytes ?? 256 * 1024;
   const maxTotalSourceBytes = opts.maxTotalSourceBytes ?? DEFAULT_LIGHTWEIGHT_SOURCE_BYTES;
-  const key = `${root}\0${maxFiles}\0${maxBytes}\0${maxTotalSourceBytes}`;
+  const key = `${root}\0${rootStat.dev}\0${rootStat.ino}\0${rootStat.birthtimeMs}\0${maxFiles}\0${maxBytes}\0${maxTotalSourceBytes}`;
   let entry = lightweightIndexes.get(key);
   if (!entry) {
     entry = {
@@ -230,22 +322,36 @@ async function gatherLightweightRepoMap(cwd: string, opts: RepoMapOptions): Prom
         persist: false,
         extractSymbols,
       }),
+      lastValidatedAt: 0,
       lastUsed: Date.now(),
     };
     lightweightIndexes.set(key, entry);
     evictLightweightIndexes();
   }
   entry.lastUsed = Date.now();
+  return entry;
+}
+
+function refreshLightweightEntry(entry: LightweightRepoMapEntry, defer = false): Promise<void> {
   if (!entry.refreshing) {
-    entry.refreshing = entry.index.refresh().then(() => undefined);
+    const run = () =>
+      entry.index.refresh().then(() => {
+        entry.lastValidatedAt = performance.now();
+      });
+    entry.refreshing = defer
+      ? new Promise<void>((resolve, reject) => {
+          setImmediate(() => {
+            void run().then(resolve, reject);
+          });
+        })
+      : run();
     const refresh = entry.refreshing;
     const clear = () => {
       if (entry?.refreshing === refresh) delete entry.refreshing;
     };
     void refresh.then(clear, clear);
   }
-  await entry.refreshing;
-  return entry.index.render(opts.query ?? "", opts.tokenBudget ?? 1500);
+  return entry.refreshing;
 }
 
 function evictLightweightIndexes(): void {

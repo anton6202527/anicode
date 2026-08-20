@@ -11,6 +11,7 @@ import {
   CommandIdempotencyConflictError,
   type CommandInboxStore,
   type DurableCommand,
+  type FencedCommandEventCommit,
   type OutboxMessage,
   type OutboxStore,
 } from "./commands.js";
@@ -899,9 +900,11 @@ export class PostgresSessionLifecycleStore implements SessionLifecycleStore {
 
 export class PostgresRuntimeEventStore implements RuntimeEventStore {
   readonly lifecycle: SessionLifecycleStore;
+  readonly atomicPersistenceBackend: object;
 
   constructor(readonly database: PostgresRuntimeDatabase) {
     this.lifecycle = new PostgresSessionLifecycleStore(database);
+    this.atomicPersistenceBackend = database;
   }
 
   append<T>(input: AppendRuntimeEvent<T>): Promise<RuntimeEvent<T>> {
@@ -1003,7 +1006,8 @@ export class PostgresRuntimeSnapshotStore implements RuntimeSnapshotStore {
       `INSERT INTO anicode_runtime_snapshots(stream_id, sequence, data)
        VALUES ($1, $2, $3::jsonb)
        ON CONFLICT(stream_id) DO UPDATE SET
-         sequence = excluded.sequence, data = excluded.data, updated_at = now()`,
+         sequence = excluded.sequence, data = excluded.data, updated_at = now()
+       WHERE excluded.sequence >= anicode_runtime_snapshots.sequence`,
       [snapshot.streamId, snapshot.sequence, JSON.stringify(snapshot)],
     );
   }
@@ -1031,6 +1035,20 @@ function sessionMetaFromRow(row: Row): SessionMeta {
     model: String(row.model),
     ...(row.title != null ? { title: String(row.title) } : {}),
   };
+}
+
+async function insertSessionMessages(
+  client: PoolClient,
+  sessionId: string,
+  firstIndex: number,
+  serializedMessages: string,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO anicode_session_messages(session_id, idx, data)
+     SELECT $1, $2::bigint + item.ordinality - 1, item.data
+     FROM jsonb_array_elements($3::jsonb) WITH ORDINALITY AS item(data, ordinality)`,
+    [sessionId, firstIndex, serializedMessages],
+  );
 }
 
 /** 共享控制面的会话存储；所有复合写入均为 SERIALIZABLE，并锁定 session row。 */
@@ -1063,7 +1081,15 @@ export class PostgresSessionStore implements ISessionStore {
   }
 
   append(id: string, message: ChatMessage): Promise<void> {
+    return this.appendMany(id, [message]);
+  }
+
+  appendMany(id: string, messages: ChatMessage[]): Promise<void> {
     assertIdentifier(id, "session id");
+    if (messages.length === 0) return Promise.resolve();
+    // Serialize before acquiring the row lock so large tool results do not extend the critical
+    // section. Index allocation and the one bulk INSERT remain in the same transaction.
+    const serializedMessages = JSON.stringify(messages);
     return this.database.transaction(async (client) => {
       const session = await client.query(
         "SELECT id FROM anicode_sessions WHERE id = $1 FOR UPDATE",
@@ -1075,17 +1101,54 @@ export class PostgresSessionStore implements ISessionStore {
          FROM anicode_session_messages WHERE session_id = $1`,
         [id],
       );
-      await client.query(
-        `INSERT INTO anicode_session_messages(session_id, idx, data)
-         VALUES ($1, $2, $3::jsonb)`,
-        [id, Number((next.rows[0] as Row).next_idx), JSON.stringify(message)],
+      await insertSessionMessages(
+        client,
+        id,
+        Number((next.rows[0] as Row).next_idx),
+        serializedMessages,
       );
       await client.query("UPDATE anicode_sessions SET updated_at = now() WHERE id = $1", [id]);
     });
   }
 
+  async getMeta(id: string): Promise<SessionMeta | undefined> {
+    assertIdentifier(id, "session id");
+    const result = await this.database.pool.query("SELECT * FROM anicode_sessions WHERE id = $1", [
+      id,
+    ]);
+    return result.rows[0] ? sessionMetaFromRow(result.rows[0] as Row) : undefined;
+  }
+
+  updateMeta(meta: SessionMeta): Promise<SessionMeta> {
+    assertIdentifier(meta.id, "session id");
+    return this.database.transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE anicode_sessions SET
+           updated_at = now(),
+           cwd = $2,
+           workspace_device = $3,
+           workspace_inode = $4,
+           model = $5,
+           title = $6
+         WHERE id = $1
+         RETURNING *`,
+        [
+          meta.id,
+          meta.cwd,
+          meta.workspaceIdentity?.device ?? null,
+          meta.workspaceIdentity?.inode ?? null,
+          meta.model,
+          meta.title ?? null,
+        ],
+      );
+      if (!result.rows[0]) throw new Error(`Session ${meta.id} not found`);
+      return sessionMetaFromRow(result.rows[0] as Row);
+    });
+  }
+
   async rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
     assertIdentifier(meta.id, "session id");
+    const serializedMessages = messages.length > 0 ? JSON.stringify(messages) : undefined;
     const updatedAt = await this.database.transaction(async (client) => {
       const timestamp = new Date().toISOString();
       await client.query(
@@ -1112,12 +1175,8 @@ export class PostgresSessionStore implements ISessionStore {
         ],
       );
       await client.query("DELETE FROM anicode_session_messages WHERE session_id = $1", [meta.id]);
-      for (let index = 0; index < messages.length; index++) {
-        await client.query(
-          `INSERT INTO anicode_session_messages(session_id, idx, data)
-           VALUES ($1, $2, $3::jsonb)`,
-          [meta.id, index, JSON.stringify(messages[index])],
-        );
+      if (serializedMessages !== undefined) {
+        await insertSessionMessages(client, meta.id, 0, serializedMessages);
       }
       return timestamp;
     });
@@ -1233,7 +1292,11 @@ async function insertOutboxRow(client: PoolClient, message: OutboxMessage): Prom
 }
 
 export class PostgresCommandInboxStore implements CommandInboxStore {
-  constructor(readonly database: PostgresRuntimeDatabase) {}
+  readonly atomicPersistenceBackend: object;
+
+  constructor(readonly database: PostgresRuntimeDatabase) {
+    this.atomicPersistenceBackend = database;
+  }
 
   async read(sessionId: string): Promise<DurableCommand[]> {
     assertIdentifier(sessionId, "command session id");
@@ -1384,6 +1447,148 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
       });
   }
 
+  async commitFencedEvent(input: FencedCommandEventCommit): Promise<RuntimeEvent> {
+    assertIdentifier(input.sessionId, "command session id");
+    assertIdentifier(input.commandId, "command id");
+    assertIdentifier(input.event.streamId, "runtime stream id");
+    if (input.event.streamId !== input.sessionId) {
+      throw new Error("A fenced command event must use its command session as the Runtime stream");
+    }
+    if (!input.event.idempotencyKey) {
+      throw new Error("A fenced command event requires an idempotency key");
+    }
+    if (input.event.expectedSequence !== undefined) {
+      throw new Error("A fenced command event cannot carry an expected Runtime sequence");
+    }
+    if (!Number.isSafeInteger(input.fencingToken) || input.fencingToken < 1) {
+      throw new Error(`Invalid fencing token for command ${input.commandId}`);
+    }
+
+    const eventId = `rte_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const outboxId = `out_${randomUUID()}`;
+    const createdAt = new Date().toISOString();
+    const message: OutboxMessage = {
+      id: outboxId,
+      status: "sent",
+      event: clone(input.event),
+      attempts: 1,
+      createdAt,
+      updatedAt: createdAt,
+      sentEventId: eventId,
+      fencingToken: 0,
+    };
+    // One statement is one network round-trip and one PostgreSQL transaction. The dependency on
+    // `lease` makes a stale fence produce neither an event nor an outbox row; the advisory lock
+    // preserves the same per-stream sequence serialization as RuntimeEventStore.append().
+    let committed: { rows: unknown[] } | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        committed = await this.database.pool.query(
+          `WITH db_clock AS MATERIALIZED (
+         SELECT clock_timestamp() AS value
+       ),
+       lease AS MATERIALIZED (
+         UPDATE anicode_commands AS command
+         SET lease_expires_at = db_clock.value + ($4::bigint * interval '1 millisecond'),
+             updated_at = db_clock.value,
+             data = (command.data - 'leaseExpiresAt') || jsonb_build_object(
+               'updatedAt', db_clock.value,
+               'leaseExpiresAt', db_clock.value + ($4::bigint * interval '1 millisecond')
+             )
+         FROM db_clock
+         WHERE command.session_id = $1 AND command.id = $2
+           AND command.status = 'running' AND command.lease_owner = $3
+           AND command.fencing_token = $5
+           AND command.lease_expires_at > db_clock.value
+         RETURNING command.session_id
+       ),
+       stream_lock AS MATERIALIZED (
+         SELECT pg_advisory_xact_lock(hashtextextended($1, 0)) AS acquired
+         FROM lease
+       ),
+       duplicate AS MATERIALIZED (
+         SELECT event.*
+         FROM anicode_runtime_events AS event
+         CROSS JOIN stream_lock
+         WHERE event.stream_id = $1 AND event.idempotency_key = $8
+       ),
+       next_sequence AS MATERIALIZED (
+         SELECT COALESCE(MAX(event.sequence), 0) + 1 AS value
+         FROM stream_lock
+         LEFT JOIN anicode_runtime_events AS event ON event.stream_id = $1
+       ),
+       inserted_event AS (
+         INSERT INTO anicode_runtime_events
+           (stream_id, sequence, id, timestamp, type, data, correlation_id, causation_id,
+            idempotency_key, trace_id, span_id)
+         SELECT $1, next_sequence.value, $9, db_clock.value, $6, $7::jsonb, $13, $14,
+                $8, $15, $16
+         FROM lease
+         CROSS JOIN stream_lock
+         CROSS JOIN next_sequence
+         CROSS JOIN db_clock
+         WHERE NOT EXISTS (SELECT 1 FROM duplicate)
+         RETURNING *
+       ),
+       committed_event AS MATERIALIZED (
+         SELECT * FROM duplicate
+         UNION ALL
+         SELECT * FROM inserted_event
+       ),
+       outbox_write AS (
+         INSERT INTO anicode_outbox
+           (id, idempotency_key, status, lease_owner, lease_expires_at,
+            fencing_token, data, created_at, updated_at)
+         SELECT $10, $8, 'sent', NULL, NULL, 0,
+                ($11::jsonb - 'sentEventId' - 'updatedAt') || jsonb_build_object(
+                  'sentEventId', committed_event.id,
+                  'updatedAt', db_clock.value
+                ),
+                $12, db_clock.value
+         FROM committed_event
+         CROSS JOIN db_clock
+         ON CONFLICT(idempotency_key) DO NOTHING
+         RETURNING id
+       )
+       SELECT committed_event.* FROM committed_event`,
+          [
+            input.sessionId,
+            input.commandId,
+            input.owner,
+            Math.max(1_000, input.leaseMs),
+            input.fencingToken,
+            input.event.type,
+            JSON.stringify(input.event.data),
+            input.event.idempotencyKey,
+            eventId,
+            outboxId,
+            JSON.stringify(message),
+            createdAt,
+            input.event.correlationId ?? null,
+            input.event.causationId ?? null,
+            input.event.traceId ?? null,
+            input.event.spanId ?? null,
+          ],
+        );
+        break;
+      } catch (error) {
+        // A single PostgreSQL statement keeps its initial MVCC snapshot while waiting for the
+        // advisory lock. If another writer commits a sequence/idempotency row during that wait,
+        // the first attempt can discover it only through a uniqueness conflict. Retrying starts a
+        // fresh statement snapshot; steady-state remains one round-trip, contention remains safe.
+        const postgres = error as { code?: string; constraint?: string };
+        const retryableConstraint =
+          postgres.constraint === "anicode_runtime_events_pkey" ||
+          postgres.constraint === "uq_anicode_event_idempotency";
+        if (postgres.code !== "23505" || !retryableConstraint || attempt === 2) throw error;
+      }
+    }
+    if (!committed) throw new Error("PostgreSQL fenced event commit exhausted its retries");
+    const row = committed.rows[0] as Row | undefined;
+    if (!row) throw new Error(`Stale fencing token for command ${input.commandId}`);
+    return eventFromRow(row);
+  }
+
   finishCommand(
     sessionId: string,
     commandId: string,
@@ -1458,7 +1663,11 @@ export class PostgresCommandInboxStore implements CommandInboxStore {
 }
 
 export class PostgresOutboxStore implements OutboxStore {
-  constructor(readonly database: PostgresRuntimeDatabase) {}
+  readonly atomicPersistenceBackend: object;
+
+  constructor(readonly database: PostgresRuntimeDatabase) {
+    this.atomicPersistenceBackend = database;
+  }
 
   async read(): Promise<OutboxMessage[]> {
     const result = await this.database.pool.query(

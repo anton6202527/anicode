@@ -16,6 +16,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "cross-env ANICODE_LANG=zh ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node --import tsx --test --test-concurrency=4 'src/**/*.test.ts'",
+    "benchmark:performance": "tsx scripts/performance-benchmark.ts",
+    "test:performance": "cross-env ANICODE_LANG=zh ANICODE_CREDENTIAL_BACKEND=memory ANICODE_DISABLE_OS_KEYCHAIN=1 node --import tsx --test scripts/performance-benchmark.test.ts",
     "demo": "tsx src/demo.ts",
     "daemon": "tsx src/daemon/launch.ts",
     "remote": "tsx src/runtime/remote-launch.ts",

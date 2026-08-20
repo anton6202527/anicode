@@ -3,15 +3,17 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { MigratingSessionStore, SessionStore } from "../session.js";
 import { CommandInbox, DurableOutbox } from "./commands.js";
 import { DurableRuntime } from "./durable.js";
-import { DurableWorkerQueue } from "./worker.js";
+import { DurableWorkerQueue, WorkerQueueQuotaError, WorktreeOwnership } from "./worker.js";
 import {
   SqliteCommandInboxStore,
   SqliteOutboxStore,
   SqliteRuntimeDatabase,
   SqliteRuntimeEventStore,
+  SqliteRuntimeSnapshotStore,
   SqliteRuntimeSessionStore,
   SqliteWorkerQueueStore,
 } from "./sqlite.js";
@@ -76,6 +78,150 @@ test("SQLite runtime: BEGIN IMMEDIATE 回滚、事件幂等与 fencing token", a
     assert.equal((await queue.list())[0]?.status, "succeeded");
   } finally {
     await database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite runtime: cross-process write contention yields instead of freezing the event loop", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-busy-yield-"));
+  const file = path.join(root, "runtime.db");
+  const database = new SqliteRuntimeDatabase(file);
+  const holder = new DatabaseSync(file);
+  let holding = false;
+  try {
+    holder.exec("PRAGMA busy_timeout = 0");
+    holder.exec("BEGIN IMMEDIATE");
+    holding = true;
+    let releaseTimerFired = false;
+    const release = setTimeout(() => {
+      holder.exec("COMMIT");
+      holding = false;
+      releaseTimerFired = true;
+    }, 30);
+
+    const started = performance.now();
+    try {
+      await database.transaction((db) => {
+        db.prepare(
+          `INSERT INTO runtime_audit
+           (id, timestamp, category, action, metadata) VALUES (?, ?, ?, ?, ?)`,
+        ).run("after-contention", new Date().toISOString(), "runtime", "busy-yield", "{}");
+      });
+    } finally {
+      clearTimeout(release);
+    }
+
+    assert.equal(releaseTimerFired, true, "the timer must run while the writer is waiting");
+    assert.ok(performance.now() - started < 1_000, "short contention should resolve promptly");
+    assert.equal(
+      (await database.auditLog()).some((row) => row.id === "after-contention"),
+      true,
+    );
+  } finally {
+    if (holding) holder.exec("ROLLBACK");
+    holder.close();
+    await database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite worker queue: row fast paths never rewrite unrelated jobs", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-worker-fast-path-"));
+  const file = path.join(root, "runtime.db");
+  const databaseA = new SqliteRuntimeDatabase(file);
+  const databaseB = new SqliteRuntimeDatabase(file);
+  try {
+    const storeA = new SqliteWorkerQueueStore(databaseA);
+    const queueA = new DurableWorkerQueue(storeA);
+    const queueB = new DurableWorkerQueue(new SqliteWorkerQueueStore(databaseB));
+    const untouched = await queueA.enqueue(
+      "untouched",
+      { marker: "must remain byte-for-byte stable" },
+      { idempotencyKey: "worker-fast-untouched" },
+    );
+    await databaseA.run((db) =>
+      db.exec(`
+        CREATE TRIGGER protect_unrelated_worker_delete
+        BEFORE DELETE ON worker_jobs
+        WHEN OLD.id = '${untouched.id}'
+        BEGIN
+          SELECT RAISE(ABORT, 'unrelated worker row deleted');
+        END;
+        CREATE TRIGGER protect_unrelated_worker_update
+        BEFORE UPDATE ON worker_jobs
+        WHEN OLD.id = '${untouched.id}'
+        BEGIN
+          SELECT RAISE(ABORT, 'unrelated worker row updated');
+        END;
+      `),
+    );
+
+    const target = await queueB.enqueue(
+      "build",
+      { tenantId: "tenant-fast", actor: "actor-fast" },
+      {
+        idempotencyKey: "worker-fast-target",
+        quota: {
+          tenantId: "tenant-fast",
+          actor: "actor-fast",
+          maxOutstandingPerTenant: 1,
+          maxQueuedPerActor: 1,
+        },
+      },
+    );
+    await assert.rejects(
+      queueA.enqueue(
+        "build",
+        { tenantId: "tenant-fast", actor: "actor-fast" },
+        {
+          idempotencyKey: "worker-fast-over-quota",
+          quota: {
+            tenantId: "tenant-fast",
+            actor: "actor-fast",
+            maxOutstandingPerTenant: 1,
+            maxQueuedPerActor: 1,
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof WorkerQueueQuotaError && error.code === "tenant_quota_exceeded",
+    );
+
+    const claims = await Promise.all([
+      queueA.claim("worker-a", ["build"]),
+      queueB.claim("worker-b", ["build"]),
+    ]);
+    assert.equal(claims.filter(Boolean).length, 1);
+    const claimed = claims.find(Boolean)!;
+    await queueA.heartbeat(target.id, claimed.leaseOwner!, 60_000, claimed.fencingToken);
+    await queueB.finish(target.id, claimed.leaseOwner!, { ok: true }, claimed.fencingToken);
+    assert.deepEqual((await queueA.get(target.id))?.result, { ok: true });
+
+    // SQLite LIKE treats `_` as a wildcard. This ordinary type deliberately matches the old
+    // `__worktree__:%` LIKE pattern and must not disappear behind the reserved-prefix filter.
+    const ordinary = await queueA.enqueue("abworktreexy:ordinary", { ordinary: true });
+    const ordinaryClaim = await queueB.claim("worker-c", ["abworktreexy:ordinary"]);
+    assert.equal(ordinaryClaim?.id, ordinary.id);
+    await queueB.finish(
+      ordinary.id,
+      ordinaryClaim!.leaseOwner!,
+      "ordinary-finished",
+      ordinaryClaim!.fencingToken,
+    );
+    assert.equal(
+      (await queueB.list()).some((job) => job.id === ordinary.id),
+      true,
+    );
+    assert.equal((await queueB.list()).length, 3);
+
+    const ownership = new WorktreeOwnership(storeA);
+    const lease = await ownership.acquire(path.join(root, "worktree"), "owner-a", 60_000);
+    await ownership.heartbeat(lease.worktree, lease.owner, 60_000, lease.fencingToken);
+    await ownership.release(lease.worktree, lease.owner, lease.fencingToken);
+    assert.equal((await queueA.get(untouched.id))?.payload instanceof Object, true);
+  } finally {
+    await databaseA.close();
+    await databaseB.close();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -183,6 +329,144 @@ test("SQLite command inbox: row fast paths preserve idempotency, fencing, and un
   } finally {
     await databaseB.close();
     await databaseA.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite fenced event commit: one transaction preserves stale-fence and outbox idempotency", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-fenced-event-"));
+  const database = new SqliteRuntimeDatabase(path.join(root, "runtime.db"));
+  try {
+    const commandStore = new SqliteCommandInboxStore(database);
+    const eventStore = new SqliteRuntimeEventStore(database);
+    const outboxStore = new SqliteOutboxStore(database);
+    const inbox = new CommandInbox(commandStore);
+    assert.equal(commandStore.atomicPersistenceBackend, eventStore.atomicPersistenceBackend);
+    assert.equal(commandStore.atomicPersistenceBackend, outboxStore.atomicPersistenceBackend);
+
+    const command = await inbox.accept({
+      sessionId: "session_fenced_event",
+      text: "reserve budget",
+      idempotencyKey: "fenced-event-command",
+    });
+    const staleLease = await inbox.claim(
+      command.sessionId,
+      command.id,
+      "checkpoint-owner-a",
+      60_000,
+    );
+    await database.run((db) =>
+      db
+        .prepare("UPDATE commands SET lease_expires_at = ? WHERE session_id = ? AND id = ?")
+        .run("2000-01-01T00:00:00.000Z", command.sessionId, command.id),
+    );
+    const currentLease = await inbox.claim(
+      command.sessionId,
+      command.id,
+      "checkpoint-owner-b",
+      60_000,
+    );
+    const event = {
+      streamId: command.sessionId,
+      type: "command.budget_checkpoint",
+      data: { commandId: command.id, snapshot: { revision: 1 } },
+      idempotencyKey: `command:${command.id}:budget:1`,
+    };
+
+    let transactions = 0;
+    const transaction = database.transaction.bind(database);
+    database.transaction = ((work) => {
+      transactions++;
+      return transaction(work);
+    }) as typeof database.transaction;
+
+    await assert.rejects(
+      commandStore.commitFencedEvent({
+        sessionId: command.sessionId,
+        commandId: command.id,
+        owner: "checkpoint-owner-a",
+        fencingToken: staleLease.fencingToken!,
+        leaseMs: 60_000,
+        event,
+      }),
+      /Stale fencing token/,
+    );
+    assert.equal(transactions, 1, "a rejected checkpoint is still exactly one DB transaction");
+    assert.equal((await eventStore.read(command.sessionId)).length, 0);
+    assert.equal((await outboxStore.read()).length, 0);
+
+    const beforeExpiry = Date.parse(currentLease.leaseExpiresAt!);
+    const first = await commandStore.commitFencedEvent({
+      sessionId: command.sessionId,
+      commandId: command.id,
+      owner: "checkpoint-owner-b",
+      fencingToken: currentLease.fencingToken!,
+      leaseMs: 60_000,
+      event,
+    });
+    assert.equal(transactions, 2, "a committed checkpoint uses one queued DB transaction");
+    const retry = await commandStore.commitFencedEvent({
+      sessionId: command.sessionId,
+      commandId: command.id,
+      owner: "checkpoint-owner-b",
+      fencingToken: currentLease.fencingToken!,
+      leaseMs: 60_000,
+      event,
+    });
+    assert.equal(transactions, 3, "an idempotent retry also uses one DB transaction");
+    assert.equal(retry.id, first.id);
+    const snapshots = new SqliteRuntimeSnapshotStore(database);
+    const runtime = new DurableRuntime(eventStore, snapshots, 1);
+    await runtime.maintainSnapshotAfterExternalCommit(first);
+    assert.equal(
+      (await snapshots.get(command.sessionId))?.sequence,
+      first.sequence,
+      "an externally committed event must retain the normal snapshot cadence",
+    );
+    assert.ok(
+      Date.parse((await inbox.get(command.sessionId, command.id))!.leaseExpiresAt!) >= beforeExpiry,
+    );
+    assert.equal((await eventStore.read(command.sessionId)).length, 1);
+    const outbox = await outboxStore.read();
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0]?.status, "sent");
+    assert.equal(outbox[0]?.sentEventId, first.id);
+  } finally {
+    await database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite runtime snapshots never regress across writers", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-snapshot-order-"));
+  const database = new SqliteRuntimeDatabase(path.join(root, "runtime.db"));
+  try {
+    const snapshots = new SqliteRuntimeSnapshotStore(database);
+    await snapshots.put({
+      version: 1,
+      streamId: "snapshot-order",
+      sequence: 100,
+      phase: "completed",
+      activeTools: [],
+      events: 100,
+      createdAt: "2026-08-20T00:00:00.000Z",
+    });
+    await snapshots.put({
+      version: 1,
+      streamId: "snapshot-order",
+      sequence: 90,
+      phase: "running",
+      activeTools: ["stale-tool"],
+      events: 90,
+      createdAt: "2026-08-19T00:00:00.000Z",
+    });
+
+    const retained = await snapshots.get("snapshot-order");
+    assert.equal(retained?.sequence, 100);
+    assert.equal(retained?.phase, "completed");
+    assert.deepEqual(retained?.activeTools, []);
+  } finally {
+    await database.close();
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -551,6 +835,60 @@ test("SQLite runtime session store: load 使用单一快照，rewrite 提交后�
   assert.equal(meta.updatedAt, originalUpdatedAt);
 });
 
+test("SQLite runtime session store: batch append and metadata point paths preserve transcript rows", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-session-fast-path-"));
+  const database = new SqliteRuntimeDatabase(path.join(root, "runtime.db"));
+  try {
+    const store = new SqliteRuntimeSessionStore(database);
+    const created = await store.create({
+      id: "session-fast-path",
+      cwd: root,
+      workspaceIdentity: { device: "device-fast", inode: "inode-fast" },
+      model: "debug/demo",
+    });
+    await store.appendMany("session-fast-path", [
+      { role: "user", content: [{ type: "text", text: "one" }] },
+      { role: "assistant", content: [{ type: "text", text: "two" }] },
+      { role: "user", content: [{ type: "text", text: "three" }] },
+    ]);
+    await database.run((db) =>
+      db.exec(`
+        CREATE TRIGGER protect_session_transcript_delete
+        BEFORE DELETE ON session_messages
+        WHEN OLD.session_id = 'session-fast-path'
+        BEGIN
+          SELECT RAISE(ABORT, 'transcript row deleted');
+        END;
+        CREATE TRIGGER protect_session_transcript_update
+        BEFORE UPDATE ON session_messages
+        WHEN OLD.session_id = 'session-fast-path'
+        BEGIN
+          SELECT RAISE(ABORT, 'transcript row updated');
+        END;
+      `),
+    );
+
+    const updated = await store.updateMeta({ ...created, title: "metadata only" });
+    assert.equal(updated.title, "metadata only");
+    assert.ok(Date.parse(updated.updatedAt) >= Date.parse(created.updatedAt));
+    assert.equal((await store.getMeta("session-fast-path"))?.title, "metadata only");
+    assert.equal(await store.getMeta("missing-session"), undefined);
+
+    await store.appendMany("session-fast-path", [
+      { role: "assistant", content: [{ type: "text", text: "four" }] },
+      { role: "user", content: [{ type: "text", text: "five" }] },
+    ]);
+    const loaded = await store.load("session-fast-path");
+    assert.deepEqual(
+      loaded.messages.map((message) => message.content.find((part) => part.type === "text")?.text),
+      ["one", "two", "three", "four", "five"],
+    );
+  } finally {
+    await database.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("SQLite runtime: ordered migration checksums and explicit retention", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-migrations-"));
   const file = path.join(root, "runtime.db");
@@ -564,11 +902,15 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
     );
     assert.deepEqual(
       migrations.map((row) => Number(row.version)),
-      [1, 2, 3, 4],
+      [1, 2, 3, 4, 5],
     );
     assert.ok(migrations.every((row) => /^[a-f0-9]{64}$/.test(String(row.checksum))));
 
     const old = "2000-01-01T00:00:00.000Z";
+    const workerStore = new SqliteWorkerQueueStore(database);
+    const leasedWorktree = path.join(root, "retained-worktree");
+    const firstLease = await workerStore.acquireWorktree(leasedWorktree, "owner-1", 60_000);
+    await workerStore.releaseWorktree(leasedWorktree, firstLease.owner, firstLease.fencingToken);
     await database.run((db) => {
       db.prepare(
         `INSERT INTO runtime_audit
@@ -578,7 +920,7 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
         `INSERT INTO worker_jobs
          (id, type, idempotency_key, status, data, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run("old-job", "test", "old-job", "succeeded", "{}", old, old);
+      ).run("old-job", "abworktreexy:old", "old-job", "succeeded", "{}", old, old);
       db.prepare(
         `INSERT INTO runtime_events
          (stream_id, sequence, id, timestamp, type, data) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -587,12 +929,18 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
         `INSERT INTO runtime_snapshots(stream_id, sequence, data, updated_at)
          VALUES (?, ?, ?, ?)`,
       ).run("compacted", 1, "{}", old);
+      db.prepare("UPDATE worker_jobs SET updated_at = ? WHERE type = ?").run(
+        old,
+        `__worktree__:${path.resolve(leasedWorktree)}`,
+      );
     });
 
     const pruned = await database.prune({}, Date.parse("2026-01-01T00:00:00.000Z"));
     assert.equal(pruned.audit, 1);
     assert.equal(pruned.workerJobs, 1);
     assert.equal(pruned.events, 1);
+    const retainedLease = await workerStore.acquireWorktree(leasedWorktree, "owner-2", 60_000);
+    assert.equal(retainedLease.fencingToken, firstLease.fencingToken + 1);
 
     await database.run((db) =>
       db.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 2").run("tampered"),
@@ -604,7 +952,7 @@ test("SQLite runtime: ordered migration checksums and explicit retention", async
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("SQLite runtime: v2 database upgrades to v4 without changing old checksums", async () => {
+test("SQLite runtime: v2 database upgrades to v5 without changing old checksums", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-sqlite-v2-upgrade-"));
   const file = path.join(root, "runtime.db");
   const seeded = new SqliteRuntimeDatabase(file);
@@ -618,6 +966,11 @@ test("SQLite runtime: v2 database upgrades to v4 without changing old checksums"
     );
     await seeded.run((db) => {
       db.exec(`
+        DROP INDEX idx_worker_claim;
+        ALTER TABLE worker_jobs DROP COLUMN max_attempts;
+        ALTER TABLE worker_jobs DROP COLUMN attempts;
+        CREATE INDEX idx_worker_claim
+          ON worker_jobs(type, status, lease_expires_at, created_at);
         DROP INDEX idx_outbox_pending;
         ALTER TABLE outbox DROP COLUMN fencing_token;
         ALTER TABLE outbox DROP COLUMN lease_expires_at;
@@ -627,7 +980,7 @@ test("SQLite runtime: v2 database upgrades to v4 without changing old checksums"
         DROP TABLE session_lifecycle;
         ALTER TABLE sessions DROP COLUMN workspace_device;
         ALTER TABLE sessions DROP COLUMN workspace_inode;
-        DELETE FROM schema_migrations WHERE version IN (3, 4);
+        DELETE FROM schema_migrations WHERE version IN (3, 4, 5);
       `);
     });
   } finally {
@@ -642,14 +995,14 @@ test("SQLite runtime: v2 database upgrades to v4 without changing old checksums"
         .all()
         .map((row) => Number((row as Record<string, unknown>).version)),
     );
-    assert.deepEqual(versions, [1, 2, 3, 4]);
+    assert.deepEqual(versions, [1, 2, 3, 4, 5]);
     const checksums = await upgraded.run((db) =>
       db
         .prepare("SELECT checksum FROM schema_migrations WHERE version IN (1, 2) ORDER BY version")
         .all()
         .map((row) => String((row as Record<string, unknown>).checksum)),
     );
-    assert.deepEqual(checksums, oldChecksums, "v4 must not rewrite historical migration records");
+    assert.deepEqual(checksums, oldChecksums, "v5 must not rewrite historical migration records");
     const columns = await upgraded.run((db) =>
       db
         .prepare("PRAGMA table_info(sessions)")
@@ -667,6 +1020,14 @@ test("SQLite runtime: v2 database upgrades to v4 without changing old checksums"
     assert.ok(outboxColumns.includes("lease_owner"));
     assert.ok(outboxColumns.includes("lease_expires_at"));
     assert.ok(outboxColumns.includes("fencing_token"));
+    const workerColumns = await upgraded.run((db) =>
+      db
+        .prepare("PRAGMA table_info(worker_jobs)")
+        .all()
+        .map((row) => String((row as Record<string, unknown>).name)),
+    );
+    assert.ok(workerColumns.includes("attempts"));
+    assert.ok(workerColumns.includes("max_attempts"));
     assert.ok(
       await upgraded.run((db) =>
         Boolean(

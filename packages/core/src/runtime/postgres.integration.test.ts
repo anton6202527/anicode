@@ -28,6 +28,142 @@ test("PostgreSQL: production timeouts cannot be disabled or made unbounded", asy
   );
 });
 
+test("PostgreSQL snapshot upsert rejects sequence regression", async () => {
+  const calls: Array<{ sql: string; params?: readonly unknown[] }> = [];
+  const database = {
+    pool: {
+      async query(sql: string, params?: readonly unknown[]) {
+        calls.push({ sql, ...(params ? { params } : {}) });
+        return { rows: [] };
+      },
+    },
+  } as unknown as PostgresRuntimeDatabase;
+
+  await new PostgresRuntimeSnapshotStore(database).put({
+    version: 1,
+    streamId: "snapshot-order",
+    sequence: 100,
+    phase: "completed",
+    activeTools: [],
+    events: 100,
+    createdAt: "2026-08-20T00:00:00.000Z",
+  });
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.sql, /WHERE excluded\.sequence >= anicode_runtime_snapshots\.sequence/);
+});
+
+test("PostgreSQL fenced event commit: one query round-trip and stale fence fails closed", async () => {
+  const calls: Array<{ sql: string; params?: readonly unknown[] }> = [];
+  const eventRow = {
+    id: "rte_fenced_event",
+    stream_id: "session_fenced_event",
+    sequence: "7",
+    timestamp: "2026-08-20T00:00:00.000Z",
+    type: "command.budget_checkpoint",
+    data: { commandId: "command_fenced_event", snapshot: { revision: 3 } },
+    correlation_id: null,
+    causation_id: null,
+    idempotency_key: "command:command_fenced_event:budget:3",
+    trace_id: null,
+    span_id: null,
+  };
+  const database = {
+    pool: {
+      async query(sql: string, params?: readonly unknown[]) {
+        calls.push({ sql, ...(params ? { params } : {}) });
+        return { rows: [eventRow] };
+      },
+    },
+  } as unknown as PostgresRuntimeDatabase;
+  const store = new PostgresCommandInboxStore(database);
+  const committed = await store.commitFencedEvent({
+    sessionId: "session_fenced_event",
+    commandId: "command_fenced_event",
+    owner: "checkpoint-owner",
+    fencingToken: 9,
+    leaseMs: 60_000,
+    event: {
+      streamId: "session_fenced_event",
+      type: "command.budget_checkpoint",
+      data: eventRow.data,
+      idempotencyKey: eventRow.idempotency_key,
+    },
+  });
+  assert.equal(calls.length, 1, "the entire fenced commit must be one pool query");
+  assert.equal(committed.id, eventRow.id);
+  assert.match(calls[0]!.sql, /UPDATE anicode_commands/);
+  assert.match(calls[0]!.sql, /pg_advisory_xact_lock/);
+  assert.match(calls[0]!.sql, /INSERT INTO anicode_runtime_events/);
+  assert.match(calls[0]!.sql, /INSERT INTO anicode_outbox/);
+
+  let staleCalls = 0;
+  const staleDatabase = {
+    pool: {
+      async query() {
+        staleCalls++;
+        return { rows: [] };
+      },
+    },
+  } as unknown as PostgresRuntimeDatabase;
+  await assert.rejects(
+    new PostgresCommandInboxStore(staleDatabase).commitFencedEvent({
+      sessionId: "session_fenced_event",
+      commandId: "command_fenced_event",
+      owner: "stale-owner",
+      fencingToken: 8,
+      leaseMs: 60_000,
+      event: {
+        streamId: "session_fenced_event",
+        type: "command.budget_checkpoint",
+        data: eventRow.data,
+        idempotencyKey: eventRow.idempotency_key,
+      },
+    }),
+    /Stale fencing token/,
+  );
+  assert.equal(staleCalls, 1);
+
+  let contendedCalls = 0;
+  const contendedDatabase = {
+    pool: {
+      async query() {
+        contendedCalls++;
+        if (contendedCalls === 1) {
+          throw Object.assign(new Error("concurrent stream sequence"), {
+            code: "23505",
+            constraint: "anicode_runtime_events_pkey",
+          });
+        }
+        return { rows: [eventRow] };
+      },
+    },
+  } as unknown as PostgresRuntimeDatabase;
+  assert.equal(
+    (
+      await new PostgresCommandInboxStore(contendedDatabase).commitFencedEvent({
+        sessionId: "session_fenced_event",
+        commandId: "command_fenced_event",
+        owner: "checkpoint-owner",
+        fencingToken: 9,
+        leaseMs: 60_000,
+        event: {
+          streamId: "session_fenced_event",
+          type: "command.budget_checkpoint",
+          data: eventRow.data,
+          idempotencyKey: eventRow.idempotency_key,
+        },
+      })
+    ).id,
+    eventRow.id,
+  );
+  assert.equal(
+    contendedCalls,
+    2,
+    "a lock-wait MVCC conflict retries with a fresh statement snapshot",
+  );
+});
+
 test("PostgreSQL session store: load uses one transaction snapshot", async () => {
   const sessionId = "session_snapshot";
   const first = {
@@ -151,6 +287,141 @@ test("PostgreSQL session store: load never escapes a failed commit", async () =>
   );
 });
 
+test("PostgreSQL session store: appendMany and rewrite use one ordered bulk INSERT", async () => {
+  type QueryCall = { sql: string; params: unknown[] | undefined };
+  const transactions: QueryCall[][] = [];
+  const database = {
+    pool: {
+      async query() {
+        return { rows: [] };
+      },
+    },
+    async transaction<T>(
+      work: (client: {
+        query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
+      }) => Promise<T> | T,
+    ): Promise<T> {
+      const calls: QueryCall[] = [];
+      transactions.push(calls);
+      return work({
+        async query(sql, params) {
+          calls.push({ sql, params });
+          const normalized = sql.replace(/\s+/g, " ").trim();
+          if (normalized.startsWith("SELECT id FROM anicode_sessions")) {
+            return { rows: [{ id: "session_bulk" }] };
+          }
+          if (normalized.startsWith("SELECT COALESCE(MAX(idx)")) {
+            return { rows: [{ next_idx: "7" }] };
+          }
+          return { rows: [] };
+        },
+      });
+    },
+  } as unknown as PostgresRuntimeDatabase;
+  const store = new PostgresSessionStore(database);
+  const messages = [
+    { role: "user" as const, content: [{ type: "text" as const, text: "first" }] },
+    { role: "assistant" as const, content: [{ type: "text" as const, text: "second" }] },
+  ];
+
+  await store.appendMany("session_bulk", messages);
+  assert.equal(transactions.length, 1);
+  const appendInserts = transactions[0]!.filter((call) =>
+    call.sql.includes("INSERT INTO anicode_session_messages"),
+  );
+  assert.equal(appendInserts.length, 1, "the whole flush must use one INSERT round-trip");
+  assert.match(appendInserts[0]!.sql, /jsonb_array_elements/);
+  assert.match(appendInserts[0]!.sql, /WITH ORDINALITY/);
+  assert.equal(appendInserts[0]!.params?.[1], 7);
+  assert.deepEqual(JSON.parse(String(appendInserts[0]!.params?.[2])), messages);
+  assert.ok(transactions[0]!.at(-1)!.sql.startsWith("UPDATE anicode_sessions"));
+
+  await store.appendMany("session_bulk", []);
+  assert.equal(transactions.length, 1, "an empty append is a no-op");
+
+  const meta = {
+    id: "session_bulk",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    cwd: "/workspace",
+    model: "model-a",
+  };
+  await store.rewrite(meta, messages);
+  assert.equal(transactions.length, 2);
+  const rewriteInserts = transactions[1]!.filter((call) =>
+    call.sql.includes("INSERT INTO anicode_session_messages"),
+  );
+  assert.equal(rewriteInserts.length, 1, "rewrite must not issue one INSERT per message");
+  assert.equal(rewriteInserts[0]!.params?.[1], 0);
+  assert.deepEqual(JSON.parse(String(rewriteInserts[0]!.params?.[2])), messages);
+  assert.notEqual(meta.updatedAt, "2026-01-01T00:00:00.000Z");
+});
+
+test("PostgreSQL session store: metadata fast paths never read or rewrite messages", async () => {
+  const baseRow = {
+    id: "session_meta",
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-02T00:00:00.000Z",
+    cwd: "/workspace",
+    workspace_device: "device-a",
+    workspace_inode: "inode-a",
+    model: "model-a",
+    title: "before",
+  };
+  const poolCalls: string[] = [];
+  const transactionCalls: string[] = [];
+  const database = {
+    pool: {
+      async query(sql: string, params?: unknown[]) {
+        poolCalls.push(sql);
+        return { rows: params?.[0] === "missing_meta" ? [] : [baseRow] };
+      },
+    },
+    async transaction<T>(
+      work: (client: {
+        query(sql: string): Promise<{ rows: Record<string, unknown>[] }>;
+      }) => Promise<T> | T,
+    ): Promise<T> {
+      return work({
+        async query(sql) {
+          transactionCalls.push(sql);
+          return {
+            rows: [
+              {
+                ...baseRow,
+                updated_at: "2026-01-03T00:00:00.000Z",
+                model: "model-b",
+                title: "after",
+              },
+            ],
+          };
+        },
+      });
+    },
+  } as unknown as PostgresRuntimeDatabase;
+  const store = new PostgresSessionStore(database);
+
+  assert.equal((await store.getMeta("session_meta"))?.title, "before");
+  assert.equal(await store.getMeta("missing_meta"), undefined);
+  const updated = await store.updateMeta({
+    id: "session_meta",
+    createdAt: baseRow.created_at,
+    updatedAt: baseRow.updated_at,
+    cwd: "/workspace",
+    workspaceIdentity: { device: "device-a", inode: "inode-a" },
+    model: "model-b",
+    title: "after",
+  });
+  assert.equal(updated.updatedAt, "2026-01-03T00:00:00.000Z");
+  assert.equal(updated.title, "after");
+  assert.equal(poolCalls.length, 2);
+  assert.equal(transactionCalls.length, 1);
+  assert.match(transactionCalls[0]!, /^UPDATE anicode_sessions/);
+  assert.ok(
+    [...poolCalls, ...transactionCalls].every((sql) => !sql.includes("anicode_session_messages")),
+  );
+});
+
 test(
   "PostgreSQL: normalized inbox/outbox/queue、SKIP LOCKED 与 fencing token",
   { skip: databaseUrl ? false : "ANICODE_TEST_DATABASE_URL is not configured" },
@@ -258,6 +529,20 @@ test(
         workspaceIdentity: { device: "pg-device", inode: "pg-inode" },
         model: "integration",
       });
+      const sessionMessages = [
+        { role: "user" as const, content: [{ type: "text" as const, text: "bulk-one" }] },
+        {
+          role: "assistant" as const,
+          content: [{ type: "text" as const, text: "bulk-two" }],
+        },
+      ];
+      await sessions.appendMany(sessionId, sessionMessages);
+      const storedMeta = await sessions.getMeta(sessionId);
+      assert.ok(storedMeta);
+      const updatedMeta = await sessions.updateMeta({ ...storedMeta, title: "fast-path-title" });
+      assert.equal(updatedMeta.title, "fast-path-title");
+      const loadedSession = await sessions.load(sessionId);
+      assert.deepEqual(loadedSession.messages, sessionMessages);
       assert.deepEqual((await sessions.load(sessionId)).workspaceIdentity, {
         device: "pg-device",
         inode: "pg-inode",
@@ -301,7 +586,8 @@ test(
       );
       await sessions.delete(sessionId);
 
-      const inbox = new CommandInbox(new PostgresCommandInboxStore(database));
+      const postgresCommandStore = new PostgresCommandInboxStore(database);
+      const inbox = new CommandInbox(postgresCommandStore);
       const command = await inbox.accept({
         sessionId,
         text: "durable",
@@ -361,6 +647,93 @@ test(
         ),
         false,
       );
+      await inbox.heartbeat(
+        sessionId,
+        skewedCommand.id,
+        "clock-owner-a",
+        60_000,
+        skewedLease.fencingToken,
+      );
+      const checkpointKey = `command:${skewedCommand.id}:budget:1`;
+      const checkpointEvent = {
+        streamId: sessionId,
+        type: "command.budget_checkpoint",
+        data: { commandId: skewedCommand.id, snapshot: { revision: 1 } },
+        idempotencyKey: checkpointKey,
+      };
+      await assert.rejects(
+        postgresCommandStore.commitFencedEvent({
+          sessionId,
+          commandId: skewedCommand.id,
+          owner: "clock-owner-a",
+          fencingToken: skewedLease.fencingToken! + 1,
+          leaseMs: 60_000,
+          event: checkpointEvent,
+        }),
+        /Stale fencing token/,
+      );
+      assert.equal(
+        Number(
+          (
+            await database.pool.query(
+              "SELECT COUNT(*) AS count FROM anicode_runtime_events WHERE stream_id = $1 AND idempotency_key = $2",
+              [sessionId, checkpointKey],
+            )
+          ).rows[0]?.count,
+        ),
+        0,
+      );
+      assert.equal(
+        Number(
+          (
+            await database.pool.query(
+              "SELECT COUNT(*) AS count FROM anicode_outbox WHERE idempotency_key = $1",
+              [checkpointKey],
+            )
+          ).rows[0]?.count,
+        ),
+        0,
+        "a stale command fence must commit neither side of the event/outbox pair",
+      );
+      const checkpoint = await postgresCommandStore.commitFencedEvent({
+        sessionId,
+        commandId: skewedCommand.id,
+        owner: "clock-owner-a",
+        fencingToken: skewedLease.fencingToken!,
+        leaseMs: 60_000,
+        event: checkpointEvent,
+      });
+      assert.equal(
+        (
+          await postgresCommandStore.commitFencedEvent({
+            sessionId,
+            commandId: skewedCommand.id,
+            owner: "clock-owner-a",
+            fencingToken: skewedLease.fencingToken!,
+            leaseMs: 60_000,
+            event: checkpointEvent,
+          })
+        ).id,
+        checkpoint.id,
+      );
+      assert.equal(
+        Number(
+          (
+            await database.pool.query(
+              "SELECT COUNT(*) AS count FROM anicode_runtime_events WHERE stream_id = $1 AND idempotency_key = $2",
+              [sessionId, checkpointKey],
+            )
+          ).rows[0]?.count,
+        ),
+        1,
+      );
+      const checkpointOutbox = await database.pool.query(
+        "SELECT status, data->>'sentEventId' AS sent_event_id FROM anicode_outbox WHERE idempotency_key = $1",
+        [checkpointKey],
+      );
+      assert.equal(checkpointOutbox.rows.length, 1);
+      assert.equal(checkpointOutbox.rows[0]?.status, "sent");
+      assert.equal(checkpointOutbox.rows[0]?.sent_event_id, checkpoint.id);
 
       const postgresOutboxStore = new PostgresOutboxStore(database);
       const skewRuntime = new DurableRuntime(new PostgresRuntimeEventStore(database));
@@ -446,10 +819,29 @@ test(
         skewWorktreeLease.fencingToken + 1,
       );
 
-      const runtime = new DurableRuntime(
-        new PostgresRuntimeEventStore(database),
-        new PostgresRuntimeSnapshotStore(database),
-      );
+      const snapshotStore = new PostgresRuntimeSnapshotStore(database);
+      const snapshotStream = `snapshot_${suffix}`;
+      await snapshotStore.put({
+        version: 1,
+        streamId: snapshotStream,
+        sequence: 100,
+        phase: "completed",
+        activeTools: [],
+        events: 100,
+        createdAt: "2026-08-20T00:00:00.000Z",
+      });
+      await snapshotStore.put({
+        version: 1,
+        streamId: snapshotStream,
+        sequence: 90,
+        phase: "running",
+        activeTools: ["stale-tool"],
+        events: 90,
+        createdAt: "2026-08-19T00:00:00.000Z",
+      });
+      assert.equal((await snapshotStore.get(snapshotStream))?.sequence, 100);
+
+      const runtime = new DurableRuntime(new PostgresRuntimeEventStore(database), snapshotStore);
       const outbox = new DurableOutbox(new PostgresOutboxStore(database), runtime);
       await outbox.publish({
         streamId: sessionId,
@@ -458,7 +850,12 @@ test(
         idempotencyKey: `event-${suffix}`,
       });
       assert.equal((await outbox.pending()).length, 0);
-      assert.equal((await runtime.events(sessionId)).length, 1);
+      assert.equal(
+        (await runtime.events(sessionId)).filter(
+          (event) => event.idempotencyKey === `event-${suffix}`,
+        ).length,
+        1,
+      );
     } finally {
       await database.close();
     }

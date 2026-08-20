@@ -119,3 +119,70 @@ test("Conversation persistence: an in-flight append keeps a stable high-water ma
 
   assert.deepEqual(persisted, ["first", "second"]);
 });
+
+test("Conversation persistence: transactional stores receive one ordered batch per flush", async () => {
+  const batches: string[][] = [];
+  const store: ISessionStore = {
+    async create() {
+      return meta;
+    },
+    async append() {
+      assert.fail("appendMany-capable stores must not fall back to per-message commits");
+    },
+    async appendMany(_id, messages) {
+      batches.push(
+        messages.map((message) => message.content.find((part) => part.type === "text")?.text ?? ""),
+      );
+    },
+    async rewrite() {},
+    async load() {
+      return { ...meta, messages: [] };
+    },
+    async list() {
+      return [meta];
+    },
+    async delete() {},
+  };
+  const conversation = new Conversation({ store, meta });
+  conversation.pushUser("one");
+  conversation.pushAssistant({
+    role: "assistant",
+    content: [{ type: "text", text: "two" }],
+  });
+  await conversation.flush();
+  conversation.pushUser("three");
+  await conversation.flush();
+
+  assert.deepEqual(batches, [["one", "two"], ["three"]]);
+});
+
+test("Conversation persistence: metadata fast path never rewrites the transcript", async () => {
+  const updates: SessionMeta[] = [];
+  const store: ISessionStore = {
+    async create() {
+      return meta;
+    },
+    async append() {},
+    async updateMeta(nextMeta) {
+      updates.push(nextMeta);
+      return { ...nextMeta, updatedAt: "2026-08-20T00:00:00.000Z" };
+    },
+    async rewrite() {
+      assert.fail("metadata-only updates must not rewrite transcript rows");
+    },
+    async load() {
+      return { ...meta, messages: [] };
+    },
+    async list() {
+      return [meta];
+    },
+    async delete() {},
+  };
+  const conversation = new Conversation({ store, meta });
+
+  await conversation.updatePersistenceMeta({ ...meta, title: "fast title" });
+  await conversation.whenPersisted();
+
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0]?.title, "fast title");
+});

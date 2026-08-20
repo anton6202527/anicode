@@ -455,7 +455,9 @@ export function productionSessionManagerOptions(
       : {}),
     skills,
     ...(supportsPersistentProcesses ? { subagents, checkpoints: true } : {}),
-    repoMap: true,
+    // Prewarm starts at Agent construction. If a very large/cold workspace is still indexing when
+    // the first prompt arrives, cap its contribution to the first-token path and use it next turn.
+    repoMap: { coldStartTimeoutMs: 25 },
     ...(webSearch ? { webSearch } : {}),
     ...(webSearchSelection
       ? { webSearchProvider: webSearchSelection.provider }

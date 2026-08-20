@@ -55,6 +55,13 @@ export class CommandIdempotencyConflictError extends Error {
 }
 
 export interface CommandInboxStore {
+  /**
+   * Opaque identity of the database/transaction coordinator behind this adapter. A fenced
+   * composite commit is safe only when inbox, outbox, and Runtime Event stores expose the exact
+   * same identity; file/memory/custom adapters intentionally omit it and retain the portable
+   * outbox fallback.
+   */
+  readonly atomicPersistenceBackend?: object;
   read(sessionId: string): Promise<DurableCommand[]>;
   write(sessionId: string, commands: DurableCommand[]): Promise<void>;
   transact?<T>(sessionId: string, fn: (commands: DurableCommand[]) => T | Promise<T>): Promise<T>;
@@ -84,6 +91,21 @@ export interface CommandInboxStore {
   getCommand?(sessionId: string, commandId: string): Promise<DurableCommand | undefined>;
   recoverableCommands?(sessionId: string, now: number): Promise<DurableCommand[]>;
   deleteSession?(sessionId: string): Promise<void>;
+  /**
+   * Validate and extend an exact command lease while atomically committing its Runtime Event and
+   * a matching sent outbox record. Implementations must reject an expired/stale fencing token and
+   * preserve Runtime/outbox idempotency.
+   */
+  commitFencedEvent?(input: FencedCommandEventCommit): Promise<RuntimeEvent>;
+}
+
+export interface FencedCommandEventCommit {
+  sessionId: string;
+  commandId: string;
+  owner: string;
+  fencingToken: number;
+  leaseMs: number;
+  event: AppendRuntimeEvent;
 }
 
 function assertId(value: string, label: string): void {
@@ -408,6 +430,8 @@ export interface OutboxMessage {
 }
 
 export interface OutboxStore {
+  /** See CommandInboxStore.atomicPersistenceBackend. */
+  readonly atomicPersistenceBackend?: object;
   read(): Promise<OutboxMessage[]>;
   write(messages: OutboxMessage[]): Promise<void>;
   transact?<T>(fn: (messages: OutboxMessage[]) => T | Promise<T>): Promise<T>;

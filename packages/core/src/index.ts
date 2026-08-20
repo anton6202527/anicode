@@ -326,6 +326,7 @@ export { appendLocalAllowRules, localSettingsPath } from "./permission-store.js"
 export {
   buildRepoMap,
   gatherRepoMap,
+  prewarmRepoMap,
   extractSymbols,
   type RepoMapOptions,
   type SourceFile,
@@ -369,6 +370,7 @@ export {
   FileWorkerQueueStore,
   PersistentWorker,
   WorktreeOwnership,
+  WorktreeOwnershipBusyError,
   type WorkerJob,
   type WorkerJobStatus,
   type WorkerCancellationResult,
@@ -450,6 +452,7 @@ export {
   type CommandStatus,
   type AcceptCommandInput,
   type CommandInboxStore,
+  type FencedCommandEventCommit,
   type OutboxMessage,
   type OutboxStatus,
   type OutboxStore,

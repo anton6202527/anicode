@@ -528,7 +528,9 @@ test("run budget: persistence append 永不返回也不能绕过 wall deadline �
         yield terminal("unexpected");
       },
     };
-    store.append = async () => new Promise<void>(() => undefined);
+    const hangPersistence = async (): Promise<void> => new Promise<void>(() => undefined);
+    store.append = hangPersistence;
+    store.appendMany = hangPersistence;
     const agent = new Agent({
       provider,
       model: "m",

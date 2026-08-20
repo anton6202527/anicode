@@ -9,7 +9,8 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, defaultSystem } from "./agent.js";
-import type { Provider, StreamEvent, ChatMessage } from "./types.js";
+import { prewarmRepoMap } from "./repomap.js";
+import type { Provider, StreamEvent, ChatMessage, StreamRequest } from "./types.js";
 
 /** 按预设脚本逐轮回放的假 provider；每次 stream() 消费一条脚本 */
 function scriptedProvider(scripts: ChatMessage[][]): Provider {
@@ -398,6 +399,94 @@ test("Agent: 并发护栏 —— send 重入抛错，不破坏历史", async () 
   assert.equal(agent.isRunning, false);
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("Agent: cold repo-map omitted on the first turn is injected after prewarm", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-agent-repomap-"));
+  const fileCount = 64;
+  const fileBytes = 128 * 1024;
+  const repoMap = {
+    maxFiles: fileCount,
+    maxFileBytes: 256 * 1024,
+    maxTotalSourceBytes: 10 * 1024 * 1024,
+    maxStaleMs: 60_000,
+    coldStartTimeoutMs: 0,
+  };
+  let prewarm: Promise<void> | undefined;
+  try {
+    await Promise.all(
+      Array.from({ length: fileCount }, (_, index) => {
+        const prefix = `export function deferredRepoMapSentinel${index}() { return sharedDependency; }\n`;
+        const repeated = "const deferredRepoMapIdentifier = sharedDependency;\n";
+        const content = (prefix + repeated.repeat(Math.ceil(fileBytes / repeated.length))).slice(
+          0,
+          fileBytes,
+        );
+        return fs.writeFile(
+          path.join(dir, `deferred-${String(index).padStart(3, "0")}.ts`),
+          content,
+        );
+      }),
+    );
+
+    const systems: string[] = [];
+    const provider: Provider = {
+      name: "capture-system",
+      async *stream(request: StreamRequest): AsyncIterable<StreamEvent> {
+        systems.push(request.system ?? "");
+        yield {
+          type: "done",
+          stopReason: "end_turn",
+          message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        };
+      },
+    };
+    const agent = new Agent({
+      provider,
+      model: "x",
+      cwd: dir,
+      system: "BASE",
+      injectEnv: false,
+      projectMemory: false,
+      repoMap,
+    });
+    const internals = agent as unknown as {
+      repoMapPrewarm?: { settled: boolean; promise: Promise<void> };
+    };
+    assert.equal(internals.repoMapPrewarm?.settled, false);
+    prewarm = internals.repoMapPrewarm?.promise;
+    assert.ok(prewarm);
+
+    await collect(agent, "first turn");
+    assert.doesNotMatch(systems[0] ?? "", /deferredRepoMapSentinel/);
+
+    await prewarm;
+    await collect(agent, "deferred repo map sentinel");
+    assert.match(systems[1] ?? "", /deferredRepoMapSentinel/);
+  } finally {
+    await prewarm?.catch(() => undefined);
+    await prewarmRepoMap(dir, repoMap).catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Agent: explicit heavyweight repo-map does not start a duplicate constructor prewarm", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "anicode-agent-heavy-repomap-"));
+  try {
+    const agent = new Agent({
+      provider: scriptedProvider([]),
+      model: "x",
+      cwd: dir,
+      injectEnv: false,
+      projectMemory: false,
+      repoMap: { incremental: true },
+    });
+    const internals = agent as unknown as { repoMapPrewarm?: unknown };
+    assert.equal(internals.repoMapPrewarm, undefined);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("Agent: resume 悬空 tool_call 自愈 + 补写落盘", async () => {

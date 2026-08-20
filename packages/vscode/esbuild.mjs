@@ -2,6 +2,7 @@
 // @anicode/core 及其 SDK 依赖一并打进主机 bundle，因此 .vsix 自包含。
 import * as esbuild from "esbuild";
 import { rm } from "node:fs/promises";
+import { HOST_ESBUILD_TARGET } from "./scripts/host-runtime-baseline.mjs";
 import { packageKeyringRuntime } from "./scripts/package-keyring-runtime.mjs";
 
 const production = process.argv.includes("--production");
@@ -21,7 +22,7 @@ const host = {
   outfile: "out/extension.js",
   platform: "node",
   format: "cjs",
-  target: "node18",
+  target: HOST_ESBUILD_TARGET,
   external: ["vscode"],
   // VSIX is built per target platform. Copy the installed N-API artifacts next to the host
   // bundle and let esbuild rewrite the generated binding loader to those concrete files.

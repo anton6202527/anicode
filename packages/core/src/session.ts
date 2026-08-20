@@ -54,6 +54,12 @@ export interface ISessionStore {
   readonly storageSemantics?: SessionStoreSemantics;
   create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta>;
   append(id: string, message: ChatMessage): Promise<void>;
+  /** Transactional batch append; avoids one durable commit/network round-trip per message. */
+  appendMany?(id: string, messages: ChatMessage[]): Promise<void>;
+  /** Metadata-only point read used by scoped-host authorization hot paths. */
+  getMeta?(id: string): Promise<SessionMeta | undefined>;
+  /** Metadata-only update; must not rewrite or reload the transcript. */
+  updateMeta?(meta: SessionMeta): Promise<SessionMeta>;
   rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void>;
   load(id: string): Promise<SessionData>;
   list(): Promise<SessionMeta[]>;
@@ -152,7 +158,7 @@ export class MigratingSessionStore implements ISessionStore {
   }
 
   private async findMeta(store: ISessionStore, id: string): Promise<SessionMeta | undefined> {
-    return (await store.list()).find((meta) => meta.id === id);
+    return store.getMeta ? store.getMeta(id) : (await store.list()).find((meta) => meta.id === id);
   }
 
   async create(meta: Omit<SessionMeta, "createdAt" | "updatedAt">): Promise<SessionMeta> {
@@ -168,6 +174,34 @@ export class MigratingSessionStore implements ISessionStore {
   async append(id: string, message: ChatMessage): Promise<void> {
     await this.migrateSession(id);
     return this.primary.append(id, message);
+  }
+
+  async appendMany(id: string, messages: ChatMessage[]): Promise<void> {
+    await this.migrateSession(id);
+    if (this.primary.appendMany) return this.primary.appendMany(id, messages);
+    for (const message of messages) await this.primary.append(id, message);
+  }
+
+  async getMeta(id: string): Promise<SessionMeta | undefined> {
+    const [primary, legacy] = await Promise.all([
+      this.findMeta(this.primary, id),
+      this.findMeta(this.legacy, id),
+    ]);
+    if (!legacy) return primary;
+    if (!primary) return legacy;
+    return sameStoredWorkspace(primary, legacy) &&
+      Date.parse(legacy.updatedAt) > Date.parse(primary.updatedAt)
+      ? legacy
+      : primary;
+  }
+
+  async updateMeta(meta: SessionMeta): Promise<SessionMeta> {
+    await this.migrateSession(meta.id);
+    if (this.primary.updateMeta) return this.primary.updateMeta(meta);
+    const current = await this.primary.load(meta.id);
+    const next = { ...meta };
+    await this.primary.rewrite(next, current.messages);
+    return next;
   }
 
   async rewrite(meta: SessionMeta, messages: ChatMessage[]): Promise<void> {
@@ -401,8 +435,20 @@ export class SessionStore implements ISessionStore {
 
   /** 追加一条消息（每轮结束调用） */
   append(id: string, message: ChatMessage): Promise<void> {
+    return this.appendMany(id, [message]);
+  }
+
+  /** 在一次 owner lock / write / fsync 中提交一批消息。 */
+  appendMany(id: string, messages: ChatMessage[]): Promise<void> {
+    assertSessionId(id);
+    if (messages.length === 0) return Promise.resolve();
+    const lines = messages.map((message) => {
+      const serialized = JSON.stringify(message);
+      if (serialized === undefined)
+        throw new Error(t("Cannot serialize session message", "无法序列化会话消息"));
+      return serialized;
+    });
     return this.withSessionLock(id, async () => {
-      assertSessionId(id);
       await this.ensurePrivateDir();
       const file = this.file(id);
       // 先 chmod 也让旧版本留下的 0644 会话在下一次使用时自动迁移。
@@ -410,19 +456,45 @@ export class SessionStore implements ISessionStore {
       await recoverIncompleteJsonlTail(file);
       await assertSessionHeader(file, id);
 
-      const serialized = JSON.stringify(message);
-      if (serialized === undefined)
-        throw new Error(t("Cannot serialize session message", "无法序列化会话消息"));
       const handle = await fs.open(file, "a", 0o600);
       try {
         // The trailing LF is the commit marker. A crash before it reaches disk is repaired on the
         // next load/append; sync makes a successfully resolved append durable before acknowledgement.
-        await handle.writeFile(serialized + "\n", "utf8");
+        await handle.writeFile(lines.join("\n") + "\n", "utf8");
         await handle.sync();
       } finally {
         await handle.close();
       }
     });
+  }
+
+  /** Read only the JSONL header; authorization does not scan unrelated sessions or transcript. */
+  async getMeta(id: string): Promise<SessionMeta | undefined> {
+    assertSessionId(id);
+    try {
+      return await this.withSessionLock(id, async () => {
+        const file = this.file(id);
+        await this.secureExistingFile(file);
+        const first = await readFirstLine(file);
+        const parsed = JSON.parse(first) as unknown;
+        if (!isRecord(parsed) || !isRecord(parsed.__meta)) {
+          throw new Error(t(`Session ${id} is missing its meta header`, `会话 ${id} 缺少 meta 头`));
+        }
+        const meta = parsed.__meta as unknown as SessionMeta;
+        if (meta.id !== id) {
+          throw new Error(
+            t(
+              `Session ${id} has a mismatched meta id: ${meta.id}`,
+              `会话 ${id} 的 meta id 不匹配: ${meta.id}`,
+            ),
+          );
+        }
+        return withFileActivity(meta, file);
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
   }
 
   /**

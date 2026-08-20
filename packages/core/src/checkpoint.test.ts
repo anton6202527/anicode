@@ -9,8 +9,10 @@ import { promises as fs } from "node:fs";
 import { execFileSync } from "node:child_process";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "./agent.js";
 import { SessionManager, type SessionEvent } from "./session-manager.js";
 import { SessionStore } from "./session.js";
+import { SnapshotStore } from "./snapshot.js";
 import type { Provider, StreamEvent } from "./types.js";
 import { DurableRuntime, MemoryRuntimeEventStore } from "./runtime/durable.js";
 
@@ -37,6 +39,58 @@ async function gitRepo(): Promise<string> {
   git("config", "user.name", "t");
   return dir;
 }
+
+test("checkpoint latency: provider text streams while Git snapshot is still running", async () => {
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => (markStarted = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  class GatedSnapshotStore extends SnapshotStore {
+    override async take(label: string) {
+      markStarted();
+      await gate;
+      return {
+        id: "checkpoint-latency",
+        tree: "tree-before-tools",
+        label,
+        createdAt: new Date(0).toISOString(),
+      };
+    }
+  }
+
+  const agent = new Agent({
+    provider: plainProvider(),
+    model: "scripted",
+    cwd: process.cwd(),
+    projectMemory: false,
+    injectEnv: false,
+    browser: false,
+    checkpoints: new GatedSnapshotStore(process.cwd()),
+  });
+  const iterator = agent.send("stream before snapshot")[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value?.type, "user_message");
+
+  const textEvent = iterator.next();
+  await started;
+  const early = await Promise.race([
+    textEvent,
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250)),
+  ]);
+  assert.notEqual(early, "timeout", "snapshot collection must not delay first provider text");
+  assert.equal(typeof early === "string" ? early : early.value?.type, "text");
+
+  const checkpointEvent = iterator.next();
+  let checkpointSettled = false;
+  void checkpointEvent.then(() => (checkpointSettled = true));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(checkpointSettled, false, "tool/outcome handling must still join the snapshot");
+  release();
+  assert.equal((await checkpointEvent).value?.type, "checkpoint");
+
+  while (!(await iterator.next()).done) {
+    // Drain the remaining turn_end/done events so Agent cleanup runs.
+  }
+});
 
 test("checkpoint/undo: 记录快照事件并回滚本轮之后的文件改动", async () => {
   const repo = await gitRepo();
