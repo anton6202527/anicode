@@ -106,7 +106,7 @@ jobs:
 
       - name: Create or update the version PR
         id: changesets
-        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
+        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v1
         with:
           version: npm run version
           commitMode: github-api
@@ -315,12 +315,12 @@ jobs:
           path: release-assets
 
       - name: Attest VSIX build provenance
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: release-assets/anicode-${{ matrix.target }}-SHA256SUMS.txt
 
       - name: Upload .vsix to release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             release-assets/anicode-${{ matrix.target }}.vsix
@@ -453,12 +453,12 @@ jobs:
           path: release-assets
 
       - name: Attest desktop build provenance
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: release-assets/anicode-${{ matrix.platform }}-SHA256SUMS.txt
 
       - name: Upload desktop release assets
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           fail_on_unmatched_files: true
           files: |
