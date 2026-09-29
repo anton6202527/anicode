@@ -61,7 +61,7 @@
     "pg": "^8.22.0",
     "react": "^19.2.0",
     "string-width": "^7.2.0",
-    "undici": "^7.24.4"
+    "undici": "^7.30.0"
   },
   "devDependencies": {
     "esbuild": "^0.28.1"
